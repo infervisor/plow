@@ -214,6 +214,16 @@ pub struct RuntimeConfig {
     )]
     pub tts_stream_first_frames: Option<usize>,
 
+    /// Most new frames one stateful codec step decodes (capped by the packet's
+    /// `stream.step_frames`): batched steps pay their launch's longest step, so equal short steps
+    /// pad less than a ramp to the packet's cap. Unset: the packet's cap.
+    #[arg(
+        long = "tts-stream-step-frames",
+        env = "PLOW_TTS_STREAM_STEP_FRAMES",
+        global = true
+    )]
+    pub tts_stream_step_frames: Option<usize>,
+
     /// Strip markup and insert runtime pauses on speech packets without a tag map. Unset: legacy text path.
     #[arg(long = "tts-tags-default", env = "PLOW_TTS_TAGS_DEFAULT", value_parser = ["strip"], global = true)]
     pub tts_tags_default: Option<String>,
@@ -340,11 +350,12 @@ pub struct RuntimeConfig {
     /// Packed audio-encoder hold (ms): while `PLOW_ASR_ENCODE_HOLD_INFLIGHT` requests are in flight
     /// and the queued audio is short of a full launch, the encoder waits up to this long from its
     /// oldest queued request for more, trading that wait for fewer per-launch fixed costs. 0 =
-    /// launch whatever is queued.
+    /// launch whatever is queued. 50 (Qwen3-ASR 1.7B, H100, open loop): holds 150 req/s at 99%
+    /// under 1 s where 0 holds 100, saturation 985 -> 1277 audio s/s, c1 and c16 unchanged.
     #[arg(
         long = "asr-encode-hold-ms",
         env = "PLOW_ASR_ENCODE_HOLD_MS",
-        default_value_t = 0,
+        default_value_t = 50,
         global = true
     )]
     pub asr_encode_hold_ms: u64,

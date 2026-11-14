@@ -2768,6 +2768,11 @@ impl Builder {
                 || op.inst.op == DevOp::GemmGroupPf as u16
                 || (op.inst.op == DevOp::MlaMergeFold as u16 && op.inst.i[5] == 1)
                 || (op.inst.op == DevOp::FlashMlaDecodeFp8 as u16 && op.isolated)
+                // An isolated wgmma conv: the speech conv object's kernel entry.
+                || ((op.inst.op == DevOp::Conv1dF32 as u16
+                    || op.inst.op == DevOp::ConvTranspose1dF32 as u16)
+                    && op.inst.j[1] & (1 << 17) != 0
+                    && op.isolated)
         }) || native_gemma4_glu
             || lean_moe_stage2
             || lean_moe_stage1

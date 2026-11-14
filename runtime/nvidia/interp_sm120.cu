@@ -268,6 +268,19 @@ extern "C" __device__ __constant__ unsigned plow_pf_fp8_request_abi = 1;
 #if PLOW_NV_SPEECH
 #include "op_speech_f32.cuh"
 #endif
+/* The conv-only speech object: plowrt launches speech_conv_node for each segment devgen isolated to
+ * one wgmma conv (PLOW_EMIT_CODEC_CONV_OBJECT), grid = the conv's blocks, the rest of the program
+ * on the full speech object. A kernel entry, not the interpreter: inside the interpreter function the
+ * ping-pong body spills (10300 LDL), here it holds its registers. */
+#if defined(PLOW_SPEECH_CONV_OBJECT) && PLOW_SPEECH_CONV_OBJECT
+#if !(PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER))
+#error "PLOW_SPEECH_CONV_OBJECT is a Hopper speech object"
+#endif
+extern "C" __global__ void __launch_bounds__(256, 1) speech_conv_node(const PlowDevInst* in, void* const* T) {
+    if (sp_wg_conv1d(in, T, blockIdx.x, gridDim.x)) return;
+    d_conv1d_f32(in, T, in->op == PLOW_DOP_CONV_TRANSPOSE1D_F32, blockIdx.x, gridDim.x, sp_smem);
+}
+#endif
 #ifndef PLOW_NV_PREFILL
 #define PLOW_NV_PREFILL 0
 #endif
@@ -887,6 +900,8 @@ extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _fp8m1)
 #elif PLOW_NV_GEMV512_ROLE
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _gemv512)
+#elif PLOW_NV_SPEECH && defined(PLOW_SPEECH_CONV_OBJECT) && PLOW_SPEECH_CONV_OBJECT
+#define PLOW_SYM(n) PLOW_NV_CAT(n, _speechconv)
 #elif PLOW_NV_SPEECH
 #define PLOW_SYM(n) PLOW_NV_CAT(n, _speech)
 #elif PLOW_NV_PREFILL && PLOW_NV_PACKED_REQUEST && PLOW_NV_SEG_GEMM
@@ -1291,16 +1306,29 @@ extern "C" __device__ unsigned PLOW_SYM(plow_fa_hd512) = PLOW_NV_FA_ONLY_HD256_O
 #if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER)
 /* Speech-op semantics beyond the op set (packet_exec::speech_features): bit 1 = conv flag bit 3
  * (ragged wgmma tiles; bit 0 is retired), bit 2 = conv flag bit 30 (split-image input,
- * PLOW_SPEECH_SPLIT_A). A packet relying on a bit is refused by an object without it. */
-#if defined(PLOW_SPEECH_SPLIT_A) && PLOW_SPEECH_SPLIT_A
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u | 4u;
-#else
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) = 2u;
+ * PLOW_SPEECH_SPLIT_A), bit 3 = conv flag bit 17 without bit 14 (bf16 taps conv,
+ * PLOW_SPEECH_CONV_BF16). A packet relying on a bit is refused by an object without it. */
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_features) =
+    2u | (PLOW_SPEECH_SPLIT_A ? 4u : 0u) | (PLOW_SPEECH_CONV_BF16 ? 8u : 0u);
 #endif
+/* The conv arms a PLOW_SPEECH_CONV_ARMS object carries (SPA_*); the loader refuses a packet whose
+ * convs reach another (plow_asset::speech_flag_layout::conv_arms). Absent = all. */
+#if PLOW_NV_SPEECH && PLOW_SPEECH_CONV_ARMS != (~0ull)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_arms) = (unsigned)PLOW_SPEECH_CONV_ARMS;
+#endif
+/* The bf16 taps conv bodies a PLOW_SPEECH_CONV_BF16_VARIANTS object carries (speech_flag_layout::
+ * conv_bf16_variants); absent = all. */
+#if PLOW_NV_SPEECH && defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16 && PLOW_SPEECH_CONV_BF16_VARIANTS != 0xFFFFFFull
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_bf16_variants) = (unsigned)PLOW_SPEECH_CONV_BF16_VARIANTS;
 #endif
 #if PLOW_NV_SPEECH && PLOW_SPEECH_OPS != (~0ull)
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_lo) = (unsigned)(PLOW_SPEECH_OPS & 0xFFFFFFFFull);
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SPEECH_OPS >> 32);
+#endif
+/* The conv epilogues compiled in: the loader requires the conv object's to equal the speech object's. */
+#if PLOW_NV_SPEECH && PLOW_SPEECH_CONV_POSTS != (~0ull)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_posts_lo) = (unsigned)(PLOW_SPEECH_CONV_POSTS & 0xFFFFFFFFull);
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_posts_hi) = (unsigned)(PLOW_SPEECH_CONV_POSTS >> 32);
 #endif
 /* Speech-object capabilities behind instruction flag bits (the op mask cannot see a flag): the
  * loader derives the required set from each program's instructions and refuses an object without
@@ -1308,22 +1336,39 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_ops_hi) = (unsigned)(PLOW_SP
  * offered: the view addressing cost the M >= 40 rungs ~25 % with the view off, so a view packet is refused;
  * bit 1: AttentionF32 query view (flag bit 6); bit 2: f16 LayerNorm / projection operands. */
 #if PLOW_NV_SPEECH
+/* bit 4: chunk-canonical K bf16 taps convs (PLOW_SPEECH_CONV_BF16_VARIANTS bits 12..23). */
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16 && ((PLOW_SPEECH_CONV_BF16_VARIANTS >> 12) & 0xFFFull)
+#define PLOW_SPEECH_CAP_CHUNKS 16u
+#else
+#define PLOW_SPEECH_CAP_CHUNKS 0u
+#endif
 #if defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 14u;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 46u | PLOW_SPEECH_CAP_CHUNKS;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 10u;
 #endif
+/* Layout 4 adds the single-product bf16 wgmma convs (Conv1dF32 / ConvTranspose1dF32 i6 bit 31), 5 the
+ * fp16 short attention (AttentionF32 j1 bit 31); every Hopper object runs both. */
+#if defined(PLOW_NV_HOPPER)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 5u;
+#else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 3u;
+#endif
 #else
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 6u;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 38u | PLOW_SPEECH_CAP_CHUNKS;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 2u;
 #endif
 /* The speech-op flag layout this object reads (plow_asset::speech_flag_layout::LAYOUT): a packet
- * layout 2 preserves layout 1 meanings and also accepts its packets. */
+ * layout 2 preserves layout 1 meanings and also accepts its packets. Hopper objects read layout 5
+ * (single-product convs, fp16 short attention); ring KV stays behind capability bit 3. */
+#if defined(PLOW_NV_HOPPER)
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 5u;
+#else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 2u;
+#endif
 #endif
 #endif
 #if PLOW_PACKET_HASH != 0ull
@@ -1336,6 +1381,7 @@ extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_hi) =
 #if PLOW_NV_KV_ILV
 /* The KV row layout this object addresses (op_attention.cuh); absent = head-major. */
 extern "C" __device__ unsigned PLOW_SYM(plow_kv_layout) = 1;
+extern "C" __device__ unsigned PLOW_SYM(plow_hnr_kv_layout) = 1;
 #endif
 
 /* ---- the op dispatch -------------------------------------------------------------------
@@ -1388,6 +1434,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     d_gemm_w8a8_m1_tma_sm90((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1),
         (const uint8_t*)TEN(2), T[in->i[7]], (const float*)TEN(3), (const float*)TEN(4),
         in->i[1], in->i[2], in->i[4], slice, nblk, (__nv_bfloat16*)arena);
+#elif PLOW_NV_SPEECH && defined(PLOW_SPEECH_CONV_OBJECT) && PLOW_SPEECH_CONV_OBJECT
+    /* The conv object runs its convs on speech_conv_node, never through the interpreter. */
+    (void)tw_; (void)in; (void)T; (void)slice; (void)nblk; (void)arena;
+    __trap();
 #elif PLOW_NV_GEMV512_ROLE
     if (in->i[0] != 1 || !in->i[2] || in->i[2] > 32768u) { __trap(); return; }
     switch (in->op) {
@@ -2224,8 +2274,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             d_gemv_tp_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                          in->i[1], in->i[2], slice, nblk);
 #else
+        {
+#if PLOW_NV_HEAD_MMA && PLOW_NV_GEMV_MMA && !PLOW_NV_SPEECH && !PLOW_NV_PREFILL
+            if (d_gemv_f32out_mma((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                                  in->i[0], in->i[1], in->i[2], in->i[7] != 0u, slice, nblk))
+                break;
+#endif
             d_gemv_f32out((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                           in->i[1], in->i[2], in->i[7] != 0u, slice, nblk, arena);
+        }
 #endif
         break;
     case PLOW_DOP_SAMPLE_SMALL_F32:

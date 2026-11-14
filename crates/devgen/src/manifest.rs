@@ -3115,6 +3115,9 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
     if manifest.get("speech_ring_kv").and_then(Value::as_bool) == Some(true) {
         feed("\x1espeech_ring_kv");
     }
+    if manifest.get("speech_conv_bf16").and_then(Value::as_bool) == Some(true) {
+        feed("\x1espeech_conv_bf16");
+    }
     feed("\x1e");
     if let Some(o) = manifest.get("tuning").and_then(Value::as_object) {
         for (k, v) in o {
@@ -3184,6 +3187,13 @@ pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
         })
 }
 
+/// The conv arms of every conv a packet runs: `PLOW_SPEECH_CONV_ARMS`.
+pub fn speech_conv_arms(model: &packet::devbuild::Model) -> u64 {
+    model.progs.iter().flat_map(|p| &p.insts).fold(0, |m, i| {
+        m | plow_asset::speech_flag_layout::conv_arms(i.op, &i.i, i.j[0], i.j[1])
+    })
+}
+
 /// Whether a conv that can reach the wide tile (flags bit 14) pads with other than zeros:
 /// `PLOW_SPEECH_CONV_WIDE_PADDED`.
 pub fn speech_conv_wide_padded(model: &packet::devbuild::Model) -> bool {
@@ -3204,6 +3214,16 @@ pub struct SpeechMasks {
     pub split_a: bool,
     pub conv_wide_padded: bool,
     pub ring_kv: bool,
+    /// A conv takes the bf16 taps arm (Conv1dF32 flag bit 17 without bit 14):
+    /// `PLOW_SPEECH_CONV_BF16` compiles it and its larger launch arena into the speech object.
+    pub conv_bf16: bool,
+    /// `PLOW_SPEECH_CONV_ARMS`: the generic conv arms compiled into the speech object.
+    pub conv_arms: u64,
+    /// `PLOW_SPEECH_CONV_BF16_VARIANTS`: the bf16 taps conv bodies (plan kind x fused input).
+    pub conv_bf16_variants: u64,
+    /// A segment is one wgmma conv (`PLOW_EMIT_CODEC_CONV_OBJECT`): the conv-only `_speechconv`
+    /// object runs it (`objects.speech_conv.required`).
+    pub conv_object: bool,
 }
 
 impl SpeechMasks {
@@ -3222,6 +3242,27 @@ impl SpeechMasks {
                 .iter()
                 .flat_map(|p| &p.insts)
                 .any(|d| plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)),
+            conv_bf16: model.progs.iter().flat_map(|p| &p.insts).any(|i| {
+                i.op == DevOp::Conv1dF32 as u16
+                    && i.j[1] & (1 << 17) != 0
+                    && i.j[1] & (1 << 14) == 0
+            }),
+            conv_arms: speech_conv_arms(model),
+            conv_bf16_variants: model.progs.iter().flat_map(|p| &p.insts).fold(0, |m, i| {
+                m | plow_asset::speech_flag_layout::conv_bf16_variants(i.op, &i.i, i.j[1])
+            }),
+            conv_object: model.progs.iter().any(|p| {
+                plow_asset::speech_flag_layout::conv_object_segments(
+                    &p.gq_seg_ofs,
+                    &p.gq_stream,
+                    |i| {
+                        let d = &p.insts[i as usize];
+                        plow_asset::speech_flag_layout::conv_object_inst(d.op, d.j[1])
+                    },
+                )
+                .iter()
+                .any(Option::is_some)
+            }),
         }
     }
     pub fn add(&mut self, other: Self) {
@@ -3230,6 +3271,10 @@ impl SpeechMasks {
         self.split_a |= other.split_a;
         self.conv_wide_padded |= other.conv_wide_padded;
         self.ring_kv |= other.ring_kv;
+        self.conv_bf16 |= other.conv_bf16;
+        self.conv_arms |= other.conv_arms;
+        self.conv_bf16_variants |= other.conv_bf16_variants;
+        self.conv_object |= other.conv_object;
     }
 }
 
@@ -3290,6 +3335,27 @@ pub fn config_header(manifest: &Value) -> String {
             "/* A conv reads split-image activations: the image GEMM arm and its launch arena. */\n\
              #ifndef PLOW_SPEECH_SPLIT_A\n#define PLOW_SPEECH_SPLIT_A 1\n#endif\n\n",
         );
+    }
+    if manifest.get("speech_conv_bf16").and_then(Value::as_bool) == Some(true) {
+        out.push_str(
+            "/* A conv takes the bf16 taps arm: compiled with its launch arena. */\n\
+             #ifndef PLOW_SPEECH_CONV_BF16\n#define PLOW_SPEECH_CONV_BF16 1\n#endif\n\n",
+        );
+    }
+    if let Some(arms) = manifest.get("speech_conv_arms").and_then(Value::as_u64) {
+        out.push_str(&format!(
+            "/* Generic conv arms the packet's convs reach; the rest are not compiled. */\n\
+             #ifndef PLOW_SPEECH_CONV_ARMS\n#define PLOW_SPEECH_CONV_ARMS 0x{arms:x}ull\n#endif\n\n"
+        ));
+    }
+    if let Some(v) = manifest
+        .get("speech_conv_bf16_variants")
+        .and_then(Value::as_u64)
+    {
+        out.push_str(&format!(
+            "/* bf16 taps conv bodies (plan kind x fused input) the packet's convs use. */\n\
+             #ifndef PLOW_SPEECH_CONV_BF16_VARIANTS\n#define PLOW_SPEECH_CONV_BF16_VARIANTS 0x{v:x}ull\n#endif\n\n"
+        ));
     }
     if let Some(radix) = manifest.get("sample_radix").and_then(Value::as_bool) {
         out.push_str(&format!(
@@ -4692,6 +4758,13 @@ mod tests {
         assert_eq!(pairing_hash(&a), pairing_hash(&c));
         c["speech_split_a"] = json!(true);
         assert_ne!(pairing_hash(&a), pairing_hash(&c));
+        let mut d = a.clone();
+        d["speech_conv_bf16"] = json!(true);
+        assert_ne!(pairing_hash(&a), pairing_hash(&d));
+        // Like the op mask, the conv arm mask is checked by the loader, not paired.
+        let mut e = a.clone();
+        e["speech_conv_arms"] = json!(0x18e);
+        assert_eq!(pairing_hash(&a), pairing_hash(&e));
     }
 
     #[test]

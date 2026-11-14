@@ -19,6 +19,58 @@ use crate::exec::packet_runtime::{
 };
 use crate::{Result, RuntimeError};
 
+#[path = "handoff_packet.rs"]
+mod handoff;
+pub(crate) use handoff::PacketHandoffProvider;
+
+#[cfg(test)]
+#[test]
+#[ignore = "CPU-only actual packet check; HANDOFF_TEST_ASSETS contains codec.pkt; use a quiet build window"]
+fn handoff_native_codec_types_are_derived_from_actual_instructions() {
+    let path =
+        std::path::PathBuf::from(std::env::var("HANDOFF_TEST_ASSETS").unwrap()).join("codec.pkt");
+    let image = crate::asset::packet_image::PacketImage::open(&path).unwrap();
+    let asset = crate::exec::packet_runtime::PacketAsset::from_bytes(&image.raw).unwrap();
+    let codec = asset
+        .pipelines()
+        .iter()
+        .find(|p| p.driver == "codec.v1")
+        .unwrap();
+    let mut checked = 0;
+    image.blob.with_packet_view(|packet| {
+        for (role, &program) in &codec.programs {
+            if !role.starts_with("step.") || !role.ends_with(".f1") {
+                continue;
+            }
+            let inferred = plow_asset::packet_pipeline_native::NativePacketTypes::infer(
+                packet,
+                program as usize,
+            )
+            .unwrap();
+            for (name, tensor) in &codec.tensors {
+                if name != "codes" && name != "pcm" && !name.starts_with("stream.") {
+                    continue;
+                }
+                let handle = packet
+                    .tensors
+                    .iter()
+                    .position(|t| t.name == tensor.name)
+                    .unwrap();
+                if inferred.access(handle).is_some() {
+                    assert_eq!(
+                        inferred.dtype(handle).unwrap(),
+                        tensor.dtype,
+                        "{role}/{name}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    });
+    assert!(checked >= 6, "no real stateful codec interfaces checked");
+    eprintln!("native codec types/accesses checked={checked}");
+}
+
 /// The speech object and its entry symbol for a compute capability.
 pub(super) fn speech_object(cc: (u32, u32)) -> (&'static str, &'static str) {
     match cc {
@@ -58,9 +110,23 @@ fn speech_ops(blob: &DevBlob) -> u64 {
         .fold(0, |mask, op| mask | 1 << (op - SPEECH_OP0))
 }
 
+fn speech_conv_bf16_variants(blob: &DevBlob) -> u64 {
+    blob.progs.iter().flat_map(|p| &p.insts).fold(0, |m, d| {
+        m | plow_asset::speech_flag_layout::conv_bf16_variants(d.op, &d.i, d.fj[2])
+    })
+}
+
+fn speech_conv_arms(blob: &DevBlob) -> u64 {
+    blob.progs.iter().flat_map(|p| &p.insts).fold(0, |m, d| {
+        m | plow_asset::speech_flag_layout::conv_arms(d.op, &d.i, d.fj[1], d.fj[2])
+    })
+}
+
 /// Speech-object capability bits the instructions need (`plow_speech_caps_speech`): bit 0 a
 /// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6),
-/// bit 2 FP16 LayerNorm output / projection operands.
+/// bit 2 FP16 LayerNorm output / projection operands, bit 3 ring KV, bit 4 a chunk-canonical K
+/// bf16 taps conv (an object without it would run the unchunked chain), bit 5 the fp16 short
+/// AttentionF32 (`j1` bit 31).
 pub(super) fn speech_caps_required<'a>(
     insts: impl IntoIterator<Item = &'a packet::dev::DevInst64>,
 ) -> u32 {
@@ -73,9 +139,17 @@ pub(super) fn speech_caps_required<'a>(
             Some(DevOp::AttentionF32) => {
                 u32::from(d.i[6] & 64 != 0) << 1
                     | u32::from(plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)) << 3
+                    | u32::from(plow_asset::speech_flag_layout::half_attention(
+                        d.op, d.fj[2],
+                    )) << 5
             }
             Some(DevOp::StreamTailF32) if plow_asset::speech_flag_layout::ring_kv(d.op, &d.i) => 8,
             Some(DevOp::LayerNormF32) if d.i[2] & 8 != 0 => 4,
+            Some(DevOp::Conv1dF32)
+                if plow_asset::speech_flag_layout::conv_bf16_chunked(d.op, d.fj[2]) =>
+            {
+                16
+            }
             _ => 0,
         }
     })
@@ -89,14 +163,16 @@ pub(super) fn missing_speech_caps(required: u32, compiled: Option<u32>) -> u32 {
 /// Speech-op semantics a packet needs beyond its op set, as the object's
 /// `plow_speech_features_speech` bits (absent = none): bit 1 = Conv1dF32 / ConvTranspose1dF32
 /// flag bit 3 (wgmma tiles spanning taps / phases at widths % 4), bit 2 = Conv1dF32 flag bit 30
-/// (a split-image input). Bit 0 is retired: it named the ragged semantics on flag bit 21, which
-/// now carries the pinned-arms field.
+/// (a split-image input), bit 3 = Conv1dF32 flag bit 17 without bit 14 (the bf16 taps conv).
+/// Bit 0 is retired: it named the ragged semantics on flag bit 21, which now carries the
+/// pinned-arms field.
 pub(super) fn speech_features(insts: impl IntoIterator<Item = (u16, u32)>) -> u32 {
     insts.into_iter().fold(0, |m, (op, flags)| {
         let conv = op == DevOp::Conv1dF32 as u16;
         let ragged = (conv || op == DevOp::ConvTranspose1dF32 as u16) && flags >> 3 & 1 != 0;
         let split = conv && flags >> 30 & 1 != 0;
-        m | u32::from(ragged) << 1 | u32::from(split) << 2
+        let bf16 = conv && flags >> 17 & 1 != 0 && flags >> 14 & 1 == 0;
+        m | u32::from(ragged) << 1 | u32::from(split) << 2 | u32::from(bf16) << 3
     })
 }
 
@@ -221,6 +297,36 @@ fn ring_speech_operands_require_layout_capability() {
 
 #[cfg(test)]
 #[test]
+fn half_short_attention_requires_the_capability() {
+    let mut d = packet::dev::DevInst64::default();
+    d.op = DevOp::AttentionF32 as u16;
+    d.fj[2] = 2048;
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.fj[2] |= 1 << 31;
+    assert_eq!(speech_caps_required([&d]), 32);
+    assert_eq!(missing_speech_caps(32, Some(6 | 16)), 32);
+    assert_eq!(missing_speech_caps(32, Some(38)), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn chunked_bf16_convs_require_the_capability() {
+    let mut d = packet::dev::DevInst64::default();
+    d.op = DevOp::Conv1dF32 as u16;
+    d.fj[2] = 0x66a000;
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.fj[2] |= 1 << 24;
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.fj[2] |= 10 << 24;
+    assert_eq!(speech_caps_required([&d]), 16);
+    assert_eq!(missing_speech_caps(16, Some(14)), 16);
+    assert_eq!(missing_speech_caps(16, None), 16);
+    d.fj[2] |= 1 << 14;
+    assert_eq!(speech_caps_required([&d]), 0);
+}
+
+#[cfg(test)]
+#[test]
 fn ragged_conv_flags_require_the_speech_feature() {
     let (conv, convt) = (DevOp::Conv1dF32 as u16, DevOp::ConvTranspose1dF32 as u16);
     assert_eq!(speech_features([(conv, 0x6e000), (convt, 0xa000)]), 0);
@@ -229,6 +335,8 @@ fn ragged_conv_flags_require_the_speech_feature() {
     assert_eq!(speech_features([(DevOp::UnaryF32 as u16, 1 << 3)]), 0);
     assert_eq!(speech_features([(conv, 0x6e000 | 1 << 30)]), 4);
     assert_eq!(speech_features([(convt, 0xa000 | 1 << 30)]), 0);
+    assert_eq!(speech_features([(conv, 0x6a000)]), 8);
+    assert_eq!(speech_features([(convt, 0x6a000)]), 0);
 }
 
 #[cfg(test)]
@@ -268,9 +376,18 @@ fn speech_object_symbols_follow_the_cmake_mangling() {
 struct Program {
     kernarg: DevProgram,
     segments: usize,
+    /// Per segment: one wgmma conv alone (its device instruction, blocks), launched on the conv
+    /// object's kernel entry when loaded.
+    conv_segments: Vec<Option<(u64, u32)>>,
     counters: u64,
     counter_bytes: usize,
     _tables: Vec<DeviceMem>,
+}
+
+pub(crate) struct SharedPacketTensors {
+    pub backend: Arc<CudaBackend>,
+    pub memory: Arc<DeviceMem>,
+    pub views: std::collections::BTreeMap<String, (u64, u64, bool)>,
 }
 
 pub struct CudaPacketRuntime {
@@ -281,6 +398,7 @@ pub struct CudaPacketRuntime {
     function: KernelFn,
     grid: u32,
     smem: u32,
+    conv: Option<ConvObject>,
     names: Vec<String>,
     tensors: Vec<DeviceMem>,
     _table: DeviceMem,
@@ -294,12 +412,191 @@ pub struct CudaPacketRuntime {
     last_us: f64,
     input_stage: Option<PinnedHost>,
     input_failed: bool,
+    shared: Option<SharedPacketTensors>,
     /// Last field: dropped after every allocation above, so [`resident_in`] turns false only once
     /// the device memory is back.
     _resident: Arc<()>,
 }
 
+/// The conv-only speech object (`<speech stem>conv.cubin`, sm_90a): `speech_conv_node(inst, tensors)`
+/// runs one wgmma conv over `blocks` CTAs, for the segments devgen isolated to it (raw segments: the
+/// stream orders them, no counters cross them).
+struct ConvObject {
+    _module: Module,
+    function: KernelFn,
+    smem: u32,
+}
+
+/// Loads the conv object beside `object` when a program has a conv segment. Absent, those
+/// segments run on the speech object (same bits). Both objects come from one build: an object
+/// whose layout, feature or arm stamps differ from the speech object's is stale.
+fn load_conv_object(
+    be: &CudaBackend,
+    main: &Module,
+    object: &Path,
+    blob: &DevBlob,
+) -> Result<Option<ConvObject>> {
+    use plow_asset::speech_flag_layout as layout;
+    let wanted = blob.progs.iter().any(|p| {
+        layout::conv_object_segments(&p.gq_seg_ofs, &p.gq_stream, |i| {
+            let d = &p.insts[i as usize];
+            layout::conv_object_inst(d.op, d.fj[2])
+        })
+        .iter()
+        .any(Option::is_some)
+    });
+    let stem = object
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let path = object.with_file_name(format!("{stem}conv.cubin"));
+    if !wanted {
+        return Ok(None);
+    }
+    let image = match std::fs::read(&path) {
+        Ok(image) => image,
+        Err(_) => {
+            tracing::warn!(object = %path.display(), "packet has conv segments but no conv object: they run on the speech object");
+            return Ok(None);
+        }
+    };
+    let module = be.module_load(&image)?;
+    let function = be.get_function(&module, "speech_conv_node")?;
+    for symbol in [
+        layout::OBJECT_SYMBOL,
+        layout::CONV_ARMS_SYMBOL,
+        layout::CONV_BF16_VARIANTS_SYMBOL,
+        "plow_speech_features_speech",
+        "plow_speech_conv_posts_lo_speech",
+        "plow_speech_conv_posts_hi_speech",
+        "plow_speech_ops_lo_speech",
+        "plow_speech_ops_hi_speech",
+    ] {
+        if be.module_global_u32(main, symbol)?
+            != be.module_global_u32(&module, &format!("{symbol}conv"))?
+        {
+            return Err(RuntimeError::Rejected(format!(
+                "{}: {symbol} differs from {}; rebuild both objects",
+                path.display(),
+                object.display()
+            )));
+        }
+    }
+    let smem = be
+        .module_global_u32(&module, "plow_arena_bytes_speechconv")?
+        .unwrap_or(49152);
+    be.set_max_dynamic_smem(function, smem)?;
+    tracing::info!(object = %path.display(), smem, "speech conv object loaded");
+    Ok(Some(ConvObject {
+        _module: module,
+        function,
+        smem,
+    }))
+}
+
 type Residents = parking_lot::Mutex<Vec<(std::path::PathBuf, u8, std::sync::Weak<()>)>>;
+
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; DEPTH_PREFIX_TEST_ASSETS contains devgen's emitted prefix blocks; run through gpuq"]
+fn persistent_depth_prefix_matches_embedding_rows() {
+    let dir = std::path::PathBuf::from(std::env::var("DEPTH_PREFIX_TEST_ASSETS").unwrap());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let sanitize = std::env::var_os("DEPTH_PREFIX_SANITIZE").is_some();
+    let batches: &[usize] = if sanitize {
+        &[33]
+    } else {
+        &[1, 8, 32, 64, 128, 200, 224]
+    };
+    let table: Vec<u16> = (0..31 * 2048 * 1024)
+        .map(|i| {
+            0x3c00
+                | ((i / 1024 * 37 + i % 1024 * 11) % 1024) as u16
+                | ((((i / 1024 + i) % 2) as u16) << 15)
+        })
+        .collect();
+    for &batch in batches {
+        for level in [1, 9, 17, 25, 31] {
+            let mut runtimes = [false, true].map(|cached| {
+                let path = dir.join(format!("prefix.b{batch}.l{level}.cache{cached}.pkt"));
+                CudaPacketRuntime::load_on(be.clone(), &path).unwrap()
+            });
+            for rt in &mut runtimes {
+                let t = rt.tensor("w.maya2.depth.emb.weight").unwrap();
+                rt.write_tensor(t, bytemuck::cast_slice(&table)).unwrap();
+            }
+            let rows = if level == 31 { 1 } else { level + 1 };
+            for frame in 0..3 {
+                let p0: Vec<f32> = (0..batch * 1024)
+                    .map(|i| (i as f32 + frame as f32) / 1024.)
+                    .collect();
+                let indices: Vec<Vec<u32>> = (0..31)
+                    .map(|k| {
+                        (0..batch)
+                            .map(|r| (k * 2048 + (r * 37 + frame * 17) % 2048) as u32)
+                            .collect()
+                    })
+                    .collect();
+                let expected: Vec<f32> = (0..batch * rows * 1024)
+                    .map(|i| {
+                        let (b, p, d) = (i / (rows * 1024), i / 1024 % rows, i % 1024);
+                        let pos = if level == 31 { level } else { p };
+                        if pos == 0 {
+                            p0[b * 1024 + d]
+                        } else {
+                            let h = table[indices[pos - 1][b] as usize * 1024 + d];
+                            f32::from_bits(
+                                (u32::from(h & 0x8000) << 16)
+                                    | 0x3f80_0000
+                                    | (u32::from(h & 1023) << 13),
+                            )
+                        }
+                    })
+                    .collect();
+                for rt in &mut runtimes {
+                    for (name, data) in
+                        std::iter::once(("act.depth.p0".to_owned(), bytemuck::cast_slice(&p0)))
+                            .chain(indices.iter().enumerate().map(|(k, v)| {
+                                (format!("act.depth.eidx.{k}"), bytemuck::cast_slice(v))
+                            }))
+                    {
+                        if let Some(t) = rt.tensor(&name) {
+                            rt.write_tensor(t, data).unwrap();
+                        }
+                    }
+                    let x = rt.tensor("act.depth.x").unwrap();
+                    let poison = vec![12345f32; x.bytes / 4];
+                    rt.write_tensor(x, bytemuck::cast_slice(&poison)).unwrap();
+                }
+                runtimes[1].run_sequence(&[0]).unwrap();
+                let mut timing = Vec::new();
+                for arm in [0, 1, 0, 1] {
+                    let rt = &mut runtimes[arm];
+                    let mut times = Vec::new();
+                    for repeat in 0..if sanitize { 1 } else { 15 } {
+                        rt.run_sequence(&[arm]).unwrap();
+                        if repeat >= 3 || sanitize {
+                            times.push(rt.last_run_us());
+                        }
+                    }
+                    times.sort_by(f64::total_cmp);
+                    timing.push((arm, times[times.len() / 2]));
+                    let t = rt.tensor("act.depth.x").unwrap();
+                    let mut actual = vec![0f32; t.bytes / 4];
+                    rt.read_tensor_at(t, 0, bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    assert_eq!(
+                        &actual[..expected.len()],
+                        expected.as_slice(),
+                        "B{batch} L{level} frame{frame} arm{arm}"
+                    );
+                    assert!(actual[expected.len()..].iter().all(|&v| v == 12345.));
+                }
+                println!("depth-prefix batch={batch} level={level} frame={frame} exact=true abab_us={timing:?}");
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 #[test]
@@ -526,10 +823,35 @@ impl CudaPacketRuntime {
     }
 
     pub fn load_on(be: Arc<CudaBackend>, path: &Path) -> Result<Self> {
+        Self::load_with_views(be, path, None)
+    }
+
+    pub(crate) fn load_with_views(
+        be: Arc<CudaBackend>,
+        path: &Path,
+        shared: Option<SharedPacketTensors>,
+    ) -> Result<Self> {
         let ordinal = be.device_ordinal;
         let image = crate::asset::packet_image::PacketImage::open(path)?;
         image.blob.check_l2_dispatch(false)?;
         let (blob, raw) = (&image.blob, &image.raw);
+        if let Some(shared) = &shared {
+            if !be.shares_context(&shared.backend)
+                || shared.views.iter().any(|(name, &(offset, bytes, _))| {
+                    !blob
+                        .tensors
+                        .iter()
+                        .any(|t| t.name == *name && t.bytes == bytes)
+                        || !offset
+                            .checked_add(bytes)
+                            .is_some_and(|end| end <= shared.memory.len)
+                })
+            {
+                return Err(RuntimeError::Rejected(
+                    "shared packet tensor binding mismatch".into(),
+                ));
+            }
+        }
         if !blob.gen.is_empty() || blob.tp.is_some() {
             return Err(RuntimeError::Rejected(format!(
                 "{}: generated tensors or TP are not supported by the CUDA packet runtime",
@@ -559,6 +881,29 @@ impl CudaPacketRuntime {
                     path.display(),
                     object.display()
                 )));
+            }
+        }
+        for (symbol, required, what) in [
+            (
+                plow_asset::speech_flag_layout::CONV_ARMS_SYMBOL,
+                speech_conv_arms(&blob),
+                "conv arms",
+            ),
+            (
+                plow_asset::speech_flag_layout::CONV_BF16_VARIANTS_SYMBOL,
+                speech_conv_bf16_variants(&blob),
+                "bf16 conv variants",
+            ),
+        ] {
+            if let Some(compiled) = be.module_global_u32(&module, symbol)? {
+                let missing = required & !u64::from(compiled);
+                if missing != 0 {
+                    return Err(RuntimeError::Rejected(format!(
+                        "{}: {} lacks {what} {missing:#x}; rebuild it for this packet",
+                        path.display(),
+                        object.display()
+                    )));
+                }
             }
         }
         let caps = missing_speech_caps(
@@ -607,13 +952,24 @@ impl CudaPacketRuntime {
                 blob.n_cu
             )));
         }
+        let conv = load_conv_object(&be, &module, &object, blob)?;
 
         let mut tensors = Vec::with_capacity(blob.tensors.len());
         for t in &blob.tensors {
-            let mem = be.alloc(0, t.bytes.max(4))?;
-            match &t.init {
-                Some(r) => be.upload(&mem, 0, &blob.init[r.clone()])?,
-                None => be.memset_d8(mem.base, 0, t.bytes as usize)?,
+            let external = shared
+                .as_ref()
+                .and_then(|s| s.views.get(&t.name).map(|v| (s, v)));
+            let (mem, initialize) = match external {
+                Some((s, &(offset, bytes, initialize))) => {
+                    (s.memory.subview(offset, bytes)?, initialize)
+                }
+                None => (be.alloc(0, t.bytes.max(4))?, true),
+            };
+            if initialize {
+                match &t.init {
+                    Some(r) => be.upload(&mem, 0, &blob.init[r.clone()])?,
+                    None => be.memset_d8(mem.base, 0, t.bytes as usize)?,
+                }
             }
             tensors.push(mem);
         }
@@ -693,9 +1049,35 @@ impl CudaPacketRuntime {
                 n_prefill_rows: 0,
                 token_batch: 0,
             };
+            let conv_segments = if conv.is_some() {
+                plow_asset::speech_flag_layout::conv_object_segments(
+                    &p.gq_seg_ofs,
+                    &p.gq_stream,
+                    |i| {
+                        let d = &p.insts[i as usize];
+                        plow_asset::speech_flag_layout::conv_object_inst(d.op, d.fj[2])
+                    },
+                )
+                .into_iter()
+                .map(|inst| {
+                    inst.map(|i| {
+                        let size = std::mem::size_of::<packet::dev::DevInst64>() as u64;
+                        // 0 = the interpreter's grid, as the interpreter reads it.
+                        let blocks = match p.insts[i as usize].blocks {
+                            0 => blob.n_cu,
+                            b => u32::from(b),
+                        };
+                        (d_inst.base + u64::from(i) * size, blocks)
+                    })
+                })
+                .collect()
+            } else {
+                vec![None; segments]
+            };
             programs.push(Program {
                 kernarg,
                 segments,
+                conv_segments,
                 counters,
                 counter_bytes: counter_only + cursor_bytes,
                 _tables: vec![
@@ -724,6 +1106,7 @@ impl CudaPacketRuntime {
             function,
             grid: blob.n_cu,
             smem,
+            conv,
             names: blob.tensors.iter().map(|t| t.name.clone()).collect(),
             tensors,
             _table: table,
@@ -733,6 +1116,7 @@ impl CudaPacketRuntime {
             last_us: 0.0,
             input_stage: None,
             input_failed: false,
+            shared,
             _resident: {
                 let token = Arc::new(());
                 residents()
@@ -847,6 +1231,9 @@ impl CudaPacketRuntime {
 
     pub(crate) fn quarantine_chain(&mut self) {
         self.input_failed = true;
+        if let Some(shared) = self.shared.take() {
+            std::mem::forget(shared);
+        }
         if let Some(stage) = self.input_stage.take() {
             std::mem::forget(stage);
         }
@@ -898,6 +1285,22 @@ impl CudaPacketRuntime {
                     .memset_d8_async(p.counters, 0, p.counter_bytes, stream)?;
             }
             for seg in 0..p.segments {
+                if let (Some(c), Some((mut inst, blocks))) = (&self.conv, p.conv_segments[seg]) {
+                    let mut tensors = p.kernarg.tensors;
+                    let mut params = [
+                        &mut inst as *mut u64 as *mut std::ffi::c_void,
+                        &mut tensors as *mut u64 as *mut std::ffi::c_void,
+                    ];
+                    self.be.launch_kernel(
+                        c.function,
+                        blocks,
+                        BLOCK,
+                        c.smem,
+                        &mut params,
+                        Some(stream),
+                    )?;
+                    continue;
+                }
                 let mut arg = p.kernarg;
                 arg.gq_seg_ofs += (seg * 4) as u64;
                 arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
@@ -1852,6 +2255,369 @@ fn native_gemm_layer_matches_packet() {
                 println!("NATIVE_LAYER_TIME batch={batch} level={level} layer={layer} routed={routed} baseline_us={} native_us={} policy=after_same_H2D_input_reset samples=10_each",times[0][times[0].len()/2],times[1][times[1].len()/2]);
             }
         }
+    }
+    be.synchronize().unwrap();
+    be.module_unload(&module).unwrap();
+}
+
+/// Per-segment device time of one program (SPEECH_SEG_PKT, SPEECH_SEG_PROGRAM): every segment
+/// launched alone between two events, median of 10 rounds. `conv` rows ran on the conv object.
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; per-segment timing, run only through gpuq"]
+fn speech_segment_times() {
+    let path = std::path::PathBuf::from(std::env::var("SPEECH_SEG_PKT").unwrap());
+    let program: usize = std::env::var("SPEECH_SEG_PROGRAM")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let rt = CudaPacketRuntime::load_on(be.clone(), &path).unwrap();
+    let p = &rt.programs[program];
+    let events: Vec<_> = (0..=p.segments)
+        .map(|_| be.event_create(true).unwrap())
+        .collect();
+    let mut times = vec![Vec::new(); p.segments];
+    for round in 0..14 {
+        be.memset_d8_async(p.counters, 0, p.counter_bytes, &rt.stream)
+            .unwrap();
+        be.event_record(&events[0], &rt.stream).unwrap();
+        for seg in 0..p.segments {
+            if let (Some(c), Some((mut inst, blocks))) = (&rt.conv, p.conv_segments[seg]) {
+                let mut tensors = p.kernarg.tensors;
+                let mut params = [
+                    &mut inst as *mut u64 as *mut std::ffi::c_void,
+                    &mut tensors as *mut u64 as *mut std::ffi::c_void,
+                ];
+                be.launch_kernel(
+                    c.function,
+                    blocks,
+                    BLOCK,
+                    c.smem,
+                    &mut params,
+                    Some(&rt.stream),
+                )
+                .unwrap();
+            } else {
+                let mut arg = p.kernarg;
+                arg.gq_seg_ofs += (seg * 4) as u64;
+                arg.gq_cursor += (seg * CTR_STRIDE as usize * 4) as u64;
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                be.launch_cooperative(
+                    rt.function,
+                    rt.grid,
+                    BLOCK,
+                    rt.smem,
+                    &mut params,
+                    Some(&rt.stream),
+                )
+                .unwrap();
+            }
+            be.event_record(&events[seg + 1], &rt.stream).unwrap();
+        }
+        be.event_synchronize(&events[p.segments]).unwrap();
+        if round >= 4 {
+            for (seg, t) in times.iter_mut().enumerate() {
+                t.push(be.event_elapsed_ms(&events[seg], &events[seg + 1]).unwrap() * 1000.);
+            }
+        }
+    }
+    let mut total = 0.0;
+    for (seg, t) in times.iter_mut().enumerate() {
+        t.sort_by(f32::total_cmp);
+        total += t[5];
+        let kind = match p.conv_segments[seg] {
+            Some((_, blocks)) => format!("conv blocks={blocks}"),
+            None => "interp".into(),
+        };
+        println!(
+            "SPEECH_SEG program={program} seg={seg} {kind} us={:.1}",
+            t[5]
+        );
+    }
+    println!(
+        "SPEECH_SEG program={program} segments={} total_us={total:.1}",
+        p.segments
+    );
+}
+
+/// The conv object runs a packet's conv segments with the speech object's bits: every tensor after
+/// one run from the same initial bytes, with and without it. Env: SPEECH_CONV_PKT (its assets hold
+/// the `_speechconv` cubin), SPEECH_CONV_PROGRAMS (indices; default every program with a conv
+/// segment), SPEECH_CONV_TIMING (interleaved event timing of both, median of 10 each).
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; speech conv object equivalence, run only through gpuq"]
+fn speech_conv_object_matches_speech_object() {
+    let path = std::path::PathBuf::from(std::env::var("SPEECH_CONV_PKT").unwrap());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let mut rt = CudaPacketRuntime::load_on(be.clone(), &path).unwrap();
+    let mut parked: Option<ConvObject> = None;
+    assert!(rt.conv.is_some(), "no conv object loaded");
+    let programs: Vec<usize> = match std::env::var("SPEECH_CONV_PROGRAMS") {
+        Ok(list) => list.split(',').map(|s| s.parse().unwrap()).collect(),
+        Err(_) => (0..rt.programs.len())
+            .filter(|&p| rt.programs[p].conv_segments.iter().any(Option::is_some))
+            .collect(),
+    };
+    let snapshot = |rt: &CudaPacketRuntime| -> Vec<Vec<u8>> {
+        rt.tensors
+            .iter()
+            .map(|m| {
+                let mut out = vec![0; m.len as usize];
+                rt.download(m, 0, &mut out).unwrap();
+                out
+            })
+            .collect()
+    };
+    let initial = snapshot(&rt);
+    let reset = |rt: &CudaPacketRuntime| {
+        for (m, bytes) in rt.tensors.iter().zip(&initial) {
+            rt.upload(m, 0, bytes).unwrap();
+        }
+    };
+    // mode 0: speech object only, 1: conv segments on the conv object.
+    let mut set = |rt: &mut CudaPacketRuntime, mode: usize| {
+        if rt.conv.is_some() != (mode == 1) {
+            std::mem::swap(&mut rt.conv, &mut parked);
+        }
+    };
+    for p in programs {
+        let conv_segments = rt.programs[p]
+            .conv_segments
+            .iter()
+            .filter(|c| c.is_some())
+            .count();
+        let mut results = Vec::new();
+        for mode in 0..2 {
+            set(&mut rt, mode);
+            reset(&rt);
+            rt.enqueue_on(&[p], &rt.stream).unwrap();
+            be.stream_synchronize(&rt.stream).unwrap();
+            results.push(snapshot(&rt));
+        }
+        let differ: Vec<usize> = (0..results[0].len())
+            .filter(|&t| results[0][t] != results[1][t])
+            .collect();
+        println!(
+            "SPEECH_CONV_BITS program={p} segments={} conv_segments={conv_segments} differing_tensors={differ:?}",
+            rt.programs[p].segments
+        );
+        assert!(differ.is_empty());
+        if std::env::var_os("SPEECH_CONV_TIMING").is_none() {
+            continue;
+        }
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..24 {
+            let mode = round % 2;
+            set(&mut rt, mode);
+            reset(&rt);
+            be.event_record(&rt.events.0, &rt.stream).unwrap();
+            rt.enqueue_on(&[p], &rt.stream).unwrap();
+            be.event_record(&rt.events.1, &rt.stream).unwrap();
+            be.event_synchronize(&rt.events.1).unwrap();
+            if round >= 4 {
+                times[mode].push(be.event_elapsed_ms(&rt.events.0, &rt.events.1).unwrap() * 1000.);
+            }
+        }
+        for t in &mut times {
+            t.sort_by(f32::total_cmp);
+        }
+        println!(
+            "SPEECH_CONV_TIME program={p} conv_segments={conv_segments} speech_us={} conv_us={} samples=10_each",
+            times[0][5], times[1][5]
+        );
+    }
+}
+
+/// The speech object's bf16 taps convs (Conv1dF32 flags bit 17 without 14, kernel > 1) on their own
+/// kernel entry (`speech_conv_node(const PlowDevInst*, void* const*)`) between interpreter spans,
+/// against the packet's program and against the same cuts with the conv as its own interpreter
+/// span (the split's cost alone). Every tensor is compared bit for bit after one run from the
+/// same initial bytes. Env: SPEECH_SPLIT_PKT (codec.pkt, PLOW_HSACO = its assets), SPEECH_SPLIT_ROUTE,
+/// SPEECH_SPLIT_CUBIN, SPEECH_SPLIT_PROGRAMS (indices), SPEECH_SPLIT_SMEM, SPEECH_SPLIT_TIMING.
+#[cfg(test)]
+#[test]
+#[ignore = "CUDA; speech conv split screen, run only through gpuq"]
+fn speech_conv_node_split_matches_packet() {
+    use packet::dev::DevInst64;
+    enum Step {
+        Packet {
+            argument: DevProgram,
+            counters: usize,
+            _tables: Vec<DeviceMem>,
+        },
+        Conv {
+            instruction: DeviceMem,
+            blocks: u32,
+        },
+    }
+    let path = std::path::PathBuf::from(std::env::var("SPEECH_SPLIT_PKT").unwrap());
+    let image = std::fs::read(std::env::var("SPEECH_SPLIT_CUBIN").unwrap()).unwrap();
+    let programs = std::env::var("SPEECH_SPLIT_PROGRAMS").unwrap_or("27".into());
+    let smem: u32 = std::env::var("SPEECH_SPLIT_SMEM").map_or(133120, |s| s.parse().unwrap());
+    let be = Arc::new(CudaBackend::new(0).unwrap());
+    let module = be.module_load(&image).unwrap();
+    let node = be.get_function(&module, "speech_conv_node").unwrap();
+    be.set_max_dynamic_smem(node, smem).unwrap();
+    let raw = std::fs::read(&path).unwrap();
+    let blob = DevBlob::parse(&raw).unwrap();
+    let rt = CudaPacketRuntime::load_on(be.clone(), &path).unwrap();
+    // SPEECH_SPLIT_ROUTE=wgmma: every wgmma conv arm (flags bit 17, ConvTranspose1dF32 too).
+    let all_wgmma = std::env::var("SPEECH_SPLIT_ROUTE").is_ok_and(|r| r == "wgmma");
+    let routed = |inst: &DevInst64| {
+        let conv = inst.op == DevOp::Conv1dF32 as u16;
+        let wgmma =
+            (conv || inst.op == DevOp::ConvTranspose1dF32 as u16) && inst.fj[2] & (1 << 17) != 0;
+        wgmma && (all_wgmma || conv && inst.fj[2] & (1 << 14) == 0 && inst.i[4] > 1)
+    };
+    let snapshot = || -> Vec<Vec<u8>> {
+        rt.tensors
+            .iter()
+            .map(|m| {
+                let mut out = vec![0; m.len as usize];
+                rt.download(m, 0, &mut out).unwrap();
+                out
+            })
+            .collect()
+    };
+    let initial = snapshot();
+    let reset = || {
+        for (m, bytes) in rt.tensors.iter().zip(&initial) {
+            rt.upload(m, 0, bytes).unwrap();
+        }
+    };
+    for p in programs.split(',').map(|s| s.parse::<usize>().unwrap()) {
+        let g = &blob.progs[p];
+        // [split only, conv node]
+        let mut plans: [Vec<Step>; 2] = [Vec::new(), Vec::new()];
+        for (mode, steps) in plans.iter_mut().enumerate() {
+            let mut span = Vec::new();
+            let emit_span = |span: &mut Vec<DevInst64>, steps: &mut Vec<Step>| {
+                if span.is_empty() {
+                    return;
+                }
+                let program = super::packed_terminal::chain(std::mem::take(span), rt.grid, g.t);
+                let (argument, _, counters, tables) =
+                    super::mixed_step::upload_program(&be, &program, rt._table.base, 0, 0).unwrap();
+                steps.push(Step::Packet {
+                    argument,
+                    counters,
+                    _tables: tables,
+                });
+            };
+            for inst in &g.insts {
+                if !routed(inst) {
+                    span.push(*inst);
+                    continue;
+                }
+                emit_span(&mut span, steps);
+                if mode == 0 {
+                    span.push(*inst);
+                    emit_span(&mut span, steps);
+                    continue;
+                }
+                let memory = be.alloc(0, 64).unwrap();
+                be.upload(&memory, 0, pod_bytes(std::slice::from_ref(inst)))
+                    .unwrap();
+                steps.push(Step::Conv {
+                    instruction: memory,
+                    blocks: u32::from(inst.blocks).max(1),
+                });
+            }
+            emit_span(&mut span, steps);
+        }
+        let n_routed = g.insts.iter().filter(|i| routed(i)).count();
+        let enqueue = |plan: Option<&Vec<Step>>| {
+            let Some(steps) = plan else {
+                rt.enqueue_on(&[p], &rt.stream).unwrap();
+                return;
+            };
+            for step in steps {
+                match step {
+                    Step::Packet {
+                        argument, counters, ..
+                    } => {
+                        be.memset_d8_async(argument.counters, 0, *counters, &rt.stream)
+                            .unwrap();
+                        let mut argument = *argument;
+                        let mut params =
+                            [&mut argument as *mut DevProgram as *mut std::ffi::c_void];
+                        be.launch_cooperative(
+                            rt.function,
+                            rt.grid,
+                            BLOCK,
+                            rt.smem,
+                            &mut params,
+                            Some(&rt.stream),
+                        )
+                        .unwrap();
+                    }
+                    Step::Conv {
+                        instruction,
+                        blocks,
+                    } => {
+                        let mut inst = instruction.base;
+                        let mut table = rt._table.base;
+                        let mut params = [
+                            &mut inst as *mut u64 as *mut std::ffi::c_void,
+                            &mut table as *mut u64 as *mut std::ffi::c_void,
+                        ];
+                        be.launch_kernel(node, *blocks, BLOCK, smem, &mut params, Some(&rt.stream))
+                            .unwrap();
+                    }
+                }
+            }
+        };
+        let plan = |mode: usize| {
+            if mode == 0 {
+                None
+            } else {
+                Some(&plans[mode - 1])
+            }
+        };
+        let mut results = Vec::new();
+        for mode in 0..3 {
+            reset();
+            enqueue(plan(mode));
+            be.stream_synchronize(&rt.stream).unwrap();
+            results.push(snapshot());
+        }
+        for mode in 1..3 {
+            let differ: Vec<usize> = (0..results[0].len())
+                .filter(|&t| results[0][t] != results[mode][t])
+                .collect();
+            println!(
+                "SPEECH_SPLIT_BITS program={p} mode={} routed={n_routed} differing_tensors={:?}",
+                ["packet", "split", "node"][mode],
+                differ
+            );
+            assert!(differ.is_empty());
+        }
+        if std::env::var_os("SPEECH_SPLIT_TIMING").is_none() {
+            continue;
+        }
+        let mut times = [Vec::new(), Vec::new(), Vec::new()];
+        for round in 0..36 {
+            let mode = round % 3;
+            reset();
+            be.event_record(&rt.events.0, &rt.stream).unwrap();
+            enqueue(plan(mode));
+            be.event_record(&rt.events.1, &rt.stream).unwrap();
+            be.event_synchronize(&rt.events.1).unwrap();
+            if round >= 6 {
+                times[mode].push(be.event_elapsed_ms(&rt.events.0, &rt.events.1).unwrap() * 1000.);
+            }
+        }
+        for t in &mut times {
+            t.sort_by(f32::total_cmp);
+        }
+        println!(
+            "SPEECH_SPLIT_TIME program={p} routed={n_routed} packet_us={} split_us={} node_us={} samples=10_each",
+            times[0][times[0].len() / 2],
+            times[1][times[1].len() / 2],
+            times[2][times[2].len() / 2]
+        );
     }
     be.synchronize().unwrap();
     be.module_unload(&module).unwrap();

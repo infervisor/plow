@@ -1,6 +1,9 @@
 use packet::dev::DevOp;
 use packet::devbuild::{Builder, Model};
 
+#[path = "pipeline_handoff.rs"]
+pub mod handoff;
+
 #[derive(Clone, Copy)]
 pub struct CausalPipelineTensors {
     pub tokens: u32,
@@ -191,6 +194,9 @@ pub enum DenseSplit {
     /// Every row sums K as a `Parallel` launch of `rows[row]` rows would (a u32 per row; flag
     /// 128): rows packed from several requests give each request's own bits.
     Reference(u32),
+    /// One accumulator per output over all of K in k16 steps (flag 0x800): the bits depend on
+    /// neither `rows`, the row's position nor the launch.
+    Continuous,
 }
 
 /// DenseGemmF32's LayerNorm prologue (flag bit 5): `A' = (A - mean) * inv * gamma + beta` with
@@ -479,6 +485,14 @@ pub enum StreamTailF32Mode<'a> {
         pos: u32,
         src_stride: u32,
     },
+    /// The state takes rows `[n[b], n[b] + tail)` of `[state (zeros on a fresh stream); src rows]`
+    /// without a `z` (a stream-input bf16 conv read them in place); the source holds `rows` rows
+    /// per item. Runs after that conv, which reads the old state.
+    StoreSrc {
+        src: u32,
+        pos: u32,
+        src_stride: u32,
+    },
 }
 
 /// [`DevOp::ReduceRowsF32`] reduction.
@@ -614,6 +628,21 @@ pub struct Conv1dF32Stage<'a> {
     /// Flag bit 31: the output is written as the split image (`out_channels % 64 == 0`), for a
     /// consumer with `input_split`.
     pub output_split: bool,
+    /// Flag bit 17 without bit 14 (`PLOW_SPEECH_CONV_BF16` objects): a `wgmma && split_bf16 &&
+    /// weight_split` taps conv runs one bf16 product per k16 on staged-once input rows
+    /// ([`conv_bf16_plan`]); its result differs from the split-bf16 one by bf16 input rounding.
+    /// With `dual_alpha` and SnakeBeta in and out, `alpha` = `[a1 | a2]` (each `[a | r]`): the input
+    /// SnakeBeta runs in the arm's staging.
+    pub bf16_taps: bool,
+    /// `i6` bit 31 (speech flag layout 4): a split-bf16 conv that statically takes only the wgmma
+    /// arm ([`plow_asset::speech_flag_layout::conv_arms`]) runs one bf16 product per k16 (bf16-rounded input
+    /// and weights, f32 accumulate) instead of three; elsewhere it keeps the split products.
+    pub single_bf16: bool,
+    /// A `bf16_taps` conv's stream input (flag bit 22): `(state, slot, pos)` of the
+    /// [`StreamTailF32Mode::Gather`] it replaces; `in_rows` counts the `(kernel - 1) * dilation`
+    /// carried rows, the input holds the other rows per item. A [`StreamTailF32Mode::StoreSrc`]
+    /// follows.
+    pub stream_in: Option<(TensorRef<'a>, u32, u32)>,
 }
 
 /// The split image of an f32 activation `[rows][width]` (`width % 64 == 0`): the layout of
@@ -923,6 +952,76 @@ pub struct StageProgram {
 }
 
 impl PacketPrefix {
+    pub(crate) fn retain_linear_program(
+        &mut self,
+        insts: &[packet::dev::DevInst],
+        input: u32,
+        output: u32,
+        rows: u32,
+    ) -> Result<(), String> {
+        use std::collections::{BTreeMap, BTreeSet};
+        if insts.is_empty()
+            || rows == 0
+            || !self.model.gen.is_empty()
+            || !self.model.kv_row_insts.is_empty()
+        {
+            return Err(
+                "linear block requires instructions, rows and static tensor bindings".into(),
+            );
+        }
+        let used: BTreeSet<_> = insts
+            .iter()
+            .flat_map(|i| i.t)
+            .chain([input, output])
+            .filter(|&h| h != packet::dev::TENSOR_NONE)
+            .collect();
+        let handles: BTreeMap<_, _> = used
+            .iter()
+            .enumerate()
+            .map(|(n, &h)| (h, n as u32))
+            .collect();
+        let tensors: Vec<_> = used
+            .iter()
+            .map(|&h| {
+                self.model
+                    .tensors
+                    .get(h as usize)
+                    .cloned()
+                    .ok_or("linear block tensor is missing".to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        let mut builder = Builder::new(self.model.n_cu);
+        builder.force_uniseg();
+        builder.adopt_tensors(tensors.clone());
+        let mut last = None;
+        for i in insts {
+            if i.blocks == 0 {
+                return Err("linear block has an empty instruction".into());
+            }
+            last = Some(builder.emit(
+                DevOp::from_u16(i.op).ok_or("unknown linear block opcode")?,
+                (0..u32::from(i.blocks)).collect(),
+                &last.into_iter().collect::<Vec<_>>(),
+                |d| {
+                    d.t =
+                        i.t.map(|h| handles.get(&h).copied().unwrap_or(packet::dev::TENSOR_NONE));
+                    d.i = i.i;
+                    d.f = i.f;
+                    d.j = i.j;
+                },
+            ));
+        }
+        self.input = *handles.get(&input).ok_or("linear block input is missing")?;
+        self.output = *handles
+            .get(&output)
+            .ok_or("linear block output is missing")?;
+        self.model.tensors = tensors;
+        self.model.progs = vec![builder.finish()];
+        self.model.prog_t = vec![rows];
+        self.programs = vec![0];
+        Ok(())
+    }
+
     pub fn forward_pipeline_section(
         &self,
         name: &str,
@@ -1105,7 +1204,23 @@ impl PacketPrefix {
             _ => splitk,
         };
         let reference = matches!(stage.split, DenseSplit::Reference(_));
-        let flags = flags | (u32::from(reference) << 7);
+        let continuous = stage.split == DenseSplit::Continuous;
+        if continuous && (!tensor_cores || stage.layer_norm.is_some() || stage.input_width % 8 != 0)
+        {
+            return Err("continuous dense needs bf16 tensor cores and no prologue".into());
+        }
+        let scratch = if continuous {
+            packet::dev::TENSOR_NONE
+        } else {
+            scratch
+        };
+        let flags = flags
+            | (u32::from(reference) << 7)
+            | if continuous {
+                DenseAccumulation::Continuous16.flags()
+            } else {
+                0
+            };
         let n_cu = self.model.n_cu;
         builder.emit(
             DevOp::DenseGemmF32,
@@ -1824,6 +1939,38 @@ impl StageProgram {
                     },
                 )
             }
+            StreamTailF32Mode::StoreSrc {
+                src,
+                pos,
+                src_stride,
+            } => {
+                if stage.cols % 4 != 0
+                    || stage.z_cols != stage.cols
+                    || stage.z_col0 != 0
+                    || src_stride < stage.cols
+                    || src_stride % 4 != 0
+                    || src == state
+                {
+                    return Err("invalid stream-tail source store".into());
+                }
+                self.input(pos, per_item, "stream-tail positions")?;
+                let span = (product(&[stage.items, stage.rows])? - 1) * u64::from(src_stride)
+                    + u64::from(stage.cols);
+                self.input(src, f32_bytes(span)?, "stream-tail source")?;
+                let elements = product(&[stage.items, stage.tail, stage.cols])?;
+                u32_elements(elements, "stream-tail store")?;
+                self.emit(
+                    DevOp::StreamTailF32,
+                    elements.div_ceil(2048),
+                    deps,
+                    state,
+                    |d| {
+                        d.t[1..6].copy_from_slice(&[src, state, stage.slot, stage.n, pos]);
+                        d.i = ints(src_stride, 4);
+                        d.j = [stage.slots, 0];
+                    },
+                )
+            }
         }
     }
 
@@ -2012,6 +2159,24 @@ impl StageProgram {
         // The flag fields are 4 bits wide (pre 4..8, post 8..12): a wider code would alias
         // another kind and spill into the next field.
         let beta_out = stage.output_activation == Activation::SnakeBeta;
+        // The bf16 arm's fused input SnakeBeta: dual alpha [a1 | a2], flags pre code snake + bits 2
+        // and 19 (a combination no other arm accepts).
+        let pre_beta = stage.input_activation == Activation::SnakeBeta;
+        if pre_beta && !(stage.bf16_taps && stage.dual_alpha && beta_out && !transpose) {
+            return Err("an input SnakeBeta fuses only into a dual-alpha bf16 taps conv with a SnakeBeta output".into());
+        }
+        if stage.stream_in.is_some()
+            && (!stage.bf16_taps
+                || transpose
+                || stage.residual.is_some()
+                || stage.lengths.is_some()
+                || row_scale != packet::dev::TENSOR_NONE)
+        {
+            return Err(
+                "a stream input needs a bf16 taps conv without residual, lengths or row scale"
+                    .into(),
+            );
+        }
         let valid_activation = |a: Activation| {
             a.code() <= 15
                 && !matches!(
@@ -2029,7 +2194,7 @@ impl StageProgram {
             || stage.pad_before > 0xFFFF
             || stage.pad_after > 0xFFFF
             || (transpose && stage.pad_mode != PadMode::Zero)
-            || !valid_activation(stage.input_activation)
+            || !(valid_activation(stage.input_activation) || pre_beta)
             || !(valid_activation(stage.output_activation) || beta_out)
             // One alpha tensor: a snake output activation reads it per output channel, so the
             // input takes no activation unless bit 19 splits the tensor between two snakes.
@@ -2037,8 +2202,9 @@ impl StageProgram {
                 && stage.input_activation != Activation::None
                 && !stage.dual_alpha)
             // SnakeBeta output (flags bit 2, post code snake): alpha = [a | r] per output channel.
-            || (beta_out && (transpose || stage.dual_alpha || stage.alpha.is_none()))
+            || (beta_out && (transpose || (stage.dual_alpha && !pre_beta) || stage.alpha.is_none()))
             || (stage.dual_alpha
+                && !pre_beta
                 && !(stage.input_activation == Activation::Snake
                     && stage.output_activation == Activation::Snake
                     && stage.alpha.is_some()))
@@ -2059,11 +2225,38 @@ impl StageProgram {
             .ok_or("convolution output is empty")?;
         let out_elements = product(&[stage.batch, out_rows, stage.out_channels])?;
         u32_elements(out_elements, "convolution output")?;
+        // A stream input holds the rows past the carried (kernel - 1) * dilation per item.
+        let carried = if stage.stream_in.is_some() {
+            (stage.kernel - 1) * stage.dilation_or_output_padding
+        } else {
+            0
+        };
         self.input(
             x,
-            f32_bytes(product(&[stage.batch, stage.in_rows, stage.in_channels])?)?,
+            f32_bytes(product(&[
+                stage.batch,
+                stage.in_rows - carried,
+                stage.in_channels,
+            ])?)?,
             "convolution input",
         )?;
+        let stream = match stage.stream_in {
+            Some((state, slot, pos)) => {
+                let state = self.resolve(
+                    state,
+                    f32_bytes(product(&[carried, stage.in_channels])?)?,
+                    "convolution stream state",
+                )?;
+                self.input(slot, u64::from(stage.batch) * 4, "convolution stream slots")?;
+                self.input(
+                    pos,
+                    u64::from(stage.batch) * 4,
+                    "convolution stream positions",
+                )?;
+                Some((state, slot, pos))
+            }
+            None => None,
+        };
         let taps = if transpose && stage.weight_tap_major {
             stage.kernel.div_ceil(stage.stride) * stage.stride
         } else {
@@ -2083,7 +2276,9 @@ impl StageProgram {
             }
             None => packet::dev::TENSOR_NONE,
         };
-        let alpha_channels = if stage.dual_alpha {
+        let alpha_channels = if pre_beta {
+            2 * (stage.in_channels + stage.out_channels)
+        } else if stage.dual_alpha {
             stage.in_channels + stage.out_channels
         } else if beta_out {
             2 * stage.out_channels
@@ -2110,7 +2305,11 @@ impl StageProgram {
         };
         // Bit 13: the GEMM-shaped cases run 3xTF32 tensor cores (FP32-accurate) on 64x64 tiles.
         let flags = pad_mode
-            | (stage.input_activation.code() << 4)
+            | (if pre_beta {
+                Activation::Snake.code()
+            } else {
+                stage.input_activation.code()
+            } << 4)
             | (u32::from(beta_out) << 2)
             | (if beta_out {
                 Activation::Snake
@@ -2121,20 +2320,36 @@ impl StageProgram {
                 << 8)
             | (u32::from(stage.weight_f16) << 12)
             | (u32::from(math == Conv1dMath::Tf32x3) << 13)
-            | (u32::from(stage.split_bf16) << 14)
+            | (u32::from(stage.split_bf16 && !stage.bf16_taps) << 14)
             | (u32::from(stage.weight_tap_major) << 15)
-            | (u32::from(stage.wgmma && stage.split_bf16) << 17)
+            | (u32::from((stage.wgmma && stage.split_bf16) || stage.bf16_taps) << 17)
             | (u32::from(stage.weight_split) << 18)
             | (u32::from(stage.dual_alpha) << 19)
             | (u32::from(stage.wgmma_ragged) << 3)
             | (u32::from(stage.input_split) << 30)
             | (u32::from(stage.output_split) << 31);
         let n_cu = self.builder.n_cu();
-        let policy = conv_class_policy(&stage, transpose, out_rows, n_cu)?;
+        let bf16 = if stage.bf16_taps {
+            if row_scale != packet::dev::TENSOR_NONE {
+                return Err("bf16 taps conv: no row scale".into());
+            }
+            Some(
+                conv_bf16_plan(&stage, transpose, out_rows)
+                    .ok_or("bf16 taps conv: shape outside the arm (conv_bf16_plan)")?,
+            )
+        } else {
+            None
+        };
+        // The bf16 arm has one tile shape: no warp arm, split-K or tile-width pins.
+        let policy = if bf16.is_some() {
+            ConvPolicy::default()
+        } else {
+            conv_class_policy(&stage, transpose, out_rows, n_cu)?
+        };
         let flags = flags
             | (u32::from(conv1d_warp(&stage, transpose, out_rows, policy).is_some()) << 16)
             | (u32::from(stage.pinned) << 21)
-            | (u32::from(stage.pinned && policy.ffma) << 22)
+            | (u32::from((stage.pinned && policy.ffma) || stream.is_some()) << 22)
             | (u32::from(stage.pinned && policy.bn128) << 23);
         // The split-image arm (op_speech_f32.cuh sp_wgi_run) is one instantiation set: ungrouped
         // pointwise pre-split wgmma GEMMs over 64-channel multiples, no input activation, split-K
@@ -2187,16 +2402,33 @@ impl StageProgram {
         let splitk = (row_scale == packet::dev::TENSOR_NONE
             && fixed.is_none()
             && !stage.pinned
-            && !stage.input_split)
-            .then(|| conv1d_splitk(&stage, transpose, out_rows, n_cu))
-            .flatten();
+            && !stage.input_split
+            && bf16.is_none())
+        .then(|| conv1d_splitk(&stage, transpose, out_rows, n_cu))
+        .flatten();
+        // Chunk-canonical K of a pinned bf16 taps conv: the class table's `sk` chunks, the same at
+        // every batch; the (unit, chunk) tasks fill otherwise idle blocks.
+        let chunks = bf16.filter(|_| stage.pinned).and_then(|(_, units)| {
+            let p = conv_class_pins()
+                .get(&conv_class(&stage, transpose))?
+                .parts
+                .filter(|&p| p > 1)?;
+            Some((units, p))
+        });
         let units = fixed
             .map(|f| f.0)
             .or(splitk)
+            .or(chunks.map(|(units, p)| units * u64::from(p)))
+            .or(bf16.map(|b| b.1))
             .unwrap_or_else(|| conv1d_units(&stage, transpose, out_rows, n_cu, policy));
         let flags = flags
             | (u32::from(splitk.is_some() || fixed.is_some()) << 20)
-            | fixed.map_or(0, |f| f.1 << 24);
+            | fixed.map_or(0, |f| f.1 << 24)
+            | chunks.map_or(0, |(_, p)| p << 24);
+        let chunk_scratch = chunks
+            .map(|(_, p)| conv_bf16_chunk_scratch(p, n_cu))
+            .transpose()?
+            .map(|bytes| self.builder.tensor(CONV_SPLITK_SCRATCH, bytes));
         let row_scale = if let Some((_, _, bytes)) = fixed {
             self.builder.tensor(CONV_SPLITK_SCRATCH, bytes)
         } else if splitk.is_some() {
@@ -2209,9 +2441,11 @@ impl StageProgram {
         } else {
             row_scale
         };
-        let splitk = splitk.or(fixed.map(|f| f.0));
+        let splitk = splitk
+            .or(fixed.map(|f| f.0))
+            .or(chunks.map(|(units, _)| units));
         if stage.pinned {
-            conv_pin_registry(conv_class(&stage, transpose), flags)?;
+            conv_pin_registry(conv_class(&stage, transpose), flags, stage.single_bf16)?;
         }
         let mut chained = deps.to_vec();
         if splitk.is_some() {
@@ -2228,6 +2462,11 @@ impl StageProgram {
                 stage.lengths.unwrap_or(packet::dev::TENSOR_NONE),
             ]);
             d.t[7] = row_scale;
+            // Stream input: t5 = state, t6 = slot, t7 = pos (the arm takes no residual, lengths or
+            // row scale).
+            if let Some((state, slot, pos)) = stream {
+                d.t[5..8].copy_from_slice(&[state, slot, pos]);
+            }
             d.i = [
                 stage.batch,
                 stage.in_rows,
@@ -2238,11 +2477,42 @@ impl StageProgram {
                 stage.dilation_or_output_padding,
                 stage.groups,
             ];
-            d.f[0] = stage.slope;
+            d.f[0] = match chunk_scratch {
+                Some(handle) => f32::from_bits(0x8000_0000 | handle),
+                None => stage.slope,
+            };
             d.j = [stage.pad_before | (stage.pad_after << 16), flags];
+            // No input activation: the wgmma eligibility of a fused one also depends on its alpha.
+            if stage.single_bf16
+                && !stage.bf16_taps
+                && (flags >> 4) & 15 == 0
+                && stage.dilation_or_output_padding >> 31 == 0
+            {
+                use plow_asset::speech_flag_layout::{conv_arm, conv_arms};
+                let mut i = d.i;
+                i[6] |= 1 << 31;
+                let arms = conv_arms(d.op, &i, d.j[0], d.j[1]);
+                if arms == conv_arm::WG || arms == conv_arm::WG_CT {
+                    d.i = i;
+                }
+            }
         })?;
         if splitk.is_some() {
             self.splitk_last = Some(emitted.done);
+        }
+        if flags & (1 << 17) != 0 {
+            if let Some(min) = crate::emit_config::active().codec_conv_object {
+                // A transposed conv's input row feeds `kernel` taps of every output channel.
+                let rows = if transpose { stage.in_rows } else { out_rows };
+                let macs = u64::from(stage.batch)
+                    * u64::from(rows)
+                    * u64::from(stage.in_channels / stage.groups.max(1))
+                    * u64::from(stage.out_channels)
+                    * u64::from(stage.kernel);
+                if macs >= u64::from(min) * 1_000_000 {
+                    self.builder.isolate(emitted.done);
+                }
+            }
         }
         Ok(emitted)
     }
@@ -3351,15 +3621,17 @@ const CONV_PIN_MASK: u32 = (1 << 16) | (1 << 20) | (0x1FF << 21);
 /// modes (different models or recipes), each with its own arms.
 const CONV_MODE_MASK: u32 = (1 << 14) | (1 << 15) | (1 << 17) | (1 << 18) | (1 << 19);
 
-/// Every pinned conv of a class (in one lowering mode), in every program this process emits,
-/// must carry the same arm bits: the first one registers them, a later mismatch is an emitter
-/// bug (a role-dependent choice), reported as an error.
-fn conv_pin_registry(class: ConvClass, flags: u32) -> Result<(), String> {
+/// Every pinned conv of a class (in one lowering mode and product count: single-product convs
+/// take their own tile defaults), in every program this process emits, must carry the same arm
+/// bits: the first one registers them, a later mismatch is an emitter bug (a role-dependent
+/// choice), reported as an error.
+fn conv_pin_registry(class: ConvClass, flags: u32, single_bf16: bool) -> Result<(), String> {
     static REG: std::sync::Mutex<Option<std::collections::HashMap<(ConvClass, u32), u32>>> =
         std::sync::Mutex::new(None);
     let mut reg = REG.lock().unwrap_or_else(|e| e.into_inner());
     let reg = reg.get_or_insert_with(Default::default);
-    match reg.insert((class, flags & CONV_MODE_MASK), flags & CONV_PIN_MASK) {
+    let mode = flags & CONV_MODE_MASK | u32::from(single_bf16) << 31;
+    match reg.insert((class, mode), flags & CONV_PIN_MASK) {
         Some(prev) if prev != flags & CONV_PIN_MASK => Err(format!(
             "codec conv class {class:?}: pinned arm bits {:#x} differ from an earlier program's {prev:#x}",
             flags & CONV_PIN_MASK
@@ -3395,6 +3667,16 @@ fn conv_fixed_splitk(
     Ok((tiles * u64::from(p), p, bytes))
 }
 
+/// Scratch of a chunked bf16 taps conv (op_speech_f32.cuh `spb_chunks`, `spb_slot`): the tickets,
+/// then 256 threads x at most 48 f32 accumulators per chunk of each key (a unit when the units leave
+/// blocks idle, else a block: at most one per block of the machine).
+fn conv_bf16_chunk_scratch(chunks: u32, n_cu: u32) -> Result<u64, String> {
+    if chunks > 63 {
+        return Err(format!("bf16 taps conv: {chunks} chunks exceed 63"));
+    }
+    Ok((u64::from(CONV_SPLITK_TICKETS) + u64::from(n_cu) * u64::from(chunks) * 256 * 48) * 4)
+}
+
 /// Split-K scratch of the pinned codec convs (every program's split convs share it; consecutive
 /// ones chain through `splitk_last`): `CONV_SPLITK_TICKETS` zeroed u32 tickets, then the parts.
 const CONV_SPLITK_SCRATCH: &str = "scratch.conv_f32_splitk";
@@ -3407,8 +3689,20 @@ const CONV_SPLITK_TICKETS: u32 = 4096;
 /// 64-wide pin (the class table) buys parallelism for small-row programs where measured.
 /// 64-wide tiles unless the class table pins 128 (measured on the 12 Hz codec: 128 loses at b1
 /// on most classes, wins only on some 192-channel ones at b8+); grouped wgmma takes 128 only.
+/// Single-product convs take 128 for the k1 C -> C and ConvTranspose1d (128 | cout) classes:
+/// the hi-only staging double-buffers A at 128 (12 Hz codec, every program size measured faster).
 fn conv_bn128_default(stage: &Conv1dF32Stage<'_>, transpose: bool) -> bool {
-    stage.wgmma && stage.split_bf16 && !transpose && stage.groups > 1
+    let wgmma = stage.wgmma && stage.split_bf16;
+    let one = wgmma
+        && stage.single_bf16
+        && stage.groups == 1
+        && matches!(stage.input_activation, Activation::None)
+        && if transpose {
+            stage.out_channels % 128 == 0
+        } else {
+            stage.kernel == 1 && stage.in_channels == stage.out_channels
+        };
+    one || (wgmma && !transpose && stage.groups > 1)
 }
 
 fn conv1d_warp(
@@ -3500,6 +3794,99 @@ fn conv1d_staged_rows(stage: &Conv1dF32Stage<'_>, transpose: bool) -> Option<u64
     })
 }
 
+/// The bf16 taps conv's (op_speech_f32.cuh `spb_eligible`, `spb_plan`) output rows per unit and
+/// unit count, or `None` outside the arm: cout 96 as 128 x 96 units over the whole input; 64-channel
+/// multiples as 128 x 64 units where every input plane's rows fit, else 64 x 128 units staging the
+/// input planes in groups.
+pub(crate) fn conv_bf16_plan(
+    stage: &Conv1dF32Stage<'_>,
+    transpose: bool,
+    out_rows: u32,
+) -> Option<(u32, u64)> {
+    let ok = !transpose
+        && stage.kernel > 1
+        && stage.stride == 1
+        && stage.groups == 1
+        && stage.pad_mode == PadMode::Zero
+        && stage.pad_before == 0
+        && stage.pad_after == 0
+        && stage.weight_tap_major
+        && !stage.weight_f16
+        && stage.wgmma
+        && stage.split_bf16
+        && stage.weight_split
+        && !stage.input_split
+        && !stage.output_split
+        && (if stage.input_activation == Activation::SnakeBeta {
+            stage.dual_alpha && stage.output_activation == Activation::SnakeBeta
+        } else {
+            stage.input_activation == Activation::None && !stage.dual_alpha
+        })
+        && matches!(
+            stage.output_activation,
+            Activation::None | Activation::SnakeBeta
+        )
+        && stage.lengths.is_none();
+    if !ok {
+        return None;
+    }
+    conv_bf16_geometry(
+        stage.in_channels,
+        stage.out_channels,
+        stage.kernel,
+        stage.dilation_or_output_padding,
+        stage.batch,
+        out_rows,
+    )
+}
+
+/// [`conv_bf16_plan`]'s shape part: `(rows per unit, units)` when the staged rows fit.
+pub(crate) fn conv_bf16_geometry(
+    cin: u32,
+    cout: u32,
+    kernel: u32,
+    dilation: u32,
+    batch: u32,
+    out_rows: u32,
+) -> Option<(u32, u64)> {
+    let kind = plow_asset::speech_flag_layout::conv_bf16_kind(cin, cout, kernel, dilation)?;
+    let (bm, nu) = match kind {
+        1 => (128, 96),
+        2 => (128, 64),
+        _ => (64, 128),
+    };
+    let tn = u64::from(cout).div_ceil(nu);
+    if kind == 3 {
+        if let Some(ipt) = conv_bf16_items(cin, kernel, dilation, out_rows) {
+            return Some((bm as u32, u64::from(batch).div_ceil(ipt) * tn));
+        }
+    }
+    let units = u64::from(batch) * u64::from(out_rows).div_ceil(bm) * tn;
+    Some((bm as u32, units))
+}
+
+/// Items per unit of a kind-3 bf16 taps conv over items of at most 8 output rows (op_speech_f32.cuh
+/// `spb_ipt` over `spb_plan`'s planes per group): the widest of 8 / 4 / 2 whose 8-row-aligned item
+/// windows and the dropped groups' read pad (`spb_items_pad`) fit beside B and the parameters.
+fn conv_bf16_items(cin: u32, kernel: u32, dilation: u32, out_rows: u32) -> Option<u64> {
+    const ARENA: u64 = 33280 * 4 - 1024;
+    const BB: u64 = 128 * 128;
+    if out_rows > 8 {
+        return None;
+    }
+    let (k, dil) = (u64::from(kernel), u64::from(dilation));
+    let planes = u64::from(cin).div_ceil(64);
+    let rpad64 = (64 + (k - 1) * dil + 7) & !7;
+    let pg = (1..=planes)
+        .rev()
+        .find(|&pg| planes % pg == 0 && pg * rpad64 * 128 + 2 * BB + 3 * 128 * 4 <= ARENA)?;
+    let w = (u64::from(out_rows) + (k - 1) * dil + 7) & !7;
+    [8u64, 4, 2].into_iter().find(|&ipt| {
+        let pad = ((7 * w + (k - 1) * dil + 8).saturating_sub(ipt * w) + 7) & !7;
+        (pg * ipt * w + pad) * 128 + 2 * BB + 3 * 128 * 4 <= ARENA
+    })
+}
+
 fn conv1d_units(
     stage: &Conv1dF32Stage<'_>,
     transpose: bool,
@@ -3583,6 +3970,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bf16_taps_short_items_share_a_unit() {
+        // The codec's dec.in (1024 -> 1536 k7) at 2 frames (8 rows per item): 4 items per unit.
+        assert_eq!(conv_bf16_items(1024, 7, 1, 8), Some(4));
+        assert_eq!(
+            conv_bf16_geometry(1024, 1536, 7, 1, 64, 8),
+            Some((64, 16 * 12))
+        );
+        assert_eq!(conv_bf16_geometry(1024, 1536, 7, 1, 1, 4), Some((64, 12)));
+        assert_eq!(
+            conv_bf16_geometry(1024, 1536, 7, 1, 16, 68),
+            Some((64, 16 * 2 * 12))
+        );
+        assert_eq!(conv_bf16_items(1024, 7, 1, 9), None);
+    }
+
+    #[test]
     fn fp32_convolution_math_rejects_split_storage() {
         for (f16, split, wgmma, packed) in [
             (false, false, false, false),
@@ -3595,6 +3998,9 @@ mod tests {
             let mut p = prefix.program();
             let stage = Conv1dF32Stage {
                 input_split: false,
+                bf16_taps: false,
+                single_bf16: false,
+                stream_in: None,
                 output_split: false,
                 output: TensorRef::Named("y"),
                 weight: TensorRef::Named("w"),
@@ -3749,6 +4155,9 @@ mod tests {
             pinned: false,
             wgmma_ragged: false,
             input_split: false,
+            bf16_taps: false,
+            single_bf16: false,
+            stream_in: None,
             output_split: false,
         };
         assert!(s.convt_wgmma_ok());
@@ -4074,6 +4483,9 @@ mod tests {
                 pinned: true,
                 wgmma_ragged: false,
                 input_split: false,
+                bf16_taps: false,
+                single_bf16: false,
+                stream_in: None,
                 output_split: false,
             };
         // Mimi's ELU-pre k3 512->256: the same policy (3xTF32 by default) at every batch and
@@ -4117,9 +4529,10 @@ mod tests {
         // The registry accepts repeats of the same bits and rejects a changed arm (a synthetic
         // class, so the codec lowering tests in this process never meet it).
         let class = [0, 7, 7, 7, 1, 1, 1, 0, 0];
-        conv_pin_registry(class, 1 << 21).unwrap();
-        conv_pin_registry(class, 1 << 21 | 1 << 13).unwrap();
-        assert!(conv_pin_registry(class, 1 << 21 | 1 << 22).is_err());
+        conv_pin_registry(class, 1 << 21, false).unwrap();
+        conv_pin_registry(class, 1 << 21 | 1 << 13, false).unwrap();
+        assert!(conv_pin_registry(class, 1 << 21 | 1 << 22, false).is_err());
+        conv_pin_registry(class, 1 << 21 | 1 << 23, true).unwrap();
         let s2 = stage(1, 1024, 256, Activation::Elu, false);
         let p2 = conv_class_policy(&s2, false, 1024, 132).unwrap();
         assert_eq!(conv1d_units(&s2, false, 1024, 132, p2), 16 * 4);
@@ -4192,6 +4605,9 @@ mod tests {
                     pinned: false,
                     wgmma_ragged: false,
                     input_split: false,
+                    bf16_taps: false,
+                    single_bf16: false,
+                    stream_in: None,
                     output_split: false,
                 },
             );
@@ -4249,6 +4665,9 @@ mod tests {
             pinned: false,
             wgmma_ragged: false,
             input_split: false,
+            bf16_taps: false,
+            single_bf16: false,
+            stream_in: None,
             output_split: false,
         };
         let mut p = prefix.program();

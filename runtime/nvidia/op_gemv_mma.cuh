@@ -341,6 +341,15 @@ __device__ __forceinline__ void gvmma_store2(float* C, unsigned N, unsigned m, u
     if (n + 1u < N) C[(size_t)m * N + n + 1u] = c1;
 }
 
+/* fp32 storage of a value rounded to bf16 (GemvF32Out `round_bf16`). */
+struct GvF32R { float v; };
+__device__ __forceinline__ void gvmma_store2(GvF32R* C, unsigned N, unsigned m, unsigned n,
+                                             float c0, float c1) {
+    float* F = (float*)C;
+    if (n < N) F[(size_t)m * N + n] = __bfloat162float(__float2bfloat16_rn(c0));
+    if (n + 1u < N) F[(size_t)m * N + n + 1u] = __bfloat162float(__float2bfloat16_rn(c1));
+}
+
 /* Split-K reduction slots: partial warps (part > 0) park their C fragments here, part 0 sums.
  * Sized for the widest tile; static so the arms need no arena hand-off. The FP8 M1 XCACHE
  * objects (dynamic arena >= 51456 floats, 201 KiB) cannot also afford the static slots (40 KiB

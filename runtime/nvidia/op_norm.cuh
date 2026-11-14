@@ -1062,6 +1062,27 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
          * B=1 decode ring with NO host i[3] patch, plan plowrt-gpu-exec-critical-path
          * stage 2; the engine arms it only on cubins carrying plow_dyn_kvrow), else the
          * legacy host-patched single-ring. */
+#if defined(PLOW_NV_KV_ILV) && PLOW_NV_KV_ILV
+        const size_t obase = out_stride
+            ? (
+#if PLOW_NV_TOKEN_BATCH_BF16
+               row_batch
+                   ? ((size_t)token_row.slot * out_stride + (token_row.position & kv_mask))
+                   :
+#endif
+#if PLOW_MIXED_STEP
+               mixed
+                   ? ((size_t)mixed_row.slot * out_stride + (mixed_row.position & kv_mask))
+                   :
+#endif
+               pfslot
+                   ? ((size_t)(unsigned)pfslot[t] * out_stride + ((unsigned)pos[t] & kv_mask))
+                   : n_batch_kv != 0
+                   ? ((size_t)t * out_stride + ((unsigned)pos[t] & kv_mask))
+                   : ((out_row0 + t) & kv_mask)
+              ) * nhead * hd + (size_t)hh * hd
+            : ((size_t)(out_row0 + t) * nhead + hh) * hd;
+#else
         const size_t obase =
             out_stride
                 ? (
@@ -1085,6 +1106,7 @@ static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
                        ? ((size_t)(t * nhead + hh) * out_stride + ((unsigned)pos[t] & kv_mask)) * hd
                        : ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd)
                 : ((size_t)(out_row0 + t) * nhead + hh) * hd;
+#endif
 
         for (unsigned pi = 0; pi < (out2 ? 2u : 1u); pi++) {
         /* Shadow the parameters so the body below stays the single-pair kernel

@@ -23,6 +23,23 @@ static float f16_to_f32(uint16_t h) {
     return out;
 }
 
+/* Round-to-nearest-even fp16 (finite inputs; overflow saturates to infinity). */
+static uint16_t f32_to_f16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    const uint32_t abs = u & 0x7fffffffu;
+    if (abs >= 0x7f800000u) return (uint16_t)(sign | 0x7c00u | (abs > 0x7f800000u ? 0x200u : 0u));
+    if (abs >= 0x477ff000u) return (uint16_t)(sign | 0x7c00u);
+    if (abs < 0x38800000u) {
+        /* Subnormal: value / 2^-24, rounded to nearest even. */
+        const float scaled = (float)(fabs((double)f) * 16777216.0);
+        return (uint16_t)(sign | (uint32_t)nearbyintf(scaled));
+    }
+    const uint32_t r = abs + 0xfffu + ((abs >> 13) & 1u);
+    return (uint16_t)(sign | ((r - 0x38000000u) >> 13));
+}
+
 G_K(g_q8_gemm_f32) {
     (void)ctx;
     float* out = PLOW_CPU_TEN(in, T, 0);
@@ -253,7 +270,10 @@ G_K(g_conv2d_f32) {
     const uint32_t depthwise = flags & 1u, relu = flags & 2u;
     const uint32_t output_layout = (flags >> 2u) & 3u, input_layout = (flags >> 4u) & 3u;
     const uint32_t weight_f32 = flags & 64u, gelu_erf_bf16 = flags & 128u;
+    /* bf16 weights as [oc][ic / 16][tap][16]. */
+    const uint32_t weight_blocked = flags & 1024u;
     if (output_layout > 2u || input_layout > 2u) return;
+    if (weight_blocked && (depthwise || weight_f32 || (input_channels & 15u))) return;
     const uint32_t stored_channels = depthwise ? 1u : input_channels;
     const uint64_t count64 = (uint64_t)batches * output_frames * output_width * output_channels;
     if (count64 > UINT32_MAX) return;
@@ -289,8 +309,12 @@ G_K(g_conv2d_f32) {
                     else
                         xi = (((size_t)batch * input_channels + input_channel) * frames +
                               input_frame) * width + input_x;
-                    const float w = weight_f32 ? ((const float*)weight)[wi]
-                                               : f16_to_f32(((const uint16_t*)weight)[wi]);
+                    const size_t bi = (((size_t)output_channel * (input_channels / 16u) +
+                                        input_channel / 16u) * kernel * kernel + ky * kernel + kx) * 16u +
+                                      input_channel % 16u;
+                    const float w = weight_blocked ? plow_bf2f(((const uint16_t*)weight)[bi])
+                                    : weight_f32   ? ((const float*)weight)[wi]
+                                                   : f16_to_f32(((const uint16_t*)weight)[wi]);
                     sum += (double)x[xi] * w;
                 }
             }
@@ -1227,7 +1251,7 @@ G_K(g_conv1d_f32) {
     /* flags bit 20: t7 is the split-K scratch of the sm_90a wgmma tile, not a row scale. */
     const float* row_scale = (in->fj[2].u >> 20) & 1u ? NULL : PLOW_CPU_TEN(in, T, 7);
     const uint32_t batch = in->i[0], in_rows = in->i[1], cin = in->i[2], cout = in->i[3];
-    const uint32_t kernel = in->i[4], stride = in->i[5], dilation = in->i[6], groups = in->i[7];
+    const uint32_t kernel = in->i[4], stride = in->i[5], dilation = in->i[6] & 0x7FFFFFFFu, groups = in->i[7];
     const uint32_t pad_before = in->fj[1].u & 0xFFFFu, pad_after = in->fj[1].u >> 16;
     const uint32_t flags = in->fj[2].u, mode = flags & 3u;
     const uint32_t pre = (flags >> 4) & 15u, post = (flags >> 8) & 15u;
@@ -1295,7 +1319,7 @@ G_K(g_conv_transpose1d_f32) {
     const float* residual = PLOW_CPU_TEN(in, T, 5);
     const uint32_t* lengths = PLOW_CPU_TEN(in, T, 6);
     const uint32_t batch = in->i[0], in_rows = in->i[1], cin = in->i[2], cout = in->i[3];
-    const uint32_t kernel = in->i[4], stride = in->i[5], output_padding = in->i[6];
+    const uint32_t kernel = in->i[4], stride = in->i[5], output_padding = in->i[6] & 0x7FFFFFFFu;
     const uint32_t groups = in->i[7];
     const uint32_t crop_before = in->fj[1].u & 0xFFFFu, crop_after = in->fj[1].u >> 16;
     const uint32_t flags = in->fj[2].u;
@@ -1510,7 +1534,52 @@ static void g_attention_ring_f32(const PlowDevInst* in, uint32_t slice, uint32_t
     }
 }
 
+/* AttentionF32 j1 bit 31: fp16 Q / K / V / output rows (stride and offsets in halves), the short
+ * geometry only (head 64, no bias, prefix or options but causal); normalized probabilities rounded
+ * to fp16 before the value sum; V read saturated to +-65504. */
+static void g_attention_h16(const PlowDevInst* in, uint32_t slice, uint32_t nblk, void* const* T) {
+    uint16_t* out = PLOW_CPU_TEN(in, T, 0);
+    const uint16_t* query = PLOW_CPU_TEN(in, T, 1);
+    const uint16_t* key = PLOW_CPU_TEN(in, T, 2);
+    const uint16_t* value = PLOW_CPU_TEN(in, T, 3);
+    const uint32_t* key_lengths = PLOW_CPU_TEN(in, T, 4);
+    const uint32_t batch = in->i[0], q_rows = in->i[1], kv_rows = in->i[2], heads = in->i[3], hw = in->i[4];
+    const uint32_t width = heads * hw, stride = in->i[5] ? in->i[5] : width, causal = in->i[6] & 1u;
+    const uint32_t k_col0 = in->fj[1].u, v_col0 = in->fj[2].u & 0x7fffffffu;
+    if (hw != 64u || q_rows > 32u || kv_rows > 32u || (in->i[6] & ~1u)) return;
+    double p[32], acc[64];
+    uint32_t lo, hi;
+    g_range(batch * heads * q_rows, slice, nblk, &lo, &hi);
+    for (uint32_t index = lo; index < hi; index++) {
+        const uint32_t b = index / (heads * q_rows), h = index / q_rows % heads, r = index % q_rows;
+        uint32_t visible = g_item_rows(key_lengths, b, kv_rows);
+        if (causal && r + 1u < visible) visible = r + 1u;
+        const uint16_t* q = query + ((size_t)b * q_rows + r) * stride + (size_t)h * hw;
+        double maximum = -INFINITY, denominator = 0.0;
+        for (uint32_t j = 0; j < visible; j++) {
+            const uint16_t* k = key + ((size_t)b * kv_rows + j) * stride + k_col0 + (size_t)h * hw;
+            double dot = 0.0;
+            for (uint32_t c = 0; c < hw; c++) dot += (double)f16_to_f32(q[c]) * f16_to_f32(k[c]);
+            p[j] = dot * in->fj[0].f;
+            if (p[j] > maximum) maximum = p[j];
+        }
+        for (uint32_t j = 0; j < visible; j++) denominator += (p[j] = exp(p[j] - maximum));
+        for (uint32_t c = 0; c < hw; c++) acc[c] = 0.0;
+        for (uint32_t j = 0; j < visible; j++) {
+            const double w = f16_to_f32(f32_to_f16((float)(p[j] / denominator)));
+            const uint16_t* v = value + ((size_t)b * kv_rows + j) * stride + v_col0 + (size_t)h * hw;
+            for (uint32_t c = 0; c < hw; c++) acc[c] += w * fminf(fmaxf(f16_to_f32(v[c]), -65504.f), 65504.f);
+        }
+        uint16_t* o = out + ((size_t)b * q_rows + r) * width + (size_t)h * hw;
+        for (uint32_t c = 0; c < hw; c++) o[c] = f32_to_f16(visible ? (float)acc[c] : 0.0f);
+    }
+}
+
 G_K(g_attention_f32) {
+    if (in->fj[2].u >> 31) {
+        g_attention_h16(in, slice, nblk, T);
+        return;
+    }
     if ((in->i[6] & 0xff08u) == 0x108u) {
         g_attention_ring_f32(in, slice, nblk, T);
         return;

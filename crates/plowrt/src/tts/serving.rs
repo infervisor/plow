@@ -1678,7 +1678,7 @@ async fn speech_with(
             };
             let t0 = Instant::now();
             ticket.segment(k);
-            let (codes, n) = match collect_codes(c, rx, &ticket).await {
+            let (codes, completed_pcm, n) = match collect_audio(c, rx, &ticket).await {
                 Ok(v) => v,
                 Err(e) => return crate::serve::api_error_for(&e),
             };
@@ -1689,8 +1689,12 @@ async fn speech_with(
                 t0.elapsed()
             };
             n_tokens += n;
-            let f = codes.len() / c.frame_codes;
-            let p = if f == 0 {
+            let f = completed_pcm
+                .as_ref()
+                .map_or(codes.len() / c.frame_codes, |p| p.len() / c.frame_samples);
+            let p = if let Some(pcm) = completed_pcm {
+                pcm
+            } else if f == 0 {
                 Vec::new()
             } else {
                 match decode_all(
@@ -2574,26 +2578,55 @@ fn short_window(samples: usize, frames: usize) -> String {
     format!("codec returned {samples} samples for a {frames}-frame window")
 }
 
-/// Drain the LM stream promptly (the mux cuts a consumer that falls behind) keeping the codes.
-async fn collect_codes(
+fn append_completed_pcm(
+    codes: &[i32],
+    output: &mut Option<Vec<f32>>,
+    frame: &stream_mod::SpeechPcm,
+    samples: usize,
+) -> crate::Result<()> {
+    if !codes.is_empty() || frame.len() != samples {
+        return Err(crate::RuntimeError::Rejected(
+            "mixed or invalid codec completion".into(),
+        ));
+    }
+    output
+        .get_or_insert_with(Vec::new)
+        .extend(frame.iter().map(|&s| f32::from(s) / 32767.0));
+    Ok(())
+}
+
+/// Drain promptly: holding a pinned tick slab until the utterance ends exhausts its bounded pool.
+async fn collect_audio(
     c: &SpeechContract,
     mut rx: stream_mod::ChunkReceiver,
     ticket: &Ticket,
-) -> crate::Result<(Vec<i32>, usize)> {
-    let (mut codes, mut n) = (Vec::new(), 0);
+) -> crate::Result<(Vec<i32>, Option<Vec<f32>>, usize)> {
+    let (mut codes, mut pcm, mut n) = (Vec::new(), None, 0);
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { id, frame, .. } => {
+            StreamChunk::Token { id, mut frame, .. } => {
                 n += 1;
-                if c.push_codes(&mut codes, id, frame.as_deref()) {
+                if let Some(pcm_frame) = stream_mod::SpeechFrame::take_pcm(&mut frame) {
+                    append_completed_pcm(&codes, &mut pcm, &pcm_frame, c.frame_samples)?;
                     ticket.frame();
+                } else {
+                    let before = codes.len();
+                    let complete = c.push_codes(&mut codes, id, frame.as_deref());
+                    if pcm.is_some() && codes.len() != before {
+                        return Err(crate::RuntimeError::Rejected(
+                            "mixed codec completion paths".into(),
+                        ));
+                    }
+                    if complete {
+                        ticket.frame();
+                    }
                 }
             }
             StreamChunk::Done { .. } => break,
             StreamChunk::Err(e) => return Err(e),
         }
     }
-    Ok((codes, n))
+    Ok((codes, pcm, n))
 }
 
 /// The emission plan for a stream holding `n` complete frames of which `emitted` are sent:
@@ -2721,13 +2754,52 @@ enum SegMsg {
         pause: Option<u32>,
         explicit_tail: bool,
     },
-    Frame(super::codec::Codes),
+    Frame(
+        super::codec::Codes,
+        Option<stream_mod::SpeechPcm>,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    ),
     /// The current segment attempt generated its last frame. A multi-segment drain then waits for
     /// the emitter's verdict on it before it starts anything else.
     End,
     /// The current segment was mute or droned and generates again: drop its frames.
     Retry,
     Err(String),
+}
+
+#[derive(Default)]
+struct PcmFrames {
+    pending: std::collections::VecDeque<(
+        stream_mod::SpeechPcm,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    )>,
+    received: usize,
+}
+
+impl PcmFrames {
+    fn push(
+        &mut self,
+        pcm: Option<stream_mod::SpeechPcm>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        samples: usize,
+    ) -> Result<(), String> {
+        if let Some(pcm) = pcm {
+            if pcm.len() != samples {
+                return Err("codec tick PCM length disagrees with frame size".into());
+            }
+            self.received = self
+                .received
+                .checked_add(1)
+                .ok_or("PCM frame count overflow")?;
+            self.pending.push_back((pcm, permit));
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.received = 0;
+    }
 }
 
 /// What becomes of a multi-segment request's segment attempt.
@@ -2826,6 +2898,12 @@ async fn stream_task(
         .as_ref()
         .filter(|r| r.conditioned && r.frames > 0)
         .cloned();
+    // The request's first step size, as its first-audio handoff was told (`SpeechModel::first_frames`).
+    let first_frames = audible
+        .0
+        .as_ref()
+        .map_or_else(|| model.contract.first_frames(), |fa| fa.next().max(1));
+    let pcm_queue_capacity = rx.max_capacity().max(first_frames);
     let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel::<SegMsg>();
     // The emitter's verdict per segment attempt (multi-segment only), tagged by `attempt_tag`.
     let (vtx, mut vrx) = tokio::sync::mpsc::unbounded_channel::<(u64, bool)>();
@@ -2837,6 +2915,7 @@ async fn stream_task(
     // stream it waits for the emitter's verdict, so a retry targets the attempt found mute.
     tokio::spawn(async move {
         let drain = async {
+            let mut pcm_budget: Option<Arc<tokio::sync::Semaphore>> = None;
             let mut rx = Some(rx);
             let mut k = 0;
             while k < later.segs.len() {
@@ -2866,11 +2945,30 @@ async fn stream_task(
                     let (mut codes, mut frames) = (Vec::new(), 0);
                     loop {
                         match rx.recv().await {
-                            Some(StreamChunk::Token { id, frame, .. }) => {
-                                if let Some(frame) = c.take_frame(&mut codes, id, frame) {
+                            Some(StreamChunk::Token { id, mut frame, .. }) => {
+                                let pcm = stream_mod::SpeechFrame::take_pcm(&mut frame);
+                                let frame = if pcm.is_some() {
+                                    Some(super::codec::Codes::default())
+                                } else {
+                                    c.take_frame(&mut codes, id, frame)
+                                };
+                                if let Some(frame) = frame {
+                                    let permit = if pcm.is_some() {
+                                        let budget = pcm_budget.get_or_insert_with(|| {
+                                            Arc::new(tokio::sync::Semaphore::new(
+                                                pcm_queue_capacity,
+                                            ))
+                                        });
+                                        match budget.clone().acquire_owned().await {
+                                            Ok(permit) => Some(permit),
+                                            Err(_) => return,
+                                        }
+                                    } else {
+                                        None
+                                    };
                                     frames += 1;
                                     lm.frame();
-                                    if ftx.send(SegMsg::Frame(frame)).is_err() {
+                                    if ftx.send(SegMsg::Frame(frame, pcm, permit)).is_err() {
                                         return;
                                     }
                                 }
@@ -2928,6 +3026,9 @@ async fn stream_task(
         lm.lm_done();
     });
     let (mut frames, mut emitted, mut first) = (super::codec::Codes::default(), 0usize, None);
+    let mut pcm_frames = PcmFrames::default();
+    let mut tick_audio = false;
+    let mut pcm_completion = None;
     // Segment and attempt, frames the earlier segments emitted, and whether this attempt's verdict
     // is out (the next message is a retry, the next segment, or the end).
     let (mut seg, mut attempt, mut total, mut joins, mut judged) =
@@ -2950,12 +3051,12 @@ async fn stream_task(
     let mut slot = initial_slot;
     let mut primed = false;
     let mut windowed = model.codec.step_frames == 0;
-    // The request's first step size, as its first-audio handoff was told (`SpeechModel::first_frames`).
-    let first_frames = audible
-        .0
-        .as_ref()
-        .map_or_else(|| model.contract.first_frames(), |fa| fa.next().max(1));
     let stream_deadline = crate::config::RuntimeConfig::get().tts_stream_deadline;
+    let step_cap = crate::config::RuntimeConfig::get()
+        .tts_stream_step_frames
+        .map_or(model.codec.step_frames, |n| {
+            n.clamp(1, model.codec.step_frames.max(1))
+        });
     // This stream's codec step time (seconds, running average): what an urgent step still costs.
     let mut step_s = 0.02f64;
     loop {
@@ -2973,6 +3074,9 @@ async fn stream_task(
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     (frames, emitted, skipping) = (super::codec::Codes::default(), 0, false);
+                    pcm_frames.clear();
+                    tick_audio = false;
+                    pcm_completion = None;
                     pace.restart();
                     period_mark = None;
                     attempt += 1;
@@ -2989,6 +3093,9 @@ async fn stream_task(
                     joins.push(sent);
                     joiner.next_segment();
                     (frames, emitted, skipping) = (super::codec::Codes::default(), 0, false);
+                    pcm_frames.clear();
+                    tick_audio = false;
+                    pcm_completion = None;
                     pace.restart();
                     period_mark = None;
                     (seg, attempt) = (seg + 1, 0);
@@ -3042,11 +3149,39 @@ async fn stream_task(
                 joiner.tagged_tail(explicit_tail);
                 continue;
             }
-            Some(SegMsg::Frame(f)) => {
+            Some(SegMsg::Frame(f, pcm, permit)) => {
+                if pcm_completion.is_some_and(|previous| previous != pcm.is_some()) {
+                    return drop(
+                        out.send(Err(std::io::Error::other("mixed codec completion paths")))
+                            .await,
+                    );
+                }
+                tick_audio = pcm.is_some();
+                pcm_completion = Some(tick_audio);
+                if let Err(e) = pcm_frames.push(pcm, permit, fs) {
+                    return drop(out.send(Err(std::io::Error::other(e))).await);
+                }
+                if tick_audio {
+                    slot = None;
+                    windowed = false;
+                }
                 frames.extend(f, fc);
                 while let Ok(m) = frx.try_recv() {
                     match m {
-                        SegMsg::Frame(f) => frames.extend(f, fc),
+                        SegMsg::Frame(f, pcm, permit) => {
+                            if pcm.is_some() != tick_audio {
+                                return drop(
+                                    out.send(Err(std::io::Error::other(
+                                        "mixed codec completion paths",
+                                    )))
+                                    .await,
+                                );
+                            }
+                            if let Err(e) = pcm_frames.push(pcm, permit, fs) {
+                                return drop(out.send(Err(std::io::Error::other(e))).await);
+                            }
+                            frames.extend(f, fc);
+                        }
                         SegMsg::End => {
                             done = true;
                             break;
@@ -3065,8 +3200,12 @@ async fn stream_task(
                 }
                 first_frame_at.get_or_insert_with(Instant::now);
                 pace.frame();
-                if slot.is_some() {
-                    let seen = frames.len() / fc.max(1);
+                if slot.is_some() || tick_audio {
+                    let seen = if tick_audio {
+                        pcm_frames.received
+                    } else {
+                        frames.len() / fc.max(1)
+                    };
                     match period_mark {
                         Some((t, at)) if seen >= at + 8 => {
                             model.observe_frame_period(
@@ -3099,8 +3238,12 @@ async fn stream_task(
         let ramp = crate::config::RuntimeConfig::get()
             .tts_chunk_ramp
             .unwrap_or_else(|| model.codec.parameters.get("stream.chunk_ramp") == Some(&1));
-        let n = frames.len() / fc;
-        if !windowed && slot.is_none() && n > emitted && !skipping {
+        let n = if tick_audio {
+            pcm_frames.received
+        } else {
+            frames.len() / fc
+        };
+        if !tick_audio && !windowed && slot.is_none() && n > emitted && !skipping {
             slot = model.codec.acquire_slot();
             windowed = slot.is_none();
             if windowed {
@@ -3178,16 +3321,27 @@ async fn stream_task(
             };
             let due = playing.map(|t| t + std::time::Duration::from_secs_f64(sent as f64 / sr));
             // (PCM, its first fresh frame, frames emitted after it, frames decoded)
-            let decoded = if let Some(slot) = slot.as_mut() {
+            let mut direct_pcm = Vec::new();
+            let decoded = if tick_audio {
+                if emitted == 0 && !done && n < first_frames {
+                    break;
+                }
+                let mut pcm = Vec::with_capacity(pcm_frames.pending.len() * fs);
+                while let Some((frame, permit)) = pcm_frames.pending.pop_front() {
+                    pcm.extend(frame.iter().map(|&sample| sample as f32 / 32767.0));
+                    direct_pcm.push((frame, permit));
+                }
+                if pcm.is_empty() {
+                    break;
+                }
+                if pcm.len() != (n - emitted) * fs {
+                    Err("codec tick PCM length disagrees with frame count".into())
+                } else {
+                    Ok((pcm, 0, n, n - emitted))
+                }
+            } else if let Some(slot) = slot.as_mut() {
                 let urgent = stream_deadline && step_urgent(due, pace.since(), n, step_s);
-                let Some(k) = step_plan(
-                    n,
-                    emitted,
-                    done,
-                    first_frames,
-                    model.codec.step_frames,
-                    urgent,
-                ) else {
+                let Some(k) = step_plan(n, emitted, done, first_frames, step_cap, urgent) else {
                     break;
                 };
                 let codes = frames.slice(emitted * fc..(emitted + k) * fc, fc);
@@ -3247,11 +3401,15 @@ async fn stream_task(
                         joined = v;
                         &joined[..]
                     };
-                    if slot.is_some() {
+                    if slot.is_some() || tick_audio {
                         frames.release(emitted..upto);
                         if let Some(fa) = &audible.0 {
                             fa.set_next(
-                                upto + step_need(upto, first_frames, model.codec.step_frames),
+                                upto + if tick_audio {
+                                    1
+                                } else {
+                                    step_need(upto, first_frames, step_cap)
+                                },
                             );
                         }
                     }
@@ -3259,7 +3417,13 @@ async fn stream_task(
                     let mut bytes = Vec::new();
                     if !fresh.is_empty() {
                         let trimmed = out_pcm.trimmed();
-                        out_pcm.push(fresh, &mut bytes);
+                        if tick_audio && n_segs == 1 {
+                            for (frame, _) in &direct_pcm {
+                                out_pcm.push_i16(frame, &mut bytes);
+                            }
+                        } else {
+                            out_pcm.push(fresh, &mut bytes);
+                        }
                         // Trimmed leading silence is never played: it neither starts playback
                         // nor counts as audio ahead of it (held samples count once sent).
                         sent += fresh.len();
@@ -3532,6 +3696,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn whole_completed_pcm_uses_audio_and_rejects_mixed_or_short_frames() {
+        let bytes: Vec<_> = [-32767i16, -1, 0, 32767]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        let frame = stream_mod::SpeechPcm::from_buffer(bytes.into(), 0..8).unwrap();
+        let mut output = None;
+        append_completed_pcm(&[], &mut output, &frame, 4).unwrap();
+        assert_eq!(output.as_ref().unwrap(), &[-1.0, -1.0 / 32767.0, 0.0, 1.0]);
+        let original = output.clone();
+        assert!(append_completed_pcm(&[1], &mut output, &frame, 4).is_err());
+        assert_eq!(output, original);
+        assert!(append_completed_pcm(&[], &mut output, &frame, 3).is_err());
+        assert_eq!(output, original);
+        append_completed_pcm(&[], &mut output, &frame, 4).unwrap();
+        assert_eq!(output.as_ref().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn pcm_frames_count_without_host_codes_and_reset_between_attempts() {
+        fn frame(samples: usize) -> stream_mod::SpeechPcm {
+            let bytes: Vec<_> = (0..samples)
+                .flat_map(|i| (i as i16).to_le_bytes())
+                .collect();
+            stream_mod::SpeechPcm::from_buffer(bytes.into(), 0..samples * 2).unwrap()
+        }
+        let mut frames = super::PcmFrames::default();
+        frames.push(None, None, 4).unwrap();
+        assert_eq!(frames.received, 0);
+        frames.push(Some(frame(4)), None, 4).unwrap();
+        let retained = frames.pending.pop_front().unwrap();
+        frames.push(Some(frame(4)), None, 4).unwrap();
+        assert_eq!(frames.received, 2);
+        assert_eq!(frames.pending.len(), 1);
+        assert!(frames.push(Some(frame(3)), None, 4).is_err());
+        assert_eq!(frames.received, 2);
+        assert_eq!(frames.pending.len(), 1);
+        frames.clear();
+        assert_eq!(frames.received, 0);
+        frames.push(Some(frame(4)), None, 4).unwrap();
+        assert_eq!(frames.received, 1);
+        assert_eq!(&*retained.0, &[0, 1, 2, 3]);
+        frames.received = usize::MAX;
+        assert!(frames.push(Some(frame(4)), None, 4).is_err());
+        assert_eq!(frames.pending.len(), 1);
+    }
+
+    #[test]
+    fn pcm_budget_bounds_pending_and_consuming_frames_through_first_audio() {
+        let channel_capacity = 1usize;
+        let first_frames = 3usize;
+        let budget = Arc::new(tokio::sync::Semaphore::new(
+            channel_capacity.max(first_frames),
+        ));
+        let mut frames = super::PcmFrames::default();
+        for _ in 0..first_frames {
+            let pcm = stream_mod::SpeechPcm::from_buffer(vec![0; 8].into(), 0..8).unwrap();
+            let permit = budget.clone().try_acquire_owned().unwrap();
+            frames.push(Some(pcm), Some(permit), 4).unwrap();
+        }
+        assert_eq!(frames.received, first_frames);
+        assert!(budget.clone().try_acquire_owned().is_err());
+        let consuming = frames.pending.pop_front().unwrap();
+        assert!(budget.clone().try_acquire_owned().is_err());
+        drop(consuming);
+        assert_eq!(budget.available_permits(), 1);
+        frames.clear();
+        assert_eq!(budget.available_permits(), first_frames);
+        let pcm = stream_mod::SpeechPcm::from_buffer(vec![0; 6].into(), 0..6).unwrap();
+        let permit = budget.clone().try_acquire_owned().unwrap();
+        assert!(frames.push(Some(pcm), Some(permit), 4).is_err());
+        assert_eq!(budget.available_permits(), first_frames);
+        let pcm = stream_mod::SpeechPcm::from_buffer(vec![0; 8].into(), 0..8).unwrap();
+        let permit = budget.clone().try_acquire_owned().unwrap();
+        frames.push(Some(pcm), Some(permit), 4).unwrap();
+        drop(frames);
+        assert_eq!(budget.available_permits(), first_frames);
     }
 
     #[test]

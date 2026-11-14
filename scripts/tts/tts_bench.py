@@ -9,8 +9,12 @@ Per request: ttfa_s (first audio byte, streaming) or latency_s, audio_s, rtf, an
 playback underruns after the first chunk (gaps, gap_s). Summary: medians, p90 TTFA, gap totals,
 aggregate audio seconds per wall second. Writes DIR/<tag>.json and optional wavs
 plus texts.json for scripts/tts/asr_check.py.
+
+Open loop: --rate R --duration D submits Poisson arrivals on a fixed schedule (--arrival-seed), never
+waiting for a completion; the summary adds offered/completed/goodput rates against --slo-ttfa-ms,
+late client starts and the peak in-flight count. A cell with late starts is client-limited.
 """
-import argparse, concurrent.futures as cf, http.client, json, os, statistics, sys, threading, time, urllib.error, urllib.request
+import argparse, concurrent.futures as cf, http.client, json, os, random, statistics, sys, threading, time, urllib.error, urllib.request
 
 sys.path.insert(0, os.path.dirname(__file__))
 from veena_ref import PROMPTS as VEENA_PROMPTS
@@ -120,6 +124,63 @@ def one_ws(url, model, voice, text, seed, extra):
                 t0=t0, chunks=[(round(t - t0, 4), n) for t, n in arrivals])
 
 
+# A scheduled start this late is a missed generator deadline (the client, not the server, was slow).
+LATE_START_S = 0.010
+
+
+def poisson_plan(rate, duration, seed):
+    """Arrival offsets (seconds) of a Poisson process of `rate` per second over `duration`."""
+    rng, t, plan = random.Random(seed), 0.0, []
+    while True:
+        t += rng.expovariate(rate)
+        if t >= duration:
+            return plan
+        plan.append(t)
+
+
+def open_loop(plan, call):
+    """Start `call(k)` at each plan offset on its own thread, whatever is still in flight.
+    Returns (results, seconds each start ran late, peak in-flight)."""
+    res, late = [None] * len(plan), [0.0] * len(plan)
+    lock, state = threading.Lock(), [0, 0]
+
+    def go(k):
+        with lock:
+            state[0] += 1
+            state[1] = max(state[1], state[0])
+        try:
+            res[k] = call(k)
+        finally:
+            with lock:
+                state[0] -= 1
+
+    t0, threads = time.perf_counter(), []
+    for k, at in enumerate(plan):
+        wait = t0 + at - time.perf_counter()
+        if wait > 0:
+            time.sleep(wait)
+        late[k] = max(0.0, time.perf_counter() - t0 - at)
+        th = threading.Thread(target=go, args=(k,))
+        th.start()
+        threads.append(th)
+    for th in threads:
+        th.join()
+    return res, late, state[1]
+
+
+def open_loop_summary(rows, plan, late, duration, slo_ttfa_ms):
+    """Rates over the offered window; a failed, stalled or over-SLO request is not goodput."""
+    ok = [r for r in rows if r["audio_s"] > 0]
+    first = lambda r: r["ttfa_s"] if r["ttfa_s"] is not None else r["latency_s"]
+    good = [r for r in ok if 1e3 * first(r) <= slo_ttfa_ms and not r["stalls"]]
+    # Completions that landed inside the offered window: below the offered rate means a backlog.
+    done = [r for r, at in zip(rows, plan) if r["audio_s"] > 0 and at + r["latency_s"] <= duration]
+    return dict(duration_s=duration, offered_rps=len(plan) / duration, completed_rps=len(done) / duration,
+                goodput_rps=len(good) / duration, slo_ttfa_ms=slo_ttfa_ms,
+                slo_attainment=len(good) / max(1, len(rows)),
+                late_starts=sum(l > LATE_START_S for l in late), max_late_ms=1e3 * max(late, default=0.0))
+
+
 def pct(xs, q):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(q * len(xs)))]
@@ -163,15 +224,28 @@ def main():
     ap.add_argument("--seed-offset", type=int, default=0, help="added to every request's seed (repeat runs)")
     ap.add_argument("--ramp-s", type=float, default=0.0, help="stagger the lanes' first requests over this many seconds")
     ap.add_argument("--session", default=None, help="X-Session-Id prefix (one session per client thread)")
+    ap.add_argument("--body", default=None, help="JSON object merged into every request body (a reference server's own fields)")
+    ap.add_argument("--rate", type=float, default=None, help="open loop: Poisson arrivals per second (--n is ignored)")
+    ap.add_argument("--duration", type=float, default=60.0, help="open loop: seconds of arrivals")
+    ap.add_argument("--arrival-seed", type=int, default=1, help="open loop: arrival schedule seed")
+    ap.add_argument("--slo-ttfa-ms", type=float, default=500.0, help="open loop: first-audio SLO for goodput")
     args = ap.parse_args()
+    plan = None
+    if args.rate:
+        if args.clone_list:
+            ap.error("--rate does not take --clone-list")
+        plan = poisson_plan(args.rate, args.duration, args.arrival_seed)
+        args.n = len(plan)
     global SESSION, PROMPT_SET, SR
     SR = card_sample_rate(args.url, args.model) or SR
     SESSION, PROMPT_SET = args.session, args.prompt_set
     os.makedirs(args.out, exist_ok=True)
-    tag = args.tag or f"{'ws' if args.ws else ('stream' if args.stream else 'full')}_c{args.conc}"
+    tag = args.tag or f"{'ws' if args.ws else ('stream' if args.stream else 'full')}_" + (f"r{args.rate:g}" if plan is not None else f"c{args.conc}")
     extra = dict(temperature=0.0) if args.greedy else {}
     if args.tags is not None:
         extra["tags"] = args.tags
+    if args.body:
+        extra.update(json.loads(args.body))
     if args.repetition_penalty is not None:
         extra["repetition_penalty"] = args.repetition_penalty
     refs = []
@@ -204,13 +278,18 @@ def main():
     for (spk, text), i in jobs[: args.warmup]:
         call_one(args.url, args.model, spk, text, args.stream or args.ws, 1000 + i, per(i))
     t0 = time.perf_counter()
-    with cf.ThreadPoolExecutor(args.conc) as ex:
+    late = peak = None
+    if plan is not None:
+        res, late, peak = open_loop(plan, lambda k: call_one(
+            args.url, args.model, jobs[k][0][0], jobs[k][0][1], args.stream or args.ws, k + 1 + args.seed_offset, per(k)))
+    else:
         def run(j):
             # --ramp-s: the lanes' first requests start spread over the ramp instead of all at once.
             if args.ramp_s and j[1] < args.conc:
                 time.sleep(args.ramp_s * j[1] / args.conc)
             return call_one(args.url, args.model, j[0][0], j[0][1], args.stream or args.ws, j[1] + 1 + args.seed_offset, per(j[1]))
-        res = list(ex.map(run, jobs))
+        with cf.ThreadPoolExecutor(args.conc) as ex:
+            res = list(ex.map(run, jobs))
     wall = time.perf_counter() - t0
     texts = {}
     rows = []
@@ -226,6 +305,9 @@ def main():
                          t0=r.get("t0"), chunks=r.get("chunks", []),
                          rtf=r["latency_s"] / r["audio_s"] if r["audio_s"] else None))
     ok = [r for r in rows if r["audio_s"] > 0]
+    if plan is not None:
+        for r, at in zip(rows, plan):
+            r["at"] = at
     if not ok:
         summ = dict(tag=tag, url=args.url, conc=args.conc, n=len(rows), failed=len(rows), error="all requests failed")
         print(json.dumps(summ), file=sys.stderr)
@@ -242,7 +324,7 @@ def main():
                     gaps=sum(r["gaps"] for r in ok), gap_streams=sum(r["gaps"] > 0 for r in ok),
                     gap_s=sum(r["gap_s"] for r in ok), stalls=sum(r["stalls"] for r in ok),
                     p90_rtf=pct([r["rtf"] for r in ok], 0.9))
-        if len(ok) > args.conc:
+        if plan is None and len(ok) > args.conc:
             steady_ok = [r for r in rows[args.conc:] if r["audio_s"] > 0]
             if steady_ok:
                 summ.update(
@@ -250,6 +332,9 @@ def main():
                     steady_p90_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in steady_ok], 0.9),
                     steady_p99_ttfa_ms=1e3 * pct([r["ttfa_s"] for r in steady_ok], 0.99),
                 )
+    if plan is not None:
+        summ.update(open_loop_summary(rows, plan, late, args.duration, args.slo_ttfa_ms), rate=args.rate,
+                    arrival_seed=args.arrival_seed, peak_inflight=peak)
     json.dump(dict(summary=summ, rows=rows), open(f"{args.out}/{tag}.json", "w"), indent=1)
     if texts:
         old = json.load(open(f"{args.out}/texts.json")) if os.path.exists(f"{args.out}/texts.json") else {}

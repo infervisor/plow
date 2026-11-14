@@ -66,8 +66,10 @@ impl CudaTokenBatch {
             // prefill attention's request table.
             && (e.recurrent.is_none() || e.recurrent_packs)
             && e.mixed_step.is_none()
-            && ((!e.has_depth_stage() && e.handle_of("in.frame_codes").is_none()
-                && e.handle_of("in.encoder_overlay").is_none()) || e.packed_depth_enabled())
+            // An overlay packet steps only through `token_batch_step_staged`, whose `prepare`
+            // writes the launch's overlay rows and index.
+            && ((!e.has_depth_stage() && e.handle_of("in.frame_codes").is_none())
+                || e.packed_depth_enabled())
             // Learned decode positions need a separate embedding contract.
             && e.handle_of("in.pos_base").is_none()
     }
@@ -245,8 +247,9 @@ impl GpuEngine {
             .handle_of(plow_asset::multimodal::TABLE_TENSOR)
             .is_some();
         let mut result = (|| {
-            if self.has_depth_stage()
-                && (prepare.is_none() || requests.iter().any(|r| r.phase == Phase::Verify))
+            if (self.has_depth_stage()
+                && (prepare.is_none() || requests.iter().any(|r| r.phase == Phase::Verify)))
+                || (prepare.is_none() && self.handle_of("in.encoder_overlay").is_some())
             {
                 return Err(RuntimeError::Rejected(
                     "speech token batch requires staged inputs and no verification spans".into(),

@@ -54,6 +54,60 @@ pub(crate) struct PacketAudioEncoder {
     buckets: std::sync::Arc<crate::obs::bucket::BucketDemand>,
 }
 
+/// Packed-launch parity of `encoder.pkt`: every utterance encoded alone, then in packed launches of
+/// `pack` utterances; per utterance, the f32 elements whose bits differ and the largest difference.
+#[cfg(feature = "cuda")]
+pub fn encoder_packing_differences(
+    encoder_packet: &std::path::Path,
+    items: &[MelFeatures],
+    pack: usize,
+) -> Result<Vec<(usize, f32)>> {
+    let mut encoder = PacketAudioEncoder::load(encoder_packet, "cuda")?;
+    let alone = items
+        .iter()
+        .map(|features| encoder.encode(features))
+        .collect::<Result<Vec<_>>>()?;
+    let mut differences = Vec::with_capacity(items.len());
+    let mut start = 0;
+    while start < items.len() {
+        let mut end = start;
+        let mut chunks = 0;
+        while end < items.len()
+            && end - start < pack
+            && chunks + encoder.chunks(items[end].frames) <= encoder.max_packed_chunks()
+        {
+            chunks += encoder.chunks(items[end].frames);
+            end += 1;
+        }
+        if end == start {
+            return Err(RuntimeError::Rejected(
+                "utterance exceeds the packed encoder".into(),
+            ));
+        }
+        let group: Vec<&MelFeatures> = items[start..end].iter().collect();
+        for (packed, single) in encoder
+            .encode_packed(&group)?
+            .iter()
+            .zip(&alone[start..end])
+        {
+            let differing = packed
+                .iter()
+                .zip(single)
+                .filter(|(a, b)| a.to_bits() != b.to_bits());
+            let worst = differing
+                .clone()
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            differences.push((
+                differing.count() + packed.len().abs_diff(single.len()),
+                worst,
+            ));
+        }
+        start = end;
+    }
+    Ok(differences)
+}
+
 /// How features map to encoder rows: fixed-size frame chunks, each producing
 /// `ceil(len / frame_stride)` rows.
 #[derive(Clone, Copy, Debug)]

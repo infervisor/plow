@@ -1,7 +1,7 @@
 # Maya 2 Native (maya-research/maya2-native) on H100 (sm_90a, 132 SMs, 80 GB): Qwen3-1.7B backbone
 # (BF16, restricted cb0 head of 2049 rows), DepthV2 as the packet's depth stage (fp16 weights,
 # tensor-core projections on mma.m16n8k16 with fp32 residuals, host cb0 controller), Mimi decoder
-# codec.pkt (fp32, 24 kHz). High concurrency decode ladder 1..128 at 2048 ctx. Apache-2.0.
+# codec.pkt (fp32 activations, split-bf16 tensor-core convs, 24 kHz). High concurrency decode ladder 1..128 at 2048 ctx. Apache-2.0.
 #
 #   PYREF=<python with torch + safetensors> nix develop --command \
 #     python3 scripts/campaign/campaign.py build recipes/infervisor/maya2-native/sm90a-h100-tp1.toml --out <fresh dir>
@@ -21,12 +21,18 @@
 # backbone. Decode Lt stops at 128 rows (crates/plow-asset/src/segment_roles.rs:262), and plowrt
 # enables it only when the widest rung is routed, so it needs the ladder capped at 128; capped,
 # c160/c256 trade median TTFA (19.5/75 s vs 3.5/44 s) for audio s/s (8.6/9.2 vs 7.8/6.7). Not adopted.
+# 2026-11-13 (plow_git below): Mimi transformer projections, residual k1 convs and the ConvTransposes
+# on the split-bf16 wgmma arms (PLOW_EMIT_SNAC_SPLIT_BF16, conv object) instead of 3xTF32; the
+# decoder-input k7 and residual k3 convs (ELU) stay 3xTF32, no Mimi conv takes the bf16 taps arm. Codec step b1.f1 3.39 -> 2.81 ms, b64.f2 12.3 -> 8.2, b64.f17 68.6 -> 36.4, b256.f17
+# 263 -> 137; PCM vs the TF32 packet 94 dB SNR. Served vs the same-commit base, same plowrt: c32
+# 65 -> 72 audio s/s, c128 110 -> 141, 20 req/s median TTFA 129 -> 70 ms, 40 req/s 147 -> 161;
+# tts_cer CER median 0.000 (n=48), as base. Evidence: <lab scratch>/sconc res/mab, m2, gate-m2bc.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "maya2-native"
 label = "sm90a-h100-tp1"
-plow_git = "b224f22feeed735bbd3b367a6f14591fdb191d8c"
+plow_git = "d5c89b2f63e380343d0ff47ce14080b92fc1e9d9"
 network = "qwen3"
 doc = "docs/runtime/tts.md"
 
@@ -96,6 +102,8 @@ PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
 PLOW_NV_FA_FOLD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
+PLOW_EMIT_CODEC_CONV_OBJECT = "20"
 
 [capabilities]
 masked_padding = "structural: request chunk limits (masked padding) are Gemma 4 only (crates/devgen/src/lib.rs:9382), and the packed contract needs the plow_pf_masked_padding_abi object capability (crates/plow-asset/src/packed_prefill.rs:87), which only the hd256/hd512 attention and Gemma 4 GLU objects declare; Maya2 is hd128 GQA2 on interp_sm90a*. Unmasked pad rows fit: prompts < 512 rows, max_ctx 2048"

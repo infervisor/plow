@@ -339,6 +339,42 @@ static __device__ void d_gemv_tp_f32(float* C, const __nv_bfloat16* x, const __n
 }
 #endif
 
+/* GemvF32Out on the decode walk (PLOW_NV_HEAD_MMA): a depth stage's codebook heads at batched
+ * rungs, where the dot8 body is compute-bound (Qwen3-TTS, 2048 x 1024 at 128 rows: 289 us a head
+ * against 26 us for a 1024 x 1024 projection on the walk). fp32 accumulation on the tensor cores:
+ * the sum order differs from the dot8 body's, so logits can differ in the last fp32 bits. */
+#ifndef PLOW_NV_HEAD_MMA
+#define PLOW_NV_HEAD_MMA 0
+#endif
+/* Decode objects only: prefill and speech objects keep dot8 sums when a recipe sets the define
+ * for every cubin. */
+#if PLOW_NV_HEAD_MMA && PLOW_NV_GEMV_MMA && !PLOW_NV_SPEECH && !PLOW_NV_PREFILL
+/* The walk indexes C as GvF32R rows; the stores write through float*. */
+static_assert(sizeof(GvF32R) == sizeof(float) && alignof(GvF32R) == alignof(float), "GvF32R is a float");
+template <typename Output>
+static __device__ __forceinline__ void gemv_f32out_mma(Output* C, const __nv_bfloat16* x,
+                                                       const __nv_bfloat16* W, unsigned M, unsigned N,
+                                                       unsigned K, unsigned slice, unsigned nblk) {
+    const bool single_tile = M <= GV_MM_MAX;
+    gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
+        constexpr int MM = decltype(mm)::v;
+        gemv_rows_mma<false, (MM + 15) / 16, (MM <= 8), false, Output>(
+            C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N, K, slice, nblk, nullptr, nullptr,
+            single_tile);
+    });
+}
+/* false: shape outside the walk's contract, the caller runs the dot8 body. */
+static __device__ __forceinline__ bool d_gemv_f32out_mma(float* C, const __nv_bfloat16* x,
+                                                         const __nv_bfloat16* W, unsigned M, unsigned N,
+                                                         unsigned K, bool round_bf16, unsigned slice,
+                                                         unsigned nblk) {
+    if (M < 2u || (K & 31u) || (N & 7u)) return false;
+    if (round_bf16) gemv_f32out_mma((GvF32R*)C, x, W, M, N, K, slice, nblk);
+    else gemv_f32out_mma(C, x, W, M, N, K, slice, nblk);
+    return true;
+}
+#endif
+
 #if PLOW_PACKET_LINEAR_BIAS
 static __device__ void d_gemv_bias(__nv_bfloat16* __restrict__ C,
                                    const __nv_bfloat16* __restrict__ x,

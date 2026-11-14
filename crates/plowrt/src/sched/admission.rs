@@ -236,6 +236,11 @@ impl DownstreamCredit {
             .store(limit, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// A stage is coupled (it set a backlog limit): its work runs on the model's device.
+    pub fn coupled(&self) -> bool {
+        self.limit.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
     /// Work handed to the stage and not finished.
     pub fn pending(&self) -> usize {
         self.backlog.load(std::sync::atomic::Ordering::Relaxed)

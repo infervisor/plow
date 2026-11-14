@@ -25,14 +25,101 @@ pub const DONE: &str = "[DONE]";
 pub const TEXT_ONLY: u32 = u32::MAX;
 
 #[derive(Debug)]
-pub struct SpeechFrame {
-    pub codes: Box<[u32]>,
-    pub device: Option<crate::exec::packet_runtime::PacketBuffer>,
+pub enum SpeechFrame {
+    Codes {
+        codes: Box<[u32]>,
+        device: Option<crate::exec::packet_runtime::PacketBuffer>,
+    },
+    Pcm(SpeechPcm),
+}
+
+impl SpeechFrame {
+    pub(crate) fn pcm(&self) -> Option<&SpeechPcm> {
+        match self {
+            Self::Pcm(pcm) => Some(pcm),
+            Self::Codes { .. } => None,
+        }
+    }
+
+    pub(crate) fn pcm_mut(&mut self) -> Option<&mut SpeechPcm> {
+        match self {
+            Self::Pcm(pcm) => Some(pcm),
+            Self::Codes { .. } => None,
+        }
+    }
+
+    pub(crate) fn take_pcm(frame: &mut Option<Self>) -> Option<SpeechPcm> {
+        if !matches!(frame, Some(Self::Pcm(_))) {
+            return None;
+        }
+        match frame.take() {
+            Some(Self::Pcm(pcm)) => Some(pcm),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SpeechPcm {
+    buffer: crate::exec::packet_runtime::PacketBuffer,
+    bytes: std::ops::Range<usize>,
+}
+
+impl SpeechPcm {
+    pub(crate) fn from_buffer(
+        buffer: crate::exec::packet_runtime::PacketBuffer,
+        bytes: std::ops::Range<usize>,
+    ) -> crate::Result<Self> {
+        let reject = || crate::RuntimeError::Rejected("invalid completed PCM slab range".into());
+        let data = buffer.host_slice().ok_or_else(reject)?;
+        if cfg!(target_endian = "big")
+            || bytes.start > bytes.end
+            || bytes.end > data.len()
+            || (bytes.end - bytes.start) % 2 != 0
+            || (data.as_ptr() as usize + bytes.start) % std::mem::align_of::<i16>() != 0
+        {
+            return Err(reject());
+        }
+        Ok(Self { buffer, bytes })
+    }
+
+    pub(crate) fn detach(
+        &mut self,
+        copies: &mut std::collections::BTreeMap<
+            (usize, usize, usize),
+            crate::exec::packet_runtime::PacketBuffer,
+        >,
+    ) -> crate::Result<()> {
+        if !self.buffer.pinned_host() {
+            return Ok(());
+        }
+        let copy = copies
+            .entry(self.buffer.host_identity())
+            .or_insert_with(|| {
+                self.buffer
+                    .host_slice()
+                    .expect("completed host PCM")
+                    .to_vec()
+                    .into()
+            })
+            .clone();
+        *self = Self::from_buffer(copy, self.bytes.clone())?;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for SpeechPcm {
+    type Target = [i16];
+    fn deref(&self) -> &[i16] {
+        let data = &self.buffer.host_slice().expect("completed host PCM")[self.bytes.clone()];
+        // SAFETY: construction checked alignment, endian, bounds and whole samples; storage is immutable.
+        unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), data.len() / 2) }
+    }
 }
 
 impl From<Box<[u32]>> for SpeechFrame {
     fn from(codes: Box<[u32]>) -> Self {
-        Self {
+        Self::Codes {
             codes,
             device: None,
         }
@@ -42,7 +129,10 @@ impl From<Box<[u32]>> for SpeechFrame {
 impl std::ops::Deref for SpeechFrame {
     type Target = [u32];
     fn deref(&self) -> &[u32] {
-        &self.codes
+        match self {
+            Self::Codes { codes, .. } => codes,
+            Self::Pcm(_) => &[],
+        }
     }
 }
 
@@ -58,7 +148,7 @@ pub enum StreamChunk {
         id: u32,
         text: String,
         logprobs: Option<Box<crate::text::logprobs::TokenLogprobs>>,
-        /// A depth-stage speech packet's frame codes for this token.
+        /// A speech packet's code frame or completed PCM for this token.
         frame: Option<SpeechFrame>,
     },
     /// Terminal event: stop condition met. `executed` is the aggregate packet
@@ -233,6 +323,51 @@ impl FrameHead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_frame_payload_keeps_code_frames_compact() {
+        type Legacy = (
+            Box<[u32]>,
+            Option<crate::exec::packet_runtime::PacketBuffer>,
+        );
+        let word = std::mem::size_of::<usize>();
+        let legacy = std::mem::size_of::<Legacy>();
+        let frame = std::mem::size_of::<SpeechFrame>();
+        let optional = std::mem::size_of::<Option<SpeechFrame>>();
+        println!("SPEECH_FRAME_LAYOUT legacy={legacy} current={frame} optional={optional}");
+        assert!(frame <= legacy + word);
+        assert!(optional <= std::mem::size_of::<Option<Legacy>>() + word);
+        let mut codes = Some(SpeechFrame::from(vec![3, 4].into_boxed_slice()));
+        assert!(SpeechFrame::take_pcm(&mut codes).is_none());
+        assert_eq!(&**codes.as_ref().unwrap(), &[3, 4]);
+    }
+
+    #[test]
+    fn pcm_slab_checks_alignment_and_survives_delivery_detach_and_pool_reuse() {
+        use crate::exec::packet_runtime::PacketHostBufferPool;
+        let mut pool = PacketHostBufferPool::host(8, 1);
+        assert!(pool.begin(8));
+        pool.writable().copy_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0]);
+        let buffer = unsafe { pool.complete() };
+        assert!(SpeechPcm::from_buffer(buffer.clone(), 1..3).is_err());
+        assert!(SpeechPcm::from_buffer(buffer.clone(), 0..3).is_err());
+        assert!(SpeechPcm::from_buffer(buffer.clone(), 6..10).is_err());
+        let mut first = SpeechPcm::from_buffer(buffer.clone(), 0..4).unwrap();
+        let mut last = SpeechPcm::from_buffer(buffer.clone(), 4..8).unwrap();
+        drop(buffer);
+        assert!(!pool.begin(8));
+        let mut copies = std::collections::BTreeMap::new();
+        first.detach(&mut copies).unwrap();
+        assert!(!pool.begin(8));
+        last.detach(&mut copies).unwrap();
+        assert_eq!(copies.len(), 1);
+        assert!(pool.begin(8));
+        pool.writable().fill(0xff);
+        let reused = unsafe { pool.complete() };
+        assert_eq!(&*first, [1, 2]);
+        assert_eq!(&*last, [3, 4]);
+        assert_eq!(reused.host_slice().unwrap(), [0xff; 8]);
+    }
     use axum::response::sse::{Event, Sse};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
