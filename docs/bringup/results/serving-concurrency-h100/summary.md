@@ -414,6 +414,12 @@ ring, so the per-layer carry gather / store pairs are gone.
   k7 3.45 ms, k1 1.62 ms, ConvTranspose 1.14 ms, dec.in 0.24 ms, the pre-transformer's four large
   pointwise convs 0.28 ms. A 96-channel k1 reads and writes ~283 MB (input, residual, output): a
   ~92 us floor at 3.1 TB/s against 210 us.
+- Single-product wgmma convs stage only the bf16 operand (no lo half), so the 128-wide tile now fits
+  a double-buffered A. Devgen pins 128 by default for single-product k1 C -> C and ConvTranspose1d
+  with 128 | cout. Same K order per output, so PCM is bit-identical. Segments at b64 x f2: ConvT into
+  768 / 384 205 / 205 -> 118 / 121 us, k1 768 / 384 / 192 / 96 58 / 95 / 133 / 193 -> 49 / 69 / 109 /
+  151 us; k7 unchanged. Step b64 x f2 9.69 -> 9.10 ms, b32 x f2 6.46 -> 6.10, b16 x f17 16.67 ->
+  15.55, b1 x f1 3.18 -> 3.14. The 12 k7 convs (3.45 ms, 38 % of the step) are next.
 - One stream, one frame (b1 x f1, 3.6 ms) is the per-launch floor: its convs take 2.5 ms on 6-16
   blocks each (dec.in 124 us on 12 blocks, each 768-channel k7 ~120 us on 6), so a small launch
   streams the codec's weights through a few SMs.
