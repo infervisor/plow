@@ -167,7 +167,7 @@ pub fn conv_arms(op: u16, i: &[u32; 8], pads: u32, f: u32) -> u64 {
 /// columns), 2 = 128 rows x 64 columns, 3 = 64 rows x 128 columns over plane groups; `None` = the
 /// shape does not fit the arm's arena.
 pub fn conv_bf16_kind(cin: u32, cout: u32, kernel: u32, dilation: u32) -> Option<u32> {
-    // SP_LAUNCH_ARENA_FLOATS under PLOW_SPEECH_CONV_BF16, less the 1024-byte alignment slack.
+    // SPB_PLAN_ARENA_FLOATS (op_speech_f32.cuh), less the 1024-byte alignment slack.
     const ARENA: u64 = 33280 * 4 - 1024;
     let (cin, cout, k, dil) = (
         u64::from(cin),

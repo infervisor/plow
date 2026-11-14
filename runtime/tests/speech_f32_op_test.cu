@@ -23,8 +23,12 @@
 
 #define SP_TEST_SHORT_MMA_Q 1
 #define SP_TEST_WG_ONE 1
+#define SP_TEST_SPB_RING 1
 #include "op_speech_f32.cuh"
 #include "cpu_dev.h"
+#if PLOW_SPEECH_CONV_OBJECT
+static void t_conv_ring();
+#endif
 
 #define GOLDEN(name) void name(const PlowDevInst*, uint32_t, uint32_t, void* const*, PlowCpuCtx*)
 extern "C" {
@@ -1511,6 +1515,9 @@ static void t_conv_pinned() {
     t_conv_bf16_stream("Conv1dF32 bf16 stream 192 d3", 192, 3, 70);
     t_conv_bf16_stream("Conv1dF32 bf16 stream 768 d9 groups", 768, 9, 32);
 #endif
+#if PLOW_SPEECH_CONV_OBJECT
+    t_conv_ring();
+#endif
 }
 
 static void t_conv_padding() {
@@ -2312,6 +2319,103 @@ static void t_attention_short(unsigned batch, unsigned qr, unsigned kr, bool cau
     }
 }
 
+#if PLOW_SPEECH_CONV_OBJECT
+/* The B ring's counter k-loop vs the single-prefetch bodies, bitwise: tap wraps at gpt 5 / 6 / 7
+ * (cin 80 / 96 / 112, plan kind 1), even and short kernels, zero-weight tail k16 groups, kind 2
+ * (rows split, ping-pong), kind 3 flat and grouped (768: two plane groups), with and without the
+ * input SnakeBeta, at the object's claim (S 4 / 3) and a 3-stage claim; ring also at 7 blocks. */
+static void t_conv_ring() {
+    struct Sh { unsigned cin, cout, k, dil, rows; };
+    const Sh shapes[] = {{80, 96, 7, 1, 70}, {112, 96, 7, 3, 70}, {96, 96, 2, 5, 70}, {64, 128, 4, 2, 150},
+                         {128, 64, 3, 1, 150}, {192, 192, 7, 9, 130}, {384, 384, 7, 3, 70}, {768, 768, 7, 9, 64}};
+    const size_t claims[] = {kSmem, 150528, 133120};
+    for (const Sh& h : shapes)
+        for (bool pre : {false, true}) {
+            ConvSpec s{3, h.rows + (h.k - 1u) * h.dil, h.cin, h.cout, h.k, 1, h.dil, 1, 0, 0, 0, 0, 12, false, true, true, false, {}, 0.f, true};
+            s.wg = true; s.tapmajor = true; s.pin = 1; s.beta = true;
+            Case c; unsigned o; build_conv(c, s, false, o);
+            if (pre) {
+                c.in.t[4] = c.f32(2u * h.cin + 2u * h.cout, 0.4f, 0.6f);
+                c.in.fj[2].u |= (12u << 4) | (1u << 19);
+            }
+            c.upload();
+            const size_t n = (size_t)3 * h.rows * h.cout;
+            void** td = upload_table(c.dev);
+            auto run = [&](unsigned ring, unsigned nblk, size_t smem) {
+                CK(cudaMemcpyToSymbol(sp_test_spb_ring, &ring, sizeof(ring)));
+                CK(cudaMemset(c.dev[o], 0x5a, n * 4));
+                k_speech<<<nblk, 256, smem>>>(c.in, td);
+                CK(cudaGetLastError());
+                CK(cudaDeviceSynchronize());
+                std::vector<uint8_t> v(n * 4);
+                CK(cudaMemcpy(v.data(), c.dev[o], n * 4, cudaMemcpyDeviceToHost));
+                return v;
+            };
+            const auto ref = run(0u, g_nblk, kSmem);
+            bool same = true;
+            for (size_t sm : claims) same = same && ref == run(1u, g_nblk, sm) && ref == run(1u, 7, sm);
+            unsigned one = 1u;
+            CK(cudaMemcpyToSymbol(sp_test_spb_ring, &one, sizeof(one)));
+            printf("  Conv1dF32 bf16 ring %u->%u k%u d%u%s bitwise == single-prefetch -> %s\n", h.cin, h.cout, h.k, h.dil,
+                   pre ? " pre" : "", same ? "PASS" : "FAIL");
+            if (!same) g_fail = 1;
+            CK(cudaFree(td));
+        }
+}
+/* The Qwen3-TTS codec's 12 k7 residual convs at step.b64.f2 (64 items, input + output SnakeBeta
+ * fused): the B-ring bodies vs the single-prefetch bodies (sp_test_spb_ring 0), bitwise (ring also at
+ * 7 blocks), then interleaved timing. SPEECH_TEST_SMEM raises the launch claim the ring sizes S from. */
+static void bench_conv_ring() {
+    auto once = [](Case& c, unsigned out, size_t n, unsigned on, unsigned nblk) {
+        CK(cudaMemcpyToSymbol(sp_test_spb_ring, &on, sizeof(on)));
+        void** td = upload_table(c.dev);
+        CK(cudaMemset(c.dev[out], 0x5a, n * 4));
+        k_speech<<<nblk, 256, kSmem>>>(c.in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(td));
+        std::vector<uint8_t> h(n * 4);
+        CK(cudaMemcpy(h.data(), c.dev[out], n * 4, cudaMemcpyDeviceToHost));
+        return h;
+    };
+    const unsigned fam[][2] = {{768, 64}, {384, 320}, {192, 1280}, {96, 3840}};
+    for (auto& f : fam)
+        for (unsigned dil : {1u, 3u, 9u}) {
+            const unsigned C = f[0], rows = f[1];
+            ConvSpec s{64, rows + 6u * dil, C, C, 7, 1, dil, 1, 0, 0, 0, 0, 12, false, true, true, false, {}, 0.f, true};
+            s.wg = true; s.tapmajor = true; s.pin = 1; s.beta = true;
+            Case c; unsigned o; build_conv(c, s, false, o);
+            c.in.t[4] = c.f32(4u * C, 0.4f, 0.6f);
+            c.in.fj[2].u |= (12u << 4) | (1u << 19);
+            c.upload();
+            const size_t n = (size_t)64 * rows * C;
+            const auto ref = once(c, o, n, 0u, g_nblk);
+            const bool same = ref == once(c, o, n, 1u, g_nblk) && ref == once(c, o, n, 1u, 7);
+            char name[96];
+            snprintf(name, sizeof(name), "k7 %u d%u [64][%u] pre", C, dil, rows);
+            printf("  %-34s old vs ring bitwise: %s\n", name, same ? "PASS" : "FAIL");
+            if (!same) g_fail = 1;
+            void** td = upload_table(c.dev);
+            for (unsigned on : {0u, 1u, 0u, 1u}) {
+                CK(cudaMemcpyToSymbol(sp_test_spb_ring, &on, sizeof(on)));
+                for (int i = 0; i < 3; i++) k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
+                cudaEvent_t e0, e1;
+                CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+                CK(cudaEventRecord(e0));
+                for (int i = 0; i < 20; i++) k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
+                CK(cudaEventRecord(e1));
+                CK(cudaEventSynchronize(e1));
+                float ms;
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                ms /= 20;
+                printf("  bench %-34s %s %8.3f ms %8.1f TFLOP/s\n", name, on ? "ring" : "old ", ms,
+                       2.0 * n * C * 7 / (ms * 1e9));
+                CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
+            }
+            CK(cudaFree(td));
+        }
+}
+#endif
 /* The Qwen3-TTS codec's single-product (i6 bit 31) wgmma convs at the served step.b64.f2 shapes:
  * k1 + residual per channel family, the merged-phase ConvTranspose into it; pinned 64- / 128-wide
  * as devgen pins them; the runtime single-product path (sp_test_wg_one 0) vs the hi-only layout
@@ -3137,6 +3241,7 @@ int main(int argc, char** argv) {
     unsigned arena_floats;
     CK(cudaMemcpyFromSymbol(&arena_floats, k_arena_floats, sizeof(arena_floats)));
     kSmem = (size_t)arena_floats * sizeof(float);
+    if (const char* e = getenv("SPEECH_TEST_SMEM")) kSmem = (size_t)atoi(e);
     CK(cudaFuncSetAttribute(k_speech, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem));
     printf("speech_f32_op_test on %s (%d SMs), nblk=%d, arena=%zu B\n", prop.name, g_nblk, g_nblk, kSmem);
 
@@ -3404,6 +3509,15 @@ int main(int argc, char** argv) {
         return 0;
     }
 #endif
+    if (argc > 1 && !strcmp(argv[1], "--bench-conv-ring")) {
+#if PLOW_SPEECH_CONV_OBJECT
+        bench_conv_ring();
+        return g_fail;
+#else
+        fprintf(stderr, "--bench-conv-ring needs -DPLOW_SPEECH_CONV_OBJECT=1 -DPLOW_SPEECH_CONV_BF16=1\n");
+        return 2;
+#endif
+    }
     if (argc > 1 && !strcmp(argv[1], "--bench-conv-1p")) {
         bench_conv_1p();
         return g_fail;

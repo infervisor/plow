@@ -89,8 +89,14 @@ static_assert(SP_ARENA_FLOATS >= SPG_SMEM_FLOATS, "speech arena");
 #ifndef PLOW_SPEECH_CONV_BF16
 #define PLOW_SPEECH_CONV_BF16 0
 #endif
-#if defined(PLOW_NV_HOPPER) && (PLOW_SPEECH_SPLIT_A || PLOW_SPEECH_CONV_BF16)
-#define SP_LAUNCH_ARENA_FLOATS 33280
+/* The bf16 taps conv plans its staging (spb_plan, devgen conv_bf16_plan) on SPB_PLAN_ARENA_FLOATS
+ * whatever the launch claims; the conv object claims up to the 164 KiB carve-out (less its 1 KiB of
+ * static and the 1 KiB reserve), which only deepens the B ring (spb_ring_run). */
+#define SPB_PLAN_ARENA_FLOATS 33280
+#if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16 && defined(PLOW_SPEECH_CONV_OBJECT) && PLOW_SPEECH_CONV_OBJECT
+#define SP_LAUNCH_ARENA_FLOATS 41472
+#elif defined(PLOW_NV_HOPPER) && (PLOW_SPEECH_SPLIT_A || PLOW_SPEECH_CONV_BF16)
+#define SP_LAUNCH_ARENA_FLOATS SPB_PLAN_ARENA_FLOATS
 #else
 #define SP_LAUNCH_ARENA_FLOATS SP_ARENA_FLOATS
 #endif
@@ -5801,13 +5807,14 @@ __device__ __forceinline__ unsigned sp_w_conv_width(const PlowDevInst* in, const
  * swizzled rows per plane; tap t's A operand is the same rows from row t * dil (the swizzle is a
  * function of the absolute shared address, so the plain descriptor at any row of a 1024-aligned
  * plane is valid; the base-offset field must stay 0). B is the hi half of the pre-split image
- * (bit 18), one 64-column k-tile of NU rows at a time, double-buffered. K runs (plane group, tap,
- * channel) on one accumulator per output, a fixed order: a row's value does not depend on M, the
- * batch or the block count.
- * The arena stays at the split-image size: a larger dynamic claim moves the carve-out to 228 KiB
- * and the other speech arms, which re-read activations through L1, lose 15-100 %.
+ * (bit 18), one 64-column k-tile of NU rows at a time, double-buffered (the conv object: a 3-4 stage
+ * ring, spb_ring_run). K runs (plane group, tap, channel) on one accumulator per output, a fixed
+ * order: a row's value does not depend on M, the batch or the block count.
+ * The plan stays on the split-image arena (SPB_PLAN_ARENA_FLOATS). The speech object's claim stays
+ * there: past the 164 KiB carve-out the other speech arms, which re-read activations through L1,
+ * lose 15-100 %; the conv object claims up to that carve-out.
  * Devgen mirrors spb_plan (conv_bf16_plan). */
-#define SPB_ARENA_BYTES (SP_LAUNCH_ARENA_FLOATS * 4u - 1024u)
+#define SPB_ARENA_BYTES (SPB_PLAN_ARENA_FLOATS * 4u - 1024u)
 /* The conv-only speech object (interp_sm120.cu): its own register allocation fits the ping-pong body,
  * which inlined beside the other arms loses (C7512 with both bodies, -3 % in-packet). */
 #ifndef PLOW_SPEECH_CONV_OBJECT
@@ -6103,6 +6110,205 @@ __device__ __forceinline__ void spb_pingpong(const SpConvArgs& a, const SpbIn& s
     }
     __syncthreads();
 }
+/* B ring (non-chunked bodies): S k-tile stages, one wgmma group left in flight across the barrier.
+ * Stage (j + S - 1) % S held tile j - 1, so it is refilled only after every consumer retired j - 1
+ * (wait<1> after committing j, then the barrier). A k-tile past the group's last commits an empty
+ * copy group, so `cp.async.wait_group S - 2` always means "tile j landed". The instruction, K order and
+ * accumulator chain per output are spb_run's / spb_pingpong's: the same bits. The plan (kind, pg,
+ * flat, ping-pong) stays the one SPB_ARENA_BYTES gives; the launch's claim sizes only S. */
+#if defined(SP_TEST_SPB_RING)
+__device__ unsigned sp_test_spb_ring = 1u; /* test builds: 0 = the single-prefetch bodies */
+#define SPB_RING_ON sp_test_spb_ring
+#else
+#define SPB_RING_ON true
+#endif
+__device__ __forceinline__ unsigned spb_claim_bytes() {
+    unsigned v;
+    asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(v));
+    return v - 1024u;
+}
+__device__ __forceinline__ unsigned spb_pp_bytes(const SpConvArgs& a, unsigned pg, unsigned nu, unsigned s) {
+    return ((unsigned)pg * spb_rpad(a, 64u) * 128u + s * nu * 128u + 3u * nu * 4u + 1023u) & ~1023u;
+}
+template <unsigned WN, bool PRE, bool STREAM, unsigned S>
+__device__ __forceinline__ void spb_pingpong_ring(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws,
+                                                  unsigned pg, unsigned wgb, unsigned slice, unsigned nblk) {
+    constexpr unsigned NU = WN, BB = NU * 128u;
+    const unsigned tid = threadIdx.x & 127u, wg = threadIdx.x >> 7, bar = 1u + wg;
+    const unsigned span = 64u + (a.kernel - 1u) * a.dil, rpad = spb_rpad(a, 64u);
+    char* As = (char*)sm90_align1024(sp_smem) + (size_t)wg * wgb;
+    char* Bs = As + (size_t)pg * rpad * 128u;
+    float* par = (float*)(Bs + S * BB);
+    /* Descriptors as base + (byte offset >> 4): shared addresses stay below 256 KiB (14-bit field). */
+    const uint64_t da0 = sm90_desc(As), db0 = sm90_desc(Bs);
+    const unsigned gpt = a.cin / 16u, nkt = (a.cin * a.kernel + 63u) / 64u, ng = a.kernel * gpt;
+    const unsigned mt = (a.out_rows + 63u) / 64u, tn = (a.cout + NU - 1u) / NU, units = a.batch * mt * tn;
+    const unsigned per = units / nblk, extra = units % nblk;
+    const unsigned c0 = slice * per + (slice < extra ? slice : extra), c1 = c0 + per + (slice < extra ? 1u : 0u);
+    const unsigned half = c0 + (c1 - c0 + 1u) / 2u, u0 = wg ? half : c0, u1 = wg ? c1 : half;
+    unsigned staged = ~0u, pn = ~0u;
+    for (unsigned u = u0; u < u1; u++) {
+        const unsigned mu = u / tn, n0 = (u - mu * tn) * NU, b = mu / mt, t0 = (mu - b * mt) * 64u;
+        float acc[WN / 2u];
+        auto copy_b = [&](unsigned j, unsigned bf) {
+            if (j < nkt) {
+                const char* src = whi + (size_t)j * ws + (size_t)n0 * 128u + tid * 16u;
+                char* dst = Bs + bf * BB + tid * 16u;
+#pragma unroll
+                for (unsigned q = 0; q < NU / 16u; q++) sm90_cp16(dst + q * 2048u, src + q * 2048u, 16);
+            }
+            sm90_cp_commit();
+        };
+#pragma unroll
+        for (unsigned k = 0; k + 1u < S; k++) copy_b(k, k);
+        if (pn != n0) spb_params(a, par, n0, NU, tid, 128u);
+        pn = n0;
+        if (staged != mu) spb_stage<PRE, STREAM>(a, si, As, rpad, span, b, t0, 0u, a.cin, tid, 128u);
+        staged = mu;
+        unsigned bf = 0u, nf = S - 1u, tj = 0u, cj = 0u; /* (tap, c16) of k16 group 4 j */
+        for (unsigned j = 0; j < nkt; j++) {
+            sm90_cp_wait<(int)S - 2>();
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile("bar.sync %0, 128;\n" ::"r"(bar) : "memory");
+            sm90_wg_fence();
+#pragma unroll
+            for (unsigned s2 = 0; s2 < 4u; s2++) {
+                const unsigned cc = cj + s2;
+                const bool wrap = cc >= gpt, past = 4u * j + s2 >= ng;
+                const unsigned tap = past ? 0u : wrap ? tj + 1u : tj, c16 = past ? 0u : wrap ? cc - gpt : cc;
+                const uint64_t da = da0 + (((c16 >> 2) * rpad + tap * a.dil) * 8u + (c16 & 3u) * 2u);
+                const uint64_t db = db0 + (bf * (BB >> 4) + s2 * 2u);
+                const int acc_on = j || s2 ? 1 : 0;
+                if constexpr (WN == 96u) spb_m64n96k16(acc, da, db, acc_on);
+                else spwg_m64n64k16(acc, da, db, acc_on);
+            }
+            cj += 4u;
+            if (cj >= gpt) { cj -= gpt; tj++; }
+            sm90_wg_commit();
+            sm90_wg_wait<1>();
+            asm volatile("bar.sync %0, 128;\n" ::"r"(bar) : "memory");
+            copy_b(j + S - 1u, nf);
+            bf = bf + 1u == S ? 0u : bf + 1u;
+            nf = nf + 1u == S ? 0u : nf + 1u;
+        }
+        sm90_wg_wait<0>();
+        sm90_cp_wait<0>();
+        if (n0 < a.cout) spb_store<WN / 8u>(a, acc, par, NU, b, t0, n0);
+        asm volatile("bar.sync %0, 128;\n" ::"r"(bar) : "memory");
+    }
+    __syncthreads();
+}
+template <unsigned WN, bool ROWS, bool PRE, bool STREAM, unsigned S>
+__device__ __forceinline__ void spb_ring(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws, unsigned pg,
+                                         unsigned slice, unsigned nblk) {
+    constexpr unsigned BM = ROWS ? 128u : 64u, NU = ROWS ? WN : 2u * WN, BB = NU * 128u;
+    char* As = (char*)sm90_align1024(sp_smem);
+    const unsigned tid = threadIdx.x, wg = tid >> 7;
+    const unsigned planes = (a.cin + 63u) / 64u, groups = planes / pg, gpt = a.cin / 16u;
+    const bool flat = groups == 1u;
+    const unsigned nkt = flat ? (a.cin * a.kernel + 63u) / 64u : a.kernel * pg, ng = a.kernel * gpt;
+    const unsigned span = BM + (a.kernel - 1u) * a.dil, rpad = spb_rpad(a, BM);
+    char* Bs = As + (size_t)pg * rpad * 128u;
+    float* par = (float*)(Bs + S * BB);
+    const uint64_t da0 = sm90_desc(As), db0 = sm90_desc(Bs);
+    const unsigned mt = (a.out_rows + BM - 1u) / BM, tn = (a.cout + NU - 1u) / NU, units = a.batch * mt * tn;
+    const unsigned rw = ROWS ? wg * 64u : 0u, cw = ROWS ? 0u : wg * WN;
+    const unsigned per = units / nblk, extra = units % nblk;
+    const unsigned u0 = slice * per + (slice < extra ? slice : extra), u1 = u0 + per + (slice < extra ? 1u : 0u);
+    unsigned staged = ~0u;
+    for (unsigned u = u0; u < u1; u++) {
+        const unsigned mu = u / tn, n0 = (u - mu * tn) * NU, b = mu / mt, t0 = (mu - b * mt) * BM;
+        float acc[WN / 2u];
+        for (unsigned gi = 0; gi < groups; gi++) {
+            /* Image k-tile of the copy cursor (tap qt, plane qp of the group; flat: the tile itself). */
+            unsigned qt = (S - 1u) / pg, qp = (S - 1u) % pg;
+            auto copy_b = [&](unsigned j, unsigned bf, unsigned kt) {
+                if (j < nkt) {
+                    const char* src = whi + (size_t)kt * ws + (size_t)n0 * 128u + tid * 16u;
+                    char* dst = Bs + bf * BB + tid * 16u;
+#pragma unroll
+                    for (unsigned q = 0; q < NU / 32u; q++) sm90_cp16(dst + q * 4096u, src + q * 4096u, 16);
+                }
+                sm90_cp_commit();
+            };
+#pragma unroll
+            for (unsigned k = 0; k + 1u < S; k++) copy_b(k, k, flat ? k : (k / pg) * planes + gi * pg + k % pg);
+            if (gi == 0u) spb_params(a, par, n0, NU);
+            if (!flat || staged != mu) spb_stage<PRE, STREAM>(a, si, As, rpad, span, b, t0, gi * pg, flat ? a.cin : pg * 64u);
+            staged = flat ? mu : ~0u;
+            /* flat: (tap, c16) of k16 group 4 j; grouped: (tap, plane) of k-tile j. */
+            unsigned bf = 0u, nf = S - 1u, tj = 0u, cj = 0u;
+            for (unsigned j = 0; j < nkt; j++) {
+                sm90_cp_wait<(int)S - 2>();
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                __syncthreads();
+                sm90_wg_fence();
+#pragma unroll
+                for (unsigned s2 = 0; s2 < 4u; s2++) {
+                    unsigned tap, c16;
+                    if (flat) {
+                        const unsigned cc = cj + s2;
+                        const bool wrap = cc >= gpt, past = 4u * j + s2 >= ng;
+                        tap = past ? 0u : wrap ? tj + 1u : tj;
+                        c16 = past ? 0u : wrap ? cc - gpt : cc;
+                    } else {
+                        tap = tj;
+                        c16 = cj * 4u + s2;
+                    }
+                    const uint64_t da = da0 + (((c16 >> 2) * rpad + tap * a.dil + rw) * 8u + (c16 & 3u) * 2u);
+                    const uint64_t db = db0 + (bf * (BB >> 4) + cw * 8u + s2 * 2u);
+                    const int acc_on = gi || j || s2 ? 1 : 0;
+                    if constexpr (WN == 96u) spb_m64n96k16(acc, da, db, acc_on);
+                    else spwg_m64n64k16(acc, da, db, acc_on);
+                }
+                if (flat) {
+                    cj += 4u;
+                    if (cj >= gpt) { cj -= gpt; tj++; }
+                } else if (++cj == pg) {
+                    cj = 0u;
+                    tj++;
+                }
+                sm90_wg_commit();
+                sm90_wg_wait<1>();
+                __syncthreads();
+                copy_b(j + S - 1u, nf, flat ? j + S - 1u : qt * planes + gi * pg + qp);
+                if (++qp == pg) { qp = 0u; qt++; }
+                bf = bf + 1u == S ? 0u : bf + 1u;
+                nf = nf + 1u == S ? 0u : nf + 1u;
+            }
+            sm90_wg_wait<0>();
+            sm90_cp_wait<0>();
+            __syncthreads(); /* the next group restages A and refills B */
+        }
+        if (n0 + cw < a.cout) spb_store<WN / 8u>(a, acc, par + cw, NU, b, t0 + rw, n0 + cw);
+        __syncthreads(); /* the next unit restages A, B and the parameters */
+    }
+}
+/* The ring's stage count for the launch's claim: the largest S <= 4 beside the plan's A and params.
+ * Two stages expose each refill (issued after the previous tile retires), so S < 3 keeps the
+ * single-prefetch body. The ring's k-loop carries (tap, channel) counters and descriptor offsets
+ * instead of per-k-tile divisions: at these shapes that address math, not the copies or the MMAs,
+ * bounded the old loop. It assumes cin >= 64 (at most one tap wrap per k-tile). */
+template <unsigned WN, bool ROWS, bool PRE, bool STREAM>
+__device__ __forceinline__ bool spb_ring_run(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws, unsigned pg,
+                                             unsigned slice, unsigned nblk) {
+    constexpr unsigned BM = ROWS ? 128u : 64u, NU = ROWS ? WN : 2u * WN, BB = NU * 128u;
+    if (!SPB_RING_ON || a.cin < 64u) return false;
+    const unsigned claim = spb_claim_bytes(), groups = (a.cin + 63u) / 64u / pg;
+    if constexpr (ROWS) {
+        if (groups == 1u && 2u * spb_pp_bytes(a, pg, NU, 2u) <= SPB_ARENA_BYTES) {
+            if (2u * spb_pp_bytes(a, pg, NU, 4u) <= claim)
+                return spb_pingpong_ring<WN, PRE, STREAM, 4>(a, si, whi, ws, pg, spb_pp_bytes(a, pg, NU, 4u), slice, nblk), true;
+            if (2u * spb_pp_bytes(a, pg, NU, 3u) <= claim)
+                return spb_pingpong_ring<WN, PRE, STREAM, 3>(a, si, whi, ws, pg, spb_pp_bytes(a, pg, NU, 3u), slice, nblk), true;
+            return false;
+        }
+    }
+    const unsigned fixed = pg * spb_rpad(a, BM) * 128u + 3u * NU * 4u;
+    if (fixed + 4u * BB <= claim) return spb_ring<WN, ROWS, PRE, STREAM, 4>(a, si, whi, ws, pg, slice, nblk), true;
+    if (fixed + 3u * BB <= claim) return spb_ring<WN, ROWS, PRE, STREAM, 3>(a, si, whi, ws, pg, slice, nblk), true;
+    return false;
+}
 #endif
 /* WN columns per warpgroup; ROWS: the warpgroups split BM = 128 rows (NU = WN), else BM = 64 and
  * they split NU = 2 WN columns. Shared [A: pg planes x rpad x 128 B][B: 2 x NU rows x 128 B][params]. */
@@ -6116,6 +6322,8 @@ __device__ __forceinline__ void spb_run(const SpConvArgs& a, const SpbIn& si, co
     /* One group covering every plane runs the flattened (tap, channel) k-tiles, which may span taps. */
     const bool flat = groups == 1u;
 #if PLOW_SPEECH_CONV_OBJECT
+    if constexpr (!CK)
+        if (spb_ring_run<WN, ROWS, PRE, STREAM>(a, si, whi, ws, pg, slice, nblk)) return;
     if constexpr (ROWS) {
         const unsigned wgb = ((unsigned)pg * spb_rpad(a, 64u) * 128u + 2u * BB + 3u * NU * 4u + 1023u) & ~1023u;
         if (!CK && flat && 2u * wgb <= SPB_ARENA_BYTES) return spb_pingpong<WN, PRE, STREAM>(a, si, whi, ws, pg, wgb, slice, nblk);

@@ -420,6 +420,16 @@ ring, so the per-layer carry gather / store pairs are gone.
   768 / 384 205 / 205 -> 118 / 121 us, k1 768 / 384 / 192 / 96 58 / 95 / 133 / 193 -> 49 / 69 / 109 /
   151 us; k7 unchanged. Step b64 x f2 9.69 -> 9.10 ms, b32 x f2 6.46 -> 6.10, b16 x f17 16.67 ->
   15.55, b1 x f1 3.18 -> 3.14. The 12 k7 convs (3.45 ms, 38 % of the step) are next.
+- k7 bf16 taps conv: the bound was the k-loop's address math, not bandwidth or MMA. Knock-out
+  screens (A staging, B copies, wgmma and store all skipped; then the per-k-tile proxy fence and
+  barriers too) left 60-70 % of the time at 768 / 384 channels: runtime divides (k16 group / channels
+  per tap, k-tile / plane group) and descriptor rebuilds every k-tile. A deeper B ring alone changed
+  nothing (3-4 stages equal, 2 slower). The conv object's loop now carries (tap, channel) counters and
+  descriptor offsets, with a 3-4 stage B ring and one wgmma group in flight; the plan (kind, plane
+  groups, K order) stays on the old arena, the object claims 162 KiB (same 164 KiB carve-out). Op
+  test, 64 items at the served rows, bitwise equal to the old body: 768 293-317 -> 192-212 us, 384
+  346-386 -> 265-281, 192 243-263 -> 223-243, 96 204-225 -> 191-213. Packet, PCM bit-identical: step
+  b64 x f2 9.12 -> 8.35 ms, b32 x f2 6.10 -> 5.65, b16 x f17 15.56 -> 13.78, b1 x f1 equal.
 - One stream, one frame (b1 x f1, 3.6 ms) is the per-launch floor: its convs take 2.5 ms on 6-16
   blocks each (dec.in 124 us on 12 blocks, each 768-channel k7 ~120 us on 6), so a small launch
   streams the codec's weights through a few SMs.

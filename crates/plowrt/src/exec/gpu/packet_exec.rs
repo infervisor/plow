@@ -2455,9 +2455,17 @@ fn speech_conv_node_split_matches_packet() {
     let path = std::path::PathBuf::from(std::env::var("SPEECH_SPLIT_PKT").unwrap());
     let image = std::fs::read(std::env::var("SPEECH_SPLIT_CUBIN").unwrap()).unwrap();
     let programs = std::env::var("SPEECH_SPLIT_PROGRAMS").unwrap_or("27".into());
-    let smem: u32 = std::env::var("SPEECH_SPLIT_SMEM").map_or(133120, |s| s.parse().unwrap());
     let be = Arc::new(CudaBackend::new(0).unwrap());
     let module = be.module_load(&image).unwrap();
+    // Default: the claim the object exports (what production launches with).
+    let smem: u32 = std::env::var("SPEECH_SPLIT_SMEM").map_or_else(
+        |_| {
+            be.module_global_u32(&module, "plow_arena_bytes_speechconv")
+                .unwrap()
+                .unwrap_or(133120)
+        },
+        |s| s.parse().unwrap(),
+    );
     let node = be.get_function(&module, "speech_conv_node").unwrap();
     be.set_max_dynamic_smem(node, smem).unwrap();
     let raw = std::fs::read(&path).unwrap();
