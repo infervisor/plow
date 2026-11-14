@@ -1536,7 +1536,7 @@ static void g_attention_ring_f32(const PlowDevInst* in, uint32_t slice, uint32_t
 
 /* AttentionF32 j1 bit 31: fp16 Q / K / V / output rows (stride and offsets in halves), the short
  * geometry only (head 64, no bias, prefix or options but causal); normalized probabilities rounded
- * to fp16 before the value sum. */
+ * to fp16 before the value sum; V read saturated to +-65504. */
 static void g_attention_h16(const PlowDevInst* in, uint32_t slice, uint32_t nblk, void* const* T) {
     uint16_t* out = PLOW_CPU_TEN(in, T, 0);
     const uint16_t* query = PLOW_CPU_TEN(in, T, 1);
@@ -1568,7 +1568,7 @@ static void g_attention_h16(const PlowDevInst* in, uint32_t slice, uint32_t nblk
         for (uint32_t j = 0; j < visible; j++) {
             const double w = f16_to_f32(f32_to_f16((float)(p[j] / denominator)));
             const uint16_t* v = value + ((size_t)b * kv_rows + j) * stride + v_col0 + (size_t)h * hw;
-            for (uint32_t c = 0; c < hw; c++) acc[c] += w * f16_to_f32(v[c]);
+            for (uint32_t c = 0; c < hw; c++) acc[c] += w * fminf(fmaxf(f16_to_f32(v[c]), -65504.f), 65504.f);
         }
         uint16_t* o = out + ((size_t)b * q_rows + r) * width + (size_t)h * hw;
         for (uint32_t c = 0; c < hw; c++) o[c] = f32_to_f16(visible ? (float)acc[c] : 0.0f);

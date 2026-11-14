@@ -21,6 +21,7 @@
 #include <cstring>
 #include <vector>
 
+#define SP_TEST_SHORT_MMA_Q 1
 #include "op_speech_f32.cuh"
 #include "cpu_dev.h"
 
@@ -2197,12 +2198,14 @@ static void bench(const char* name, Case& c, double flops, double bytes, int rep
 }
 
 /* half (j1 bit 31): fp16 Q / K / V / output rows; against the golden's fp16 output (P rounded to fp16
- * after normalization), within a few fp16 ulps (sum order and P rounding ties). */
+ * after normalization), within a few fp16 ulps (sum order and P rounding ties): |d| / max(rms, |ref|). */
+static bool g_odd_stride = false;
 static void t_attention_short(unsigned batch, unsigned qr, unsigned kr, bool causal, bool fused, bool timing,
                               bool half = false) {
     Case c;
     constexpr unsigned heads = 16, width = heads * 64;
-    const unsigned stride = fused ? 3 * width : width;
+    /* odd: an odd row stride fails the MMA alignment gate (the FFMA body must run instead). */
+    const unsigned stride = (fused ? 3 * width : width) + g_odd_stride;
     const unsigned out = half ? c.add(((size_t)batch * qr * width + 16) * 2) : c.out((size_t)batch * qr * width + 16);
     auto rows = [&](size_t n) { return half ? c.f16(n, 1.f) : c.f32(n, 1.f); };
     unsigned q, k, v;
@@ -2212,7 +2215,24 @@ static void t_attention_short(unsigned batch, unsigned qr, unsigned kr, bool cau
         k = v = rows((size_t)batch * kr * stride);
     }
     std::vector<uint32_t> lengths(batch);
-    for (unsigned b = 0; b < batch; b++) lengths[b] = timing ? kr : b % 4 == 0 ? 0 : b % 4 == 1 ? 1 : kr + b % 2;
+    for (unsigned b = 0; b < batch; b++)
+        lengths[b] = timing ? kr : b % 5 == 0 ? 0 : b % 5 == 1 ? 1 : b % 5 == 2 ? (kr + 1) / 2 : kr + b % 5 - 3;
+    /* Keys past a row's length never reach the output: poison them (separate K / V only). */
+    if (half && !timing && !(fused && qr == kr))
+        for (unsigned b = 0; b < batch; b++)
+            for (unsigned j = std::min(lengths[b], kr); j < kr; j++)
+                for (unsigned i = 0; i < stride; i++) ((uint16_t*)c.host[k].data())[((size_t)b * kr + j) * stride + i] = 0x7e00;
+    /* Causal: +-inf in the last V row (V columns only); V reads saturate, so every row is compared and the
+     * rows that cannot see it must not turn NaN. */
+    if (half && !timing && causal && qr == kr && kr >= 2 && fused)
+        for (unsigned b = 0; b < batch; b++)
+            if (lengths[b] >= kr)
+                for (unsigned i = 0; i < width; i++)
+                    ((uint16_t*)c.host[k].data())[((size_t)b * kr + kr - 1) * stride + 2 * width + i] = i & 1 ? 0xfc00 : 0x7c00;
+    if (half) {
+        uint16_t* o = (uint16_t*)c.host[out].data();
+        for (size_t i = 0; i < (size_t)batch * qr * width + 16; i++) o[i] = 0x5a5a;
+    }
     c.in.op = PLOW_DOP_ATTENTION_F32;
     c.in.t[0] = out; c.in.t[1] = q; c.in.t[2] = k; c.in.t[3] = v; c.in.t[4] = c.u32(lengths);
     c.in.i[0] = batch; c.in.i[1] = qr; c.in.i[2] = kr; c.in.i[3] = heads; c.in.i[4] = 64;
@@ -2227,29 +2247,47 @@ static void t_attention_short(unsigned batch, unsigned qr, unsigned kr, bool cau
         for (auto& h : c.host) th.push_back(h.data());
         g_attention_f32(&c.in, 0, 1, th.data(), nullptr);
         void** td = upload_table(c.dev);
-        k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
-        CK(cudaGetLastError());
-        CK(cudaDeviceSynchronize());
-        CK(cudaFree(td));
         const size_t n = (size_t)batch * qr * width;
-        std::vector<uint16_t> got(n);
-        CK(cudaMemcpy(got.data(), c.dev[out], n * 2, cudaMemcpyDeviceToHost));
         const uint16_t* ref = (const uint16_t*)c.host[out].data();
-        size_t exact = 0;
-        double rms = 0, maxd = 0;
-        for (size_t i = 0; i < n; i++) {
-            const double r = __half2float(__ushort_as_half(ref[i]));
-            rms += r * r;
-            exact += got[i] == ref[i];
-        }
+        double rms = 0;
+        for (size_t i = 0; i < n; i++) rms += (double)__half2float(__ushort_as_half(ref[i])) * __half2float(__ushort_as_half(ref[i]));
         rms = sqrt(rms / (double)n);
-        for (size_t i = 0; i < n; i++)
-            maxd = std::max(maxd, fabs((double)__half2float(__ushort_as_half(got[i])) -
-                                       __half2float(__ushort_as_half(ref[i]))) / (rms ? rms : 1.0));
-        const bool pass = maxd <= 4e-3;
-        printf("  %-34s n=%-8zu exact=%6.2f%%  max|d|/rms=%-9.3g -> %s\n", name, n, 100.0 * exact / n, maxd,
-               pass ? "PASS" : "FAIL");
-        if (!pass) g_fail = 1;
+        /* Arms: MMA (threshold 1) at two block counts, FFMA (threshold 33); the MMA runs must be bitwise equal. */
+        std::vector<uint16_t> first;
+        const struct { unsigned q; int nblk; const char* tag; } arms[] = {{1, g_nblk, "mma"}, {1, 7, "mma/7"}, {4096, g_nblk, "ffma"}};
+        for (const auto& arm : arms) {
+            CK(cudaMemcpyToSymbol(sp_short_mma_q, &arm.q, sizeof(arm.q)));
+            std::vector<uint16_t> canary(n + 16, 0x5a5a);
+            CK(cudaMemcpy(c.dev[out], canary.data(), (n + 16) * 2, cudaMemcpyHostToDevice));
+            k_speech<<<arm.nblk, 256, kSmem>>>(c.in, td);
+            CK(cudaGetLastError());
+            CK(cudaDeviceSynchronize());
+            std::vector<uint16_t> got(n + 16);
+            CK(cudaMemcpy(got.data(), c.dev[out], (n + 16) * 2, cudaMemcpyDeviceToHost));
+            size_t exact = 0, bad = 0;
+            double maxd = 0;
+            for (size_t i = 0; i < n; i++) {
+                const float gv = __half2float(__ushort_as_half(got[i]));
+                exact += got[i] == ref[i];
+                if (!std::isfinite(gv)) { bad++; continue; }
+                const double r = __half2float(__ushort_as_half(ref[i]));
+                maxd = std::max(maxd, fabs((double)gv - r) / std::max(rms ? rms : 1.0, fabs(r)));
+            }
+            for (size_t i = n; i < n + 16; i++) bad += got[i] != 0x5a5a;
+            for (unsigned b = 0; b < batch; b++)
+                if (lengths[b] == 0)
+                    for (size_t i = (size_t)b * qr * width; i < (size_t)(b + 1) * qr * width; i++) bad += got[i] != 0;
+            if (arm.q == 1) {
+                if (first.empty()) first = got;
+                else bad += memcmp(first.data(), got.data(), n * 2) != 0;
+            }
+            const bool pass = !bad && maxd <= 4e-3;
+            printf("  %-34s%s %-5s n=%-8zu exact=%6.2f%%  max|d|/rms=%-9.3g bad=%zu -> %s\n", name,
+                   g_odd_stride ? " odd" : "", arm.tag, n,
+                   100.0 * exact / n, maxd, bad, pass ? "PASS" : "FAIL");
+            if (!pass) g_fail = 1;
+        }
+        CK(cudaFree(td));
         return;
     }
     if (!timing) {
@@ -2257,8 +2295,12 @@ static void t_attention_short(unsigned batch, unsigned qr, unsigned kr, bool cau
         return;
     }
     if (half) {
-        bench(name, c, 4.0 * batch * qr * kr * width, 0, 50);
-        bench(name, c, 4.0 * batch * qr * kr * width, 0, 50);
+        for (unsigned q : {1u, 4096u, 1u, 4096u}) {
+            CK(cudaMemcpyToSymbol(sp_short_mma_q, &q, sizeof(q)));
+            char label[192];
+            snprintf(label, sizeof(label), "%s %s", name, q == 1 ? "mma" : "ffma");
+            bench(label, c, 4.0 * batch * qr * kr * width, 0, 50);
+        }
         return;
     }
     for (unsigned arm : {2u, 0u, 2u, 0u}) {
@@ -3039,21 +3081,27 @@ int main(int argc, char** argv) {
 
     if (argc > 1 && !strcmp(argv[1], "--short-attention")) {
         for (unsigned b : {3u, 16u, 33u})
-            for (unsigned q : {1u, 2u, 17u, 32u})
-                for (unsigned k : {1u, 7u, 32u})
+            for (unsigned q = 1; q <= 32; q++)
+                for (unsigned k : {1u, 7u, 17u, 32u})
                     for (bool causal : {false, true})
                         for (bool fused : {false, true}) {
                             t_attention_short(b, q, k, causal, fused, false);
                             t_attention_short(b, q, k, causal, fused, false, true);
                         }
+        g_odd_stride = true;
+        for (unsigned q : {4u, 18u, 26u})
+            for (bool causal : {false, true}) t_attention_short(16, q, q, causal, false, false, true);
+        g_odd_stride = false;
         return g_fail;
     }
     if (argc > 1 && !strcmp(argv[1], "--bench-short-attention")) {
         for (unsigned b : {32u, 64u, 128u, 200u, 224u})
-            for (unsigned q : {1u, 2u, 26u}) {
+            for (unsigned q : {1u, 2u, 4u, 8u, 12u, 16u, 18u, 26u}) {
                 t_attention_short(b, q, q == 1 ? 32u : q, q != 1, true, true);
                 t_attention_short(b, q, q == 1 ? 32u : q, q != 1, true, true, true);
             }
+        for (unsigned b : {32u, 128u, 224u})
+            for (unsigned k : {2u, 4u, 8u, 16u}) t_attention_short(b, 1, k, false, true, true, true);
         return g_fail;
     }
 

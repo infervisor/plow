@@ -8070,6 +8070,142 @@ static __device__ __noinline__ void sp_attention_w256(const PlowDevInst* in, voi
 /* H (j1 bit 31): Q / K / V and the output are fp16 rows (stride and column offsets in halves), the
  * normalized probabilities are rounded to fp16 before the value sum (fp16 SDPA: f32 scores, softmax
  * and accumulate). */
+#if defined(PLOW_NV_HOPPER)
+/* The fp16 short attention (j1 bit 31) on m16n8k16 fp16 MMA from 4 query rows and this many q_rows * kv_rows
+ * (one query row stays on the FFMA body, whose cost follows the item's key length). A warp owns
+ * (item, head, 16-row query tile): S = Q.K^T (16 x 32 over K 64) and O = P.V (16 x 64 over 32 keys)
+ * with f32 accumulate; the S fragments are reused as P's A fragments. Same contract as the FFMA body
+ * (f32 softmax, normalized P rounded to fp16, fp16 output, zero for a row without keys); keys past
+ * the tile's visible range are zero operands. V is read saturated to the finite fp16 range (as in the
+ * FFMA body): a causal key one row of the tile cannot see still enters its P.V with probability 0. */
+#ifndef SP_SHORT_MMA_Q
+#define SP_SHORT_MMA_Q 16u
+#endif
+#if defined(SP_TEST_SHORT_MMA_Q)
+__device__ unsigned sp_short_mma_q = SP_SHORT_MMA_Q;
+#define SPS_MMA_Q sp_short_mma_q
+#else
+#define SPS_MMA_Q SP_SHORT_MMA_Q
+#endif
+static __device__ __noinline__ void sp_attention_short_mma(const PlowDevInst* in, void* const* T, unsigned slice,
+                                                         unsigned nblk) {
+    auto* out = (__half*)SP_TEN(0);
+    const auto* query = (const __half*)SP_TEN(1);
+    const auto* key = (const __half*)SP_TEN(2);
+    const auto* value = (const __half*)SP_TEN(3);
+    const auto* lengths = (const unsigned*)SP_TEN(4);
+    const unsigned batch = in->i[0], qr = in->i[1], kr = in->i[2], heads = in->i[3];
+    const unsigned width = heads * 64u, stride = in->i[5] ? in->i[5] : width;
+    const unsigned k_col0 = in->fj[1].u, v_col0 = in->fj[2].u & 0x7FFFFFFFu;
+    const bool causal = in->i[6] & 1u;
+    const float scale = in->fj[0].f;
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3u;
+    const unsigned tiles = (qr + 15u) / 16u;
+    for (unsigned u = slice * PLOW_NV_WARPS + warp; u < batch * heads * tiles; u += nblk * PLOW_NV_WARPS) {
+        const unsigned tile = u % tiles, h = u / tiles % heads, b = u / (tiles * heads);
+        const unsigned r0 = tile * 16u;
+        const unsigned len = lengths ? min(lengths[b], kr) : kr;
+        /* Keys any row of this tile can see. */
+        const unsigned kmax = causal ? min(len, min(r0 + 16u, qr)) : len;
+        const __half* qb = query + (size_t)b * qr * stride + h * 64u;
+        const __half* kb = key + (size_t)b * kr * stride + k_col0 + h * 64u;
+        const __half* vb = value + (size_t)b * kr * stride + v_col0 + h * 64u;
+        auto q2 = [&](unsigned r, unsigned c) -> unsigned {
+            return r < qr ? *(const unsigned*)(qb + (size_t)r * stride + c) : 0u;
+        };
+        auto k2 = [&](unsigned j, unsigned c) -> unsigned {
+            return j < kmax ? *(const unsigned*)(kb + (size_t)j * stride + c) : 0u;
+        };
+        float sc[4][4];
+#pragma unroll
+        for (unsigned n = 0; n < 4; n++)
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) sc[n][e] = 0.f;
+#pragma unroll
+        for (unsigned k0 = 0; k0 < 64u; k0 += 16u) {
+            const unsigned a[4] = {q2(r0 + g, k0 + 2u * t), q2(r0 + g + 8u, k0 + 2u * t), q2(r0 + g, k0 + 2u * t + 8u),
+                                   q2(r0 + g + 8u, k0 + 2u * t + 8u)};
+#pragma unroll
+            for (unsigned n = 0; n < 4; n++)
+                if (8u * n < kmax) sp_mma_f16(sc[n], a, k2(8u * n + g, k0 + 2u * t), k2(8u * n + g, k0 + 2u * t + 8u));
+        }
+        /* Rows r0 + g (e 0, 1) and r0 + g + 8 (e 2, 3); key 8n + 2t + (e & 1). */
+        float mx[2] = {-INFINITY, -INFINITY}, sum[2] = {0.f, 0.f};
+        unsigned vis[2];
+#pragma unroll
+        for (unsigned hr = 0; hr < 2; hr++) {
+            const unsigned r = r0 + g + 8u * hr;
+            vis[hr] = r < qr ? (causal ? min(len, r + 1u) : len) : 0u;
+        }
+#pragma unroll
+        for (unsigned n = 0; n < 4; n++)
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) {
+                const unsigned hr = e >> 1, j = 8u * n + 2u * t + (e & 1u);
+                sc[n][e] = j < vis[hr] ? sc[n][e] * scale : -INFINITY;
+                mx[hr] = fmaxf(mx[hr], sc[n][e]);
+            }
+#pragma unroll
+        for (unsigned hr = 0; hr < 2; hr++)
+#pragma unroll
+            for (unsigned d = 1; d <= 2; d <<= 1) mx[hr] = fmaxf(mx[hr], __shfl_xor_sync(0xffffffffu, mx[hr], d));
+#pragma unroll
+        for (unsigned n = 0; n < 4; n++)
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) {
+                const unsigned hr = e >> 1;
+                sc[n][e] = vis[hr] && 8u * n + 2u * t + (e & 1u) < vis[hr] ? expf(sc[n][e] - mx[hr]) : 0.f;
+                sum[hr] += sc[n][e];
+            }
+#pragma unroll
+        for (unsigned hr = 0; hr < 2; hr++)
+#pragma unroll
+            for (unsigned d = 1; d <= 2; d <<= 1) sum[hr] += __shfl_xor_sync(0xffffffffu, sum[hr], d);
+        unsigned pa[2][4];
+#pragma unroll
+        for (unsigned n = 0; n < 4; n++) {
+            float pn[4];
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) {
+                const unsigned hr = e >> 1;
+                pn[e] = sum[hr] > 0.f ? sc[n][e] / sum[hr] : 0.f;
+            }
+            const __half2 lo = __floats2half2_rn(pn[0], pn[1]), hi = __floats2half2_rn(pn[2], pn[3]);
+            pa[n >> 1][(n & 1u) * 2u] = *(const unsigned*)&lo;
+            pa[n >> 1][(n & 1u) * 2u + 1u] = *(const unsigned*)&hi;
+        }
+        auto v1 = [&](unsigned j, unsigned c) -> unsigned {
+            if (j >= kmax) return 0u;
+            const __half v = vb[(size_t)j * stride + c];
+            return (unsigned)__half_as_ushort(__float2half_rn(fminf(fmaxf(__half2float(v), -65504.f), 65504.f)));
+        };
+        float o[8][4];
+#pragma unroll
+        for (unsigned n = 0; n < 8; n++)
+#pragma unroll
+            for (unsigned e = 0; e < 4; e++) o[n][e] = 0.f;
+#pragma unroll
+        for (unsigned s2 = 0; s2 < 2; s2++) {
+            if (16u * s2 >= kmax) continue;
+            const unsigned j0 = 16u * s2 + 2u * t;
+#pragma unroll
+            for (unsigned n = 0; n < 8; n++) {
+                const unsigned c = 8u * n + g;
+                sp_mma_f16(o[n], pa[s2], v1(j0, c) | v1(j0 + 1u, c) << 16, v1(j0 + 8u, c) | v1(j0 + 9u, c) << 16);
+            }
+        }
+#pragma unroll
+        for (unsigned hr = 0; hr < 2; hr++) {
+            const unsigned r = r0 + g + 8u * hr;
+            if (r >= qr) continue;
+            __half* orow = out + ((size_t)b * qr + r) * width + h * 64u + 2u * t;
+#pragma unroll
+            for (unsigned n = 0; n < 8; n++)
+                *(__half2*)(orow + 8u * n) = __floats2half2_rn(o[n][2u * hr], o[n][2u * hr + 1u]);
+        }
+    }
+}
+#endif
 template <bool H> struct SpShortElem { using type = float; };
 template <> struct SpShortElem<true> { using type = __half; };
 template <bool H>
@@ -8084,6 +8220,10 @@ static __device__ __noinline__ void sp_attention_short(const PlowDevInst* in, vo
     const unsigned k_col0 = in->fj[1].u, v_col0 = in->fj[2].u & 0x7FFFFFFFu;
     auto ld = [](const E* p, size_t i) -> float {
         if constexpr (H) return __half2float(p[i]); else return p[i];
+    };
+    /* fp16 V is read saturated to the finite range (the MMA body needs it; both bodies agree). */
+    auto ldv = [&](const E* p, size_t i) -> float {
+        if constexpr (H) return fminf(fmaxf(ld(p, i), -65504.f), 65504.f); else return p[i];
     };
     const unsigned batch = in->i[0], qr = in->i[1], kr = in->i[2], heads = in->i[3];
     const unsigned width = heads * 64u, stride = in->i[5] ? in->i[5] : width;
@@ -8113,8 +8253,8 @@ static __device__ __noinline__ void sp_attention_short(const PlowDevInst* in, vo
         for (unsigned j = 0; j < len; j++) {
             const float w = __shfl_sync(0xffffffffu, p, j);
             const size_t off = ((size_t)b * kr + j) * stride + h * 64u + lane + v_col0;
-            v0 = __fmaf_rn(w, ld(value, off), v0);
-            v1 = __fmaf_rn(w, ld(value, off + 32u), v1);
+            v0 = __fmaf_rn(w, ldv(value, off), v0);
+            v1 = __fmaf_rn(w, ldv(value, off + 32u), v1);
         }
         const size_t off = ((size_t)b * qr + r) * width + h * 64u + lane;
         if constexpr (H) {
@@ -8136,6 +8276,15 @@ static __device__ __noinline__ void d_attention_f32(const PlowDevInst* in, void*
 #if PLOW_NV_SPEECH
         if (in->i[4] == 64u && in->i[1] <= 32u && in->i[2] <= 32u && !(in->i[6] & ~1u) && !SP_TEN(5) &&
             !SP_TEN(6)) {
+#if defined(PLOW_NV_HOPPER)
+            /* MMA needs 4-byte Q / K pairs and output stores; V is read by halves. */
+            const unsigned stride = in->i[5] ? in->i[5] : in->i[3] * 64u;
+            if (in->i[1] >= 4u && in->i[1] * in->i[2] >= SPS_MMA_Q && !(stride & 1u) && !(in->fj[1].u & 1u) && sp_aligned(SP_TEN(0), 4) &&
+                sp_aligned(SP_TEN(1), 4) && sp_aligned(SP_TEN(2), 4)) {
+                sp_attention_short_mma(in, T, slice, nblk);
+                return;
+            }
+#endif
             sp_attention_short<true>(in, T, slice, nblk);
             return;
         }

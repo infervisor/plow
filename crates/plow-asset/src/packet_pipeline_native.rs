@@ -140,6 +140,9 @@ impl NativePacketTypes {
                 if crate::speech_flag_layout::is_ring_attention(d.i[6]) {
                     set(&[0, 1, 2], F32);
                     set(&[3, 4, 5], U32);
+                } else if crate::speech_flag_layout::half_attention(d.op, d.fj[2]) {
+                    set(&[0, 1, 2, 3], F16);
+                    set(&[4], U32);
                 } else {
                     set(&[0, 1, 2, 3, 6], F32);
                     set(&[4, 7], U32);
@@ -249,6 +252,37 @@ mod tests {
             assert_eq!(inferred.access(1), Some(HandoffAccessMode::ReadWrite));
             assert_eq!(inferred.access(3), Some(HandoffAccessMode::Write));
         });
+    }
+
+    #[test]
+    fn native_packet_types_read_half_short_attention_as_f16() {
+        for half in [false, true] {
+            let mut b = Builder::new(1);
+            b.force_uniseg();
+            let out = b.tensor("out", 256);
+            let qkv = b.tensor("qkv", 768);
+            b.emit(DevOp::AttentionF32, vec![0], &[], |d| {
+                d.t[..4].copy_from_slice(&[out, qkv, qkv, qkv]);
+                d.i[..6].copy_from_slice(&[1, 2, 2, 2, 64, 384]);
+                d.f[0] = 0.125;
+                d.j = [128, 256 | u32::from(half) << 31];
+            });
+            let m = Model {
+                n_cu: 1,
+                target: 0,
+                tensors: b.tensors(),
+                progs: vec![b.finish()],
+                prog_t: vec![1],
+                kv_row_insts: vec![],
+                gen: vec![],
+            };
+            let want = if half { PipelineDType::F16 } else { PipelineDType::F32 };
+            crate::program::with_model(&m, |packet| {
+                let inferred = NativePacketTypes::infer(packet, 0).unwrap();
+                assert_eq!(inferred.dtype(0).unwrap(), want);
+                assert_eq!(inferred.dtype(1).unwrap(), want);
+            });
+        }
     }
 
     #[test]

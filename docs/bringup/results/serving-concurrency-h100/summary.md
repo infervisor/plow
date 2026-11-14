@@ -467,11 +467,24 @@ the reference does not do.
     0.0303 (n 48). Served (two rounds vs one): c128 146.2 / 155.0 vs 147.0 audio s/s, r20 median
     latency 2.43 / 2.47 vs 2.71 s, r40 169.5 / 171.8 vs 169.0; at r60 (past capacity, 429s in both) 157 /
     162 vs 169, unresolved on one baseline round. The 18- and 26-row first layers of levels 17 and 25
-    moved from 3xTF32 tensor cores to the FFMA body (0.04 -> 0.23 ms per op); an fp16 MMA body for them
-    is the next step.
+    moved from 3xTF32 tensor cores to the FFMA body (0.04 -> 0.23 ms per op).
+  - Maya2 depth fp16 attention on m16n8k16 fp16 tensor cores from 4 query rows and q_rows * kv_rows
+    >= 16 (one warp per item, head and 16-row query tile; key tiles past the item's visible keys
+    skipped). One query row stays on the FFMA body: those are the decode steps, kv_rows 32 with
+    per-level key lengths, where the FFMA loop follows the length (q1 k8: 0.009 vs 0.012 ms at b128).
+    V is read saturated to the finite fp16 range in both bodies and the golden, so a causal key a row
+    cannot see never turns its output NaN. Op test: 6162 cases against the fp16 golden, max |d| /
+    max(rms, |ref|) 1.5e-3, MMA bitwise equal across block counts. b128 q26 op 0.234 -> 0.028 ms.
+    Depth program b32 / b64 / b128 / b224 16.36 / 19.42 / 26.53 / 41.07 -> 16.21 / 18.83 / 25.14 /
+    38.57 ms, b1 / b8 -0.5 %. CER median 0, mean 0.028 (n 48). Served vs the FFMA build (two rounds vs
+    one): c32 78.2 / 78.7 vs 74.0 audio s/s, c128 160.3 / 153.5 vs 150.8, r40 177.4 / 176.3 vs 171.1,
+    r60 176.4 / 172.9 vs 163.7 (429s 639 / 689 vs 763); r20 latency equal.
   Still wider: Maya2 depth residual adds and projection epilogues (fp16 rounding boundaries), prepared
-  constants and batch < 16; the Qwen3-TTS codec attention (bf16 operands; ring attention is 8 ops per
-  step, at most ~3 % of the step by bytes, not yet measured).
+  constants and batch < 16; the Qwen3-TTS codec attention (bf16 operands). Its 8 attention ops take
+  0.51 ms of the 9.7 ms b64 x f2 codec step (5.2 %, 19 % of their roofline; instruction sweep of
+  qtts-1p). Matching it needs a new speech flag layout (j1 bit 30), the ring stream path and the
+  packed-tile variant to round Q / K / V / P to bf16: a work item behind the conv kernels below, which
+  take ~6.2 of those 9.7 ms.
 
 ## TTS
 
