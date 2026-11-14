@@ -276,7 +276,11 @@ mod tests {
                 kv_row_insts: vec![],
                 gen: vec![],
             };
-            let want = if half { PipelineDType::F16 } else { PipelineDType::F32 };
+            let want = if half {
+                PipelineDType::F16
+            } else {
+                PipelineDType::F32
+            };
             crate::program::with_model(&m, |packet| {
                 let inferred = NativePacketTypes::infer(packet, 0).unwrap();
                 assert_eq!(inferred.dtype(0).unwrap(), want);
