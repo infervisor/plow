@@ -2445,7 +2445,7 @@ impl StageProgram {
             .or(fixed.map(|f| f.0))
             .or(chunks.map(|(units, _)| units));
         if stage.pinned {
-            conv_pin_registry(conv_class(&stage, transpose), flags)?;
+            conv_pin_registry(conv_class(&stage, transpose), flags, stage.single_bf16)?;
         }
         let mut chained = deps.to_vec();
         if splitk.is_some() {
@@ -3621,15 +3621,17 @@ const CONV_PIN_MASK: u32 = (1 << 16) | (1 << 20) | (0x1FF << 21);
 /// modes (different models or recipes), each with its own arms.
 const CONV_MODE_MASK: u32 = (1 << 14) | (1 << 15) | (1 << 17) | (1 << 18) | (1 << 19);
 
-/// Every pinned conv of a class (in one lowering mode), in every program this process emits,
-/// must carry the same arm bits: the first one registers them, a later mismatch is an emitter
-/// bug (a role-dependent choice), reported as an error.
-fn conv_pin_registry(class: ConvClass, flags: u32) -> Result<(), String> {
+/// Every pinned conv of a class (in one lowering mode and product count: single-product convs
+/// take their own tile defaults), in every program this process emits, must carry the same arm
+/// bits: the first one registers them, a later mismatch is an emitter bug (a role-dependent
+/// choice), reported as an error.
+fn conv_pin_registry(class: ConvClass, flags: u32, single_bf16: bool) -> Result<(), String> {
     static REG: std::sync::Mutex<Option<std::collections::HashMap<(ConvClass, u32), u32>>> =
         std::sync::Mutex::new(None);
     let mut reg = REG.lock().unwrap_or_else(|e| e.into_inner());
     let reg = reg.get_or_insert_with(Default::default);
-    match reg.insert((class, flags & CONV_MODE_MASK), flags & CONV_PIN_MASK) {
+    let mode = flags & CONV_MODE_MASK | u32::from(single_bf16) << 31;
+    match reg.insert((class, mode), flags & CONV_PIN_MASK) {
         Some(prev) if prev != flags & CONV_PIN_MASK => Err(format!(
             "codec conv class {class:?}: pinned arm bits {:#x} differ from an earlier program's {prev:#x}",
             flags & CONV_PIN_MASK
@@ -3687,8 +3689,20 @@ const CONV_SPLITK_TICKETS: u32 = 4096;
 /// 64-wide pin (the class table) buys parallelism for small-row programs where measured.
 /// 64-wide tiles unless the class table pins 128 (measured on the 12 Hz codec: 128 loses at b1
 /// on most classes, wins only on some 192-channel ones at b8+); grouped wgmma takes 128 only.
+/// Single-product convs take 128 for the k1 C -> C and ConvTranspose1d (128 | cout) classes:
+/// the hi-only staging double-buffers A at 128 (12 Hz codec, every program size measured faster).
 fn conv_bn128_default(stage: &Conv1dF32Stage<'_>, transpose: bool) -> bool {
-    stage.wgmma && stage.split_bf16 && !transpose && stage.groups > 1
+    let wgmma = stage.wgmma && stage.split_bf16;
+    let one = wgmma
+        && stage.single_bf16
+        && stage.groups == 1
+        && matches!(stage.input_activation, Activation::None)
+        && if transpose {
+            stage.out_channels % 128 == 0
+        } else {
+            stage.kernel == 1 && stage.in_channels == stage.out_channels
+        };
+    one || (wgmma && !transpose && stage.groups > 1)
 }
 
 fn conv1d_warp(
@@ -4515,9 +4529,10 @@ mod tests {
         // The registry accepts repeats of the same bits and rejects a changed arm (a synthetic
         // class, so the codec lowering tests in this process never meet it).
         let class = [0, 7, 7, 7, 1, 1, 1, 0, 0];
-        conv_pin_registry(class, 1 << 21).unwrap();
-        conv_pin_registry(class, 1 << 21 | 1 << 13).unwrap();
-        assert!(conv_pin_registry(class, 1 << 21 | 1 << 22).is_err());
+        conv_pin_registry(class, 1 << 21, false).unwrap();
+        conv_pin_registry(class, 1 << 21 | 1 << 13, false).unwrap();
+        assert!(conv_pin_registry(class, 1 << 21 | 1 << 22, false).is_err());
+        conv_pin_registry(class, 1 << 21 | 1 << 23, true).unwrap();
         let s2 = stage(1, 1024, 256, Activation::Elu, false);
         let p2 = conv_class_policy(&s2, false, 1024, 132).unwrap();
         assert_eq!(conv1d_units(&s2, false, 1024, 132, p2), 16 * 4);

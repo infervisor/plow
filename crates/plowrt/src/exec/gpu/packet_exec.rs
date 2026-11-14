@@ -139,7 +139,9 @@ pub(super) fn speech_caps_required<'a>(
             Some(DevOp::AttentionF32) => {
                 u32::from(d.i[6] & 64 != 0) << 1
                     | u32::from(plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)) << 3
-                    | u32::from(plow_asset::speech_flag_layout::half_attention(d.op, d.fj[2])) << 5
+                    | u32::from(plow_asset::speech_flag_layout::half_attention(
+                        d.op, d.fj[2],
+                    )) << 5
             }
             Some(DevOp::StreamTailF32) if plow_asset::speech_flag_layout::ring_kv(d.op, &d.i) => 8,
             Some(DevOp::LayerNormF32) if d.i[2] & 8 != 0 => 4,

@@ -22,6 +22,7 @@
 #include <vector>
 
 #define SP_TEST_SHORT_MMA_Q 1
+#define SP_TEST_WG_ONE 1
 #include "op_speech_f32.cuh"
 #include "cpu_dev.h"
 
@@ -2311,6 +2312,72 @@ static void t_attention_short(unsigned batch, unsigned qr, unsigned kr, bool cau
     }
 }
 
+/* The Qwen3-TTS codec's single-product (i6 bit 31) wgmma convs at the served step.b64.f2 shapes:
+ * k1 + residual per channel family, the merged-phase ConvTranspose into it; pinned 64- / 128-wide
+ * as devgen pins them; the runtime single-product path (sp_test_wg_one 0) vs the hi-only layout
+ * (1), interleaved, outputs compared bitwise first. */
+static void bench_conv_1p() {
+    auto once = [](Case& c, unsigned out, size_t n, unsigned on) {
+        CK(cudaMemcpyToSymbol(sp_test_wg_one, &on, sizeof(on)));
+        void** td = upload_table(c.dev);
+        k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(td));
+        std::vector<uint8_t> h(n * 4);
+        CK(cudaMemcpy(h.data(), c.dev[out], n * 4, cudaMemcpyDeviceToHost));
+        return h;
+    };
+    auto run = [&](const char* name, const ConvSpec& s, bool tr, double flops, double bytes) {
+        Case c; unsigned o; build_conv(c, s, tr, o);
+        c.upload();
+        const size_t n = (size_t)s.batch * conv_out_rows(s, tr) * s.cout;
+        const bool same = once(c, o, n, 0u) == once(c, o, n, 1u);
+        printf("  %-52s old vs one bitwise: %s\n", name, same ? "PASS" : "FAIL");
+        if (!same) g_fail = 1;
+        for (unsigned on : {0u, 1u, 0u, 1u}) {
+            CK(cudaMemcpyToSymbol(sp_test_wg_one, &on, sizeof(on)));
+            char label[128];
+            snprintf(label, sizeof(label), "%s %s", name, on ? "one" : "old");
+            void** td = upload_table(c.dev);
+            for (int i = 0; i < 3; i++) k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
+            cudaEvent_t e0, e1;
+            CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+            CK(cudaEventRecord(e0));
+            for (int i = 0; i < 20; i++) k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
+            CK(cudaEventRecord(e1));
+            CK(cudaEventSynchronize(e1));
+            float ms;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            ms /= 20;
+            printf("  bench %-58s %8.3f ms %8.1f TFLOP/s %7.0f GB/s\n", label, ms, flops / (ms * 1e9), bytes / (ms * 1e6));
+            CK(cudaFree(td));
+        }
+    };
+    const unsigned fam[][2] = {{768, 64}, {384, 320}, {192, 1280}, {96, 3840}};
+    for (auto& f : fam)
+        for (unsigned pin : {1u, 5u}) {
+            const unsigned C = f[0], R = f[1];
+            ConvSpec k1{64, R, C, C, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true, {}, 0.f, true};
+            k1.wide = true; k1.wg = true; k1.pin = pin; k1.one = true;
+            char name[96];
+            snprintf(name, sizeof(name), "k1+res 1p %u [64][%u] bn%u", C, R, pin & 4 ? 128 : 64);
+            run(name, k1, false, 2.0 * 64 * R * C * C, 12.0 * 64 * R * C);
+        }
+    const unsigned cts[][4] = {{1536, 768, 9, 8}, {768, 384, 65, 5}, {384, 192, 321, 4}, {192, 96, 1281, 3}};
+    for (auto& t : cts)
+        for (unsigned pin : {1u, 5u}) {
+            const unsigned ci = t[0], co = t[1], R = t[2], st = t[3];
+            if ((pin & 4) && co % 128) continue;
+            ConvSpec ct{64, R, ci, co, 2 * st, st, 0, 1, st, st, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+            ct.wide = true; ct.wg = true; ct.tapmajor = true; ct.pin = pin; ct.ragged = co % 64 != 0; ct.one = true;
+            char name[96];
+            snprintf(name, sizeof(name), "ConvT 1p s%u %u->%u [64][%u] bn%u", st, ci, co, R, pin & 4 ? 128 : 64);
+            const double rows = 64.0 * R * st;
+            run(name, ct, true, 2.0 * rows * co * ci * 2, 4.0 * 64 * R * ci + 4.0 * rows * co);
+        }
+}
+
 static void bench_signal() {
     {
         Case c; const unsigned rows = 32 * 16384, width = 64;
@@ -3337,6 +3404,10 @@ int main(int argc, char** argv) {
         return 0;
     }
 #endif
+    if (argc > 1 && !strcmp(argv[1], "--bench-conv-1p")) {
+        bench_conv_1p();
+        return g_fail;
+    }
     if (argc > 1 && !strcmp(argv[1], "--bench-codec")) {
         for (bool tc : {false, true}) {
             ConvSpec s{32, 16384, 64, 64, 1, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, true,

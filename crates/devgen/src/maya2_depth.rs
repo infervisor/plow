@@ -543,11 +543,12 @@ impl Chain {
                 | if view.is_some() { 1 << 12 } else { 0 };
             let half_out = self.half && (ep.gelu || ep.out_half);
             if half_out && !x_half {
-                return Err(format!("depth projection {w}: f16 output needs an f16 input"));
+                return Err(format!(
+                    "depth projection {w}: f16 output needs an f16 input"
+                ));
             }
-            let flags = flags
-                | if x_half { 1 << 13 } else { 0 }
-                | if half_out { 1 << 14 } else { 0 };
+            let flags =
+                flags | if x_half { 1 << 13 } else { 0 } | if half_out { 1 << 14 } else { 0 };
             let none = packet::dev::TENSOR_NONE;
             let e = self.p.raw(
                 DevOp::GemvF32Out,
