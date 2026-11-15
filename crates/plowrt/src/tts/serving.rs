@@ -3417,7 +3417,7 @@ async fn stream_task(
                     let mut bytes = Vec::new();
                     if !fresh.is_empty() {
                         let trimmed = out_pcm.trimmed();
-                        if tick_audio && n_segs == 1 {
+                        if tick_audio && n_segs == 1 && !joiner.has_tagged_boundary() {
                             for (frame, _) in &direct_pcm {
                                 out_pcm.push_i16(frame, &mut bytes);
                             }

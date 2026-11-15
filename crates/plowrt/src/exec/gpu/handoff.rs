@@ -654,6 +654,7 @@ impl CudaHandoff {
             let view = &self.plan.views[&declared.view];
             if binds[..index].iter().any(|b| b.name == bind.name)
                 || bind.bytes.len() as u64 != view.row_stride
+                || admission.slot() >= view.rows
                 || admission.slot() >= self.plan.rows_capacity(&declared.rows).map_err(reject)?
             {
                 return Err(reject("invalid admission row or bind size"));
