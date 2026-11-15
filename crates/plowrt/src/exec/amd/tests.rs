@@ -956,6 +956,7 @@ fn specialised_decode_arms_require_a_build_manifest() {
 
     let mut xr = segmented_prog(&[DevOp::XReduce], &[0]);
     xr.insts[0].i[7] = 1;
+    xr.insts[0].t[2] = packet::dev::TENSOR_NONE16;
     assert_eq!(
         packet_decode_arm_requirements(std::slice::from_ref(&xr)),
         ["PLOW_XR_COMBINE_FOLD=1"]
