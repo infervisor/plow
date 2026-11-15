@@ -3996,7 +3996,7 @@ mod tests {
 
     #[test]
     fn fp8_tc64_is_an_explicit_wide_object_request() {
-        let _guard = crate::test_env::env_guard();
+        let _guard = held_env();
         let mut shapes = Shapes::default();
         shapes.decode_batch = 64;
         shapes.decode_gemv_k.insert(3840);
@@ -4030,7 +4030,20 @@ mod tests {
 
     /// Shadows [`super::build`]: most assertions here are about arms/shapes and
     /// do not care about the lean block, which has its own tests below.
+    thread_local! {
+        static HOLDS_ENV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn held_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::test_env::env_guard();
+        HOLDS_ENV.set(true);
+        guard
+    }
+
+    /// `super::build` reads the process-wide emit config: a sibling's `EnvScope` live during the
+    /// call changes the manifest (or trips a config assert), so every call holds the env lock.
     fn build(m: &Model, arch: &str) -> Value {
+        let _env = (!HOLDS_ENV.get()).then(crate::test_env::env_guard);
         super::build(m, arch, &crate::LeanReport::skipped("test: gate not run"))
     }
 
@@ -4348,7 +4361,7 @@ mod tests {
     /// the default manifest carries neither key nor macro, so its pairing hash is unchanged.
     #[test]
     fn moe_body_variants_are_opt_in_object_requests() {
-        let _guard = crate::test_env::env_guard();
+        let _guard = held_env();
         let ordinary = build(&model(), "gfx950");
         assert!(ordinary["objects"]["lean"].get("moe_stage1_body").is_none());
         assert!(ordinary["objects"]["lean"].get("moe_stage2_body").is_none());
@@ -5824,7 +5837,7 @@ mod tests {
     /// token-batch body programs (the `_tb` object twins) exist.
     #[test]
     fn header_carries_the_object_recipe_inputs() {
-        let _guard = crate::test_env::env_guard();
+        let _guard = held_env();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_DECODE_BATCH_LADDER", "1,2,4")]);
         let mut man = build(&model(), "gfx942");
         let h = config_header(&man);
@@ -5987,6 +6000,7 @@ mod tests {
     /// anything else.
     #[test]
     fn lean_block_is_false_with_a_reason_when_the_verifier_is_absent() {
+        let _guard = held_env();
         let skipped = crate::LeanReport::skipped(
             "no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)",
         );
@@ -6008,6 +6022,7 @@ mod tests {
     /// The other side of it: a real pass says so, and says it with no reason.
     #[test]
     fn lean_block_reports_a_clean_verification() {
+        let _guard = held_env();
         let ok = crate::LeanReport {
             verified: true,
             oracle: true,
@@ -6033,6 +6048,7 @@ mod tests {
     /// re-creates in data the CLI coupling the flags were fixed to avoid.
     #[test]
     fn oracle_and_verify_are_recorded_independently() {
+        let _guard = held_env();
         let oracle_only = crate::LeanReport {
             verified: false,
             oracle: true,
@@ -6053,6 +6069,7 @@ mod tests {
     /// touching. It is hashed over `union` + `tuning` only; this pins that.
     #[test]
     fn the_lean_block_does_not_change_the_pairing_hash() {
+        let _guard = held_env();
         let m = model();
         let a = super::build(&m, "gfx950", &crate::LeanReport::skipped("absent"));
         let b = super::build(

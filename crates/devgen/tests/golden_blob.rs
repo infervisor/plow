@@ -90,7 +90,7 @@ fn emit_with(dir: &Path, ctx: u32, n_cu: u32, tp: u32, rope_gen: bool) -> Vec<u8
 fn generated_tables_match_baked_tables() {
     let _g = emit_guard();
     use packet::devbuild::{
-        BlobSectionEntry, BlobTensor, BLOB_MAGIC, BLOB_MAGIC_V7, INIT_NONE, NAME_LEN,
+        BlobSectionEntry, BlobTensor, BLOB_MAGIC_V6, BLOB_MAGIC_V7, INIT_NONE, NAME_LEN,
         SECT_GEN_TENSORS, SECT_MAGIC,
     };
     use packet::rope::GenTensor;
@@ -103,7 +103,7 @@ fn generated_tables_match_baked_tables() {
     let baked = emit_with(&root, 512, 128, 1, false);
     let gen = emit_with(&root, 512, 128, 1, true);
 
-    assert_eq!(&baked[..8], BLOB_MAGIC, "--no-rope-gen must stay v5");
+    assert_eq!(&baked[..8], BLOB_MAGIC_V6, "--no-rope-gen must stay v6");
     assert_eq!(
         &gen[..8],
         BLOB_MAGIC_V7,
@@ -217,8 +217,8 @@ fn qwen3_dense_blob_is_stable() {
     // (four 72-byte recipes, a 48-byte section entry, and the 8-byte directory
     // header). `generated_tables_match_baked_tables` above pins the bytes those
     // recipes expand to, which is the property this hash used to cover.
-    const GOLDEN_FNV1A: u64 = 0x1323_437f_82f1_9604;
-    const GOLDEN_LEN: usize = 432828;
+    const GOLDEN_FNV1A: u64 = 0x6080_39ca_fcd9_9e3a;
+    const GOLDEN_LEN: usize = 435650;
     assert_eq!(blob.len(), GOLDEN_LEN, "dense Qwen3 blob length changed");
     assert_eq!(
         fnv1a(&blob),
@@ -354,7 +354,7 @@ fn gemma_dense_blob_is_stable() {
     std::fs::create_dir_all(&root).unwrap();
     write_gemma_config(&root);
     let blob = emit(&root, 512, 128, 1);
-    const GEMMA_GOLDEN_FNV1A: u64 = 0xefe5_b0ec_5b7d_a84f;
+    const GEMMA_GOLDEN_FNV1A: u64 = 0x8659_ff90_17e4_6f25;
     assert_eq!(
         fnv1a(&blob),
         GEMMA_GOLDEN_FNV1A,
@@ -437,7 +437,7 @@ fn llama_dense_blob_is_stable() {
     std::fs::create_dir_all(&root).unwrap();
     write_llama_config(&root);
     let blob = emit(&root, 512, 128, 1);
-    const LLAMA_GOLDEN_FNV1A: u64 = 0xca67_12ad_d306_d875;
+    const LLAMA_GOLDEN_FNV1A: u64 = 0xed54_bac0_557f_c69f;
     assert_eq!(
         fnv1a(&blob),
         LLAMA_GOLDEN_FNV1A,
@@ -1265,7 +1265,8 @@ fn the_occupancy_floor_is_configurable() {
 // The egglog rewrite's extracted fused graph decides each residual/norm seam. On these fixtures every
 // seam the hand arms fuse is a rule site, so knob on (default or explicit) must be the hand blob byte
 // for byte, `=0` must ignore the sites entirely, and the default without sites falls back to the hand
-// fusions.
+// fusions. The gated MLP is the exception: the rewrite fuses it wherever it matches, the hand arm
+// asks the tile cost model per rung, so a knob-on blob is no longer the hand blob.
 
 fn emit_rewrite(dir: &Path, knob: Option<&str>, sites: Option<devgen::RewriteSites>) -> Vec<u8> {
     let env: Vec<(&str, &str)> = knob.map(|v| ("PLOW_EMIT_REWRITE", v)).into_iter().collect();
@@ -1299,7 +1300,7 @@ fn fixture_sites(dir: &Path) -> devgen::RewriteSites {
 }
 
 #[test]
-fn emit_rewrite_on_reproduces_the_hand_seams_and_off_ignores_the_sites() {
+fn emit_rewrite_is_on_by_default_and_off_ignores_the_sites() {
     let _g = emit_guard();
     let fixtures: [(&str, fn(&Path)); 3] = [
         ("qwen3", write_qwen3_config),
@@ -1311,20 +1312,17 @@ fn emit_rewrite_on_reproduces_the_hand_seams_and_off_ignores_the_sites() {
         write(&dir);
         let hand = fnv1a(&emit(&dir, 512, 128, 1));
         let sites = fixture_sites(&dir);
+        let ruled = fnv1a(&emit_rewrite(&dir, Some("1"), Some(sites.clone())));
+        assert_ne!(ruled, hand, "{name}: the sites changed nothing");
         assert_eq!(
             fnv1a(&emit_rewrite(&dir, None, Some(sites.clone()))),
-            hand,
+            ruled,
             "{name}: default (on)"
         );
         assert_eq!(
-            fnv1a(&emit_rewrite(&dir, Some("0"), Some(sites.clone()))),
+            fnv1a(&emit_rewrite(&dir, Some("0"), Some(sites))),
             hand,
             "{name}: knob 0"
-        );
-        assert_eq!(
-            fnv1a(&emit_rewrite(&dir, Some("1"), Some(sites))),
-            hand,
-            "{name}: the rule-driven seams are not the hand seams"
         );
     }
 }
@@ -1334,8 +1332,8 @@ fn emit_rewrite_unfuses_a_seam_the_rewrite_did_not_extract() {
     let _g = emit_guard();
     let dir = tempdir("emit_rewrite_missing_site");
     write_qwen3_config(&dir);
-    let hand = fnv1a(&emit(&dir, 512, 128, 1));
-    let mut sites = fixture_sites(&dir);
+    let sites = fixture_sites(&dir);
+    let ruled = fnv1a(&emit_rewrite(&dir, Some("1"), Some(sites.clone())));
     for seam in [
         "model.layers.1.post_attention_layernorm.weight",
         "model.layers.1.input_layernorm.weight",
@@ -1348,14 +1346,10 @@ fn emit_rewrite_unfuses_a_seam_the_rewrite_did_not_extract() {
         );
         assert_ne!(
             fnv1a(&emit_rewrite(&dir, Some("1"), Some(dropped))),
-            hand,
+            ruled,
             "{seam}"
         );
     }
-    // Sites of a kind no lowering reads change nothing.
-    sites.remove("SwiGLU");
-    sites.remove("FusedNormLinear");
-    assert_eq!(fnv1a(&emit_rewrite(&dir, Some("1"), Some(sites))), hand);
 }
 
 #[test]

@@ -248,7 +248,10 @@ mod tests {
     fn every_gemv_opcode_has_a_shape_rule() {
         let i = [1u32, 2, 3, 4, 5, 6, 7, 8];
         for op in DevOp::ALL {
-            let is_gemv = format!("{op:?}").starts_with("Gemv");
+            // The speech depth-stage GEMV: its flag word selects operand dtypes, bias, residual
+            // and a LayerNorm prologue, so (m, n, k, quant) does not name one kernel and it has
+            // no store cell.
+            let is_gemv = format!("{op:?}").starts_with("Gemv") && *op != DevOp::GemvF32Out;
             assert_eq!(
                 op.gemv_case(&i).is_some(),
                 is_gemv,

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use devgen::asr::audio_lm::lower_audio_encoder;
+use devgen::asr::qwen::{lower_audio_encoder, AudioDims};
 use plowrt::asr::frontend::MelFeatures;
 use plowrt::exec::apple::asr::QwenAudioEncoder;
 use plowrt::exec::packet_runtime::{load_packet_runtime, PacketAsset};
@@ -22,7 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let chunks = feature_frames.div_ceil(100);
     let chunk_frames = feature_frames.min(100);
-    let mut lowered = lower_audio_encoder(feature_frames.try_into()?, 16)?;
+    let mut lowered =
+        lower_audio_encoder(feature_frames.try_into()?, 16, AudioDims::QWEN3_ASR_1_7B)?;
     let input_handle = lowered.input;
     let convolution_handle = lowered.convolution;
     let projection_handle = lowered.projection;
