@@ -2119,6 +2119,63 @@ static void t_attention(const char* name, unsigned batch, unsigned rows, unsigne
     run(name, c, g_attention_f32, {o}, FP32, 2e-5);
 }
 
+#if PLOW_NV_SPEECH && defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
+__global__ void k_ring_attention_block(PlowDevInst in, void* const* T) {
+    sp_ring_attention_block(&in, T, blockIdx.x, gridDim.x);
+}
+/* Ring attention (warp per unit past one unit per block) == the block-per-unit body, bitwise:
+ * counts 1..256 (L 255), the codec's L 71 at B 64 / B 1, masked rows, zero rows and underflowing
+ * probabilities. */
+static void t_ring_attention_bitwise() {
+    struct G { unsigned B, N, L, H; float amp; };
+    const G gs[] = {{64, 2, 71, 16, .2f}, {1, 1, 71, 16, .2f}, {9, 4, 255, 16, .2f}, {9, 3, 255, 16, 40.f}, {5, 2, 7, 16, 1.f}};
+    const uint32_t positions[] = {0, 1, 6, 30, 70, 71, 254, 255, 256, 1000, 100003};
+    const unsigned slots = 96;
+    for (const G& g : gs) {
+        Case c;
+        const unsigned width = g.H * 64u, stride = 3 * width;
+        const size_t n_out = (size_t)g.B * g.N * width;
+        unsigned out = c.out(n_out);
+        unsigned qkv = c.f32((size_t)g.B * g.N * stride, g.amp);
+        unsigned state = c.f32((size_t)slots * g.L * 2 * width, g.amp);
+        float* st = (float*)c.host[state].data();
+        for (size_t i = 0; i < (size_t)g.L * 2 * width; i++) st[(size_t)7 * g.L * 2 * width + i] = 0.f;
+        std::vector<uint32_t> vs(g.B), vn(g.B), vp(g.B);
+        for (unsigned b = 0; b < g.B; b++) {
+            vn[b] = b % 5 == 3 ? 0 : b % 5 == 2 ? g.N - 1 : g.N;
+            vs[b] = b % 4 == 1 ? 7 : (b * 13 + 5) % slots;
+            vp[b] = positions[(b * 7 + g.L) % 11];
+        }
+        unsigned slot = c.u32(vs), n = c.u32(vn), pos = c.u32(vp);
+        c.in.op = PLOW_DOP_ATTENTION_F32;
+        const unsigned ts[] = {out, qkv, state, slot, n, pos};
+        for (unsigned k = 0; k < 6; k++) c.in.t[k] = ts[k];
+        const unsigned is[] = {g.B, g.N, g.L, g.H, 64, stride, 0x109u | ((g.L + 1u) << 16), slots};
+        for (unsigned k = 0; k < 8; k++) c.in.i[k] = is[k];
+        c.in.fj[0].f = .125f;
+        c.in.fj[1].u = width; c.in.fj[2].u = 2 * width;
+        c.upload();
+        void** td = upload_table(c.dev);
+        std::vector<uint32_t> got(n_out), want(n_out);
+        k_speech<<<g_nblk, 256, kSmem>>>(c.in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(got.data(), c.dev[out], n_out * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(c.dev[out], c.host[out].data(), n_out * 4, cudaMemcpyHostToDevice));
+        k_ring_attention_block<<<g_nblk, 256, 16384>>>(c.in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(want.data(), c.dev[out], n_out * 4, cudaMemcpyDeviceToHost));
+        CK(cudaFree(td));
+        size_t bad = 0;
+        for (size_t i = 0; i < n_out; i++) bad += got[i] != want[i];
+        printf("  ring attention B%u N%u L%u H%u amp %g == block body bitwise -> %s\n", g.B, g.N, g.L, g.H, g.amp,
+               bad ? "FAIL" : "PASS");
+        if (bad) { printf("    %zu differing elements\n", bad); g_fail = 1; }
+    }
+}
+#endif
+
 /* Stream mode: fused QKV item rows [hist carried | n new]; positions mask absent history, and the
  * TC flag must fall back to the fp32 kernel. */
 static void t_ring_kv() {
@@ -3359,6 +3416,9 @@ int main(int argc, char** argv) {
 
 #ifdef SPEECH_TEST_RING_ONLY
     t_ring_kv();
+#if PLOW_NV_SPEECH && defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
+    t_ring_attention_bitwise();
+#endif
     printf(g_fail ? "FAIL\n" : "ALL PASS\n");
     return g_fail;
 #endif

@@ -18,22 +18,18 @@ static __device__ __forceinline__ const float* sp_ring_key(
            head * 64u + (value ? 2u * width : width);
 }
 
-static __device__ __noinline__ void d_attention_ring_f32(
+/* One 256-thread block per (item, row, head): with at most one unit per block it beats a warp
+ * per unit (more loads in flight per unit). Inputs as validated by d_attention_ring_f32. */
+static __device__ __forceinline__ void sp_ring_attention_block(
     const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
     const unsigned B = in->i[0], N = in->i[1], L = in->i[2], H = in->i[3];
     const unsigned stride = in->i[5], W = in->i[6] >> 16, slots = in->i[7];
-    if (!B || !N || N > 4u || !L || L > 255u || !H || in->i[4] != 64u ||
-        (uint64_t)B * N > 0xffffffffull || (uint64_t)B * N * H > 0xffffffffull ||
-        stride % 4u || (uint64_t)H * 192u > stride ||
-        in->fj[1].u != H * 64u || in->fj[2].u != H * 128u || W != L + 1u ||
-        (in->i[6] & 0xffffu) != 0x109u || !slots) { __trap(); return; }
     const auto* qkv = (const float*)SP_TEN(1);
     const auto* state = (const float*)SP_TEN(2);
     const auto* slot = (const unsigned*)SP_TEN(3);
     const auto* lengths = (const unsigned*)SP_TEN(4);
     const auto* position = (const unsigned*)SP_TEN(5);
     auto* out = (float*)SP_TEN(0);
-    if ((((size_t)qkv | (size_t)state | (size_t)out) & 15u) != 0u) { __trap(); return; }
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned width = H * 64u;
     float* query = sp_smem;
@@ -114,6 +110,150 @@ static __device__ __noinline__ void d_attention_ring_f32(
         }
         __syncthreads();
     }
+}
+
+/* One warp per (item, row, head), past one unit per block. Inputs as validated by
+ * d_attention_ring_f32. */
+static __device__ __noinline__ void sp_ring_attention_warp(
+    const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    const unsigned B = in->i[0], N = in->i[1], L = in->i[2], H = in->i[3];
+    const unsigned stride = in->i[5], W = in->i[6] >> 16, slots = in->i[7];
+    const auto* qkv = (const float*)SP_TEN(1);
+    const auto* state = (const float*)SP_TEN(2);
+    const auto* slot = (const unsigned*)SP_TEN(3);
+    const auto* lengths = (const unsigned*)SP_TEN(4);
+    const auto* position = (const unsigned*)SP_TEN(5);
+    auto* out = (float*)SP_TEN(0);
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned width = H * 64u;
+    /* One warp per (item, row, head). Scores, softmax and the weighted sum keep the per-thread
+     * order of a 256-thread block per item: thread t holds key t, the sum folds the eight
+     * 32-key warp sums in order, and output partial w chains keys w, w + 8, ... from +0. */
+    float* scores = sp_smem + warp * 256u;
+    const unsigned group = lane >> 2, component = (lane & 3u) * 4u;
+    const unsigned mask = 15u << (lane & ~3u);
+    for (uint64_t work = slice + (uint64_t)warp * nblk; work < (uint64_t)B * N * H;
+         work += (uint64_t)nblk * PLOW_NV_WARPS) {
+        const unsigned item = (unsigned)work;
+        const unsigned h = item % H, r = item / H % N, b = item / (H * N);
+        const unsigned n = lengths[b];
+        if (n > N) { __trap(); return; }
+        const size_t output = ((size_t)b * N + r) * width + h * 64u;
+        if (r >= n) {
+            ((float2*)(out + output))[lane] = make_float2(0.f, 0.f);
+            continue;
+        }
+        const unsigned s = slot[b], pos = position[b], ring0 = pos % L;
+        if (s >= slots) { __trap(); return; }
+        const unsigned long long end = (unsigned long long)pos + r + 1u;
+        const unsigned long long first = end > W ? end - W : 0u;
+        const unsigned count = (unsigned)(end - first);
+        float4 query[4];
+#pragma unroll
+        for (unsigned k = 0; k < 4; k++)
+            query[k] = *(const float4*)(qkv + ((size_t)b * N + r) * stride + h * 64u + component + k * 16u);
+        for (unsigned j0 = group; j0 < count; j0 += 32u) {
+            float4 values[4][4];
+#pragma unroll
+            for (unsigned u = 0; u < 4; u++) {
+                const unsigned j = j0 + 8u * u;
+                const float* key = sp_ring_key(qkv, state, b, s, N, L, stride, width, h,
+                                                pos, ring0, first + min(j, count - 1u), false);
+#pragma unroll
+                for (unsigned k = 0; k < 4; k++) values[u][k] = *(const float4*)(key + component + k * 16u);
+            }
+#pragma unroll
+            for (unsigned u = 0; u < 4; u++) {
+                const unsigned j = j0 + 8u * u;
+                if (j >= count) break;
+                float dot = 0.f;
+#pragma unroll
+                for (unsigned k = 0; k < 4; k++) {
+                    dot = __fmaf_rn(query[k].x, values[u][k].x, dot);
+                    dot = __fmaf_rn(query[k].y, values[u][k].y, dot);
+                    dot = __fmaf_rn(query[k].z, values[u][k].z, dot);
+                    dot = __fmaf_rn(query[k].w, values[u][k].w, dot);
+                }
+                dot += __shfl_down_sync(mask, dot, 2, 4);
+                dot += __shfl_down_sync(mask, dot, 1, 4);
+                if ((lane & 3u) == 0) scores[j] = dot * in->fj[0].f;
+            }
+        }
+        __syncwarp();
+        float maximum = -INFINITY;
+        for (unsigned t = lane; t < count; t += 32u) maximum = fmaxf(maximum, scores[t]);
+        maximum = warp_max32(maximum);
+        float sum = 0.f;
+        for (unsigned w = 0; w * 32u < count; w++) {
+            const unsigned t = w * 32u + lane;
+            const float probability = t < count ? expf(scores[t] - maximum) : 0.f;
+            if (t < count) scores[t] = probability;
+            const float part = warp_sum32(probability);
+            sum = w ? sum + part : part;
+        }
+        __syncwarp();
+        for (unsigned t = lane; t < count; t += 32u) scores[t] = sum > 0.f ? scores[t] / sum : 0.f;
+        __syncwarp();
+        /* Chain w takes keys w, w + 8, ... in order; its zero terms past count only turn -0 into +0. */
+        float2 chain[PLOW_NV_WARPS];
+#pragma unroll
+        for (unsigned w = 0; w < PLOW_NV_WARPS; w++) chain[w] = make_float2(0.f, 0.f);
+        for (unsigned j0 = 0; j0 < count; j0 += 32u) {
+            // Keep the global loads ahead of the dependent weighted-sum chains.
+            float2 values[32];
+#pragma unroll
+            for (unsigned k = 0; k < 32; k++) {
+                const unsigned j = j0 + k;
+                values[k] = j < count ? *(const float2*)(sp_ring_key(qkv, state, b, s, N, L,
+                    stride, width, h, pos, ring0, first + j, true) + lane * 2u) : make_float2(0.f, 0.f);
+            }
+#pragma unroll
+            for (unsigned k = 0; k < 32; k++) {
+                const unsigned j = j0 + k;
+                if (j < count) {
+                    const float p = scores[j];
+                    chain[k % PLOW_NV_WARPS].x = __fmaf_rn(p, values[k].x, chain[k % PLOW_NV_WARPS].x);
+                    chain[k % PLOW_NV_WARPS].y = __fmaf_rn(p, values[k].y, chain[k % PLOW_NV_WARPS].y);
+                }
+            }
+        }
+        float2 value = make_float2(0.f, 0.f);
+#pragma unroll
+        for (unsigned w = 0; w < PLOW_NV_WARPS; w++) {
+            if (w + 31u * PLOW_NV_WARPS >= count) {
+                chain[w].x = __fadd_rn(chain[w].x, 0.f);
+                chain[w].y = __fadd_rn(chain[w].y, 0.f);
+            }
+            if (w) {
+                value.x += chain[w].x;
+                value.y += chain[w].y;
+            } else {
+                value = chain[w];
+            }
+        }
+        ((float2*)(out + output))[lane] = value;
+        __syncwarp();
+    }
+}
+
+static __device__ __noinline__ void d_attention_ring_f32(
+    const PlowDevInst* in, void* const* T, unsigned slice, unsigned nblk) {
+    const unsigned B = in->i[0], N = in->i[1], L = in->i[2], H = in->i[3];
+    const unsigned stride = in->i[5], W = in->i[6] >> 16, slots = in->i[7];
+    if (!B || !N || N > 4u || !L || L > 255u || !H || in->i[4] != 64u ||
+        (uint64_t)B * N > 0xffffffffull || (uint64_t)B * N * H > 0xffffffffull ||
+        stride % 4u || (uint64_t)H * 192u > stride ||
+        in->fj[1].u != H * 64u || in->fj[2].u != H * 128u || W != L + 1u ||
+        (in->i[6] & 0xffffu) != 0x109u || !slots) { __trap(); return; }
+    const auto* qkv = (const float*)SP_TEN(1);
+    const auto* state = (const float*)SP_TEN(2);
+    const auto* slot = (const unsigned*)SP_TEN(3);
+    const auto* lengths = (const unsigned*)SP_TEN(4);
+    const auto* position = (const unsigned*)SP_TEN(5);
+    auto* out = (float*)SP_TEN(0);
+    if ((((size_t)qkv | (size_t)state | (size_t)out) & 15u) != 0u) { __trap(); return; }
+    if ((uint64_t)B * N * H <= nblk) sp_ring_attention_block(in, T, slice, nblk);
+    else sp_ring_attention_warp(in, T, slice, nblk);
 }
 
 static __device__ __noinline__ void d_stream_ring_f32(
