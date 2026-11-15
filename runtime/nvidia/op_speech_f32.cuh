@@ -5163,6 +5163,35 @@ __device__ __forceinline__ void spwg_m64n64k16(float* d, uint64_t da, uint64_t d
           "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
         : "l"(da), "l"(db), "r"(scale_d));
 }
+/* m64n192k16 .f32.bf16.bf16, both operands from shared memory, 96 f32 accumulators per thread. */
+__device__ __forceinline__ void spwg_m64n192k16(float* d, uint64_t da, uint64_t db, int scale_d) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, %98, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n192k16.f32.bf16.bf16 "
+        "{"
+        "%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,"
+        "%24,%25,%26,%27,%28,%29,%30,%31,%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,"
+        "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63,%64,%65,%66,%67,%68,%69,%70,%71,"
+        "%72,%73,%74,%75,%76,%77,%78,%79,%80,%81,%82,%83,%84,%85,%86,%87,%88,%89,%90,%91,%92,%93,%94,%95}, "
+        "%96, %97, p, 1, 1, 0, 0;\n"
+        "}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
+          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
+          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
+          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
+          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),
+          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),
+          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),
+          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]), "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),
+          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95])
+        : "l"(da), "l"(db), "r"(scale_d));
+}
+__device__ __forceinline__ void spb_m64n96k16(float* d, uint64_t da, uint64_t db, int scale_d);
 /* Output activations inlined (a call anywhere in the function serializes the wgmma pipeline,
  * ptxas C7510): none, tanh, SiLU, ELU, leaky ReLU, Mish, GELU, snake. The common ones get their
  * own instantiation (P: 0 none, 1 GELU, 2 snake), the rest one uniform switch (P = 3). */
@@ -5221,12 +5250,13 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
      * MMAs; A has two buffers where they fit (128x64 tiles). Grouped, a stage is [Ahi | Alo | Bhi |
      * Blo] with both operands split from f32 loads, two stages where they fit. */
     constexpr bool WS = !GR;
-    /* DIRECT (single-product pointwise / taps): each thread stores its fragment pairs (four lanes
-     * cover a row's 32 contiguous bytes) instead of staging the tile for row bulk copies: no staging
-     * barrier, no bulk-store source wait. A row past the conv length stores zeros at its ~base like
-     * the bulk path. */
-    constexpr bool DIRECT = ONE && !CT && !SK;
+    /* DIRECT (single-product pointwise / taps, and ConvTranspose tiles of one phase): each thread
+     * stores its fragment pairs (four lanes cover a row's 32 contiguous bytes) instead of staging the
+     * tile for row bulk copies: no staging barrier, no bulk-store source wait. A row past the conv
+     * length stores zeros at its ~base (ConvTranspose: inside the output geometry) like the bulk path. */
+    constexpr bool DIRECT = ONE && !SK && (!CT || BN == 96u || BN == 192u);
     static_assert(!ONE || WS, "hi-only layout: ungrouped tiles");
+    static_assert(BN == 64u || BN == 128u || (ONE && CT && (BN == 96u || BN == 192u)), "tile width");
     constexpr unsigned H = ONE ? 1u : 2u; /* halves per operand buffer */
     constexpr unsigned BOP = BN * SPWG_BK * 2u, LDO = BN + 8u, NG = BN / 8u, SZ = 2u * SPWG_OP + 2u * BOP;
     constexpr bool DB = WS ? 2u * H * SPWG_OP + 2u * H * BOP + 1024u <= SP_ARENA_FLOATS * 4u : 2u * SZ + 1024u <= SP_ARENA_FLOATS * 4u;
@@ -5235,7 +5265,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
     auto boff = [&](unsigned b) { return sm + (WS ? NA * H * SPWG_OP + b * H * BOP : b * SZ + 2u * SPWG_OP); };
     float* stage = (float*)sm;         /* the output tile, after the last k-tile's MMAs */
     /* The tile's bias, loaded with its first k-tile and staged past the operand and output stages. */
-    constexpr unsigned BIAS_OFF = OPS > 128u * LDO * 4u ? OPS : 128u * LDO * 4u;
+    constexpr unsigned BIAS_OFF = DIRECT || OPS > 128u * LDO * 4u ? OPS : 128u * LDO * 4u;
     static_assert(BIAS_OFF + BN * 4u + 4u + 1024u <= SP_ARENA_FLOATS * 4u, "wgmma bias stage");
     float* bias_s = (float*)(sm + BIAS_OFF);
     const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u, wg = warp >> 2;
@@ -5388,7 +5418,9 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             for (unsigned s = 0; s < SPWG_BK / 16u; s++) {
                 const uint64_t o = (s * 32u) >> 4; /* +32 B per k16 in the start-address field */
                 if (one) {
-                    if constexpr (BN == 128u) wgmma_m64n128k16(acc, dah + o, dbh + o, kt != kb || s ? 1 : 0);
+                    if constexpr (BN == 192u) spwg_m64n192k16(acc, dah + o, dbh + o, kt != kb || s ? 1 : 0);
+                    else if constexpr (BN == 96u) spb_m64n96k16(acc, dah + o, dbh + o, kt != kb || s ? 1 : 0);
+                    else if constexpr (BN == 128u) wgmma_m64n128k16(acc, dah + o, dbh + o, kt != kb || s ? 1 : 0);
                     else spwg_m64n64k16(acc, dah + o, dbh + o, kt != kb || s ? 1 : 0);
                 } else if constexpr (BN == 128u) {
                     wgmma_m64n128k16(acc, dal + o, dbh + o, kt != kb || s ? 1 : 0);
@@ -5462,7 +5494,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
          * issued before the first use); the tile staged row-major. */
         const unsigned rw = wg * 64u + (warp & 3u) * 16u + (lane >> 2), cw = 2u * (lane & 3u);
         size_t base[2];
-        bool ok[2], ok1[2] = {false, false};
+        bool ok[2], ok1[2] = {false, false}, geo2[2] = {false, false};
 #pragma unroll
         for (unsigned h = 0; h < 2; h++) {
             const unsigned m = m0 + rw + 8u * h;
@@ -5470,6 +5502,7 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
                 bool geo = false, live = false;
                 base[h] = m < M ? ct_base(m, ph, geo, live) : 0;
                 ok[h] = m < M && live;
+                if constexpr (DIRECT) geo2[h] = m < M && geo;
                 if (cb < BN && m < M) {
                     ct_base(m, ph + 1u, geo, live);
                     ok1[h] = live;
@@ -5480,14 +5513,19 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
             ok[h] = m < M && (long long)base[h] >= 0;
             if (!ok[h]) base[h] = ~base[h];
         }
-        float2 res[2][NG];
+        /* Up to 128 columns the residual is loaded ahead of use; wider tiles load it at the add (registers). */
+        constexpr bool RES_AHEAD = BN <= 128u;
+        auto res_at = [&](unsigned h, unsigned g) {
+            const unsigned o = n0 + 8u * g + cw;
+            return a.residual && ok[h] && o < N ? *(const float2*)(a.residual + base[h] + og + o) : make_float2(0.f, 0.f);
+        };
+        float2 res[2][RES_AHEAD ? NG : 1u];
+        if constexpr (RES_AHEAD) {
 #pragma unroll
-        for (unsigned h = 0; h < 2; h++)
+            for (unsigned h = 0; h < 2; h++)
 #pragma unroll
-            for (unsigned g = 0; g < NG; g++) {
-                const unsigned o = n0 + 8u * g + cw;
-                res[h][g] = a.residual && ok[h] && o < N ? *(const float2*)(a.residual + base[h] + og + o) : make_float2(0.f, 0.f);
-            }
+                for (unsigned g = 0; g < NG; g++) res[h][g] = res_at(h, g);
+        }
 #pragma unroll
         for (unsigned g = 0; g < NG; g++) {
             const unsigned c = 8u * g + cw, o = n0 + c;
@@ -5511,10 +5549,11 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
                         const float rs = a.row_scale[base[h] / a.cout];
                         y.x = __fmul_rn(rs, y.x); y.y = __fmul_rn(rs, y.y);
                     }
-                    y.x = __fadd_rn(y.x, res[h][g].x); y.y = __fadd_rn(y.y, res[h][g].y);
+                    const float2 rv = RES_AHEAD ? res[h][RES_AHEAD ? g : 0u] : res_at(h, g);
+                    y.x = __fadd_rn(y.x, rv.x); y.y = __fadd_rn(y.y, rv.y);
                 }
                 if constexpr (DIRECT) {
-                    if (m0 + rw + 8u * h < M && on) *(float2*)(a.out + base[h] + col + c) = y;
+                    if ((CT ? geo2[h] : m0 + rw + 8u * h < M) && on) *(float2*)(a.out + base[h] + col + c) = y;
                 } else {
                     *(float2*)(stage + (rw + 8u * h) * LDO + c) = y;
                 }
@@ -5758,6 +5797,15 @@ __device__ __forceinline__ void sp_wg_run_ct(const SpConvArgs& a, unsigned slice
                    r64 = (mt * ((N + 63u) / 64u) + nblk - 1u) / nblk;
     const float* w = spwg_wsplit(a);
     const bool w128 = a.cout % 128u == 0 && (a.pinned() ? a.pin_bn() == 128u : 20u * r128 <= 13u * r64);
+#if PLOW_SPEECH_CONV_OBJECT && PLOW_SPEECH_CONV_BF16
+    /* One phase per tile where cout is 96 or 192 (no 128 tiling): the per-k-tile A staging and loop
+     * cost spread over cout columns instead of 64. Same products and K order per output. */
+    if (a.one && SPWG_ONE_ON && !w128 && (a.cout == 96u || a.cout == 192u)) {
+        if (a.cout == 96u) sp_wg_gemm<96, true, 0, false, true, false, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
+        else sp_wg_gemm<192, true, 0, false, true, false, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
+        return;
+    }
+#endif
     if (a.one && SPWG_ONE_ON) {
         if (w128) sp_wg_gemm<128, true, 0, false, true, false, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);
         else sp_wg_gemm<64, true, 0, false, true, false, false, true>(M, N, 2u * a.cin, a.x, w, ep, slice, nblk);

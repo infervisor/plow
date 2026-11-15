@@ -442,6 +442,11 @@ ring, so the per-layer carry gather / store pairs are gone.
   the staged tile and row bulk copies: k1 96 / 192 / 384 / 768 158 / 110 / 66 / 43 -> 139 / 101 /
   62 / 41 us. Packet, PCM bit-identical: step b64 x f2 8.36 -> 8.07 ms, b32 x f2 5.65 -> 5.45, b16 x
   f17 13.77 -> 13.24, b1 x f1 3.14 -> 3.09.
+- ConvTranspose into 192 / 96 channels (no 128 tiling, so 64-wide tiles re-staged A for 12 / 5
+  column tiles): with A loads, B copies and wgmma all skipped, 75 % of the time remained. Tiles of
+  one phase (N = cout, m64n192 / m64n96, direct stores): 384 -> 192 209 -> 112 us, 192 -> 96 218 ->
+  153; bitwise equal to the 64-wide path over cropped edges and short items. Packet, PCM
+  bit-identical: step b64 x f2 8.08 -> 7.93 ms, b32 x f2 5.45 -> 5.38, b16 x f17 13.25 -> 12.95.
 - One stream, one frame (b1 x f1, 3.6 ms) is the per-launch floor: its convs take 2.5 ms on 6-16
   blocks each (dec.in 124 us on 12 blocks, each 768-channel k7 ~120 us on 6), so a small launch
   streams the codec's weights through a few SMs.

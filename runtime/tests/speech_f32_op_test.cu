@@ -29,6 +29,9 @@
 #if PLOW_SPEECH_CONV_OBJECT
 static void t_conv_ring();
 #endif
+#if PLOW_SPEECH_CONV_OBJECT && PLOW_SPEECH_CONV_BF16
+static void t_conv_ct_wide();
+#endif
 
 #define GOLDEN(name) void name(const PlowDevInst*, uint32_t, uint32_t, void* const*, PlowCpuCtx*)
 extern "C" {
@@ -1518,6 +1521,9 @@ static void t_conv_pinned() {
 #if PLOW_SPEECH_CONV_OBJECT
     t_conv_ring();
 #endif
+#if PLOW_SPEECH_CONV_OBJECT && PLOW_SPEECH_CONV_BF16
+    t_conv_ct_wide();
+#endif
 }
 
 static void t_conv_padding() {
@@ -2365,6 +2371,43 @@ static void t_conv_ring() {
 /* The Qwen3-TTS codec's 12 k7 residual convs at step.b64.f2 (64 items, input + output SnakeBeta
  * fused): the B-ring bodies vs the single-prefetch bodies (sp_test_spb_ring 0), bitwise (ring also at
  * 7 blocks), then interleaved timing. SPEECH_TEST_SMEM raises the launch claim the ring sizes S from. */
+#if PLOW_SPEECH_CONV_OBJECT && PLOW_SPEECH_CONV_BF16
+/* Single-product ConvTranspose1d tiles of one phase (cout 96 / 192, direct stores) vs the 64-wide
+ * runtime single-product path, bitwise over a sentinel-filled output: cropped edges, item lengths
+ * 0 / 1 / short / full, partial row tiles, 132 / 7 / 1 blocks. */
+static void t_conv_ct_wide() {
+    auto once = [](Case& c, unsigned out, size_t n, unsigned on, unsigned nblk) {
+        CK(cudaMemcpyToSymbol(sp_test_wg_one, &on, sizeof(on)));
+        void** td = upload_table(c.dev);
+        CK(cudaMemset(c.dev[out], 0x5a, n * 4));
+        k_speech<<<nblk, 256, kSmem>>>(c.in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(td));
+        std::vector<uint8_t> h(n * 4);
+        CK(cudaMemcpy(h.data(), c.dev[out], n * 4, cudaMemcpyDeviceToHost));
+        return h;
+    };
+    const unsigned cts[][4] = {{384, 192, 37, 4}, {192, 96, 53, 3}};
+    for (auto& t : cts)
+        for (unsigned ls = 0; ls < 2; ls++) {
+            const unsigned ci = t[0], co = t[1], R = t[2], st = t[3];
+            ConvSpec ct{5, R, ci, co, 2 * st, st, 0, 1, st, st, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+            ct.wide = true; ct.wg = true; ct.tapmajor = true; ct.pin = 1; ct.ragged = co % 64 != 0; ct.one = true;
+            if (ls) ct.lengths = {0, 1, 7, R, R - 2};
+            Case c; unsigned o; build_conv(c, ct, true, o);
+            c.upload();
+            const size_t n = (size_t)ct.batch * conv_out_rows(ct, true) * co;
+            const auto ref = once(c, o, n, 0u, g_nblk);
+            bool same = true;
+            for (unsigned nb : {(unsigned)g_nblk, 7u, 1u}) same = same && ref == once(c, o, n, 1u, nb);
+            const unsigned on = 1u;
+            CK(cudaMemcpyToSymbol(sp_test_wg_one, &on, sizeof(on)));
+            printf("  ConvT 1p s%u %u->%u one-phase tiles%s vs 64-wide: %s\n", st, ci, co, ls ? " lengths" : "", same ? "PASS" : "FAIL");
+            if (!same) g_fail = 1;
+        }
+}
+#endif
 static void bench_conv_ring() {
     auto once = [](Case& c, unsigned out, size_t n, unsigned on, unsigned nblk) {
         CK(cudaMemcpyToSymbol(sp_test_spb_ring, &on, sizeof(on)));
