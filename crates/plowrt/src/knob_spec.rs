@@ -70,6 +70,13 @@ const SESSION_TTL_CANDIDATE: Status = Status::Candidate {
         "no effect without `X-Session-Id`; `=0` gives sessions no special retention",
     ],
 };
+/// Default 50 ms above `rt.asr_encode_hold_inflight`; no checkpoint P certificate yet.
+const ASR_ENCODE_HOLD_CANDIDATE: Status = Status::Candidate {
+    evidence: &[
+        "docs/bringup/results/serving-concurrency-h100/summary.md (ASR, Qwen3-ASR 1.7B H100), hold 50 vs 0: c64 RTFx 1041 vs 850, c256 1152 vs 1169, c1 p50 54.1 vs 53.8 ms",
+        "`=0` is the rollback",
+    ],
+};
 const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
     evidence: &[
         "agent/prefix-cache v2, 12B H100 prefix-repetition C16, default vs =0: hits 57/67 vs 53/67, TTFT 259.4 vs 295.7 ms, tok/s 915 vs 889; C4 hits 26 vs 25, TTFT 144.7 vs 123.3 (v1 default 122.3, same hits)",
@@ -945,7 +952,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.overload_miss", Some("PLOW_OVERLOAD_MISS"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05,0.1,0.2")), DIAG),
     KnobSpec::new("rt.asr_partial_duty", Some("PLOW_ASR_PARTIAL_DUTY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), DIAG),
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
-    KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(50)), OPT_IN),
+    KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(50)), ASR_ENCODE_HOLD_CANDIDATE),
     KnobSpec::new("rt.asr_encode_hold_inflight", Some("PLOW_ASR_ENCODE_HOLD_INFLIGHT"), Layer::Runtime, USIZE, Default::Static(Val::Nat(32)), DIAG),
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
