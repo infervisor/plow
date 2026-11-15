@@ -430,6 +430,18 @@ ring, so the per-layer carry gather / store pairs are gone.
   test, 64 items at the served rows, bitwise equal to the old body: 768 293-317 -> 192-212 us, 384
   346-386 -> 265-281, 192 243-263 -> 223-243, 96 204-225 -> 191-213. Packet, PCM bit-identical: step
   b64 x f2 9.12 -> 8.35 ms, b32 x f2 6.10 -> 5.65, b16 x f17 15.56 -> 13.78, b1 x f1 equal.
+- Next knock-outs (scratch build; its own global flag reads skew absolute times, so only the ratios
+  count). Ping-pong k7 classes (96 / 192 ch): the parts add up (96 ch: loop alone 51 + staging 48 +
+  store 52 + wgmma 62 + B copies 8 = 221 us measured), but ordered warpgroup turns, which force one
+  warpgroup's main loop under the other's staging, gained nothing (96 -2 %, 192 +5 %). The main
+  loop is ~700 cycles per k-tile for ~180 cycles of tensor work. One barrier per k-tile instead of
+  two (copies D = S - 2 tiles ahead; tile j - 2's stage is refilled right after k-tile j's barrier):
+  768 189 -> 181 us, 384 279 -> 259, 192 228 -> 206, 96 187 -> 185. k1 + residual (sp_wg_gemm, 96
+  ch): with A, residual, wgmma and store all skipped, 55 % of the time remained, a per-128-row-tile
+  chain (bias load, B copy waits, staging barrier, bulk store). Direct fragment stores in place of
+  the staged tile and row bulk copies: k1 96 / 192 / 384 / 768 158 / 110 / 66 / 43 -> 139 / 101 /
+  62 / 41 us. Packet, PCM bit-identical: step b64 x f2 8.36 -> 8.07 ms, b32 x f2 5.65 -> 5.45, b16 x
+  f17 13.77 -> 13.24, b1 x f1 3.14 -> 3.09.
 - One stream, one frame (b1 x f1, 3.6 ms) is the per-launch floor: its convs take 2.5 ms on 6-16
   blocks each (dec.in 124 us on 12 blocks, each 768-channel k7 ~120 us on 6), so a small launch
   streams the codec's weights through a few SMs.

@@ -5221,6 +5221,11 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
      * MMAs; A has two buffers where they fit (128x64 tiles). Grouped, a stage is [Ahi | Alo | Bhi |
      * Blo] with both operands split from f32 loads, two stages where they fit. */
     constexpr bool WS = !GR;
+    /* DIRECT (single-product pointwise / taps): each thread stores its fragment pairs (four lanes
+     * cover a row's 32 contiguous bytes) instead of staging the tile for row bulk copies: no staging
+     * barrier, no bulk-store source wait. A row past the conv length stores zeros at its ~base like
+     * the bulk path. */
+    constexpr bool DIRECT = ONE && !CT && !SK;
     static_assert(!ONE || WS, "hi-only layout: ungrouped tiles");
     constexpr unsigned H = ONE ? 1u : 2u; /* halves per operand buffer */
     constexpr unsigned BOP = BN * SPWG_BK * 2u, LDO = BN + 8u, NG = BN / 8u, SZ = 2u * SPWG_OP + 2u * BOP;
@@ -5508,9 +5513,14 @@ static __device__ __forceinline__ void sp_wg_gemm(unsigned M, unsigned N, unsign
                     }
                     y.x = __fadd_rn(y.x, res[h][g].x); y.y = __fadd_rn(y.y, res[h][g].y);
                 }
-                *(float2*)(stage + (rw + 8u * h) * LDO + c) = y;
+                if constexpr (DIRECT) {
+                    if (m0 + rw + 8u * h < M && on) *(float2*)(a.out + base[h] + col + c) = y;
+                } else {
+                    *(float2*)(stage + (rw + 8u * h) * LDO + c) = y;
+                }
             }
         }
+        if constexpr (DIRECT) continue;
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         __syncthreads();
         if (tid < 128u && m0 + tid < M) {
@@ -6110,10 +6120,11 @@ __device__ __forceinline__ void spb_pingpong(const SpConvArgs& a, const SpbIn& s
     }
     __syncthreads();
 }
-/* B ring (non-chunked bodies): S k-tile stages, one wgmma group left in flight across the barrier.
- * Stage (j + S - 1) % S held tile j - 1, so it is refilled only after every consumer retired j - 1
- * (wait<1> after committing j, then the barrier). A k-tile past the group's last commits an empty
- * copy group, so `cp.async.wait_group S - 2` always means "tile j landed". The instruction, K order and
+/* B ring (non-chunked bodies): S k-tile stages, one wgmma group left in flight, one barrier per
+ * k-tile. Copies run D = S - 2 tiles ahead: after k-tile j's barrier every thread has passed its
+ * wait<1> of k-tile j - 1, so tile j - 2 is retired and its stage (j + D) % S is refilled there,
+ * while j - 1 may still be in flight. A k-tile past the group's last commits an empty copy group, so
+ * `cp.async.wait_group D - 1` before the barrier always means "tile j landed". The instruction, K order and
  * accumulator chain per output are spb_run's / spb_pingpong's: the same bits. The plan (kind, pg,
  * flat, ping-pong) stays the one SPB_ARENA_BYTES gives; the launch's claim sizes only S. */
 #if defined(SP_TEST_SPB_RING)
@@ -6134,6 +6145,7 @@ template <unsigned WN, bool PRE, bool STREAM, unsigned S>
 __device__ __forceinline__ void spb_pingpong_ring(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws,
                                                   unsigned pg, unsigned wgb, unsigned slice, unsigned nblk) {
     constexpr unsigned NU = WN, BB = NU * 128u;
+    constexpr unsigned D = S - 2u;
     const unsigned tid = threadIdx.x & 127u, wg = threadIdx.x >> 7, bar = 1u + wg;
     const unsigned span = 64u + (a.kernel - 1u) * a.dil, rpad = spb_rpad(a, 64u);
     char* As = (char*)sm90_align1024(sp_smem) + (size_t)wg * wgb;
@@ -6160,16 +6172,17 @@ __device__ __forceinline__ void spb_pingpong_ring(const SpConvArgs& a, const Spb
             sm90_cp_commit();
         };
 #pragma unroll
-        for (unsigned k = 0; k + 1u < S; k++) copy_b(k, k);
+        for (unsigned k = 0; k < D; k++) copy_b(k, k);
         if (pn != n0) spb_params(a, par, n0, NU, tid, 128u);
         pn = n0;
         if (staged != mu) spb_stage<PRE, STREAM>(a, si, As, rpad, span, b, t0, 0u, a.cin, tid, 128u);
         staged = mu;
-        unsigned bf = 0u, nf = S - 1u, tj = 0u, cj = 0u; /* (tap, c16) of k16 group 4 j */
+        unsigned bf = 0u, nf = D, tj = 0u, cj = 0u; /* (tap, c16) of k16 group 4 j */
         for (unsigned j = 0; j < nkt; j++) {
-            sm90_cp_wait<(int)S - 2>();
+            sm90_cp_wait<(int)D - 1>();
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             asm volatile("bar.sync %0, 128;\n" ::"r"(bar) : "memory");
+            copy_b(j + D, nf);
             sm90_wg_fence();
 #pragma unroll
             for (unsigned s2 = 0; s2 < 4u; s2++) {
@@ -6186,8 +6199,6 @@ __device__ __forceinline__ void spb_pingpong_ring(const SpConvArgs& a, const Spb
             if (cj >= gpt) { cj -= gpt; tj++; }
             sm90_wg_commit();
             sm90_wg_wait<1>();
-            asm volatile("bar.sync %0, 128;\n" ::"r"(bar) : "memory");
-            copy_b(j + S - 1u, nf);
             bf = bf + 1u == S ? 0u : bf + 1u;
             nf = nf + 1u == S ? 0u : nf + 1u;
         }
@@ -6202,6 +6213,7 @@ template <unsigned WN, bool ROWS, bool PRE, bool STREAM, unsigned S>
 __device__ __forceinline__ void spb_ring(const SpConvArgs& a, const SpbIn& si, const char* whi, size_t ws, unsigned pg,
                                          unsigned slice, unsigned nblk) {
     constexpr unsigned BM = ROWS ? 128u : 64u, NU = ROWS ? WN : 2u * WN, BB = NU * 128u;
+    constexpr unsigned D = S - 2u;
     char* As = (char*)sm90_align1024(sp_smem);
     const unsigned tid = threadIdx.x, wg = tid >> 7;
     const unsigned planes = (a.cin + 63u) / 64u, groups = planes / pg, gpt = a.cin / 16u;
@@ -6221,7 +6233,7 @@ __device__ __forceinline__ void spb_ring(const SpConvArgs& a, const SpbIn& si, c
         float acc[WN / 2u];
         for (unsigned gi = 0; gi < groups; gi++) {
             /* Image k-tile of the copy cursor (tap qt, plane qp of the group; flat: the tile itself). */
-            unsigned qt = (S - 1u) / pg, qp = (S - 1u) % pg;
+            unsigned qt = D / pg, qp = D % pg;
             auto copy_b = [&](unsigned j, unsigned bf, unsigned kt) {
                 if (j < nkt) {
                     const char* src = whi + (size_t)kt * ws + (size_t)n0 * 128u + tid * 16u;
@@ -6232,16 +6244,18 @@ __device__ __forceinline__ void spb_ring(const SpConvArgs& a, const SpbIn& si, c
                 sm90_cp_commit();
             };
 #pragma unroll
-            for (unsigned k = 0; k + 1u < S; k++) copy_b(k, k, flat ? k : (k / pg) * planes + gi * pg + k % pg);
+            for (unsigned k = 0; k < D; k++) copy_b(k, k, flat ? k : (k / pg) * planes + gi * pg + k % pg);
             if (gi == 0u) spb_params(a, par, n0, NU);
             if (!flat || staged != mu) spb_stage<PRE, STREAM>(a, si, As, rpad, span, b, t0, gi * pg, flat ? a.cin : pg * 64u);
             staged = flat ? mu : ~0u;
             /* flat: (tap, c16) of k16 group 4 j; grouped: (tap, plane) of k-tile j. */
-            unsigned bf = 0u, nf = S - 1u, tj = 0u, cj = 0u;
+            unsigned bf = 0u, nf = D, tj = 0u, cj = 0u;
             for (unsigned j = 0; j < nkt; j++) {
-                sm90_cp_wait<(int)S - 2>();
+                sm90_cp_wait<(int)D - 1>();
                 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                 __syncthreads();
+                copy_b(j + D, nf, flat ? j + D : qt * planes + gi * pg + qp);
+                if (++qp == pg) { qp = 0u; qt++; }
                 sm90_wg_fence();
 #pragma unroll
                 for (unsigned s2 = 0; s2 < 4u; s2++) {
@@ -6270,9 +6284,6 @@ __device__ __forceinline__ void spb_ring(const SpConvArgs& a, const SpbIn& si, c
                 }
                 sm90_wg_commit();
                 sm90_wg_wait<1>();
-                __syncthreads();
-                copy_b(j + S - 1u, nf, flat ? j + S - 1u : qt * planes + gi * pg + qp);
-                if (++qp == pg) { qp = 0u; qt++; }
                 bf = bf + 1u == S ? 0u : bf + 1u;
                 nf = nf + 1u == S ? 0u : nf + 1u;
             }
@@ -6285,8 +6296,8 @@ __device__ __forceinline__ void spb_ring(const SpConvArgs& a, const SpbIn& si, c
     }
 }
 /* The ring's stage count for the launch's claim: the largest S <= 4 beside the plan's A and params.
- * Two stages expose each refill (issued after the previous tile retires), so S < 3 keeps the
- * single-prefetch body. The ring's k-loop carries (tap, channel) counters and descriptor offsets
+ * Two stages leave no copy in flight under the MMAs (D = 0), so S < 3 keeps the single-prefetch
+ * body. The ring's k-loop carries (tap, channel) counters and descriptor offsets
  * instead of per-k-tile divisions: at these shapes that address math, not the copies or the MMAs,
  * bounded the old loop. It assumes cin >= 64 (at most one tap wrap per k-tile). */
 template <unsigned WN, bool ROWS, bool PRE, bool STREAM>
