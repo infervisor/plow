@@ -5560,6 +5560,10 @@ fn unwind_attach(
 /// `MemAvailable` of `/proc/meminfo` in bytes; `None` where it cannot be read.
 /// `(MemAvailable, MemTotal)` in bytes.
 pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
+    // Unit tests size mock tiers in bytes; the reserve (>= 16 GiB) would zero them on a small host.
+    if cfg!(test) {
+        return None;
+    }
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let field = |key: &str| -> Option<u64> {
         let line = text.lines().find(|l| l.starts_with(key))?;
