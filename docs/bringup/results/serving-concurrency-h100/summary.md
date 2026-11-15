@@ -617,6 +617,10 @@ Next experiments, in order:
 Blocked: hardware counters (profiler permission off on the box); per-op attribution uses knock-out
 builds (their extra global reads skew absolute times ~20 %, ratios only).
 
+State at the freeze: every run stopped, no lease or build in flight, nothing uncommitted. None of
+the experiments above has started; packets for the two 11-15 changes exist only as separate
+screens (stream output conv, ring attention), not combined.
+
 ## Evidence
 
 Campaign scratch `sconc`: `res/{base1,base2,peer1,steps1,w256b,codec1,asr2,asr3,asrhold,asrhold2,gather1,gather2,encbench,enc2,gate3,final1,roof}`,
