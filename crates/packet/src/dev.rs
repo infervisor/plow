@@ -2244,6 +2244,11 @@ pub enum DevOp {
     /// `[out_channels,in_channels,kernel]`; other implementations read that prefix.
     /// Optional `row_scale` f32 `[batch][out_rows]` scales each row after the output activation,
     /// before the residual: `out = residual + row_scale[b][t] * post(bias + conv)`.
+    /// Input-only SnakeBeta over a stream input (pre code snake + bits 2, 19 and 22, no post code;
+    /// speech flag layout 6): `t4=[a|r](f32[2*in_channels]) t5=state(f32[slots,L,in_channels])
+    /// t6=slot(u32[batch]) t7=pos(u32[batch])`, `L = (kernel-1)*dilation`; input row `u < L` of
+    /// item `b` is `state[slot[b]]` row `u` (zero while `pos[b] == 0`), row `u >= L` is `x` row
+    /// `b*(in_rows-L) + u - L`.
     /// `t0=out(f32[batch,out_rows,out_channels]) t1=x(f32[batch,in_rows,in_channels])
     /// t2=weight(f32|f16[out_channels,in_channels/groups,kernel]) t3=bias? t4=alpha?
     /// t5=residual? t6=lengths(u32[batch])? t7=row_scale?` ·

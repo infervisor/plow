@@ -1285,9 +1285,12 @@ fn program_for(
             (0, Some(0))
         };
         c.len = packet::dev::TENSOR_NONE;
-        // The bf16 taps arm reads [state; x] in place (no z, no separate input SnakeBeta); the
-        // state takes its new tail after the conv has read the old one.
-        if crate::codec::bf16_taps_ok(&c, splits.is_some()) {
+        // The bf16 taps arm and the staged input-SnakeBeta conv read [state; x] in place (no z, no
+        // separate input SnakeBeta); the state takes its new tail after the conv has read the old
+        // one. Both arms exist only in the Hopper objects that split-bf16 emits target.
+        if crate::codec::bf16_taps_ok(&c, splits.is_some())
+            || (splits.is_some() && crate::codec::staged_beta_ok(&c))
+        {
             c.stream_in = Some((state.clone(), io.slot, io.pos));
             let cin = c.cin;
             let e = fused_conv(p, fuse, splits, x, dep, c)?;
@@ -3191,6 +3194,26 @@ mod tests {
                             assert!(after(prog, w, k + 1), "z written before its store");
                         }
                         assert_eq!(insts[k + 2].t[1], z, "z consumed after its store");
+                        assert_eq!(d.i[0], b);
+                        assert!(
+                            carried.insert(name(d.t[2]).to_string(), d.i[1]).is_none(),
+                            "one carry per state"
+                        );
+                        assert_eq!(
+                            model.tensors[d.t[2] as usize].bytes,
+                            u64::from(STREAM_SLOTS * d.i[1] * d.i[3]) * 4
+                        );
+                    }
+                    // A conv that read [state; src] in place, then the store from src.
+                    Some(DevOp::StreamTailF32) if d.i[7] == 4 => {
+                        let conv = &insts[k - 1];
+                        assert_eq!(DevOp::from_u16(conv.op), Some(DevOp::Conv1dF32));
+                        assert!(plow_asset::speech_flag_layout::conv_stream_in(
+                            conv.op, conv.j[1]
+                        ));
+                        assert_eq!((conv.t[1], conv.t[5]), (d.t[1], d.t[2]));
+                        assert_eq!((conv.t[6], conv.t[7]), (d.t[3], d.t[5]));
+                        assert!(after(prog, k, k - 1));
                         assert_eq!(d.i[0], b);
                         assert!(
                             carried.insert(name(d.t[2]).to_string(), d.i[1]).is_none(),

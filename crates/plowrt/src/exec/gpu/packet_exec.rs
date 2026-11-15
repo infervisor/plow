@@ -126,7 +126,8 @@ fn speech_conv_arms(blob: &DevBlob) -> u64 {
 /// GemvF32Out row view (flag bit 12), bit 1 an AttentionF32 query view (flag bit 6),
 /// bit 2 FP16 LayerNorm output / projection operands, bit 3 ring KV, bit 4 a chunk-canonical K
 /// bf16 taps conv (an object without it would run the unchunked chain), bit 5 the fp16 short
-/// AttentionF32 (`j1` bit 31).
+/// AttentionF32 (`j1` bit 31), bit 6 the staged conv's input SnakeBeta over a stream input
+/// ([`plow_asset::speech_flag_layout::staged_input_beta`]).
 pub(super) fn speech_caps_required<'a>(
     insts: impl IntoIterator<Item = &'a packet::dev::DevInst64>,
 ) -> u32 {
@@ -145,10 +146,13 @@ pub(super) fn speech_caps_required<'a>(
             }
             Some(DevOp::StreamTailF32) if plow_asset::speech_flag_layout::ring_kv(d.op, &d.i) => 8,
             Some(DevOp::LayerNormF32) if d.i[2] & 8 != 0 => 4,
-            Some(DevOp::Conv1dF32)
-                if plow_asset::speech_flag_layout::conv_bf16_chunked(d.op, d.fj[2]) =>
-            {
-                16
+            Some(DevOp::Conv1dF32) => {
+                u32::from(plow_asset::speech_flag_layout::conv_bf16_chunked(
+                    d.op, d.fj[2],
+                )) << 4
+                    | u32::from(plow_asset::speech_flag_layout::staged_input_beta(
+                        d.op, d.fj[2],
+                    )) << 6
             }
             _ => 0,
         }
@@ -327,6 +331,22 @@ fn chunked_bf16_convs_require_the_capability() {
 
 #[cfg(test)]
 #[test]
+fn staged_input_beta_convs_require_the_capability() {
+    let mut d = packet::dev::DevInst64::default();
+    d.op = DevOp::Conv1dF32 as u16;
+    d.fj[2] = 0x226000 | 1 << 22;
+    assert_eq!(speech_caps_required([&d]), 0);
+    d.fj[2] |= 12 << 4 | 1 << 2 | 1 << 19;
+    assert_eq!(speech_caps_required([&d]), 64);
+    assert_eq!(missing_speech_caps(64, Some(38 | 16)), 64);
+    assert_eq!(missing_speech_caps(64, None), 64);
+    assert_eq!(missing_speech_caps(64, Some(38 | 64)), 0);
+    d.fj[2] |= 12 << 8;
+    assert_eq!(speech_caps_required([&d]), 0);
+}
+
+#[cfg(test)]
+#[test]
 fn ragged_conv_flags_require_the_speech_feature() {
     let (conv, convt) = (DevOp::Conv1dF32 as u16, DevOp::ConvTranspose1dF32 as u16);
     assert_eq!(speech_features([(conv, 0x6e000), (convt, 0xa000)]), 0);
@@ -471,6 +491,7 @@ fn load_conv_object(
         "plow_speech_conv_posts_hi_speech",
         "plow_speech_ops_lo_speech",
         "plow_speech_ops_hi_speech",
+        "plow_speech_caps_speech",
     ] {
         if be.module_global_u32(main, symbol)?
             != be.module_global_u32(&module, &format!("{symbol}conv"))?

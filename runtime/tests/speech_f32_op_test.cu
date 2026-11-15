@@ -1319,6 +1319,70 @@ static void t_conv_bf16_stream(const char* name, unsigned C, unsigned dil, unsig
     CK(cudaFree(td));
 }
 
+#if defined(PLOW_NV_HOPPER)
+/* The fused stream output conv (pre code snake + bits 2, 19 and 22, no post code): the staged
+ * few-output conv reading [state; src] in place with the input SnakeBeta in its staging, then
+ * StreamTailF32 store mode 4, against the unfused chain gather -> store -> UnaryF32 SnakeBeta ->
+ * staged conv over z (the 12 Hz codec's 96 -> 1 k7, flags 0x226000). Output (over sentinels) and
+ * every state byte bit for bit: fresh streams (pos 0, their slots NaN-poisoned) with n = N and
+ * n < L, n < L, n == L, n == 0, shuffled slots, partial tiles. */
+static void t_conv_staged_stream(const char* name, unsigned B, unsigned N) {
+    const unsigned slots = 6, C = 96, L = 6;
+    ConvSpec s{B, L + N, C, 1, 7, 1, 1, 1, 0, 0, 0, 0, 0, false, true, false, false, {}, 0.f, true};
+    s.wide = true; s.wg = true; s.pin = 1;
+    Case c; unsigned o;
+    build_conv(c, s, false, o);
+    c.in.fj[2].u &= ~(1u << 18);
+    const PlowDevInst conv = c.in;
+    const unsigned src = c.f32((size_t)B * N * C, 1.f), z = c.out((size_t)B * (L + N) * C);
+    const unsigned st_r = c.f32((size_t)slots * L * C, 1.f), st_f = c.add(c.host[st_r].size());
+    const unsigned ar = c.f32(2u * C, 0.4f, 0.6f);
+    std::vector<uint32_t> vs{3, 0, 5, 1, 4}, vn{N, std::min(L - 2u, N - 1u), std::min(L, N), 0u, std::min(2u, N)},
+        vp{0, 7, 4, 9, 0};
+    vs.resize(B); vn.resize(B); vp.resize(B);
+    for (unsigned b = 0; b < B; b++)
+        if (!vp[b])
+            for (size_t i = 0; i < (size_t)L * C; i++) {
+                const uint32_t nan = 0x7fc0deadu;
+                memcpy(c.host[st_r].data() + ((size_t)vs[b] * L * C + i) * 4, &nan, 4);
+            }
+    c.host[st_f] = c.host[st_r];
+    const unsigned slot = c.u32(vs), n = c.u32(vn), pos = c.u32(vp);
+    const unsigned o_f = c.out((size_t)B * N);
+    c.upload();
+    void** td = upload_table(c.dev);
+    auto launch = [&](const PlowDevInst& in) {
+        k_speech<<<g_nblk, 256, kSmem>>>(in, td);
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+    };
+    PlowDevInst g{}, st{}, un{}, cr = conv, cf = conv, sf{};
+    for (auto* i : {&g, &st, &un, &sf})
+        for (auto& t : i->t) t = PLOW_TENSOR_NONE;
+    st_inst(g, z, src, st_r, slot, n, pos, B, slots, L, N, C, C, 0, C, 0);
+    st_inst(st, PLOW_TENSOR_NONE, z, st_r, slot, n, PLOW_TENSOR_NONE, B, slots, L, N, C, C, 0, 0, 1);
+    un.op = PLOW_DOP_UNARY_F32; un.t[0] = z; un.t[1] = z; un.t[2] = ar;
+    un.i[0] = B * (L + N); un.i[1] = C; un.i[2] = 19;
+    cr.t[1] = z;
+    for (const PlowDevInst& i : {g, st, un, cr}) launch(i);
+    cf.t[0] = o_f; cf.t[1] = src; cf.t[4] = ar; cf.t[5] = st_f; cf.t[6] = slot; cf.t[7] = pos;
+    cf.fj[2].u |= (12u << 4) | (1u << 2) | (1u << 19) | (1u << 22);
+    st_inst(sf, PLOW_TENSOR_NONE, src, st_f, slot, n, pos, B, slots, L, N, C, C, 0, C, 4);
+    launch(cf);
+    launch(sf);
+    auto same = [&](unsigned x, unsigned y) {
+        std::vector<uint8_t> hx(c.host[x].size()), hy(c.host[y].size());
+        CK(cudaMemcpy(hx.data(), c.dev[x], hx.size(), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hy.data(), c.dev[y], hy.size(), cudaMemcpyDeviceToHost));
+        return hx == hy;
+    };
+    const bool out_ok = same(o, o_f), state_ok = same(st_r, st_f);
+    printf("  %-34s fused == chain: out %s, state %s\n", name, out_ok ? "PASS" : "FAIL", state_ok ? "PASS" : "FAIL");
+    if (!out_ok || !state_ok) g_fail = 1;
+    CK(cudaFree(td));
+}
+#endif
+
 static void t_conv_pinned() {
 #if defined(PLOW_NV_HOPPER) && PLOW_SPEECH_CONV_BF16
     t_conv_bf16();
@@ -1517,6 +1581,11 @@ static void t_conv_pinned() {
     t_conv_bf16_stream("Conv1dF32 bf16 stream 96 d9", 96, 9, 136);
     t_conv_bf16_stream("Conv1dF32 bf16 stream 192 d3", 192, 3, 70);
     t_conv_bf16_stream("Conv1dF32 bf16 stream 768 d9 groups", 768, 9, 32);
+#endif
+#if defined(PLOW_NV_HOPPER)
+    t_conv_staged_stream("Conv1dF32 staged beta stream N300", 5, 300);
+    t_conv_staged_stream("Conv1dF32 staged beta stream N1920", 3, 1920);
+    t_conv_staged_stream("Conv1dF32 staged beta stream N4", 5, 4);
 #endif
 #if PLOW_SPEECH_CONV_OBJECT
     t_conv_ring();

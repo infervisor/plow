@@ -6976,12 +6976,82 @@ static __device__ __noinline__ bool sp_conv1d_rows(const SpConvArgs& a, unsigned
     return true;
 }
 
+/* The staged conv's stream input with an input SnakeBeta [pa | pr] (sp_staged_beta): virtual row
+ * u < L of item b is state[slot[b]] row u (zero while pos[b] == 0), row u >= L is x row b * N + u - L,
+ * as StreamTailF32's gather would have built z. */
+struct SpStagedIn {
+    const float* state; const unsigned* slot; const unsigned* pos; const float* pa; const float* pr;
+    unsigned L, N;
+};
+/* Conv1dF32 pre code snake + flags bits 2, 19 and 22 without a post code, not the bf16 taps arm
+ * (devgen staged_input_beta, speech flag layout 6): the staged arm over SpStagedIn. */
+__device__ __forceinline__ bool sp_staged_beta(unsigned f) {
+    constexpr unsigned M = (15u << 4) | (15u << 8) | (1u << 2) | (1u << 19) | (1u << 22);
+    return (f & M) == ((12u << 4) | (1u << 2) | (1u << 19) | (1u << 22)) && !(((f >> 17) & 1u) && !((f >> 14) & 1u));
+}
+/* The generic fields with those bits taken out; t4 = [a | r] (2 cin), t5 = state, t6 = slot, t7 = pos.
+ * False outside the staged arm's contract (the caller traps: no other arm reads t5..t7 this way). */
+__device__ __forceinline__ bool sp_staged_beta_args(const PlowDevInst* in, void* const* T, SpConvArgs& a,
+                                                    SpStagedIn& si) {
+    PlowDevInst c = *in;
+    c.fj[2].u &= ~((15u << 4) | (1u << 2) | (1u << 19) | (1u << 22));
+    if (((in->fj[2].u >> 16) & 1u) || !sp_conv_args(&c, T, false, a)) return false;
+    si.state = a.residual; si.slot = a.lengths; si.pos = (const unsigned*)a.row_scale;
+    si.pa = a.alpha;
+    si.L = (a.kernel - 1u) * a.dil;
+    a.residual = nullptr; a.lengths = nullptr; a.row_scale = nullptr; a.alpha = nullptr; a.post_alpha = nullptr;
+    if (!si.state || !si.slot || !si.pos || !si.pa || a.in_rows <= si.L) return false;
+    si.pr = si.pa + a.cin;
+    si.N = a.in_rows - si.L;
+    return a.pinned() && a.groups == 1u && a.cout <= 4u && a.kernel > 1u && a.stride == 1u && a.mode == 0u &&
+           a.before == 0u && a.after == 0u && !a.splitk && !a.one && a.cin % 4u == 0u && sp_aligned(a.x, 16) &&
+           sp_aligned(si.state, 16) && sp_aligned(si.pa, 16);
+}
+/* sp_conv1d_staged's window over SpStagedIn: UnaryF32 SnakeBeta's expression on every element of a
+ * virtual row (the zero rows of a fresh stream too), the values the unfused gather + unary left in z.
+ * L2 loads: state and x may be written earlier in the same launch. */
+__device__ __forceinline__ void sp_staged_stream(const SpConvArgs& a, const SpStagedIn& si, float* xs, unsigned ld,
+                                                 unsigned window, unsigned b, unsigned t0) {
+    const unsigned C4 = a.cin / 4u, n4 = window * C4;
+    const float* xb = a.x + (size_t)b * si.N * a.cin;
+    const float* sb = si.pos[b] ? si.state + (size_t)si.slot[b] * si.L * a.cin : nullptr;
+    for (unsigned e0 = threadIdx.x; e0 < n4; e0 += 4u * PLOW_NV_THREADS) {
+        float4 v[4];
+#pragma unroll
+        for (unsigned q = 0; q < 4u; q++) {
+            const unsigned e = e0 + q * PLOW_NV_THREADS, r = e / C4, c = (e - r * C4) * 4u, u = t0 + r;
+            v[q] = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (e >= n4 || u >= a.in_rows) continue;
+            if (u >= si.L) v[q] = __ldcg((const float4*)(xb + (size_t)(u - si.L) * a.cin + c));
+            else if (sb) v[q] = __ldcg((const float4*)(sb + (size_t)u * a.cin + c));
+        }
+#pragma unroll
+        for (unsigned q = 0; q < 4u; q++) {
+            const unsigned e = e0 + q * PLOW_NV_THREADS, r = e / C4, c = (e - r * C4) * 4u;
+            if (e >= n4) break;
+            float* d = xs + (size_t)r * ld + c;
+            if (t0 + r >= a.in_rows) {
+                d[0] = d[1] = d[2] = d[3] = 0.f;
+                continue;
+            }
+            const float4 pa = __ldg((const float4*)(si.pa + c)), pr = __ldg((const float4*)(si.pr + c));
+            d[0] = fmaf(pr.x, sp_sin2(v[q].x * pa.x), v[q].x);
+            d[1] = fmaf(pr.y, sp_sin2(v[q].y * pa.y), v[q].y);
+            d[2] = fmaf(pr.z, sp_sin2(v[q].z * pa.z), v[q].z);
+            d[3] = fmaf(pr.w, sp_sin2(v[q].w * pa.w), v[q].w);
+        }
+    }
+}
+
 /* Few-output Conv1d (ungrouped, cout <= 4) that would run sp_conv1d_direct: the same per-output
  * fmaf chain (bias, then tap by tap, channel by channel, skipping padded taps), so the same bits,
  * with the input window and the weights staged through smem. A tile is TB consecutive output rows
  * of one item; TB (the widest of 256..32 whose window fits) depends on the shape alone. The input
- * activation is applied once per staged element. False when no TB fits (uniform per launch). */
-static __device__ __noinline__ bool sp_conv1d_staged(const SpConvArgs& a, unsigned slice, unsigned nblk, float* arena) {
+ * activation is applied once per staged element. False when no TB fits (uniform per launch).
+ * STREAM: the window comes from SpStagedIn (sp_staged_stream). */
+template <bool STREAM = false>
+static __device__ __noinline__ bool sp_conv1d_staged(const SpConvArgs& a, unsigned slice, unsigned nblk, float* arena,
+                                                     const SpStagedIn* si = nullptr) {
     const unsigned ld = a.cin | 1u, K = a.kernel * a.cin, span = a.dil * (a.kernel - 1u);
     /* Tiles size against the launch's claim: the rows only change which block computes an output. */
     unsigned TB = 256u;
@@ -6996,7 +7066,9 @@ static __device__ __noinline__ bool sp_conv1d_staged(const SpConvArgs& a, unsign
         const int length = (int)a.length(b), lo = (int)(t0 * a.stride) - (int)a.before;
         const float* xb = a.x + (size_t)b * a.in_rows * a.cin;
         __syncthreads();
-        if (vec) {
+        if constexpr (STREAM) {
+            sp_staged_stream(a, *si, xs, ld, window, b, t0);
+        } else if (vec) {
             /* Four float4 loads in flight per thread: one scalar load at a time is latency-bound. */
             const unsigned C4 = a.cin / 4u, n4 = window * C4;
             for (unsigned e0 = threadIdx.x; e0 < n4; e0 += 4u * PLOW_NV_THREADS) {
@@ -7058,6 +7130,15 @@ static __device__ __noinline__ void d_conv1d_f32(const PlowDevInst* in, void* co
                                     unsigned nblk, float* arena) {
     arena = sp_smem;
     SpConvArgs a;
+#if defined(PLOW_NV_HOPPER)
+    if (!transpose && sp_staged_beta(in->fj[2].u)) {
+        SpStagedIn si;
+        if (!sp_arm_on(SPA_STAGED) || !sp_staged_beta_args(in, T, a, si) ||
+            !sp_conv1d_staged<true>(a, slice, nblk, arena, &si))
+            __trap();
+        return;
+    }
+#endif
     if (!sp_conv_args(in, T, transpose, a)) return;
     if (a.one) { __trap(); return; }
     if (!transpose && ((in->fj[2].u >> 16) & 1u) && a.groups == 1u) {

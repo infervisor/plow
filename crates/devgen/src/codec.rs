@@ -631,7 +631,8 @@ pub(crate) struct Conv {
     /// Wgmma tiles may span taps / transposed-conv phases at widths % 4 (flag bit 3).
     pub(crate) wgmma_ragged: bool,
     /// A stream step's carried input `(state, slot, pos)`, read in place by the bf16 taps arm
-    /// ([`bf16_taps_ok`]): `x` holds the new rows, `in_rows` counts the carried ones too.
+    /// ([`bf16_taps_ok`]) or the staged input-SnakeBeta conv ([`staged_beta_ok`]): `x` holds the
+    /// new rows, `in_rows` counts the carried ones too.
     pub(crate) stream_in: Option<(String, u32, u32)>,
 }
 
@@ -661,6 +662,26 @@ pub(crate) fn bf16_taps_ok(c: &Conv, splits: bool) -> bool {
             c.in_rows - span,
         )
         .is_some()
+}
+
+/// `c` (unpadded, length-free) is a few-output conv whose input SnakeBeta runs in the staged arm's
+/// staging over a stream input read in place (pipeline [`crate::pipeline::staged_beta_ok`]).
+pub(crate) fn staged_beta_ok(c: &Conv) -> bool {
+    !c.transpose
+        && c.groups == 1
+        && c.stride == 1
+        && c.pad == 0
+        && c.pad_after.unwrap_or(0) == 0
+        && c.len == packet::dev::TENSOR_NONE
+        && c.residual.is_none()
+        && c.row_scale.is_none()
+        && c.act_in == Activation::SnakeBeta
+        && c.act_out == Activation::None
+        && c.alpha.is_some()
+        && c.alpha_out.is_none()
+        && !c.taps_wgmma
+        && c.in_rows > c.dilation * c.kernel.saturating_sub(1)
+        && crate::pipeline::staged_beta_ok(c.cin, c.cout, c.kernel, c.dilation)
 }
 
 /// `c` with the fusions `fuse` decides; an unfused piece runs as its own `UnaryF32` /
@@ -706,8 +727,13 @@ pub(crate) fn fused_conv(
         && c.act_in == Activation::SnakeBeta
         && c.act_out == Activation::SnakeBeta
         && unit.is_some();
-    if c.stream_in.is_some() && !bf16 {
-        return Err("codec conv: a stream input needs the bf16 taps arm".into());
+    // The staged arm reads a stream input in place with its input SnakeBeta in the staging.
+    let staged_beta = c.stream_in.is_some() && !bf16 && staged_beta_ok(&c);
+    if c.stream_in.is_some() && !bf16 && !staged_beta {
+        return Err(
+            "codec conv: a stream input needs the bf16 taps arm or the staged input-SnakeBeta conv"
+                .into(),
+        );
     }
     let dual = (dual && !taps) || pre_bf16;
     // An input SnakeBeta (two parameter arrays) only runs as its own unary pass.
@@ -723,7 +749,7 @@ pub(crate) fn fused_conv(
     let fuse_res =
         c.residual.is_some() && (c.row_scale.is_some() || fuse.residual(&c.weight, true));
     let (mut x, mut dep) = (x, dep);
-    if act_in && !fuse_in && !pre_bf16 {
+    if act_in && !fuse_in && !pre_bf16 && !staged_beta {
         let output = if c.input_is_temp {
             TensorRef::Handle(x)
         } else {
@@ -771,7 +797,7 @@ pub(crate) fn fused_conv(
             c.alpha_out.as_deref().map(TensorRef::Named)
         } else if out_alpha.is_some() {
             out_alpha.as_deref().map(TensorRef::Named)
-        } else if fuse_in {
+        } else if fuse_in || staged_beta {
             c.alpha.as_deref().map(TensorRef::Named)
         } else {
             None
@@ -789,7 +815,7 @@ pub(crate) fn fused_conv(
         pad_before: c.pad,
         pad_after: c.pad_after.unwrap_or(c.pad),
         pad_mode: PadMode::Zero,
-        input_activation: if fuse_in || pre_bf16 {
+        input_activation: if fuse_in || pre_bf16 || staged_beta {
             c.act_in
         } else {
             Activation::None

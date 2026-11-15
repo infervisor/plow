@@ -78,6 +78,7 @@ impl NativePacketTypes {
         let mut types = [None; 8];
         let mut copy = false;
         let mut read_output = false;
+        let mut read_state = false;
         let mut set = |slots: &[usize], dtype| {
             for &slot in slots {
                 types[slot] = Some(dtype);
@@ -98,12 +99,17 @@ impl NativePacketTypes {
             DevOp::StreamTailF32 => {
                 set(&[0, 1, 2], F32);
                 set(&[3, 4, 5], U32);
+                // Store-from-source keeps old state rows when fewer than L rows arrive.
+                read_state = d.i[7] == 4;
             }
             DevOp::Conv1dF32 | DevOp::ConvTranspose1dF32 => {
                 set(&[0, 1, 3, 4, 5], F32);
                 set(&[2], if d.fj[2] & (1 << 12) != 0 { F16 } else { F32 });
                 set(&[6], U32);
-                if op == DevOp::Conv1dF32 && d.fj[2] & (1 << 20) == 0 {
+                // A stream input's t5 / t6 / t7 = state / slot / pos.
+                if crate::speech_flag_layout::conv_stream_in(d.op, d.fj[2]) {
+                    set(&[7], U32);
+                } else if op == DevOp::Conv1dF32 && d.fj[2] & (1 << 20) == 0 {
                     set(&[7], F32);
                 }
             }
@@ -168,7 +174,7 @@ impl NativePacketTypes {
             }
             let access = &mut self.accesses[id];
             let write = writes.contains(&slot);
-            access.0 |= !write || (slot == 0 && read_output);
+            access.0 |= !write || (slot == 0 && read_output) || (slot == 2 && read_state);
             access.1 |= write;
             let root = self.root(id);
             if copy && slot < 2 {
@@ -287,6 +293,40 @@ mod tests {
                 assert_eq!(inferred.dtype(1).unwrap(), want);
             });
         }
+    }
+
+    #[test]
+    fn native_packet_types_store_from_source_reads_and_writes_state() {
+        let mut b = Builder::new(1);
+        b.force_uniseg();
+        let src = b.tensor("src", 64);
+        let state = b.tensor("state", 64);
+        let slot = b.tensor("slot", 4);
+        let n = b.tensor("n", 4);
+        let pos = b.tensor("pos", 4);
+        b.emit(DevOp::StreamTailF32, vec![0], &[], |d| {
+            d.t[..6].copy_from_slice(&[packet::dev::TENSOR_NONE, src, state, slot, n, pos]);
+            d.i = [1, 2, 2, 4, 4, 0, 4, 4];
+            d.j = [0, 2];
+        });
+        let m = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: b.tensors(),
+            progs: vec![b.finish()],
+            prog_t: vec![1],
+            kv_row_insts: vec![],
+            gen: vec![],
+        };
+        crate::program::with_model(&m, |packet| {
+            let inferred = NativePacketTypes::infer(packet, 0).unwrap();
+            assert_eq!(inferred.access(src as usize), Some(HandoffAccessMode::Read));
+            assert_eq!(
+                inferred.access(state as usize),
+                Some(HandoffAccessMode::ReadWrite)
+            );
+            assert_eq!(inferred.dtype(pos as usize).unwrap(), PipelineDType::U32);
+        });
     }
 
     #[test]

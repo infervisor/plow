@@ -1342,30 +1342,39 @@ extern "C" __device__ unsigned PLOW_SYM(plow_speech_conv_posts_hi) = (unsigned)(
 #else
 #define PLOW_SPEECH_CAP_CHUNKS 0u
 #endif
+/* bit 6: the staged few-output conv over a stream input with an input SnakeBeta (op_speech_f32.cuh
+ * sp_staged_beta). */
+#if defined(PLOW_NV_HOPPER)
+#define PLOW_SPEECH_CAP_STAGED_BETA 64u
+#else
+#define PLOW_SPEECH_CAP_STAGED_BETA 0u
+#endif
 #if defined(PLOW_SPEECH_RING_KV) && PLOW_SPEECH_RING_KV
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 46u | PLOW_SPEECH_CAP_CHUNKS;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 46u | PLOW_SPEECH_CAP_CHUNKS | PLOW_SPEECH_CAP_STAGED_BETA;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 10u;
 #endif
 /* Layout 4 adds the single-product bf16 wgmma convs (Conv1dF32 / ConvTranspose1dF32 i6 bit 31), 5 the
- * fp16 short attention (AttentionF32 j1 bit 31); every Hopper object runs both. */
+ * fp16 short attention (AttentionF32 j1 bit 31), 6 the staged conv's input SnakeBeta over a stream
+ * input; every Hopper object runs all three. */
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 5u;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 6u;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 3u;
 #endif
 #else
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 38u | PLOW_SPEECH_CAP_CHUNKS;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 38u | PLOW_SPEECH_CAP_CHUNKS | PLOW_SPEECH_CAP_STAGED_BETA;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_caps) = 2u;
 #endif
 /* The speech-op flag layout this object reads (plow_asset::speech_flag_layout::LAYOUT): a packet
- * layout 2 preserves layout 1 meanings and also accepts its packets. Hopper objects read layout 5
- * (single-product convs, fp16 short attention); ring KV stays behind capability bit 3. */
+ * layout 2 preserves layout 1 meanings and also accepts its packets. Hopper objects read layout 6
+ * (single-product convs, fp16 short attention, staged input SnakeBeta); ring KV stays behind
+ * capability bit 3. */
 #if defined(PLOW_NV_HOPPER)
-extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 5u;
+extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 6u;
 #else
 extern "C" __device__ unsigned PLOW_SYM(plow_speech_flag_layout) = 2u;
 #endif

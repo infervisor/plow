@@ -18,8 +18,9 @@ use packet::dev::{DevInst64, DevOp, TENSOR_NONE16};
 /// bits 13 / 14 (f16 input / output). Layout 3 adds slot-indexed ring attention and tail modes.
 /// Layout 4 adds single-product bf16 wgmma convs (Conv1dF32 / ConvTranspose1dF32 `i6` bit 31,
 /// above the dilation / output padding). Layout 5 adds the fp16 short attention (AttentionF32 `j1`
-/// bit 31, above `v_col0`). Every Hopper speech object exports 5; ring KV stays a capability.
-pub const LAYOUT: u32 = 5;
+/// bit 31, above `v_col0`). Layout 6 adds the staged conv's input SnakeBeta over a stream input
+/// ([`staged_input_beta`]). Every Hopper speech object exports 6; ring KV stays a capability.
+pub const LAYOUT: u32 = 6;
 pub const DEFAULT_LAYOUT: u32 = 2;
 /// `extern "C" __device__ unsigned` exported by every speech interpreter object.
 pub const OBJECT_SYMBOL: &str = "plow_speech_flag_layout_speech";
@@ -58,6 +59,14 @@ pub fn conv_arms(op: u16, i: &[u32; 8], pads: u32, f: u32) -> u64 {
     let bit = |n: u32| (f >> n) & 1 == 1;
     if !transpose && (bit(30) || (bit(17) && !bit(14))) {
         return 0;
+    }
+    // The wgmma arm declines it (sp_conv_args rejects the combination); the staged arm or a trap.
+    if staged_input_beta(op, f) {
+        return if bit(17) && !bit(16) {
+            WG | STAGED
+        } else {
+            STAGED
+        };
     }
     let (cin, cout, kernel, stride, groups) = (i[2], i[3], i[4], i[5], i[7].max(1));
     let (cg, ng) = (cin / groups, cout / groups);
@@ -261,6 +270,28 @@ pub fn is_ring_attention(flags: u32) -> bool {
     flags & 0xff08 == 0x108
 }
 
+/// A Conv1dF32 on the staged few-output arm reading its input in place as a stream (`[state[slot] ;
+/// x]`, t5 = state, t6 = slot, t7 = pos) under an input SnakeBeta (t4 = `[a | r]`, 2 x cin): pre
+/// code snake, bits 2, 19 and 22, no post code, not the bf16 taps arm (bit 17 without bit 14). Bit 22
+/// alone is the pinned FFMA choice; inside this combination it is the stream input. Layout 6,
+/// speech capability bit 6.
+pub fn staged_input_beta(op: u16, f: u32) -> bool {
+    const BITS: u32 = 1 << 2 | 1 << 19 | 1 << 22;
+    op == DevOp::Conv1dF32 as u16
+        && (f >> 4) & 15 == 12
+        && (f >> 8) & 15 == 0
+        && f & BITS == BITS
+        && !((f >> 17) & 1 == 1 && (f >> 14) & 1 == 0)
+}
+
+/// A Conv1dF32 whose t5 / t6 / t7 are a stream input's state / slot / pos: the bf16 taps arm with
+/// bit 22, or [`staged_input_beta`].
+pub fn conv_stream_in(op: u16, f: u32) -> bool {
+    op == DevOp::Conv1dF32 as u16
+        && ((f >> 17) & 1 == 1 && (f >> 14) & 1 == 0 && (f >> 22) & 1 == 1
+            || staged_input_beta(op, f))
+}
+
 /// A Conv1dF32 / ConvTranspose1dF32 whose wgmma products are one bf16 product per k16.
 pub fn single_product(op: u16, i: &[u32; 8]) -> bool {
     matches!(
@@ -312,7 +343,9 @@ pub fn required_layout(insts: impl IntoIterator<Item = (u16, u32, [u32; 8])>) ->
         .into_iter()
         .filter_map(|(op, j1, i)| {
             protected(op, j1, &i).then(|| {
-                if half_attention(op, j1) {
+                if staged_input_beta(op, j1) {
+                    6
+                } else if half_attention(op, j1) {
                     5
                 } else if single_product(op, &i) {
                     4
@@ -479,6 +512,44 @@ mod tests {
         assert_eq!(required_layout([half]), Some(5));
         assert!(check(Some(5), first_protected([half]), Some(4)).is_err());
         assert!(check(Some(5), first_protected([half]), Some(5)).is_ok());
+    }
+
+    #[test]
+    fn staged_input_beta_needs_layout_six_and_keeps_bit_22_alone_as_ffma() {
+        let (conv, convt) = (DevOp::Conv1dF32 as u16, DevOp::ConvTranspose1dF32 as u16);
+        // The 12 Hz codec's 96 -> 1 output conv: today's unfused flags, then the fused stream form.
+        let i = [8, 176, 96, 1, 7, 1, 1, 1];
+        let base = 0x226000;
+        let f = base | 12 << 4 | 1 << 2 | 1 << 19 | 1 << 22;
+        assert!(staged_input_beta(conv, f) && conv_stream_in(conv, f));
+        assert_eq!(required_layout([(conv, f, i)]), Some(6));
+        assert!(check(Some(6), first_protected([(conv, f, i)]), Some(5)).is_err());
+        assert!(check(Some(6), first_protected([(conv, f, i)]), Some(6)).is_ok());
+        assert_eq!(conv_arms(conv, &i, 0, f), conv_arm::WG | conv_arm::STAGED);
+        assert_eq!(conv_arms(conv, &i, 0, f & !(1 << 17)), conv_arm::STAGED);
+        assert_eq!(required_layout([(conv, base, i)]), Some(1));
+        assert_eq!(
+            conv_arms(conv, &i, 0, base),
+            conv_arm::WG | conv_arm::STAGED | conv_arm::DIRECT
+        );
+        for g in [
+            base | 1 << 22,
+            f & !(1 << 2),
+            f & !(1 << 19),
+            f & !(1 << 22),
+        ] {
+            assert!(
+                !staged_input_beta(conv, g) && !conv_stream_in(conv, g),
+                "{g:#x}"
+            );
+        }
+        assert_ne!(required_layout([(conv, base | 1 << 22, i)]), Some(6));
+        // A post code (the bf16 arm's dual SnakeBeta), the bf16 arm itself, or a ConvTranspose.
+        assert!(!staged_input_beta(conv, f | 12 << 8));
+        assert!(!staged_input_beta(conv, f & !(1 << 14)));
+        assert!(!staged_input_beta(convt, f));
+        assert!(!staged_input_beta(conv, 0x6eaccc) && conv_stream_in(conv, 0x6eaccc));
+        assert!(!conv_stream_in(conv, 0x6eaccc & !(1 << 22)));
     }
 
     /// Every bit the layout-0 (RC9, 45e1da259) emitters could set stays unprotected. The values

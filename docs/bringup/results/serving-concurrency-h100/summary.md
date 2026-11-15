@@ -447,6 +447,11 @@ ring, so the per-layer carry gather / store pairs are gone.
   one phase (N = cout, m64n192 / m64n96, direct stores): 384 -> 192 209 -> 112 us, 192 -> 96 218 ->
   153; bitwise equal to the 64-wide path over cropped edges and short items. Packet, PCM
   bit-identical: step b64 x f2 8.08 -> 7.93 ms, b32 x f2 5.45 -> 5.38, b16 x f17 13.25 -> 12.95.
+- Stream output conv (96 -> 1, k7, staged few-output arm): the carried-state gather, state store and
+  input SnakeBeta pass (0.31 ms of the b64 step) folded into the conv, which stages [state; x] in
+  place with the same SnakeBeta expression; the state then takes its tail from x after the conv
+  (speech flag layout 6, capability bit 6). Packet, PCM bit-identical: step b64 x f2 7.94 -> 7.60
+  ms, b32 x f2 5.39 -> 5.20, b16 x f17 12.95 -> 12.28, b1 x f1 3.09 -> 3.07.
 - One stream, one frame (b1 x f1, 3.6 ms) is the per-launch floor: its convs take 2.5 ms on 6-16
   blocks each (dec.in 124 us on 12 blocks, each 768-channel k7 ~120 us on 6), so a small launch
   streams the codec's weights through a few SMs.
