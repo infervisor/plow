@@ -452,6 +452,11 @@ ring, so the per-layer carry gather / store pairs are gone.
   place with the same SnakeBeta expression; the state then takes its tail from x after the conv
   (speech flag layout 6, capability bit 6). Packet, PCM bit-identical: step b64 x f2 7.94 -> 7.60
   ms, b32 x f2 5.39 -> 5.20, b16 x f17 12.95 -> 12.28, b1 x f1 3.09 -> 3.07.
+- Codec transformer ring attention (B64 N2, 71 carried rows, 16 heads): a 256-thread block per
+  (item, row, head) spent 62 us per call on seven barriers per unit. A warp per unit keeping the
+  block's per-thread reduction order (bitwise equal over counts to 256): step b64 x f2 7.93 ->
+  7.58 ms, b32 x f2 5.39 -> 5.23 (vs the previous packet); one unit per block or fewer (b1) keeps
+  the block body.
 - One stream, one frame (b1 x f1, 3.6 ms) is the per-launch floor: its convs take 2.5 ms on 6-16
   blocks each (dec.in 124 us on 12 blocks, each 768-channel k7 ~120 us on 6), so a small launch
   streams the codec's weights through a few SMs.
@@ -583,6 +588,34 @@ in the decoder.
   22 transformer programs stay ~1 ms each (dense ~48 TFLOP/s effective).
 - Rejected here: codec hold / deadline order knobs and a longer codec burst gather (5-9 % more
   Qwen3-TTS audio s/s, but 2-6x more streams with small underruns and a Maya2 regression).
+
+## Checkpoint 2026-11-15 (branch frozen at this commit)
+
+Qwen3-TTS codec stateful step, b64 x f2, every step PCM bit-identical to the one before:
+11.02 ms (released form) -> 9.69 (single-product bf16) -> 9.12 (ONE layout, BN128) -> 8.35 (k7
+divide-free ring) -> 8.07 (one-barrier ring, direct k1 stores) -> 7.93 (one-phase ConvT) -> 7.60
+(stream output conv fused) / 7.58 (warp ring attention), each measured against 7.93 separately.
+The combined packet, the served cells above and the CER gate have not been rerun since 11-13: the
+TTS table predates every codec change from 11-14 on.
+
+Next experiments, in order:
+
+| # | Experiment | Expected | State / notes |
+|---|---|---|---|
+| 1 | Emit the combined packet (both 11-15 changes), PCM vs previous, step A/B, CER gate, served c32 / c128 / c512 and open-loop rates vs vLLM-Omni | step b64 ~7.25 ms; first served read since 11-13 | owed before any recipe re-pin |
+| 2 | Recipe promotion: re-pin Qwen3-TTS (and Maya2 depth objects, owed since 11-13) to this branch | | after 1 |
+| 3 | Stream ConvTs read [state; x] in place with input SnakeBeta in the ConvTranspose loads (stage B of the output-conv fusion) | ~0.4 ms of gather + SnakeBeta at b64 (1536 / 768 / 384 / 192 ch sites) | design done; new capability bit, layout 6 already carries the encoding family |
+| 4 | Codec transformer (interpreter segment 0, 1.56 ms at b64): ~100 instructions at 2-8 us of fixed cost each; fuse RmsNorm / RoPE / SiLU-mul into the projection epilogues and prologues | 0.3-0.6 ms | split-K pins on these projections were negative (latency bound, not bandwidth) |
+| 5 | k1 + residual (96 ch 139 us vs ~92 floor): two independent 64-row warpgroup streams per block, or next-A carry under the epilogue | 96: ~110 us | resident B, bias cache and early residual loads gave nothing |
+| 6 | Fused residual unit at 96 / 192 ch (k7 -> SnakeBeta -> k1 -> residual in one pass) | 0.3+ ms at b64 | needs a fused-op contract |
+| 7 | k7 96 / 192 ch tensor efficiency (~700 cycles per k-tile for ~180 of MMA) | 10-20 % of k7 time | ordered warpgroup turns were negative |
+| 8 | Codec attention and Maya2 depth at the reference's precision (bf16 / fp16 boundaries) | parity + speed | parked tasks |
+| 9 | Maya2 depth M >= 16: canonical-K wgmma with split-K scratch, fp16 KV | depth b128 26.5 -> ~15 ms | capacity-invariance contract (M >= 16 bits == M = 257) |
+| 10 | ASR: 0.6B continuous-dense gate rerun (2 of 3), localize the decoder's concurrency dependence, re-pin ASR recipes | | open correctness item |
+| 11 | Loader integration tests for layout 6 / capability bit 6 (old object + new packet, new main + old conv object) and a dependent producer -> fused conv -> store chain inside one launch | test coverage | review follow-ups |
+
+Blocked: hardware counters (profiler permission off on the box); per-op attribution uses knock-out
+builds (their extra global reads skew absolute times ~20 %, ratios only).
 
 ## Evidence
 
