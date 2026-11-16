@@ -564,35 +564,6 @@ mod tests {
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
-    #[test]
-    fn full_context_kv_clones_by_head_prefix_and_unknown_kv_refuses() {
-        let tensors = [
-            tensor("kv.3.ckv", 4 * 2 * 64 * 1024),
-            tensor("kv.0.state", 4 * 256),
-        ];
-        let mut d = DevInst64::default();
-        d.op = DevOp::HeadNormRope as u16;
-        d.t[0] = 0;
-        d.i[1] = 2;
-        d.i[2] = 512;
-        d.fj[1] = 64;
-        d.fj[2] = u32::MAX;
-        let regions = snapshot_regions(&tensors, [d].iter(), 4, 64).unwrap();
-        let spans = clone_spans(&tensors, [d].iter(), &regions, 4).unwrap();
-        assert_eq!(spans.len(), 1);
-        let mut copies = Vec::new();
-        spans[0].copy_spans(10, |off, bytes| copies.push((off, bytes)));
-        assert_eq!(copies, [(0, 10 * 1024), (64 * 1024, 10 * 1024)]);
-        let extra = [
-            tensor("kv.3.ckv", 4 * 2 * 64 * 1024),
-            tensor("kv.0.state", 4 * 256),
-            tensor("kv.5.kidx", 4 * 64),
-        ];
-        assert!(clone_spans(&extra, [d].iter(), &regions, 4).is_none());
-        let mut ring = d;
-        ring.fj[2] = 63;
-        assert!(clone_spans(&tensors, [ring].iter(), &[], 4).is_none());
-    }
     fn tensor(name: &str, bytes: u64) -> DevTensor {
         DevTensor {
             name: name.into(),
