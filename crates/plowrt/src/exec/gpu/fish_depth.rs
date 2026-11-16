@@ -321,6 +321,7 @@ struct Maya2 {
     speech: SpeechFn,
     /// The null speaker's depth memory, `[layers][hidden]` (named, plain and `icl` voices).
     null_memory: Vec<f32>,
+    _control_module: Option<Module>,
 }
 
 #[derive(Clone)]
@@ -624,11 +625,22 @@ impl FishDepth {
         let maya2 = match (maya2, manifest.depth_sampling) {
             (true, Some([t, k])) => {
                 let speech = SpeechFn::load(e, assets, &section.programs, packet)?;
+                let control_cubin = assets.join("control_sample.cubin");
+                let control_mod = if control_cubin.exists() {
+                    let bytes = std::fs::read(&control_cubin).map_err(|source| RuntimeError::Io {
+                        path: control_cubin.clone(),
+                        source,
+                    })?;
+                    Some(e.be.module_load(&bytes)?)
+                } else {
+                    None
+                };
                 let device = if crate::config::RuntimeConfig::process_get().tts_device_control {
+                    let module = control_mod.as_ref().unwrap_or(&speech._module);
                     Some(super::control_sample::ControlledSample::load(
                         &e.be,
                         &e.stream,
-                        &speech._module,
+                        module,
                         e.batch,
                         stage_rows,
                         manifest.codebooks as usize,
@@ -650,6 +662,7 @@ impl FishDepth {
                     depth: (f32::from_bits(t), k),
                     speech,
                     null_memory: null_memory(e, &manifest)?,
+                    _control_module: control_mod,
                 })
             }
             _ => None,
