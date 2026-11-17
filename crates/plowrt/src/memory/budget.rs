@@ -31,7 +31,8 @@ pub struct GpuMemoryBudget {
 }
 
 impl GpuMemoryBudget {
-    /// Compute the unified memory budget for any model family (LLM, Sliding, Recurrent, TTS).
+    /// Compute the unified memory budget for any model family (LLM, Sliding, Recurrent, TTS)
+    /// across single-model or multi-model co-tenant deployments.
     pub fn compute(
         total_bytes: u64,
         free_bytes: u64,
@@ -70,11 +71,14 @@ impl GpuMemoryBudget {
 
         // 5. Dynamic KV cache / prefix block store budget.
         // Takes all remaining usable memory after the ring reservation.
+        // If an explicit cap is configured, it is respected but clamped to available usable room
+        // so that misconfigured large values never trigger out-of-memory errors.
+        let remaining_room = usable_room.saturating_sub(ring_park_cap_bytes);
         let explicit_cap = config.prefix_cache_cap_bytes(total_bytes);
         let kv_cache_cap_bytes = if explicit_cap > 0 {
-            explicit_cap
+            explicit_cap.min(remaining_room)
         } else {
-            usable_room.saturating_sub(ring_park_cap_bytes)
+            remaining_room
         };
 
         Self {
@@ -152,5 +156,62 @@ mod tests {
         let b = GpuMemoryBudget::compute(total, free, weights, batch, ring_charge, &cfg);
         assert_eq!(b.kv_cache_cap_bytes, 16384u64 << 20);
         assert_eq!(b.ring_park_cap_bytes, 32 * ring_charge);
+    }
+
+    #[test]
+    fn test_budget_multi_model_co_tenancy() {
+        // Co-tenancy: Model A already holds 40 GB on an 80 GB device.
+        // Model B (TTS) loads with only 25 GB free.
+        let total = 81559u64 << 20;
+        let free = 25000u64 << 20;
+        let weights = 5000u64 << 20;
+        let ring_charge = 0u64;
+        let batch = 64;
+        let cfg = test_config();
+
+        let b = GpuMemoryBudget::compute(total, free, weights, batch, ring_charge, &cfg);
+        assert_eq!(b.ring_park_slots, 0);
+        assert_eq!(b.ring_park_cap_bytes, 0);
+        // All usable headroom above floor goes to KV/audio token cache
+        assert_eq!(b.kv_cache_cap_bytes, b.usable_room_bytes());
+        assert!(b.kv_cache_cap_bytes > 20u64 << 30);
+    }
+
+    #[test]
+    fn test_budget_constrained_memory_guards() {
+        // High co-tenant pressure: only 4 GB free remaining.
+        let total = 81559u64 << 20;
+        let free = 4000u64 << 20;
+        let weights = 2000u64 << 20;
+        let ring_charge = 200u64 << 20;
+        let batch = 128;
+        let cfg = test_config();
+
+        let b = GpuMemoryBudget::compute(total, free, weights, batch, ring_charge, &cfg);
+        // Floor is preserved (free/8 = 500 MiB)
+        assert!(b.floor_bytes > 0);
+        // Ring park is strictly capped to at most half of usable room
+        assert!(b.ring_park_cap_bytes <= b.usable_room_bytes() / 2);
+        // KV cache cap plus ring park cap never exceeds usable room
+        assert!(b.ring_park_cap_bytes + b.kv_cache_cap_bytes <= b.usable_room_bytes());
+    }
+
+    #[test]
+    fn test_budget_explicit_cap_clamped_to_headroom() {
+        // Operator specifies an oversized 60 GiB cache cap, but only 30 GiB is usable.
+        let total = 81559u64 << 20;
+        let free = 32000u64 << 20;
+        let weights = 25000u64 << 20;
+        let ring_charge = 200u64 << 20;
+        let batch = 128;
+        let mut cfg = test_config();
+        cfg.decode_max_rung = Some(32);
+        cfg.vmm_cache_mib = Some(61440); // 60 GiB
+
+        let b = GpuMemoryBudget::compute(total, free, weights, batch, ring_charge, &cfg);
+        // Clamped to remaining usable room: never overcommits
+        let max_kv = b.usable_room_bytes().saturating_sub(b.ring_park_cap_bytes);
+        assert_eq!(b.kv_cache_cap_bytes, max_kv);
+        assert!(b.ring_park_cap_bytes + b.kv_cache_cap_bytes <= b.usable_room_bytes());
     }
 }
