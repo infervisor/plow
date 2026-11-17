@@ -12,6 +12,15 @@
 #
 # Gates: talker/predictor codes and logits vs the HF reference loop (scripts/tts/qwen3_tts_ref.py,
 # equal to the official `generate` greedy), Whisper CER of served speech, Seed-TTS-eval WER.
+#
+# 2026-11-17: High concurrency serving tuning and peer comparison vs Pipeshift & vLLM-Omni:
+# Pipeshift published TTFA: 12.7 ms (r1), 15.8 ms (r20), 18.1 ms (r30), 20.2 ms (r40); E2E p95: 440 ms (r20), 517 ms (r30).
+# vLLM-Omni (peer1/omni_tts): 18.66 ms TTFA (r1) to 31.68 ms (r40), but suffers catastrophic client underruns
+# under load (78 stalls at r4, 328 at r8, 658 at r12, 1174 at r20, 2388 at r40) due to coarse 25-frame chunks.
+# Plowrt serving (PLOW_TTS_STREAM_FIRST_FRAMES=1, PLOW_TTS_STREAM_STEP_FRAMES=1, PLOW_TTS_CODEC_SCHED=1,
+# PLOW_DECODE_PIPELINE=1, PLOW_MAX_HOLD_MS=0): 0 stalls across all rates (r1..r20), c1 TTFA 19.57 ms,
+# r20 107.66 audio s/s (med TTFA 42.44 ms, 0 failed), r30 157.63 audio s/s (med TTFA 58.98 ms, 0 stalls, 0 failed),
+# c64 148.30 audio s/s, c128 186.37 audio s/s, c256 182.39 audio s/s. Evidence: res/base2/qtts, res/ttsab-1p/p1.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -70,7 +79,7 @@ PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
 # Prompts are 10 rows + the text (streaming) or + the text again (non-streaming).
 PLOW_MAX_CHUNK = "512"
 PLOW_PF_LADDER_APPEND = "64,256"
-PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32,48,64,96,128,160,192,224,256"
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "48"
 # The 64-row prefill rung's projections as cuBLASLt segments: prefill 16.3 -> 8.5 ms, c1 TTFA p95
@@ -96,4 +105,5 @@ arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox --voice ryan", "
 cer_median_max = 0.05
 
 [serve]
-env = { PLOW_VMM_PREFIX = "1" }
+extra_args = "--decode-pipeline --max-hold-ms 0"
+env = { PLOW_VMM_LIVE = "1", PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1", PLOW_MAX_HOLD_MS = "0", PLOW_TTS_REALTIME = "0", PLOW_TTS_STREAM_FIRST_FRAMES = "1", PLOW_TTS_STREAM_STEP_FRAMES = "1", PLOW_TTS_CODEC_SCHED = "1" }
