@@ -109,6 +109,8 @@ PLOW_NV_FA_FOLD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
 PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
 PLOW_EMIT_CODEC_CONV_OBJECT = "20"
+PLOW_DEPTH_FUSE = "1"
+PLOW_DEPTH_ROWS = "6,12,20,24,36"
 
 [capabilities]
 masked_padding = "structural: request chunk limits (masked padding) are Gemma 4 only (crates/devgen/src/lib.rs:9382), and the packed contract needs the plow_pf_masked_padding_abi object capability (crates/plow-asset/src/packed_prefill.rs:87), which only the hd256/hd512 attention and Gemma 4 GLU objects declare; Maya2 is hd128 GQA2 on interp_sm90a*. Unmasked pad rows fit: prompts < 512 rows, max_ctx 2048"
@@ -127,4 +129,4 @@ cer_median_max = 0.05
 
 [serve]
 extra_args = "--decode-pipeline --max-hold-ms 0"
-env = { PLOW_VMM_LIVE = "1", PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1", PLOW_MAX_HOLD_MS = "0", PLOW_TTS_REALTIME = "0", PLOW_TTS_DEVICE_CONTROL = "1", PLOW_TTS_STREAM_FIRST_FRAMES = "1", PLOW_TTS_STREAM_STEP_FRAMES = "1", PLOW_PF_SEG_GRAPH = "0", PLOW_PF_INTERLEAVE = "128", PLOW_TICK_DELIVERY = "1", PLOW_TTS_CODEC_SCHED = "1" }
+env = { PLOW_VMM_LIVE = "1", PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1", PLOW_MAX_HOLD_MS = "0", PLOW_TTS_REALTIME = "0", PLOW_TTS_DEVICE_CONTROL = "1", PLOW_TTS_STREAM_FIRST_FRAMES = "1", PLOW_TTS_STREAM_STEP_FRAMES = "1", PLOW_PF_SEG_GRAPH = "0", PLOW_PF_INTERLEAVE = "128", PLOW_TICK_DELIVERY = "1", PLOW_TTS_CODEC_SCHED = "1", PLOW_MAX_QUEUED_REQUESTS = "4096" }
