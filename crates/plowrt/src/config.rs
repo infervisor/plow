@@ -617,18 +617,8 @@ pub struct RuntimeConfig {
     /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to the
     /// prefix cache. Default 0: no static cap; the cache grows into free memory and pressure
     /// eviction (`--vmm-cache-min-free-mib`) or allocation OOM evicts it, as vLLM's prefix
-    /// cache uses every free KV block. `--vmm-cache-mib` sets an explicit size.
-    #[arg(
-        long = "vmm-cache-memory-utilization",
-        env = "PLOW_VMM_CACHE_MEMORY_UTILIZATION",
-        default_value_t = 0.0,
-        value_parser = clap::value_parser!(f64),
-        global = true
-    )]
-    pub vmm_cache_memory_utilization: f64,
-
-    /// Explicit soft cap on prefix blocks and boundary snapshots in MiB; overrides
-    /// `--vmm-cache-memory-utilization`. 0 = OOM-driven eviction only.
+    /// Explicit soft cap on prefix blocks and boundary snapshots in MiB.
+    /// 0 or unset = dynamic unified headroom budgeting (OOM-driven pressure eviction only).
     #[arg(long = "vmm-cache-mib", env = "PLOW_VMM_CACHE_MIB", global = true)]
     pub vmm_cache_mib: Option<u32>,
 
@@ -3058,10 +3048,8 @@ impl RuntimeConfig {
     }
 
     /// Prefix-cache soft cap in bytes for a device with `device_bytes` of memory.
-    /// An explicit `--vmm-cache-mib` wins; otherwise `--vmm-cache-memory-utilization`
-    /// of the device. `device_bytes == 0` means the backend could not say, and the cap
-    /// falls back to the 4 GiB the H100 campaign qualified rather than to "unbounded".
-    pub(crate) fn prefix_cache_cap_bytes(&self, device_bytes: u64) -> u64 {
+    /// An explicit `--vmm-cache-mib` wins; otherwise 0 (dynamic headroom budgeting).
+    pub(crate) fn prefix_cache_cap_bytes(&self, _device_bytes: u64) -> u64 {
         let allow_env = !Self::is_initialized();
         let explicit: Option<u32> = if allow_env {
             Self::env_parse("PLOW_VMM_CACHE_MIB").or(self.vmm_cache_mib)
@@ -3071,20 +3059,7 @@ impl RuntimeConfig {
         if let Some(mib) = explicit {
             return (mib as u64) << 20;
         }
-        let fraction = select_compat(
-            self.vmm_cache_memory_utilization,
-            Self::env_parse("PLOW_VMM_CACHE_MEMORY_UTILIZATION"),
-            allow_env,
-        )
-        .clamp(0.0, 1.0);
-        if fraction == 0.0 {
-            return 0;
-        }
-        if device_bytes == 0 {
-            return 4096u64 << 20;
-        }
-        // Whole MiB, so the figure in logs and metrics reads like the knob.
-        ((device_bytes as f64 * fraction) as u64) >> 20 << 20
+        0
     }
 
     /// The free-device-memory floor the prefix cache evicts to hold, in bytes, for a device
@@ -4115,25 +4090,18 @@ mod tests {
             .find(|arg| arg.get_id() == "vmm_cache_mib")
             .unwrap();
         assert!(budget.get_default_values().is_empty());
-        let fraction = command
-            .get_arguments()
-            .find(|arg| arg.get_id() == "vmm_cache_memory_utilization")
-            .unwrap();
-        assert_eq!(fraction.get_default_values(), ["0"]);
-        // No static cap by default: the cache grows until pressure or OOM evicts it.
+        // No static cap by default: dynamic headroom budgeting partitions usable VRAM.
         let matches = command.clone().try_get_matches_from(["test"]).unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 0);
         assert_eq!(config.prefix_cache_cap_bytes(0), 0);
-        // An explicit fraction scales with the device; an unknown size keeps 4 GiB.
+        // An explicit --vmm-cache-mib sets the soft cap.
         let matches = command
             .clone()
-            .try_get_matches_from(["test", "--vmm-cache-memory-utilization=0.05"])
+            .try_get_matches_from(["test", "--vmm-cache-mib=4096"])
             .unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 4096 << 20);
-        assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 9830 << 20);
-        assert_eq!(config.prefix_cache_cap_bytes(0), 4096 << 20);
         for (flag, expected) in [("--vmm-prefix", true), ("--vmm-prefix=false", false)] {
             let matches = command
                 .clone()
