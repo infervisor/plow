@@ -27,6 +27,11 @@
 # 263 -> 137; PCM vs the TF32 packet 94 dB SNR. Served vs the same-commit base, same plowrt: c32
 # 65 -> 72 audio s/s, c128 110 -> 141, 20 req/s median TTFA 129 -> 70 ms, 40 req/s 147 -> 161;
 # tts_cer CER median 0.000 (n=48), as base. Evidence: <lab scratch>/sconc res/mab, m2, gate-m2bc.
+# 2026-11-17: Production serving concurrency tuning (PLOW_TTS_STREAM_FIRST_FRAMES=1, PLOW_TTS_STREAM_STEP_FRAMES=1,
+# PLOW_TTS_CODEC_SCHED=1, PLOW_DECODE_PIPELINE=1, PLOW_MAX_HOLD_MS=0). Served vs vendor baseline:
+# r2 12.07 vs 9.61 audio s/s (+25.6%), r5 30.78 vs 23.95 (+28.5%), r10 56.90 vs 47.08 (+20.8%),
+# r20 111.11 vs 92.10 (+20.6%), 99.5% SLO attainment (<500ms TTFA), 0 failed out of 1178 requests;
+# c1 TTFA 20.70 ms (0 stalls, 0 gaps), c8 0 stalls; tts_cer CER median 0.000 (n=16). Evidence: res/maya2-step1.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
