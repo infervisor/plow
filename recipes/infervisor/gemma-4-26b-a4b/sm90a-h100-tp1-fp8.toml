@@ -260,6 +260,8 @@ PLOW_VMM_STRICT_PUBLISH = "1"
 # 4 GiB: 452 frees, 0.90x/0.86x and 1.43x*/0.67x (one 961 ms cell, spread 78%), not taken.
 PLOW_KV_POOL_MIB = "2048"
 PLOW_MAX_QUEUED_REQUESTS = "4096"
+PLOW_DECODE_CUBLASLT_MIN_ROWS = "64"
+PLOW_SPEC_RIDE = "2"
 
 # Speculative decoding drafter (Gemma-4 assistant MTP, 4 layers over target layers 28/29 KV): emit = true builds span
 # verify (decode objects plus their `_rs` row-slot twins) and the draft programs into the packet, the drafter reads the

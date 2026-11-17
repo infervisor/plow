@@ -1063,6 +1063,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.multistep", Some("PLOW_MULTISTEP"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.tts_stream_windows", Some("PLOW_TTS_STREAM_WINDOWS"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_pipeline", Some("PLOW_DECODE_PIPELINE"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
+    KnobSpec::new("rt.decode_cublaslt_min_rows", Some("PLOW_DECODE_CUBLASLT_MIN_ROWS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.spec", Some("PLOW_SPEC"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.spec_sampled", Some("PLOW_SPEC_SAMPLED"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.spec_sampled_kmax", Some("PLOW_SPEC_SAMPLED_KMAX"), Layer::Runtime, U32, Default::Static(Val::Nat(3)), PROMOTED),

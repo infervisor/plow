@@ -6513,13 +6513,33 @@ impl GpuEngine {
                 .enumerate()
                 .map(|(index, g)| {
                     let program = blob.progs.len() - blob.decode_progs().len() + index;
-                    let projection_roles = segment_roles
-                        .as_ref()
-                        .and_then(|r| r.program(program))
-                        .map(|p| &p.roles)
-                        .filter(|roles| {
-                            roles.iter().copied().any(plow_asset::segment_roles::is_projection)
-                        });
+                    let rows = packet::devbuild::program_rows(g.t);
+                    let lt_min = crate::config::RuntimeConfig::get().nv.decode_cublaslt_min_rows;
+                    let projection_roles = if lt_min > 0 && rows < lt_min {
+                        if segment_roles
+                            .as_ref()
+                            .and_then(|r| r.program(program))
+                            .map(|p| &p.roles)
+                            .is_some_and(|roles| {
+                                roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                            })
+                        {
+                            tracing::info!(
+                                rows,
+                                lt_min,
+                                "decode rung kept native for speculative verify (below decode_cublaslt_min_rows)"
+                            );
+                        }
+                        None
+                    } else {
+                        segment_roles
+                            .as_ref()
+                            .and_then(|r| r.program(program))
+                            .map(|p| &p.roles)
+                            .filter(|roles| {
+                                roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                            })
+                    };
                     let mut rung = if let (Some(lt), Some(roles)) = (&cublaslt, projection_roles) {
                         let segments = cublaslt::decode_segments(g, &blob.tensors, roles)?;
                         let moe_segments =

@@ -1544,6 +1544,17 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "decode-pipeline", env = "PLOW_DECODE_PIPELINE", hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_pipeline: Option<bool>,
 
+    /// Minimum decode rung rows to route through cuBLASLt (CUDA). Rungs narrower than this run
+    /// natively in the decode interpreter, leaving them available for speculative decode verify.
+    /// Default 0 uses the emitted packet's projection roles as-is.
+    #[arg(
+        long = "decode-cublaslt-min-rows",
+        env = "PLOW_DECODE_CUBLASLT_MIN_ROWS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub decode_cublaslt_min_rows: u32,
+
     /// Speculative decoding with the packet's drafter (CUDA; packets emitted with
     /// `PLOW_EMIT_SPEC`): pure decode ticks of greedy rows draft and verify when the measured
     /// plan beats the plain step. Off by default.

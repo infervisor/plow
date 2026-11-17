@@ -13,6 +13,7 @@ server reported as cached (usage.prompt_tokens_details.cached_tokens or X-Sessio
 """
 import argparse
 import json
+import os
 import random
 import statistics
 import threading
@@ -45,12 +46,14 @@ def pct(v, p):
     return v[min(len(v) - 1, int(round(p / 100 * (len(v) - 1))))] if v else float("nan")
 
 
-def turn(port, model, messages, session, max_tokens):
+def turn(port, model, messages, session, max_tokens, api_key=None):
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0,
             "ignore_eos": True, "stream": True, "stream_options": {"include_usage": True}}
     h = {"Content-Type": "application/json"}
     if session:
         h["X-Session-Id"] = session
+    if api_key:
+        h["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), h)
     t0 = time.perf_counter()
     ttft, stamps, text, usage = None, [], [], None
@@ -86,6 +89,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--think", type=float, default=0.5)
     ap.add_argument("--no-session", action="store_true")
+    ap.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY") or os.environ.get("VLLM_API_KEY"))
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     results, lock = [], threading.Lock()
@@ -97,7 +101,7 @@ def main():
         sess = None if a.no_session else f"call-{k}-{int(time.time())}"
         for t in range(a.turns):
             msgs.append({"role": "user", "content": UTTER[(k + t) % len(UTTER)] + f" (call {k}, turn {t})"})
-            r = turn(a.port, a.model, msgs, sess, a.max_tokens)
+            r = turn(a.port, a.model, msgs, sess, a.max_tokens, a.api_key)
             r.update(call=k, turn=t)
             with lock:
                 results.append(r)
