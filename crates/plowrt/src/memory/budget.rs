@@ -214,4 +214,40 @@ mod tests {
         assert_eq!(b.kv_cache_cap_bytes, max_kv);
         assert!(b.ring_park_cap_bytes + b.kv_cache_cap_bytes <= b.usable_room_bytes());
     }
+
+    #[test]
+    fn test_budget_multi_model_co_serving_sequential() {
+        // Co-serving: Model 1 (Gemma 26B hybrid) loads first on 80 GB card.
+        let total = 81559u64 << 20;
+        let free_initial = 78000u64 << 20;
+        let weights_1 = 25000u64 << 20;
+        let ring_charge_1 = 200u64 << 20;
+        let batch_1 = 128;
+        let mut cfg_1 = test_config();
+        cfg_1.decode_max_rung = Some(32);
+
+        // After loading model 1 weights, free memory drops
+        let free_after_1 = free_initial - weights_1;
+        let b1 = GpuMemoryBudget::compute(total, free_after_1, weights_1, batch_1, ring_charge_1, &cfg_1);
+        assert_eq!(b1.concurrency_cap, 32);
+        assert_eq!(b1.ring_park_slots, 32);
+        assert!(b1.ring_park_cap_bytes + b1.kv_cache_cap_bytes <= b1.usable_room_bytes());
+
+        // Model 2 (TTS Maya2 or Qwen full attention) loads on the same GPU.
+        let weights_2 = 12000u64 << 20;
+        let ring_charge_2 = 0u64; // Pure full attention / audio
+        let batch_2 = 64;
+        let cfg_2 = test_config();
+
+        // Device free memory when model 2 loads reflects model 1's presence
+        let free_after_2 = free_after_1.saturating_sub(weights_2);
+        let b2 = GpuMemoryBudget::compute(total, free_after_2, weights_2, batch_2, ring_charge_2, &cfg_2);
+        assert_eq!(b2.ring_park_slots, 0);
+        assert_eq!(b2.ring_park_cap_bytes, 0);
+        assert_eq!(b2.kv_cache_cap_bytes, b2.usable_room_bytes());
+        assert!(b2.ring_park_cap_bytes + b2.kv_cache_cap_bytes <= b2.usable_room_bytes());
+        // Both models respect their respective usable rooms safely
+        assert!(b1.usable_room_bytes() > b2.usable_room_bytes());
+        assert!(b2.usable_room_bytes() > 30u64 << 30);
+    }
 }
