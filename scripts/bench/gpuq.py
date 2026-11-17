@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import platform
+import signal
 import sys
 import time
 import uuid
@@ -48,6 +49,50 @@ def tenant_blocks(audit, ngpu, vendor=None):
     return ngpu >= total or total - len(busy) < ngpu
 
 
+def wait_process(child, cancellation):
+    stopping = False
+    while True:
+        if cancellation.exists() and not stopping:
+            child.terminate()
+            stopping = True
+        try:
+            return child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def wait_job(path, runner):
+    cancellation = path.with_suffix(".cancel")
+    interrupted = 0
+    def stop(signum, frame):
+        nonlocal interrupted
+        interrupted = signum
+        cancellation.touch()
+    previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+    offset = 0
+    try:
+        while True:
+            job = json.loads(path.read_text())
+            log = path.with_suffix(".log")
+            if log.exists():
+                with log.open() as stream:
+                    stream.seek(offset)
+                    output = stream.read()
+                    offset = stream.tell()
+                if output:
+                    print(output, end="", flush=True)
+            if job["state"] in ("done", "failed", "cancelled"):
+                rc = job.get("rc", 0)
+                return 128 + interrupted if interrupted else (128 - rc if rc < 0 else rc)
+            if runner.poll() not in (None, 0):
+                cancellation.touch()
+                return runner.returncode
+            time.sleep(0.5)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def work(root):
     render_nodes = list(Path("/dev/dri").glob("renderD*"))
     if Path("/dev/kfd").exists() and (not render_nodes or not all(os.access(p, os.R_OK | os.W_OK) for p in render_nodes)):
@@ -71,6 +116,11 @@ def work(root):
             # Do not run a benchmark alongside a server that bypassed the lease locks.
             metal = platform.system() == "Darwin"
             path, job = pending[0]
+            cancellation = path.with_suffix(".cancel")
+            if cancellation.exists():
+                job.update(state="cancelled", rc=0, finished=time.time())
+                save(path, job)
+                continue
             # Mixed NVIDIA+AMD box: gpulease keeps one pool per vendor and refuses a lease without one.
             vendor = ["--vendor", job["vendor"]] if job.get("vendor") else []
             # Named cards (possibly both vendors): gpulease waits for exactly those and audits them.
@@ -97,10 +147,11 @@ def work(root):
                                          cwd=job["cwd"], env=child_env, stdout=log, stderr=subprocess.STDOUT)
                 job["pid"] = child.pid
                 save(path, job)
-                rc = child.wait()
+                rc = wait_process(child, cancellation) if job.get("wait") else child.wait()
                 if metal_lock is not None:
                     metal_lock.close()
-            job.update(state="done" if rc == 0 else "failed", rc=rc, finished=time.time())
+            state = "cancelled" if cancellation.exists() else "done" if rc == 0 else "failed"
+            job.update(state=state, rc=rc, finished=time.time())
             save(path, job)
             idle = time.monotonic()
 
@@ -116,6 +167,8 @@ def main():
     submit = sub.add_parser("submit")
     submit.add_argument("--enqueue-only", action="store_true",
                         help="queue for a host runner without starting a local runner")
+    submit.add_argument("--wait", action="store_true",
+                        help="stay in the foreground, stream logs, return the job's status; signals cancel the job")
     submit.add_argument("label")
     submit.add_argument("ngpu", type=int)
     submit.add_argument("command", nargs=argparse.REMAINDER)
@@ -147,13 +200,16 @@ def main():
         job_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         save(root / (job_id + ".json"), dict(state="queued", label=args.label, ngpu=args.ngpu,
              command=args.command, cwd=os.getcwd(), submitted=time.time(), lease_timeout=lease_timeout,
-             vendor=args.vendor, devices=args.devices))
+             vendor=args.vendor, devices=args.devices, wait=args.wait))
+        runner = None
         if not args.enqueue_only:
             with (root / "runner.log").open("ab") as log:
-                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "run"],
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                 start_new_session=True)
-        print(job_id)
+                runner = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "run"],
+                                          stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                          start_new_session=True)
+        print(job_id, flush=True)
+        if args.wait:
+            sys.exit(wait_job(root / (job_id + ".json"), runner))
 
 
 if __name__ == "__main__":

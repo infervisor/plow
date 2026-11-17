@@ -8737,18 +8737,13 @@ impl AmdEngine {
         let find = |name: &str| blob.tensors.iter().position(|t| t.name == name);
         let bytes_of = |name: &str| find(name).map(|i| blob.tensors[i].bytes);
         let packet_max_ctx = (bytes_of("in.pos")? / 4) as u32;
-        let max_ctx = crate::config::RuntimeConfig::get()
-            .rt_max_ctx
-            .map(|c| c as u32)
-            .unwrap_or(packet_max_ctx)
-            .min(packet_max_ctx);
         let batch = u32::try_from(batch).ok()?;
 
         let kv = match hsaco_kv {
             Some(kv) => Some(kv.clone()),
             None => plow_asset::serve_manifest::KvGeometry::from_config(ckpt),
         };
-        let mut geo = match kv.and_then(|kv| VmmGeometry::from_kv(&kv, max_ctx, batch)) {
+        let mut geo = match kv.and_then(|kv| VmmGeometry::from_kv(&kv, packet_max_ctx, batch)) {
             Some(g) => g,
             None => {
                 tracing::warn!("vmm off: no usable KV geometry in the serve manifest");

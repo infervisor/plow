@@ -5439,7 +5439,9 @@ fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
     }
     inner.by_id.remove(&snap.id);
     policy::unlink_snapshot(s, inner, &snap);
-    inner.stats.snapshots_evicted += 1;
+    if inner.drop_mech != Mechanism::Retire {
+        inner.stats.snapshots_evicted += 1;
+    }
     match snap.store {
         SnapStore::Device(va) => {
             inner.stats.snapshot_bytes -= snap.bytes;

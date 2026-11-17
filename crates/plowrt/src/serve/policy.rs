@@ -63,13 +63,18 @@ pub enum Class {
 /// profiles, so the band sits between them and a C8 workload does not oscillate.
 const WIDE_ENTER: usize = 8;
 const WIDE_LEAVE: usize = 4;
+/// Queue depth at or above which the window enters high-concurrency immediately, and the depth
+/// it must fall back to before calm countdown can start. Entering requires >= 2 to avoid
+/// flapping on transient single-request arrival bursts at low load.
+const QUEUE_ENTER: usize = 2;
+const QUEUE_LEAVE: usize = 0;
 /// How long the window must stay narrow before throughput hands back to latency: long enough
 /// that a burst's tail does not flip the class twice inside one request's decode. Entering
 /// throughput is immediate — latency rules under load cost E4B c64/c128 15-20% tok/s and up to
 /// 15x TTFT (queue-sized packing serialises a burst), while throughput rules at low load cost
 /// little. Wall time, not ticks: an idle server runs no ticks, and a tick-counted dwell held a
 /// fresh burst on the latency rules for its first 200 ticks.
-const CALM_MS: u64 = 2000;
+const CALM_MS: u64 = 5000;
 const NOT_CALM: u64 = u64::MAX;
 /// Share of the KV budget live sequences reserve at or above which the window is
 /// high-concurrency whatever its width (a few long prompts fill the device as surely as many
@@ -116,9 +121,9 @@ fn decide(current: Class, calm_since: u64, now: u64, load: Load) -> (Class, u64)
         queued,
         kv_used,
     } = load;
-    if width >= WIDE_ENTER || queued > 0 || kv_used >= KV_ENTER {
+    if width >= WIDE_ENTER || queued >= QUEUE_ENTER || kv_used >= KV_ENTER {
         (Class::HighConcurrency, NOT_CALM)
-    } else if width <= WIDE_LEAVE && kv_used < KV_LEAVE && current == Class::HighConcurrency {
+    } else if width <= WIDE_LEAVE && queued <= QUEUE_LEAVE && kv_used < KV_LEAVE && current == Class::HighConcurrency {
         let since = if calm_since == NOT_CALM {
             now
         } else {
@@ -379,6 +384,12 @@ mod tests {
             queued,
             kv_used,
         }
+    }
+
+    #[test]
+    fn single_waiting_request_does_not_flap_to_throughput() {
+        let (c, calm) = decide(Class::Realtime, NOT_CALM, 10, load(1, 1, 0.0));
+        assert_eq!((c, calm), (Class::Realtime, NOT_CALM));
     }
 
     #[test]

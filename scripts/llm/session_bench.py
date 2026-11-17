@@ -46,8 +46,8 @@ def pct(v, p):
     return v[min(len(v) - 1, int(round(p / 100 * (len(v) - 1))))] if v else float("nan")
 
 
-def turn(port, model, messages, session, max_tokens, api_key=None):
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0,
+def turn(port, model, messages, session, max_tokens, api_key=None, temperature=0.0):
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
             "ignore_eos": True, "stream": True, "stream_options": {"include_usage": True}}
     h = {"Content-Type": "application/json"}
     if session:
@@ -74,8 +74,9 @@ def turn(port, model, messages, session, max_tokens, api_key=None):
                     stamps.append(now)
                     text.append(piece)
     tpot = (stamps[-1] - stamps[0]) / (len(stamps) - 1) if len(stamps) > 1 else float("nan")
+    itls = [(stamps[i] - stamps[i - 1]) * 1e3 for i in range(1, len(stamps))]
     cached = max(((usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens") or 0, hdr_cached)
-    return {"ttft": ttft, "tpot": tpot, "text": "".join(text), "out": len(stamps),
+    return {"ttft": ttft, "tpot": tpot, "itls": itls, "text": "".join(text), "out": len(stamps),
             "prompt": (usage or {}).get("prompt_tokens", 0), "cached": cached or 0}
 
 
@@ -84,11 +85,14 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokenizer", default=None)
+    ap.add_argument("--system-repeat", type=int, default=2)
     ap.add_argument("--calls", type=int, default=64)
     ap.add_argument("--turns", type=int, default=6)
     ap.add_argument("--max-tokens", type=int, default=48)
+    ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--think", type=float, default=0.5)
     ap.add_argument("--no-session", action="store_true")
+    ap.add_argument("--unique-system", action="store_true", help="Give each call a unique per-session middle block (MYA pattern)")
     ap.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY") or os.environ.get("VLLM_API_KEY"))
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -97,11 +101,18 @@ def main():
     def call(k):
         rng = random.Random(k)
         time.sleep(rng.random() * 2.0)
-        msgs = [{"role": "system", "content": SYSTEM}]
+        if a.unique_system:
+            preamble = SYSTEM[:1500]
+            unique_part = f" Customer Account Context {k} identifier {k*1377+41} medical records for patient {k}. " * max(1, a.system_repeat // 4)
+            suffix = (SYSTEM * max(1, a.system_repeat // 2))[1500:]
+            sys_content = preamble + unique_part + suffix
+        else:
+            sys_content = SYSTEM * max(1, a.system_repeat // 2)
+        msgs = [{"role": "system", "content": sys_content}]
         sess = None if a.no_session else f"call-{k}-{int(time.time())}"
         for t in range(a.turns):
             msgs.append({"role": "user", "content": UTTER[(k + t) % len(UTTER)] + f" (call {k}, turn {t})"})
-            r = turn(a.port, a.model, msgs, sess, a.max_tokens, a.api_key)
+            r = turn(a.port, a.model, msgs, sess, a.max_tokens, a.api_key, a.temperature)
             r.update(call=k, turn=t)
             with lock:
                 results.append(r)
@@ -118,6 +129,7 @@ def main():
     first = [r["ttft"] * 1e3 for r in results if r["turn"] == 0]
     later = [r["ttft"] * 1e3 for r in results if r["turn"] > 0]
     tpot = [r["tpot"] * 1e3 for r in results if r["tpot"] == r["tpot"]]
+    all_itls = [x for r in results for x in r.get("itls", [])]
     later_prompt = sum(r["prompt"] for r in results if r["turn"] > 0)
     later_cached = sum(r["cached"] for r in results if r["turn"] > 0)
     summary = {
@@ -125,6 +137,7 @@ def main():
         "ttft_first_p50": pct(first, 50), "ttft_first_p90": pct(first, 90),
         "ttft_later_p50": pct(later, 50), "ttft_later_p90": pct(later, 90), "ttft_later_p99": pct(later, 99),
         "tpot_p50": pct(tpot, 50), "tpot_p90": pct(tpot, 90),
+        "itl_p50": pct(all_itls, 50), "itl_p90": pct(all_itls, 90), "itl_p99": pct(all_itls, 99), "itl_max": max(all_itls) if all_itls else float("nan"),
         "out_tok_s": sum(r["out"] for r in results) / wall,
         "mean_prompt_later": later_prompt / max(1, len(later)),
         "cached_frac_later": later_cached / max(1, later_prompt),
