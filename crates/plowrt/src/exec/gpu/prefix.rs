@@ -748,7 +748,8 @@ impl GpuEngine {
             // arm time, `bound_ring_park`): remapping a slot's ring on readmission (unmap +
             // cuMemCreate + map + set_access per unit, serial on the mux tick) cost 26B BF16 at
             // 1.8 sessions/s TTFT P99 1688 ms against 680 ms with every slot parked.
-            let park = geo.batch;
+            let rt = crate::config::RuntimeConfig::get();
+            let park = geo.batch.min(rt.decode_max_rung.unwrap_or(geo.batch));
             rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
             tracing::info!(
                 park,

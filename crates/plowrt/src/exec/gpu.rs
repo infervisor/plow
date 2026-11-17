@@ -7993,11 +7993,13 @@ impl GpuEngine {
         }
         // Parked ring units come out of the free memory the store grows into: they may hold at
         // most half of its device tier, so a wide batch parks fewer slots than it serves instead
-        // of starving the store.
+        // of starving the store. Both paths clamp to `decode_max_rung` so a wide compiled batch
+        // never parks more slots than the server is admitted to run concurrently.
         if let (Some(room), Some(rings)) = (store_room, vmm.as_mut().and_then(|v| v.rings.as_mut()))
         {
+            let max_park = config.decode_max_rung.unwrap_or(rings.slots() as u32) as u64;
             let charge = rings.slot_charge().max(1);
-            let slots = (room / 2 / charge).min(rings.slots() as u64);
+            let slots = (room / 2 / charge).min(rings.slots() as u64).min(max_park);
             rings.set_park_cap(slots * charge);
             tracing::info!(
                 park_slots = slots,
@@ -8006,11 +8008,14 @@ impl GpuEngine {
                 store_cap_mib = room >> 20,
                 "vmm prefix: live ring park bounded by the block store"
             );
-        } else if let Some(rings) = vmm.as_ref().and_then(|v| v.rings.as_ref()) {
+        } else if let Some(rings) = vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+            let max_park = config.decode_max_rung.unwrap_or(rings.slots() as u32) as u64;
+            let park_slots = (rings.slots() as u64).min(max_park);
+            rings.set_park_cap(park_slots * rings.slot_charge());
             tracing::info!(
-                park_slots = rings.slots(),
+                park_slots,
                 slots = rings.slots(),
-                park_mib = (rings.slots() as u64 * rings.slot_charge()) >> 20,
+                park_mib = (park_slots * rings.slot_charge()) >> 20,
                 "vmm prefix: live ring park unbounded (no pressure-sized block store)"
             );
         }
