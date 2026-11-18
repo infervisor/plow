@@ -12093,7 +12093,14 @@ fn emit_dense_gqa(
                     .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
                 let lower = |bucket: &asr::qwen::AudioBucket| {
                     bucket
-                        .lower(n_cu, audio_dims)
+                        .lower_with(
+                            n_cu,
+                            audio_dims,
+                            asr::qwen::AudioLowering {
+                                continuous_dense: emit_config::active().asr_dense_continuous,
+                                conv_bf16: emit_config::active().asr_conv_bf16,
+                            },
+                        )
                         .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
                 };
                 let (base, rest) = buckets.split_first().expect("single-utterance capacities");
@@ -12272,6 +12279,19 @@ fn emit_dense_gqa(
             if speech.ring_kv {
                 man["speech_ring_kv"] = true.into();
             }
+            if speech.conv_bf16 {
+                man["speech_conv_bf16"] = true.into();
+            }
+            man["speech_conv_arms"] = speech.conv_arms.into();
+            if speech.conv_bf16 {
+                man["speech_conv_bf16_variants"] = speech.conv_bf16_variants.into();
+            }
+            if speech.conv_object {
+                man["objects"]["speech_conv"] = serde_json::json!({ "required": true });
+            }
+            // The speech fields above feed the pairing hash (split-image, ring KV, bf16 arms).
+            man["pairing"]["hash"] =
+                serde_json::json!(format!("0x{:016x}", manifest::pairing_hash(&man)));
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

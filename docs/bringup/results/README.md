@@ -16,6 +16,7 @@ outside the repo ([../README.md](../README.md), "Results").
 | Qwen3-ASR 0.6B / 1.7B (RTX 5090) | [qwen3-asr-rtx5090/summary.md](qwen3-asr-rtx5090/summary.md) | none (no strict ASR report); same-box served tables vs vLLM 0.31.0: [summary.md](qwen3-asr-rtx5090/summary.md), [served.csv](qwen3-asr-rtx5090/served.csv) |
 | Qwen3.8-27B (H100, BF16) | [comparison.md](qwen38-27b-h100/comparison.md) | TTFT P99 at c1 vs vLLM 0.28 (0.48x / 0.62x) and c8 greedy (0.39x, baseline spread); packed prefill for the hybrid chain lifted c8..c128 throughput 4-7% (0.58-0.88x) and cut c32 TTFT/TPOT P99 24%/7%; throughput and TPOT still lost in every cell; FP32 gate PASS at c1/c8/c32: [comparison.md](qwen38-27b-h100/comparison.md) |
 | TTS (Veena, Chatterbox, Chatterbox MTL) | [tts-h100/summary.md](tts-h100/summary.md) | none (no strict speech report) |
+| Speech serving concurrency vs reference servers (Maya2, Qwen3-TTS, Qwen3-ASR) | [serving-concurrency-h100/summary.md](serving-concurrency-h100/summary.md) | none (screen; no strict speech report) |
 | GLM-5.3-Flash (MI350X, TP8) | [glm53flash-mi350x-2026-10-12/summary.md](glm53flash-mi350x-2026-10-12/summary.md) | [comparison.md](glm53flash-mi350x-2026-10-12/comparison.md): TP8 isl4096/c8 1.05x, isl1024/c8 1.06x vLLM throughput, [comparison.csv](glm53flash-mi350x-2026-10-12/comparison.csv); accuracy gate PASS |
 
 Each campaign keeps one `comparison.csv` for matched serving rows and a neighboring

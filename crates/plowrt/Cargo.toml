@@ -296,6 +296,10 @@ name = "asr_matrix_sweep"
 path = "examples/asr/matrix_sweep.rs"
 
 [[example]]
+name = "asr_encoder_pack_check"
+path = "examples/asr/encoder_pack_check.rs"
+
+[[example]]
 name = "asr_slot_check"
 path = "examples/asr/slot_check.rs"
 

@@ -537,13 +537,8 @@ impl GpuEngine {
             .iter()
             .find(|t| t.name == "in.pos")
             .map(|t| (t.bytes / 4) as u32)?;
-        let max_ctx = crate::config::RuntimeConfig::get()
-            .rt_max_ctx
-            .map(|c| c as u32)
-            .unwrap_or(packet_max_ctx)
-            .min(packet_max_ctx);
         let Some(mut geo) =
-            kv.and_then(|kv| crate::memory::vmm::VmmGeometry::from_kv(kv, max_ctx, batch))
+            kv.and_then(|kv| crate::memory::vmm::VmmGeometry::from_kv(kv, packet_max_ctx, batch))
         else {
             tracing::warn!("vmm off: no usable KV geometry in the serve manifest");
             return None;
@@ -615,7 +610,7 @@ impl GpuEngine {
             match (geo.elem, scales_of(l)) {
                 (2, None) => {}
                 (1, Some((ik, iv))) => {
-                    let want = batch as u64 * geo.kvh_full as u64 * max_ctx as u64 * 4;
+                    let want = batch as u64 * geo.kvh_full as u64 * geo.max_ctx as u64 * 4;
                     if blob.tensors[ik].bytes != want || blob.tensors[iv].bytes != want {
                         tracing::warn!(layer = l, "vmm off: full-layer KV scale bytes mismatch");
                         return None;
@@ -753,7 +748,8 @@ impl GpuEngine {
             // arm time, `bound_ring_park`): remapping a slot's ring on readmission (unmap +
             // cuMemCreate + map + set_access per unit, serial on the mux tick) cost 26B BF16 at
             // 1.8 sessions/s TTFT P99 1688 ms against 680 ms with every slot parked.
-            let park = geo.batch;
+            let rt = crate::config::RuntimeConfig::get();
+            let park = geo.batch.min(rt.decode_max_rung.unwrap_or(geo.batch));
             rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
             tracing::info!(
                 park,

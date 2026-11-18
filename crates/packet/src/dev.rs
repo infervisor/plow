@@ -2244,6 +2244,11 @@ pub enum DevOp {
     /// `[out_channels,in_channels,kernel]`; other implementations read that prefix.
     /// Optional `row_scale` f32 `[batch][out_rows]` scales each row after the output activation,
     /// before the residual: `out = residual + row_scale[b][t] * post(bias + conv)`.
+    /// Input-only SnakeBeta over a stream input (pre code snake + bits 2, 19 and 22, no post code;
+    /// speech flag layout 6): `t4=[a|r](f32[2*in_channels]) t5=state(f32[slots,L,in_channels])
+    /// t6=slot(u32[batch]) t7=pos(u32[batch])`, `L = (kernel-1)*dilation`; input row `u < L` of
+    /// item `b` is `state[slot[b]]` row `u` (zero while `pos[b] == 0`), row `u >= L` is `x` row
+    /// `b*(in_rows-L) + u - L`.
     /// `t0=out(f32[batch,out_rows,out_channels]) t1=x(f32[batch,in_rows,in_channels])
     /// t2=weight(f32|f16[out_channels,in_channels/groups,kernel]) t3=bias? t4=alpha?
     /// t5=residual? t6=lengths(u32[batch])? t7=row_scale?` ·
@@ -2322,6 +2327,11 @@ pub enum DevOp {
     /// Old keys are at absolute_position modulo history; current QKV supplies new keys.
     /// Zero-length items produce zero without reading their slot or position. Ring stores
     /// must depend on every attention producer, before any current key overwrites history.
+    /// `j1` bit 31 (layout 5, `v_col0` below it): Q / K / V and the output are fp16 rows (stride
+    /// and column offsets in halves), probabilities rounded to fp16 after normalization, V read
+    /// saturated to the finite fp16 range (+-65504; a NaN reads as -65504); only the
+    /// short geometry (head width 64, q_rows and kv_rows <= 32, flags but causal 0, no bias or
+    /// prefix), anything else traps.
     /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias|prefix_rows? t6=prefix?
     /// t7=prefix_index(u32[batch])?` ·
     /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags

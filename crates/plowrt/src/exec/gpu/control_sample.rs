@@ -780,6 +780,544 @@ mod tests {
             println!("CONTROL_PREFIX prefix={prefix} last_slot={last} exact, rejected prefixes and poisoned tail intact");
         }
     }
+    fn owned_sampler_handoff_fixture(
+        scatter: bool,
+    ) -> (
+        plow_asset::packet_pipeline::HandoffPlan,
+        plow_asset::packet_pipeline::HandoffProofCatalog,
+    ) {
+        use devgen::pipeline::handoff::SharedLayout;
+        use plow_asset::packet_pipeline::*;
+        use std::collections::BTreeMap;
+        let live_capacity = 320u32;
+        let state_capacity = 353u32;
+        let logits_capacity = 384u32;
+        let samples = 7u32;
+        let stride = 24usize;
+        let mut layout = SharedLayout::default();
+        for (name, dtype, rows, width, domain, persistent, immutable) in [
+            (
+                "slots",
+                PipelineDType::U32,
+                state_capacity,
+                1,
+                "packed",
+                false,
+                true,
+            ),
+            (
+                "logits_rows",
+                PipelineDType::U32,
+                logits_capacity,
+                1,
+                "packed",
+                false,
+                true,
+            ),
+            (
+                "states",
+                PipelineDType::U8,
+                state_capacity,
+                2296,
+                "physical",
+                true,
+                false,
+            ),
+            (
+                "logits",
+                PipelineDType::Bf16,
+                logits_capacity,
+                2057,
+                "backbone",
+                false,
+                false,
+            ),
+            (
+                "codes",
+                PipelineDType::U32,
+                if scatter {
+                    state_capacity
+                } else {
+                    live_capacity + 8
+                },
+                1,
+                "packed",
+                false,
+                false,
+            ),
+            (
+                "pcm",
+                PipelineDType::F32,
+                live_capacity,
+                samples,
+                "packed",
+                false,
+                false,
+            ),
+            (
+                "readback",
+                PipelineDType::U8,
+                live_capacity,
+                stride as u32,
+                "packed",
+                false,
+                false,
+            ),
+        ] {
+            layout
+                .allocate(
+                    name,
+                    "control",
+                    name,
+                    dtype,
+                    rows,
+                    width,
+                    domain,
+                    persistent,
+                    matches!(name, "states" | "logits"),
+                    immutable,
+                )
+                .unwrap();
+        }
+        layout.gather("states", "slots", "physical", true).unwrap();
+        if scatter {
+            layout.gather("codes", "slots", "physical", true).unwrap();
+        }
+        layout
+            .gather("logits", "logits_rows", "backbone", false)
+            .unwrap();
+        if scatter {
+            layout
+                .allocate(
+                    "history",
+                    "control",
+                    "history",
+                    PipelineDType::U32,
+                    live_capacity,
+                    1,
+                    "packed",
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+        }
+        let views = layout.views();
+        let reference = |name: &str| HandoffProgramRef {
+            component: "control".into(),
+            program: name.into(),
+        };
+        let (sample, sample_proof) =
+            devgen::tts::sampler_handoff_program(devgen::tts::SampleHandoff {
+                component: "control",
+                object_role: "control",
+                extent: "live",
+                live_capacity,
+                classes: 2049,
+                states: ("states", &views["states"]),
+                slots: ("slots", &views["slots"]),
+                logits_rows: ("logits_rows", &views["logits_rows"]),
+                logits: ("logits", &views["logits"]),
+                codes: ("codes", &views["codes"]),
+            })
+            .unwrap();
+        let (pack, pack_proof, readback) =
+            devgen::tts::pcm16_handoff_program(devgen::tts::Pcm16Handoff {
+                producer: reference("pack"),
+                object_role: "control",
+                extent: "live",
+                live_capacity,
+                states: ("states", &views["states"]),
+                slots: ("slots", &views["slots"]),
+                pcm: ("pcm", &views["pcm"]),
+                output: ("readback", &views["readback"]),
+            })
+            .unwrap();
+        let live = HandoffRows::Live {
+            extent: "live".into(),
+        };
+        let mut native = HandoffProofCatalog {
+            arena: Some(layout.arena()),
+            extents: BTreeMap::from([("live".into(), live_capacity)]),
+            views: views.clone(),
+            programs: BTreeMap::from([
+                (reference("sample"), sample_proof),
+                (reference("pack"), pack_proof),
+            ]),
+            readbacks: BTreeMap::from([(reference("pack"), readback.clone())]),
+        };
+        let readback_view = readback.view.clone();
+        let mut declaration = HandoffPlan {
+            components: BTreeMap::from([(
+                "control".into(),
+                HandoffComponent {
+                    packet: "control.pkt".into(),
+                    driver: devgen::tts::DRIVER.into(),
+                    objects: BTreeMap::from([("control".into(), "control_sample.cubin".into())]),
+                    programs: BTreeMap::from([("sample".into(), sample), ("pack".into(), pack)]),
+                },
+            )]),
+            arena: layout.arena(),
+            extents: native.extents.clone(),
+            views: views.clone(),
+            schedule: vec![reference("sample"), reference("pack")],
+            edges: vec![
+                HandoffEdge {
+                    producer: HandoffEndpoint {
+                        program: reference("sample"),
+                        view: "states".into(),
+                    },
+                    consumer: HandoffConsumer::Program {
+                        endpoint: HandoffEndpoint {
+                            program: reference("pack"),
+                            view: "states".into(),
+                        },
+                    },
+                    class: HandoffClass::Alias,
+                    dtype: PipelineDType::U8,
+                    rows: live.clone(),
+                    order: HandoffOrder::SameStream,
+                    generation_delta: 0,
+                },
+                HandoffEdge {
+                    producer: HandoffEndpoint {
+                        program: reference("pack"),
+                        view: readback_view,
+                    },
+                    consumer: HandoffConsumer::Host,
+                    class: HandoffClass::Host,
+                    dtype: PipelineDType::U8,
+                    rows: live.clone(),
+                    order: HandoffOrder::SameStream,
+                    generation_delta: 0,
+                },
+            ],
+            bind_writes: [
+                (
+                    "states",
+                    HandoffBindPhase::Admission,
+                    HandoffRows::Fixed {
+                        rows: state_capacity,
+                    },
+                ),
+                ("slots", HandoffBindPhase::Tick, live.clone()),
+                ("logits_rows", HandoffBindPhase::Tick, live.clone()),
+                ("pcm", HandoffBindPhase::Tick, live),
+            ]
+            .into_iter()
+            .map(|(name, phase, rows)| HandoffBindWrite {
+                name: name.into(),
+                view: name.into(),
+                phase,
+                rows,
+                order: HandoffOrder::SameStream,
+            })
+            .collect(),
+            readback,
+            execution: HandoffExecution::Synchronous,
+        };
+        if scatter {
+            let (program, proof) = devgen::tts::codes_handoff_program(devgen::tts::CodesHandoff {
+                object_role: "control",
+                extent: "live",
+                live_capacity,
+                capacity: live_capacity,
+                source: ("codes", &views["codes"]),
+                slots: ("slots", &views["slots"]),
+                target: ("history", &views["history"]),
+            })
+            .unwrap();
+            native.programs.insert(reference("history"), proof);
+            declaration
+                .components
+                .get_mut("control")
+                .unwrap()
+                .programs
+                .insert("history".into(), program);
+            declaration.schedule.insert(1, reference("history"));
+            declaration.edges.push(HandoffEdge {
+                producer: HandoffEndpoint {
+                    program: reference("sample"),
+                    view: "codes".into(),
+                },
+                consumer: HandoffConsumer::Program {
+                    endpoint: HandoffEndpoint {
+                        program: reference("history"),
+                        view: "codes".into(),
+                    },
+                },
+                class: HandoffClass::Alias,
+                dtype: PipelineDType::U32,
+                rows: HandoffRows::Live {
+                    extent: "live".into(),
+                },
+                order: HandoffOrder::SameStream,
+                generation_delta: 0,
+            });
+        }
+        (declaration, native)
+    }
+
+    #[test]
+    fn controlled_sampler_owned_handoff_plan_is_provable() {
+        for scatter in [false, true] {
+            let (plan, native) = owned_sampler_handoff_fixture(scatter);
+            plan.prove(&native).unwrap();
+            let mut reordered = plan.clone();
+            reordered.schedule.swap(0, 1);
+            assert!(reordered.prove(&native).is_err());
+            let mut changed = plan;
+            changed.views.get_mut("states").unwrap().row_stride -= 8;
+            assert!(changed.prove(&native).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
+    fn controlled_sampler_owned_handoff_matches_host() {
+        use crate::exec::gpu::handoff::{CudaHandoff, HandoffBind, HandoffRun, HandoffSelection};
+        use crate::exec::gpu::handoff_aux::AuxHandoffProvider;
+        use crate::exec::gpu::handoff_provider::{OwnedHandoffProviders, SharedHandoffArena};
+        use plow_asset::packet_pipeline::*;
+        use std::collections::BTreeMap;
+        let scatter = std::env::var_os("CONTROL_SAMPLE_SCATTER").is_some();
+        let (declaration, native) = owned_sampler_handoff_fixture(scatter);
+        let live_capacity = declaration.extents["live"];
+        let state_capacity = declaration.views["states"].rows;
+        let logits_capacity = declaration.views["logits"].rows;
+        let samples = declaration.views["pcm"].row_width;
+        let stride = declaration.readback.row_stride as usize;
+        let serialized = serde_json::to_vec(&declaration).unwrap();
+        let declared_plan: HandoffPlan = serde_json::from_slice(&serialized).unwrap();
+        let proven = declared_plan.prove(&native).unwrap();
+        let be = Arc::new(CudaBackend::new(0).unwrap());
+        let arena = SharedHandoffArena::allocate(be.clone(), &proven).unwrap();
+        be.memset_d8(arena.memory().base, 0xa5, arena.memory().len as usize)
+            .unwrap();
+        let states = &declared_plan.views["states"];
+        be.memset_d8(
+            arena.memory().base + states.offset,
+            0,
+            states.bytes as usize,
+        )
+        .unwrap();
+        let raw: Vec<u16> = (0..logits_capacity as usize * 2057)
+            .map(|i| {
+                let row = i / 2057;
+                let code = i % 2057;
+                let value = (((row * 193 + code * 997) % 2001) as f32 - 1000.) / 211.;
+                (value.to_bits() >> 16) as u16
+            })
+            .collect();
+        be.upload(
+            arena.memory(),
+            declared_plan.views["logits"].offset,
+            bytemuck::cast_slice(&raw),
+        )
+        .unwrap();
+        be.synchronize().unwrap();
+        let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
+        let owner = unsafe {
+            AuxHandoffProvider::from_native(arena.clone(), &image, "control", "control", native)
+        }
+        .unwrap();
+        let mut owners = OwnedHandoffProviders::new();
+        owners.insert("control".into(), Box::new(owner));
+        let mut executor = CudaHandoff::bind_owned(&proven, arena.clone(), owners, 3).unwrap();
+        let mut hosts = Vec::new();
+        let mut state_keys = Vec::new();
+        let mut logits_keys = Vec::new();
+        for row in 0..live_capacity {
+            let mut p = plan(1000 + u64::from(row), 64, 0.9);
+            if row % 3 == 0 {
+                p.cap = 2;
+            }
+            let value = state(p).unwrap();
+            hosts.push(Slot::new(p));
+            let slot = (row * 37 + 17) % state_capacity;
+            let admission = executor.prepare_admission("physical", slot).unwrap();
+            state_keys.push(
+                executor
+                    .admit(
+                        admission,
+                        &[HandoffBind {
+                            name: "states",
+                            bytes: bytemuck::bytes_of(&value),
+                        }],
+                    )
+                    .unwrap(),
+            );
+            let index = (row * 53 + 11) % logits_capacity;
+            let admission = executor.prepare_admission("backbone", index).unwrap();
+            logits_keys.push(executor.admit(admission, &[]).unwrap());
+        }
+        let mut scratch = Vec::new();
+        let mut held: Option<(crate::exec::packet_runtime::PacketBuffer, Vec<u8>)> = None;
+        let counts: &[usize] = if std::env::var_os("CONTROL_SAMPLE_SANITIZE").is_some() {
+            &[0, 8, 320]
+        } else {
+            &[0, 1, 8, 32, 64, 128, 200, 224, 300, 320]
+        };
+        for &count in counts {
+            let mut stopped = Vec::new();
+            for row in 0..count {
+                let index = logits_keys[row].slot() as usize;
+                let host = &mut hosts[row];
+                stopped.push(
+                    match host.tick(&raw[index * 2057..index * 2057 + 2049], &mut scratch) {
+                        Tick::Stop => true,
+                        Tick::Code(code) => {
+                            host.emitted(code);
+                            false
+                        }
+                    },
+                );
+            }
+            let state_rows: Vec<_> = state_keys[..count].iter().collect();
+            let logit_rows: Vec<_> = logits_keys[..count].iter().collect();
+            let keys: Vec<_> = state_rows.iter().chain(&logit_rows).copied().collect();
+            let slots: Vec<_> = state_rows.iter().map(|key| key.slot()).collect();
+            let indices: Vec<_> = logit_rows.iter().map(|key| key.slot()).collect();
+            let pcm: Vec<f32> = (0..count * samples as usize)
+                .map(|i| (i % 37) as f32 / 16. - 1.)
+                .collect();
+            let binds = [
+                HandoffBind {
+                    name: "slots",
+                    bytes: bytemuck::cast_slice(&slots),
+                },
+                HandoffBind {
+                    name: "logits_rows",
+                    bytes: bytemuck::cast_slice(&indices),
+                },
+                HandoffBind {
+                    name: "pcm",
+                    bytes: bytemuck::cast_slice(&pcm),
+                },
+            ];
+            let counts = BTreeMap::from([("live".into(), count as u32)]);
+            let selections = [
+                HandoffSelection {
+                    map: "slots",
+                    rows: &state_rows,
+                },
+                HandoffSelection {
+                    map: "logits_rows",
+                    rows: &logit_rows,
+                },
+            ];
+            if count >= 2 {
+                let mut wrong = state_rows.clone();
+                wrong.swap(0, 1);
+                assert!(executor
+                    .run_mapped(
+                        &counts,
+                        &BTreeMap::new(),
+                        &binds,
+                        &keys,
+                        &[
+                            HandoffSelection {
+                                map: "slots",
+                                rows: &wrong
+                            },
+                            HandoffSelection {
+                                map: "logits_rows",
+                                rows: &logit_rows
+                            },
+                        ]
+                    )
+                    .is_err());
+            }
+            let HandoffRun::Complete(output) = executor
+                .run_mapped(&counts, &BTreeMap::new(), &binds, &keys, &selections)
+                .unwrap()
+            else {
+                panic!("three completed slabs exhausted")
+            };
+            let bytes = output.host_slice().unwrap();
+            assert_eq!(bytes.len(), count * stride);
+            for row in 0..count {
+                let at = row * stride;
+                assert_eq!(
+                    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+                    u32::from(stopped[row])
+                );
+                assert_eq!(
+                    u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+                    hosts[row].last
+                );
+                for sample in 0..samples as usize {
+                    let at = at + 8 + sample * 2;
+                    let expected = if stopped[row] {
+                        0
+                    } else {
+                        (pcm[row * samples as usize + sample].clamp(-1., 1.) * 32767.).round()
+                            as i16
+                    };
+                    assert_eq!(
+                        i16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()),
+                        expected
+                    );
+                }
+                assert_eq!(&bytes[at + 22..at + 24], &[0, 0]);
+            }
+            if let Some((old, expected)) = &held {
+                assert_eq!(old.host_slice().unwrap(), expected);
+            }
+            if count == 8 {
+                held = Some((output.clone(), bytes.to_vec()));
+            }
+            for (name, prefix) in [("codes", count * 4), ("readback", count * stride)] {
+                let view = &declared_plan.views[name];
+                let mut stored = vec![0u8; view.bytes as usize];
+                be.download(arena.memory(), view.offset, &mut stored)
+                    .unwrap();
+                if name == "codes" && scatter {
+                    let mut expected = vec![0xa5u8; stored.len()];
+                    for row in 0..count {
+                        let at = state_keys[row].slot() as usize * 4;
+                        expected[at..at + 4].copy_from_slice(&hosts[row].last.to_le_bytes());
+                    }
+                    assert_eq!(stored, expected);
+                    continue;
+                }
+                assert!(
+                    stored[prefix..].iter().all(|&v| v == 0xa5),
+                    "{name} tail rows={count}"
+                );
+                if name == "codes" {
+                    for (row, code) in stored[..prefix].chunks_exact(4).enumerate() {
+                        assert_eq!(
+                            u32::from_le_bytes(code.try_into().unwrap()),
+                            hosts[row].last
+                        );
+                    }
+                }
+            }
+            if scatter {
+                let view = &declared_plan.views["history"];
+                let mut bytes = vec![0u8; view.bytes as usize];
+                be.download(arena.memory(), view.offset, &mut bytes)
+                    .unwrap();
+                for (row, code) in bytes.chunks_exact(4).enumerate() {
+                    let expected = if row < count {
+                        hosts[row].last
+                    } else if count == 0 {
+                        0xa5a5a5a5
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        u32::from_le_bytes(code.try_into().unwrap()),
+                        expected,
+                        "fixed history padding row={row} live={count}"
+                    );
+                }
+            }
+            println!("OWNED_SAMPLE_PCM rows={count} history_padding={scatter} exact controller/pcm, sparse generations, retained slab");
+        }
+    }
+
     #[test]
     #[ignore = "CUDA; CONTROL_SAMPLE_CUBIN must name a compiled controlled-sampler object"]
     fn checked_sampler_rejects_invalid_metadata() {
@@ -788,9 +1326,16 @@ mod tests {
         let image = std::fs::read(std::env::var("CONTROL_SAMPLE_CUBIN").unwrap()).unwrap();
         let module = be.module_load(&image).unwrap();
         let stream = be.stream_create().unwrap();
-        let function = be.get_function(&module, "handoff_control_sample").unwrap();
+        let symbol = if case == "output_index" {
+            "handoff_control_sample_scatter"
+        } else {
+            "handoff_control_sample"
+        };
+        let function = be.get_function(&module, symbol).unwrap();
         be.set_max_dynamic_smem(function, 65540).unwrap();
-        let state_mem = be.alloc(0, std::mem::size_of::<State>() as u64).unwrap();
+        let state_mem = be
+            .alloc(0, (2 * std::mem::size_of::<State>()) as u64)
+            .unwrap();
         let slot_mem = be.alloc(0, 4).unwrap();
         let row_mem = be.alloc(0, 4).unwrap();
         let logits_mem = be.alloc(0, 8192).unwrap();
@@ -820,6 +1365,10 @@ mod tests {
             "count" => count = 2,
             "state_capacity" => state_cap = 0,
             "output_capacity" => output_cap = 0,
+            "output_index" => {
+                slot = 1;
+                state_cap = 2;
+            }
             "logits_capacity" => logits_cap = 0,
             "classes" => classes = 4097,
             "stop" => stop = 2047,
@@ -833,7 +1382,7 @@ mod tests {
             "last" => value.last = stop,
             _ => panic!("unknown invalid metadata case {case}"),
         }
-        be.upload(&state_mem, 0, bytemuck::bytes_of(&value))
+        be.upload(&state_mem, 0, bytemuck::cast_slice(&[value, value]))
             .unwrap();
         be.upload(&slot_mem, 0, bytemuck::bytes_of(&slot)).unwrap();
         be.upload(&row_mem, 0, bytemuck::bytes_of(&row)).unwrap();
@@ -875,9 +1424,15 @@ mod tests {
         let stream = be.stream_create().unwrap();
         let sanitize = std::env::var_os("CONTROL_SAMPLE_SANITIZE").is_some();
         let production = std::env::var_os("CONTROL_SAMPLE_PRODUCTION").is_some();
-        let checked = std::env::var_os("CONTROL_SAMPLE_CHECKED").is_some();
+        let scatter = std::env::var_os("CONTROL_SAMPLE_SCATTER").is_some();
+        let checked = scatter || std::env::var_os("CONTROL_SAMPLE_CHECKED").is_some();
         let checked_kernel = checked.then(|| {
-            let function = be.get_function(&module, "handoff_control_sample").unwrap();
+            let symbol = if scatter {
+                "handoff_control_sample_scatter"
+            } else {
+                "handoff_control_sample"
+            };
+            let function = be.get_function(&module, symbol).unwrap();
             be.set_max_dynamic_smem(function, 65540).unwrap();
             function
         });
@@ -919,7 +1474,9 @@ mod tests {
             .enumerate()
             .map(|(i, r)| Row {
                 slot: r as u32,
-                output: if checked {
+                output: if scatter {
+                    r as u32
+                } else if checked {
                     i as u32
                 } else {
                     ((r + 7) % n) as u32
@@ -1068,7 +1625,7 @@ mod tests {
             }
             assert!(codes[n..].iter().all(|&code| code == 0));
             rows.rotate_left(1);
-            if checked {
+            if checked && !scatter {
                 for (i, row) in rows.iter_mut().enumerate() {
                     row.output = i as u32;
                 }
@@ -1098,7 +1655,15 @@ mod tests {
                 for row in &rows[..b] {
                     assert_eq!(codes[row.output as usize], host[row.slot as usize].last);
                 }
-                assert_eq!(&codes[b..], &before[b..]);
+                let mut written = vec![false; codes.len()];
+                for row in &rows[..b] {
+                    written[row.output as usize] = true;
+                }
+                for (index, &is_written) in written.iter().enumerate() {
+                    if !is_written {
+                        assert_eq!(codes[index], before[index]);
+                    }
+                }
                 println!("CHECKED_SAMPLE_PREFIX rows={b} states={n} exact cb0/padding");
             }
         }

@@ -112,11 +112,13 @@ plowrt serve --model infervisor/gemma-4-26b-a4b:sm90a-h100-tp1-fp8 --port 8080
 
 # Equivalently, from a locally built asset directory:
 nix develop --command env \
+  PLOW_DECODE_CUBLASLT_MIN_ROWS=64 \
   PLOW_DECODE_MAX_RUNG=128 \
   PLOW_DECODE_PIPELINE=1 \
   PLOW_KV_POOL_MIB=2048 \
   PLOW_LT_FP8_FAST_ACCUM_MAX_K=8192 \
   PLOW_LT_RUNG_ALGOS=true \
+  PLOW_MAX_QUEUED_REQUESTS=4096 \
   PLOW_MULTISTEP=0 \
   PLOW_PF_ADMIT_OVERLAP=1 \
   PLOW_PF_INTERLEAVE=0 \
@@ -126,6 +128,7 @@ nix develop --command env \
   PLOW_PF_SEG_PURE=fp8 \
   PLOW_PREFIX_CACHE=1 \
   PLOW_SPEC=1 \
+  PLOW_SPEC_RIDE=2 \
   PLOW_TERMINAL_LT=0 \
   PLOW_VMM_LIVE_RINGS=1 \
   PLOW_VMM_PREFIX=1 \

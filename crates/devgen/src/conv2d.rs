@@ -31,6 +31,9 @@ pub enum ConvWeight {
     F32,
     /// FP32 storage of bf16-representable values (a bf16 checkpoint widened at embed time).
     Bf16InF32,
+    /// bf16 as `[out][in / 16][tap][16]` (flag 1024): the order the staged 3x3 stride-2 tensor-core
+    /// kernel consumes, so it copies the weights instead of converting them per tile.
+    Bf16Blocked,
 }
 
 #[derive(Clone, Copy)]
@@ -228,7 +231,7 @@ pub fn lower(
             stage.weight,
             weight_elements
                 * match stage.weight_type {
-                    ConvWeight::F16 => 2,
+                    ConvWeight::F16 | ConvWeight::Bf16Blocked => 2,
                     ConvWeight::F32 | ConvWeight::Bf16InF32 => 4,
                 },
         );
@@ -252,9 +255,26 @@ pub fn lower(
             .ok_or("convolution output size overflows")?;
         // The input is bf16-exact when the previous stage rounded its GELU to bf16.
         let tensor_cores = stage.kind == ConvKind::Standard
-            && stage.weight_type == ConvWeight::Bf16InF32
+            && matches!(
+                stage.weight_type,
+                ConvWeight::Bf16InF32 | ConvWeight::Bf16Blocked
+            )
             && index > 0
             && stages[index - 1].activation == ConvActivation::GeluErfBf16;
+        if stage.weight_type == ConvWeight::Bf16Blocked
+            && !(tensor_cores
+                && stage.kernel == 3
+                && stage.stride == 2
+                && width_stride == 2
+                && stage.pad_before == 1
+                && stage.pad_after == 1
+                && stage.input_channels % 16 == 0
+                && layout == ConvLayout::ChannelsFramesWidth)
+        {
+            return Err(
+                "blocked bf16 weights need a bf16-exact 3x3 stride-2 conv over NCFW input".into(),
+            );
+        }
         // Otherwise a standard conv with FP32 weights runs 3xTF32 tensor cores (FP32-accurate).
         let tf32x3 = !tensor_cores
             && stage.kind == ConvKind::Standard
@@ -332,8 +352,12 @@ fn flags(stage: &Conv2dStage<'_>, input_layout: ConvLayout) -> u32 {
         | (u32::from(stage.activation == ConvActivation::Relu) << 1)
         | (layout_code(stage.output_layout) << 2)
         | (layout_code(input_layout) << 4)
-        | (u32::from(stage.weight_type != ConvWeight::F16) << 6)
+        | (u32::from(matches!(
+            stage.weight_type,
+            ConvWeight::F32 | ConvWeight::Bf16InF32
+        )) << 6)
         | (u32::from(stage.activation == ConvActivation::GeluErfBf16) << 7)
+        | (u32::from(stage.weight_type == ConvWeight::Bf16Blocked) << 10)
 }
 
 fn layout_code(layout: ConvLayout) -> u32 {

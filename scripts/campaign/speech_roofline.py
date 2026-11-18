@@ -75,12 +75,12 @@ def cost(inst, ctx):
         b, tin, cin, cout, kk, s, groups = g("batch", 1), g("in_rows"), g("in_channels"), g("out_channels"), g("kernel"), g("stride", 1), max(g("groups", 1), 1)
         if op == "Conv1dF32":
             pads = g("pads"); pb, pa = pads & 0xFFFF, pads >> 16
-            dil = max(g("dilation", 1), 1)
+            dil = max(g("dilation", 1) & 0x7FFFFFFF, 1)
             tout = (tin + pb + pa - dil * (kk - 1) - 1) // max(s, 1) + 1
             flops = 2 * b * tout * cout * (cin // groups) * kk
         else:
             crops = g("crops"); cb, ca = crops & 0xFFFF, crops >> 16
-            tout = (tin - 1) * s + kk + g("output_padding") - cb - ca
+            tout = (tin - 1) * s + kk + (g("output_padding") & 0x7FFFFFFF) - cb - ca
             flops = 2 * b * tin * cin * (cout // groups) * kk
         by = cout * (cin // groups) * kk * 4 + b * tin * cin * 4 + b * tout * cout * 4 * (2 if present(inst, "residual") else 1)
         # Flag bit 14: the split-bf16 tiles run three bf16 passes (hi*lo + lo*hi + hi*hi) per
@@ -89,7 +89,11 @@ def cost(inst, ctx):
         # (fewer than 16 output channels per group or k * cin/groups < 16) dispatch first.
         cg, ng = cin // groups, cout // groups
         depthwise = cg == 1 and ng == 1 and op == "Conv1dF32"
-        if g("flags") & (1 << 14) and not depthwise and ng >= 16 and cg * kk >= 16:
+        gemm = not depthwise and ng >= 16 and cg * kk >= 16
+        # i6 bit 31: one bf16 product per term (A rounded, weight hi half).
+        if gemm and g("dilation" if op == "Conv1dF32" else "output_padding") >> 31:
+            return by, flops, "bf16"
+        if g("flags") & (1 << 14) and gemm:
             return by, 3 * flops, "bf16"
         return by, flops, ("tf32" if g("flags") & (1 << 13) else "fp32")
     if op == "Conv2dF32":
@@ -97,7 +101,13 @@ def cost(inst, ctx):
         of, ow = (f + g("pad_before") + g("pad_after") - kk) // s + 1, (w + g("pad_before") + g("pad_after") - kk) // s + 1
         depthwise = g("flags") & 1
         flops = 2 * max(b, 1) * of * ow * cout * (1 if depthwise else cin) * kk * kk
-        return cout * cin * kk * kk * 4 + max(b, 1) * (f * w * cin + of * ow * cout) * 4, flops, "fp32"
+        # flag 256 = bf16-exact operands on tensor cores, 512 = 3xTF32 (three TF32 products per FP32 one).
+        fl = g("flags")
+        if fl & 512:
+            flops, prec = 3 * flops, "tf32"
+        else:
+            prec = "bf16" if fl & 256 else "fp32"
+        return cout * cin * kk * kk * 4 + max(b, 1) * (f * w * cin + of * ow * cout) * 4, flops, prec
     if op in ("LayerNormF32",):
         return g("rows") * g("feat") * 4 * 2, 0, "fp32"
     if op == "GemvF32Out":
@@ -112,6 +122,10 @@ def cost(inst, ctx):
         return g("S") * g("H") * 2 * 2, 0, "fp32"
     if op == "AttentionF32":
         b, q, kv, h, hw = g("batch", 1), g("q_rows"), g("kv_rows"), g("heads"), g("head_width")
+        # v_col0 bit 31: fp16 operands/output; m16n8k16 fp16 tensor cores at q_rows >= 4 and q_rows * kv_rows >= 16
+        # (useful FLOPs; aligned operands), FFMA below.
+        if g("v_col0") >> 31:
+            return b * (q * 2 + kv * 2) * h * hw * 2, 4 * b * h * q * kv * hw, ("bf16" if q >= 4 and q * kv >= 16 else "fp32")
         return b * (q * 2 + kv * 2) * h * hw * 4, 4 * b * h * q * kv * hw, "fp32"
     if op == "GroupedAttentionF32":
         rows, width, grp = g("rows"), g("width"), g("group_rows")

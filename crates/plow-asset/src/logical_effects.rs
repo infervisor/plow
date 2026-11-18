@@ -19,7 +19,7 @@ fn ring_effects_require_positions_and_write_only_the_declared_destination() {
         t: [0; 8],
         ..Default::default()
     };
-    for (mode, written) in [(2, &[2][..]), (3, &[0][..])] {
+    for (mode, written) in [(2, &[2][..]), (3, &[0][..]), (4, &[2][..])] {
         d.i[7] = mode;
         assert_eq!(outputs(&d).unwrap(), written);
         d.t[5] = TENSOR_NONE16;
@@ -40,12 +40,14 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
     use DevOp::*;
     let op = DevOp::from_u16(d.op).ok_or("unknown kernel effects")?;
     if op == StreamTailF32 {
-        // Gather writes z from src + state; store writes state from z alone.
+        // Gather writes z from src + state; store writes state from z alone; store-from-source
+        // writes state from src + state.
         let (required, writes): (&[usize], &'static [usize]) = match d.i[7] {
             0 => (&[0, 1, 2, 3, 4, 5], &[0]),
             1 => (&[1, 2, 3, 4], &[2]),
             2 => (&[1, 2, 3, 4, 5], &[2]),
             3 => (&[0, 1, 2, 3, 4, 5], &[0]),
+            4 => (&[1, 2, 3, 4, 5], &[2]),
             _ => return Err("unknown stream-tail mode".into()),
         };
         if required.iter().any(|&slot| d.t[slot] == TENSOR_NONE16) {
@@ -386,6 +388,10 @@ fn handle_accesses(d: &DevInst64) -> Result<Vec<(u32, bool)>, String> {
         Some(DevOp::Gemv) if d.i[3] == 4 => reads(&[d.i[5], d.i[6], d.i[7]]),
         Some(DevOp::GemvGlu) if d.i[3] == 4 && fold == 0 => reads(&[d.i[4], d.i[6], d.i[7]]),
         // sm_90a TMA descriptors over A and B (dev_isa.h GEMM: 0 = absent).
+        // Chunked bf16 taps conv: tickets and chunk partials (op_speech_f32.cuh spb_chunks).
+        Some(DevOp::Conv1dF32) if crate::speech_flag_layout::conv_bf16_chunked(d.op, d.fj[2]) => {
+            vec![(d.fj[0] & 0x7FFF_FFFF, true)]
+        }
         Some(DevOp::Gemm | DevOp::GemmFp8) => [d.i[6], d.i[7]]
             .into_iter()
             .filter(|&h| h != 0)

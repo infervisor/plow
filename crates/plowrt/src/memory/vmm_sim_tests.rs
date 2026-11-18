@@ -1097,12 +1097,13 @@ fn cell_session_demotion_waits_for_a_live_mapping() {
 fn cell_session_attach_refreshes_ttl() {
     let mut r = Rig::new(false, 1 << 20, 64, 2);
     let p1 = conv_prompt(50, 40, 200);
-    let (_, reply) = r.turn_session(0, &p1, 30, 80);
+    let (_, reply) = r.turn_session(0, &p1, 30, 400);
     std::thread::sleep(std::time::Duration::from_millis(50));
     let p2 = next_prompt(&p1, &reply, 4, 100, 91_000);
     let rows = r.admit(0, &p2);
     assert!(rows > 0);
-    r.kv().hold_session(0, std::time::Duration::from_millis(80));
+    r.kv()
+        .hold_session(0, std::time::Duration::from_millis(400));
     std::thread::sleep(std::time::Duration::from_millis(50));
     r.kv().begin_seq(1);
     assert_eq!(
@@ -1110,7 +1111,7 @@ fn cell_session_attach_refreshes_ttl() {
         0,
         "refreshed at the attach"
     );
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(std::time::Duration::from_millis(500));
     // The request that attached it ends without publishing (cancelled): expired, and demoted
     // once nothing maps it.
     r.kv().begin_seq(0);

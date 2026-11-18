@@ -30,6 +30,7 @@ struct Loaded {
     rows: u32,
     arg: DevProgram,
     counter_bytes: usize,
+    host_insts: Vec<DevInst64>,
     _tables: Vec<DeviceMem>,
 }
 
@@ -156,6 +157,7 @@ impl CompactDepth {
                 rows: e.batch as u32,
                 arg,
                 counter_bytes,
+                host_insts: vec![],
                 _tables: tables,
             },
             index,
@@ -319,6 +321,7 @@ struct Maya2 {
     speech: SpeechFn,
     /// The null speaker's depth memory, `[layers][hidden]` (named, plain and `icl` voices).
     null_memory: Vec<f32>,
+    _control_module: Option<Module>,
 }
 
 #[derive(Clone)]
@@ -610,6 +613,7 @@ impl FishDepth {
                     rows,
                     arg,
                     counter_bytes,
+                    host_insts: p.insts.clone(),
                     _tables: tables,
                 })
             })
@@ -621,11 +625,22 @@ impl FishDepth {
         let maya2 = match (maya2, manifest.depth_sampling) {
             (true, Some([t, k])) => {
                 let speech = SpeechFn::load(e, assets, &section.programs, packet)?;
+                let control_cubin = assets.join("control_sample.cubin");
+                let control_mod = if control_cubin.exists() {
+                    let bytes = std::fs::read(&control_cubin).map_err(|source| RuntimeError::Io {
+                        path: control_cubin.clone(),
+                        source,
+                    })?;
+                    Some(e.be.module_load(&bytes)?)
+                } else {
+                    None
+                };
                 let device = if crate::config::RuntimeConfig::process_get().tts_device_control {
+                    let module = control_mod.as_ref().unwrap_or(&speech._module);
                     Some(super::control_sample::ControlledSample::load(
                         &e.be,
                         &e.stream,
-                        &speech._module,
+                        module,
                         e.batch,
                         stage_rows,
                         manifest.codebooks as usize,
@@ -647,6 +662,7 @@ impl FishDepth {
                     depth: (f32::from_bits(t), k),
                     speech,
                     null_memory: null_memory(e, &manifest)?,
+                    _control_module: control_mod,
                 })
             }
             _ => None,
@@ -1821,6 +1837,7 @@ mod tests {
                     // SAFETY: DevProgram contains only integers; this fixture never launches it.
                     arg: unsafe { std::mem::zeroed() },
                     counter_bytes: 0,
+                    host_insts: vec![],
                     _tables: Vec::new(),
                 },
                 index: DeviceMem::view(0, 0),
@@ -1981,3 +1998,70 @@ fn observe_plan(plan: &mut crate::sched::row_plan::RowPlan, us: f32) {
 #[cfg(test)]
 #[path = "fish_depth_tests.rs"]
 mod packed_tests;
+
+impl GpuEngine {
+    pub(super) fn prepare_handoff_depth(
+        &self,
+        (blob, raw): (&DevBlob, &[u8]),
+        index: usize,
+    ) -> Result<super::handoff_causal::PreparedCausalProgram> {
+        let depth = self
+            .fish
+            .as_ref()
+            .ok_or_else(|| reject("no auxiliary depth programs"))?;
+        let speech = &depth
+            .maya2
+            .as_ref()
+            .ok_or_else(|| reject("unsupported auxiliary sampler ABI"))?
+            .speech;
+        let bytes = blob
+            .reserved_metadata(raw, plow_asset::fish_depth::PROGRAMS_SECTION)?
+            .ok_or_else(|| reject("missing native auxiliary section"))?;
+        let section =
+            plow_asset::aux_program::parse(bytes, self.grid, self.devp.len()).map_err(reject)?;
+        let native = section
+            .programs
+            .get(index)
+            .ok_or_else(|| reject("invalid auxiliary program index"))?;
+        let loaded = depth
+            .programs
+            .get(index)
+            .ok_or_else(|| reject("auxiliary program not prepared"))?;
+        if native.gq_seg_ofs.len() != 2
+            || super::pod_bytes(&native.insts) != super::pod_bytes(&loaded.host_insts)
+            || loaded.arg.tensors != self.d_tens.base
+        {
+            return Err(reject(
+                "auxiliary program or table differs from native packet",
+            ));
+        }
+        Ok(super::handoff_causal::PreparedCausalProgram {
+            argument: loaded.arg,
+            function: speech.f,
+            grid: self.grid,
+            block: BLOCK,
+            shared_bytes: speech.smem,
+            counter_bytes: loaded.counter_bytes,
+            rows: loaded.rows as usize,
+        })
+    }
+
+    pub(super) fn resolve_handoff_depth_kernel(
+        &self,
+        symbol: &str,
+        capability: &str,
+        value: u32,
+    ) -> Result<KernelFn> {
+        let module = &self
+            .fish
+            .as_ref()
+            .and_then(|d| d.maya2.as_ref())
+            .ok_or_else(|| reject("no native auxiliary module"))?
+            .speech
+            ._module;
+        if self.be.module_global_u32(module, capability)? != Some(value) {
+            return Err(reject("native auxiliary capability mismatch"));
+        }
+        self.be.get_function(module, symbol)
+    }
+}

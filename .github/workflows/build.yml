@@ -114,7 +114,8 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # The workspace tests alone take 45 minutes on these runners.
+    timeout-minutes: 90
     defaults:
       run:
         shell: nix develop .#ci --command bash -euo pipefail {0}

@@ -1,6 +1,7 @@
 //! §C Memory & weights — physical allocation, weight loading, KV paging, the
 //! DMA plane (§M) and the tiered streamer (§N).
 
+pub mod budget;
 pub mod container;
 pub mod dma;
 pub mod kv;

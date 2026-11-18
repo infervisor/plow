@@ -386,7 +386,8 @@ def main():
         inputs.append((wav, meta))
     import torch, jiwer, soundfile as sf, librosa
     from transformers import pipeline
-    asr = pipeline("automatic-speech-recognition", model=args.model, torch_dtype=torch.float16, device=args.device)
+    dtype = torch.float32 if args.device == "cpu" else torch.float16
+    asr = pipeline("automatic-speech-recognition", model=args.model, torch_dtype=dtype, device=args.device)
     cers, by_lang, rows = [], {}, []
     for w, meta in inputs:
         ref, lang = meta["text"], meta.get("language")

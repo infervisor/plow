@@ -214,6 +214,16 @@ pub struct RuntimeConfig {
     )]
     pub tts_stream_first_frames: Option<usize>,
 
+    /// Most new frames one stateful codec step decodes (capped by the packet's
+    /// `stream.step_frames`): batched steps pay their launch's longest step, so equal short steps
+    /// pad less than a ramp to the packet's cap. Unset: the packet's cap.
+    #[arg(
+        long = "tts-stream-step-frames",
+        env = "PLOW_TTS_STREAM_STEP_FRAMES",
+        global = true
+    )]
+    pub tts_stream_step_frames: Option<usize>,
+
     /// Strip markup and insert runtime pauses on speech packets without a tag map. Unset: legacy text path.
     #[arg(long = "tts-tags-default", env = "PLOW_TTS_TAGS_DEFAULT", value_parser = ["strip"], global = true)]
     pub tts_tags_default: Option<String>,
@@ -340,11 +350,12 @@ pub struct RuntimeConfig {
     /// Packed audio-encoder hold (ms): while `PLOW_ASR_ENCODE_HOLD_INFLIGHT` requests are in flight
     /// and the queued audio is short of a full launch, the encoder waits up to this long from its
     /// oldest queued request for more, trading that wait for fewer per-launch fixed costs. 0 =
-    /// launch whatever is queued.
+    /// launch whatever is queued. 50 (Qwen3-ASR 1.7B, H100, open loop): holds 150 req/s at 99%
+    /// under 1 s where 0 holds 100, saturation 985 -> 1277 audio s/s, c1 and c16 unchanged.
     #[arg(
         long = "asr-encode-hold-ms",
         env = "PLOW_ASR_ENCODE_HOLD_MS",
-        default_value_t = 0,
+        default_value_t = 50,
         global = true
     )]
     pub asr_encode_hold_ms: u64,
@@ -602,31 +613,17 @@ pub struct RuntimeConfig {
     )]
     pub encode_split_min: Option<u32>,
 
-    /// Optional soft cap on prefix blocks and boundary snapshots as a fraction of the device's
-    /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to the
-    /// prefix cache. Default 0: no static cap; the cache grows into free memory and pressure
-    /// eviction (`--vmm-cache-min-free-mib`) or allocation OOM evicts it, as vLLM's prefix
-    /// cache uses every free KV block. `--vmm-cache-mib` sets an explicit size.
-    #[arg(
-        long = "vmm-cache-memory-utilization",
-        env = "PLOW_VMM_CACHE_MEMORY_UTILIZATION",
-        default_value_t = 0.0,
-        value_parser = clap::value_parser!(f64),
-        global = true
-    )]
-    pub vmm_cache_memory_utilization: f64,
-
-    /// Explicit soft cap on prefix blocks and boundary snapshots in MiB; overrides
-    /// `--vmm-cache-memory-utilization`. 0 = OOM-driven eviction only.
+    /// Explicit soft cap on prefix blocks and boundary snapshots in MiB.
+    /// Unset or 0 = dynamic headroom budgeting (OOM-driven pressure eviction only).
     #[arg(long = "vmm-cache-mib", env = "PLOW_VMM_CACHE_MIB", global = true)]
     pub vmm_cache_mib: Option<u32>,
 
     /// Keep every cached prefix (whole shared blocks and private boundary snapshots alike)
     /// until free device memory would drop below this many MiB, instead of trimming as soon
-    /// as `--vmm-cache-mib`/`--vmm-cache-memory-utilization` bytes of cache are held. Unset
-    /// (the default) derives 4% of the device; `=0` is the rollback to the static byte budget
-    /// as the only trim trigger. Needs the backend to report free device memory cheaply
-    /// (`VmmOps::free_bytes`); a backend that cannot degrades to the static budget unchanged.
+    /// as `--vmm-cache-mib` bytes of cache are held. Unset (the default) derives 4% of the
+    /// device; `=0` is the rollback to the static byte budget as the only trim trigger.
+    /// Needs the backend to report free device memory cheaply (`VmmOps::free_bytes`); a
+    /// backend that cannot degrades to the static budget unchanged.
     #[arg(
         long = "vmm-cache-min-free-mib",
         env = "PLOW_VMM_CACHE_MIN_FREE_MIB",
@@ -1532,6 +1529,17 @@ pub struct NvidiaRuntimeConfig {
     /// the diagnostic rollback.
     #[arg(long = "decode-pipeline", env = "PLOW_DECODE_PIPELINE", hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_pipeline: Option<bool>,
+
+    /// Minimum decode rung rows to route through cuBLASLt (CUDA). Rungs narrower than this run
+    /// natively in the decode interpreter, leaving them available for speculative decode verify.
+    /// Default 0 uses the emitted packet's projection roles as-is.
+    #[arg(
+        long = "decode-cublaslt-min-rows",
+        env = "PLOW_DECODE_CUBLASLT_MIN_ROWS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub decode_cublaslt_min_rows: u32,
 
     /// Speculative decoding with the packet's drafter (CUDA; packets emitted with
     /// `PLOW_EMIT_SPEC`): pure decode ticks of greedy rows draft and verify when the measured
@@ -3036,10 +3044,8 @@ impl RuntimeConfig {
     }
 
     /// Prefix-cache soft cap in bytes for a device with `device_bytes` of memory.
-    /// An explicit `--vmm-cache-mib` wins; otherwise `--vmm-cache-memory-utilization`
-    /// of the device. `device_bytes == 0` means the backend could not say, and the cap
-    /// falls back to the 4 GiB the H100 campaign qualified rather than to "unbounded".
-    pub(crate) fn prefix_cache_cap_bytes(&self, device_bytes: u64) -> u64 {
+    /// An explicit `--vmm-cache-mib` wins; otherwise 0 (dynamic headroom budgeting).
+    pub(crate) fn prefix_cache_cap_bytes(&self, _device_bytes: u64) -> u64 {
         let allow_env = !Self::is_initialized();
         let explicit: Option<u32> = if allow_env {
             Self::env_parse("PLOW_VMM_CACHE_MIB").or(self.vmm_cache_mib)
@@ -3049,20 +3055,7 @@ impl RuntimeConfig {
         if let Some(mib) = explicit {
             return (mib as u64) << 20;
         }
-        let fraction = select_compat(
-            self.vmm_cache_memory_utilization,
-            Self::env_parse("PLOW_VMM_CACHE_MEMORY_UTILIZATION"),
-            allow_env,
-        )
-        .clamp(0.0, 1.0);
-        if fraction == 0.0 {
-            return 0;
-        }
-        if device_bytes == 0 {
-            return 4096u64 << 20;
-        }
-        // Whole MiB, so the figure in logs and metrics reads like the knob.
-        ((device_bytes as f64 * fraction) as u64) >> 20 << 20
+        0
     }
 
     /// The free-device-memory floor the prefix cache evicts to hold, in bytes, for a device
@@ -4093,25 +4086,18 @@ mod tests {
             .find(|arg| arg.get_id() == "vmm_cache_mib")
             .unwrap();
         assert!(budget.get_default_values().is_empty());
-        let fraction = command
-            .get_arguments()
-            .find(|arg| arg.get_id() == "vmm_cache_memory_utilization")
-            .unwrap();
-        assert_eq!(fraction.get_default_values(), ["0"]);
-        // No static cap by default: the cache grows until pressure or OOM evicts it.
+        // No static cap by default: dynamic headroom budgeting partitions usable VRAM.
         let matches = command.clone().try_get_matches_from(["test"]).unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 0);
         assert_eq!(config.prefix_cache_cap_bytes(0), 0);
-        // An explicit fraction scales with the device; an unknown size keeps 4 GiB.
+        // An explicit --vmm-cache-mib sets the soft cap.
         let matches = command
             .clone()
-            .try_get_matches_from(["test", "--vmm-cache-memory-utilization=0.05"])
+            .try_get_matches_from(["test", "--vmm-cache-mib=4096"])
             .unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 4096 << 20);
-        assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 9830 << 20);
-        assert_eq!(config.prefix_cache_cap_bytes(0), 4096 << 20);
         for (flag, expected) in [("--vmm-prefix", true), ("--vmm-prefix=false", false)] {
             let matches = command
                 .clone()

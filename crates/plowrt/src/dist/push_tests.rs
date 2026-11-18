@@ -57,7 +57,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::dist::manifest::portable_temp_dir().join(format!(
             "plow-push-{}-{}-{tag}",
             std::process::id(),
             std::time::SystemTime::now()

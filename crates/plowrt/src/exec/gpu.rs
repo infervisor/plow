@@ -189,6 +189,10 @@ pub use codec_tick::{CodecTick, CodecTickState};
 pub use fish_depth::{FishInfo, FishRow};
 mod fp8_block;
 mod gen_decode;
+pub(crate) mod handoff;
+pub(crate) mod handoff_aux;
+pub(crate) mod handoff_causal;
+pub(crate) mod handoff_provider;
 mod mixed_step;
 mod moe_lt;
 mod native_decode;
@@ -2802,6 +2806,7 @@ pub struct GpuEngine {
     /// Per-tensor device buffers, indexed by blob tensor handle. Ordinarily
     /// **views** into `_weight_slab`, not owners — see it for why.
     devp: Vec<DeviceMem>,
+    handoff_shared: Option<handoff_causal::SharedCausalTensors>,
     /// Owner of the one span every non-VMM-prefix tensor is carved out of.
     ///
     /// The blob declares every tensor and its size before a byte moves, so the
@@ -4167,7 +4172,26 @@ impl GpuEngine {
         be: Arc<CudaBackend>,
         assets_dir: &Path,
         checkpoint_dir: &Path,
+        rank_bind: Option<rank::RankBind>,
+    ) -> Result<Self> {
+        Self::load_rank_inner(be, assets_dir, checkpoint_dir, rank_bind, None)
+    }
+
+    pub(crate) fn load_handoff_shared(
+        be: Arc<CudaBackend>,
+        assets_dir: &Path,
+        checkpoint_dir: &Path,
+        shared: handoff_causal::SharedCausalTensors,
+    ) -> Result<Self> {
+        Self::load_rank_inner(be, assets_dir, checkpoint_dir, None, Some(shared))
+    }
+
+    fn load_rank_inner(
+        be: Arc<CudaBackend>,
+        assets_dir: &Path,
+        checkpoint_dir: &Path,
         mut rank_bind: Option<rank::RankBind>,
+        handoff_shared: Option<handoff_causal::SharedCausalTensors>,
     ) -> Result<Self> {
         let t0 = std::time::Instant::now();
         crate::knob_spec::check_assets(&assets_dir.join("model.pkt"))?;
@@ -5096,11 +5120,30 @@ impl GpuEngine {
             }
         };
         let config = RuntimeConfig::get();
+        if let Some(shared) = &handoff_shared {
+            if rank_bind.is_some() {
+                return Err(RuntimeError::Rejected(
+                    "shared causal tensors do not support rank bindings".into(),
+                ));
+            }
+            shared.validate(&be, &blob, |id, name| {
+                vmm_va_of(id).is_none()
+                    && !name.starts_with("kv.")
+                    && !vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(&id))
+                    && !is_checkpoint_tensor(id, name, packed_prefill_metadata.as_ref())
+                    && !blob.gen.iter().any(|g| g.tensor == id as u32)
+            })?;
+        }
         let slab_bytes: u64 = blob
             .tensors
             .iter()
             .enumerate()
-            .filter(|(id, _)| vmm_va_of(*id).is_none())
+            .filter(|(id, td)| {
+                vmm_va_of(*id).is_none()
+                    && !handoff_shared
+                        .as_ref()
+                        .is_some_and(|s| s.contains(&td.name))
+            })
             .map(|(_, td)| carve_bytes(td.bytes))
             .sum();
         // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
@@ -5265,23 +5308,32 @@ impl GpuEngine {
             for (i, td) in blob.tensors.iter().enumerate() {
                 let vmm_va = vmm_va_of(i);
                 let packet_cache = vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(&i));
-                let t_alloc =
-                    (load_prof && vmm_va.is_none() && matches!(weight_slab, WeightSlab::PerTensor))
-                        .then(std::time::Instant::now);
+                let shared = handoff_shared.as_ref().filter(|s| s.contains(&td.name));
+                let t_alloc = (load_prof
+                    && shared.is_none()
+                    && vmm_va.is_none()
+                    && matches!(weight_slab, WeightSlab::PerTensor))
+                .then(std::time::Instant::now);
                 let tensor_bytes = td.bytes;
-                let mem = match (vmm_va, &weight_slab) {
-                    (Some(va), _) => DeviceMem::view(va, td.bytes),
-                    (None, WeightSlab::Vmm(slab)) => {
-                        let m = DeviceMem::view(slab.base() + slab_off, tensor_bytes);
-                        slab_off += carve_bytes(tensor_bytes);
-                        m
+                let mem = if let Some(s) = shared {
+                    s.memory(&td.name)?.ok_or_else(|| {
+                        RuntimeError::Rejected("missing shared tensor binding".into())
+                    })?
+                } else {
+                    match (vmm_va, &weight_slab) {
+                        (Some(va), _) => DeviceMem::view(va, td.bytes),
+                        (None, WeightSlab::Vmm(slab)) => {
+                            let m = DeviceMem::view(slab.base() + slab_off, tensor_bytes);
+                            slab_off += carve_bytes(tensor_bytes);
+                            m
+                        }
+                        (None, WeightSlab::Flat(slab)) => {
+                            let m = slab.subview(slab_off, tensor_bytes)?;
+                            slab_off += carve_bytes(tensor_bytes);
+                            m
+                        }
+                        (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                     }
-                    (None, WeightSlab::Flat(slab)) => {
-                        let m = slab.subview(slab_off, tensor_bytes)?;
-                        slab_off += carve_bytes(tensor_bytes);
-                        m
-                    }
-                    (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                 };
                 // Producers use the mirror only after every interpreter candidate passed the guard.
                 let mem = match (&tp_shards, td.name.as_str()) {
@@ -5321,6 +5373,17 @@ impl GpuEngine {
                         td.name
                     )));
                 }
+                if shared.is_some_and(|s| !s.initialize(&td.name)) {
+                    devp.push(mem);
+                    continue;
+                }
+                let commit = |end, wait: &mut f64| -> Result<()> {
+                    if shared.is_some() {
+                        Ok(())
+                    } else {
+                        slab_commit_wait(&weight_slab, end, wait)
+                    }
+                };
                 if !packet_cache
                     && td.init.is_none()
                     && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
@@ -5350,11 +5413,7 @@ impl GpuEngine {
                         let wide = wide?;
                         for (o, chunk) in wide.chunks(STAGE).enumerate() {
                             let dst = mem.base + (o * STAGE) as u64;
-                            slab_commit_wait(
-                                &weight_slab,
-                                dst + chunk.len() as u64,
-                                &mut slab_wait_ms,
-                            )?;
+                            commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
                             pipe.push(dst, chunk)?;
                         }
                         wb += td.bytes;
@@ -5397,11 +5456,7 @@ impl GpuEngine {
                     prefetch_ahead(&mut pf, 1);
                     for (o, chunk) in src.chunks(STAGE).enumerate() {
                         let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
+                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
                         if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
                             // SAFETY: `chunk` borrows the checkpoint mmap
                             // (`ckpt`, whose Arc outlives pipe.finish()).
@@ -5415,11 +5470,7 @@ impl GpuEngine {
                 } else if let Some(r) = &td.init {
                     for (o, chunk) in blob.init[r.clone()].chunks(STAGE).enumerate() {
                         let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
+                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
                         if pipe.is_direct() {
                             // SAFETY: `chunk` borrows `blob.init`, which lives
                             // past pipe.finish().
@@ -5445,11 +5496,7 @@ impl GpuEngine {
                     }
                     for (o, chunk) in data.chunks(STAGE).enumerate() {
                         let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
+                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
                         pipe.push(dst, chunk)?;
                     }
                     tracing::debug!(
@@ -5457,7 +5504,7 @@ impl GpuEngine {
                         "materialised generated tensor"
                     );
                 } else if vmm_va.is_none() && !packet_cache && !td.name.starts_with("kv.") {
-                    slab_commit_wait(&weight_slab, mem.base + td.bytes, &mut slab_wait_ms)?;
+                    commit(mem.base + td.bytes, &mut slab_wait_ms)?;
                     let t_ms = load_prof.then(std::time::Instant::now);
                     be.memset_d8(mem.base, 0, td.bytes as usize)?;
                     if let (Some(t), Some(tm)) = (t_ms, load_tim.as_mut()) {
@@ -6466,13 +6513,33 @@ impl GpuEngine {
                 .enumerate()
                 .map(|(index, g)| {
                     let program = blob.progs.len() - blob.decode_progs().len() + index;
-                    let projection_roles = segment_roles
-                        .as_ref()
-                        .and_then(|r| r.program(program))
-                        .map(|p| &p.roles)
-                        .filter(|roles| {
-                            roles.iter().copied().any(plow_asset::segment_roles::is_projection)
-                        });
+                    let rows = packet::devbuild::program_rows(g.t);
+                    let lt_min = crate::config::RuntimeConfig::get().nv.decode_cublaslt_min_rows;
+                    let projection_roles = if lt_min > 0 && rows < lt_min {
+                        if segment_roles
+                            .as_ref()
+                            .and_then(|r| r.program(program))
+                            .map(|p| &p.roles)
+                            .is_some_and(|roles| {
+                                roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                            })
+                        {
+                            tracing::info!(
+                                rows,
+                                lt_min,
+                                "decode rung kept native for speculative verify (below decode_cublaslt_min_rows)"
+                            );
+                        }
+                        None
+                    } else {
+                        segment_roles
+                            .as_ref()
+                            .and_then(|r| r.program(program))
+                            .map(|p| &p.roles)
+                            .filter(|roles| {
+                                roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                            })
+                    };
                     let mut rung = if let (Some(lt), Some(roles)) = (&cublaslt, projection_roles) {
                         let segments = cublaslt::decode_segments(g, &blob.tensors, roles)?;
                         let moe_segments =
@@ -7890,22 +7957,41 @@ impl GpuEngine {
         // The floor is 2% of the device, at most half of what is free after load; a card the
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
-        let mut store_room = None;
         let mut cache_floor = 0;
         let mut store_floor_band = None;
-        if let Some(kv) = vmm
-            .as_mut()
-            .and_then(|v| v.kv.as_mut())
-            .filter(|kv| kv.prefix_reuse())
-        {
-            if let Ok((free, total)) = be.mem_info() {
-                let config = crate::config::RuntimeConfig::get();
-                if let Some(floor) = config.vmm_cache_min_free_bytes(total, Some(free)) {
-                    kv.enable_pressure_eviction(floor);
-                    cache_floor = floor;
+        if let Ok((free, total)) = be.mem_info() {
+            let config = crate::config::RuntimeConfig::get();
+            let ring_charge = vmm
+                .as_ref()
+                .and_then(|v| v.rings.as_ref())
+                .map(|r| r.slot_charge())
+                .unwrap_or(0);
+            let packet_batch = vmm
+                .as_ref()
+                .and_then(|v| v.rings.as_ref())
+                .map(|r| r.slots() as u32)
+                .unwrap_or(batch as u32);
+            let budget = crate::memory::budget::GpuMemoryBudget::compute(
+                crate::memory::budget::GpuMemoryBudgetParams {
+                    total_bytes: total,
+                    free_bytes: free,
+                    packet_batch,
+                    ring_slot_charge: ring_charge,
+                    config,
+                },
+            );
+
+            if let Some(kv) = vmm
+                .as_mut()
+                .and_then(|v| v.kv.as_mut())
+                .filter(|kv| kv.prefix_reuse())
+            {
+                if budget.floor_bytes > 0 {
+                    kv.enable_pressure_eviction(budget.floor_bytes);
+                    cache_floor = budget.floor_bytes;
                     let cache_cap = config.prefix_cache_cap_bytes(total);
                     tracing::info!(
-                        floor_mib = floor >> 20,
+                        floor_mib = budget.floor_bytes >> 20,
                         free_mib = free >> 20,
                         cache_cap_mib = cache_cap >> 20,
                         "vmm prefix cache: pressure eviction armed (static cap is the fallback)"
@@ -7913,37 +7999,38 @@ impl GpuEngine {
                     // The store may reserve what the pool could have grown to; pressure
                     // shrinks it below that when the rings grow.
                     if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
-                        bs.set_device_cap(free.saturating_sub(floor));
-                        store_room = Some(free.saturating_sub(floor));
+                        bs.set_device_cap(budget.usable_room_bytes);
                         // Slot growth beyond the block pool creates blocks from free memory:
                         // the store stops a pool's worth above the floor so that does not
                         // trip the OOM path on every new slot.
-                        bs.set_device_floor(floor + (config.kv_pool_mib() << 20));
+                        bs.set_device_floor(budget.floor_bytes + (config.kv_pool_mib() << 20));
                         store_floor_band = Some(config.kv_pool_mib() << 20);
                     }
                 }
             }
-        }
-        // Parked ring units come out of the free memory the store grows into: they may hold at
-        // most half of its device tier, so a wide batch parks fewer slots than it serves instead
-        // of starving the store.
-        if let (Some(room), Some(rings)) = (store_room, vmm.as_mut().and_then(|v| v.rings.as_mut()))
-        {
-            let charge = rings.slot_charge().max(1);
-            let slots = (room / 2 / charge).min(rings.slots() as u64);
-            rings.set_park_cap(slots * charge);
+
+            // Parked ring units come out of the free memory the store grows into: they may hold at
+            // most half of its device tier, and clamp to decode_max_rung so wide compiled batches
+            // never park more slots than the server is admitted to run concurrently.
+            if let Some(rings) = vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+                rings.set_park_cap(budget.ring_park_cap_bytes);
+                tracing::info!(
+                    park_slots = budget.ring_park_slots,
+                    slots = rings.slots(),
+                    park_mib = budget.ring_park_cap_bytes >> 20,
+                    store_cap_mib = budget.usable_room_bytes >> 20,
+                    "vmm prefix: live ring park bounded by the block store"
+                );
+            }
+        } else if let Some(rings) = vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+            let config = crate::config::RuntimeConfig::get();
+            let max_park = config.decode_max_rung.unwrap_or(rings.slots() as u32) as u64;
+            let park_slots = (rings.slots() as u64).min(max_park);
+            rings.set_park_cap(park_slots * rings.slot_charge());
             tracing::info!(
-                park_slots = slots,
+                park_slots,
                 slots = rings.slots(),
-                park_mib = (slots * charge) >> 20,
-                store_cap_mib = room >> 20,
-                "vmm prefix: live ring park bounded by the block store"
-            );
-        } else if let Some(rings) = vmm.as_ref().and_then(|v| v.rings.as_ref()) {
-            tracing::info!(
-                park_slots = rings.slots(),
-                slots = rings.slots(),
-                park_mib = (rings.slots() as u64 * rings.slot_charge()) >> 20,
+                park_mib = (park_slots * rings.slot_charge()) >> 20,
                 "vmm prefix: live ring park unbounded (no pressure-sized block store)"
             );
         }
@@ -8061,6 +8148,7 @@ impl GpuEngine {
             ctr_bytes,
             cursor_bytes,
             devp,
+            handoff_shared,
             _weight_slab: Arc::new(weight_slab),
             d_inst,
             _ctr_block: ctr_block,
@@ -8197,7 +8285,9 @@ impl GpuEngine {
             engine.fish =
                 fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
         }
-        engine.depth_calibrate()?;
+        if engine.handoff_shared.is_none() {
+            engine.depth_calibrate()?;
+        }
         engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
@@ -9539,6 +9629,10 @@ impl GpuEngine {
 
     pub fn record_stream_event(&self, event: &CudaEvent) -> Result<()> {
         self.be.event_record(event, &self.stream)
+    }
+
+    pub(crate) fn quarantine_unretired(&self, error: &RuntimeError) -> RuntimeError {
+        self.be.quarantine_unretired(error)
     }
 
     fn step_slots_sampled_unchecked(
@@ -15768,6 +15862,21 @@ impl GpuEngine {
                 "instruction caps cannot profile library-routed decode; use segment kernel timing"
                     .into(),
             ));
+        }
+        for gw in self.gemv_wide_modules.iter().flatten() {
+            self.be
+                .module_global_set_u32(gw.module(), "plow_debug_max_inst_gw", limit)?;
+        }
+        self.be
+            .module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
+    }
+
+    /// [`Self::set_debug_max_inst`] for the depth stage alone: its programs run in the interpreter
+    /// objects whatever route serves the backbone rung, so a library-routed backbone does not
+    /// refuse the cap. The caller steps only the depth stage while a cap is set.
+    pub fn set_depth_debug_max_inst(&self, limit: u32) -> Result<bool> {
+        if !self.has_depth_stage() {
+            return Err(RuntimeError::Rejected("packet has no depth stage".into()));
         }
         for gw in self.gemv_wide_modules.iter().flatten() {
             self.be

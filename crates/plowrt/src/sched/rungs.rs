@@ -146,6 +146,7 @@ pub struct RungController {
     dwell_ticks: u32,
     low_load_ticks: u32,
     fast_probe: bool,
+    throughput: bool,
 }
 
 impl RungController {
@@ -158,6 +159,7 @@ impl RungController {
             dwell_ticks: 0,
             low_load_ticks: 0,
             fast_probe: false,
+            throughput: true,
         }
     }
 
@@ -166,6 +168,14 @@ impl RungController {
     pub fn with_fast_probe(mut self, on: bool) -> Self {
         self.fast_probe = on;
         self
+    }
+
+    /// Whether a narrower rung may take the seat on its measured capacity. Off while a coupled
+    /// stage (a codec) runs inside the model's ticks: its work lags the rows that caused it, so a
+    /// rung's service time is not its own and narrow rungs read cheap (Qwen3-TTS at 40 req/s
+    /// narrowed 192 -> 16 and held it with requests waiting upstream). Demand still sets the seat.
+    pub fn set_throughput(&mut self, on: bool) {
+        self.throughput = on;
     }
 
     /// Follow a serving-policy switch: the probe is a per-window choice, not a fixed property.
@@ -320,7 +330,7 @@ impl RungController {
     }
 
     fn throughput_seat(&self, demand_seat: usize, queued: usize) -> usize {
-        if demand_seat == 0 {
+        if demand_seat == 0 || !self.throughput {
             return demand_seat;
         }
         let widest = self.rungs.len() - 1;
@@ -421,6 +431,23 @@ mod tests {
         c.target = 4;
         let decision = c.decide(load(16, 8));
         assert_eq!(c.admission_limit(), 16, "{decision:?}");
+    }
+
+    /// With a coupled stage in the ticks, a cheaper-looking narrow rung does not take the seat.
+    #[test]
+    fn a_coupled_stage_keeps_the_demanded_rung() {
+        let mut c = controller(&[16, 192]);
+        for _ in 0..20 {
+            c.observe_decode(0, 5.0, NonZeroUsize::MIN);
+            c.observe_decode(1, 90.0, NonZeroUsize::MIN);
+        }
+        c.target = 1;
+        c.decide(load(192, 0));
+        assert_eq!(c.admission_limit(), 16);
+        c.set_throughput(false);
+        c.target = 1;
+        let decision = c.decide(load(192, 0));
+        assert_eq!(c.admission_limit(), 192, "{decision:?}");
     }
 
     /// A burst must widen the admission window and a QUIET PERIOD must narrow it back.

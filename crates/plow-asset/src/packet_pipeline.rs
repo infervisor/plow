@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 pub const SECTION: &str = "packet_pipeline.json";
 pub const VERSION: u32 = 1;
 
+#[path = "packet_pipeline_handoff.rs"]
+mod handoff;
+pub use handoff::*;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PacketPipelines {
@@ -191,6 +195,8 @@ pub struct PipelineTensor {
 pub enum PipelineDType {
     U8,
     U32,
+    U64,
+    I16,
     F16,
     Bf16,
     F32,
@@ -201,7 +207,8 @@ impl PipelineDType {
         match self {
             Self::U8 => 1,
             Self::U32 | Self::F32 => 4,
-            Self::F16 | Self::Bf16 => 2,
+            Self::U64 => 8,
+            Self::I16 | Self::F16 | Self::Bf16 => 2,
         }
     }
 }

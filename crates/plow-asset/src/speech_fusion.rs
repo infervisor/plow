@@ -88,7 +88,7 @@ fn conv_site(p: &Packet<'_>, d: &DevInst64) -> Result<Value, String> {
     Ok(json!({
         "kind": "conv_row_scale",
         "batch": d.i[0], "in_rows": d.i[1], "out_channels": d.i[3], "kernel": d.i[4],
-        "stride": d.i[5], "dilation": d.i[6], "pad_before": pads & 0xffff, "pad_after": pads >> 16,
+        "stride": d.i[5], "dilation": d.i[6] & 0x7FFF_FFFF, "pad_before": pads & 0xffff, "pad_after": pads >> 16,
         "out_bytes": bytes(p, d.t[0])?, "residual_bytes": bytes(p, d.t[5])?,
         "row_scale_bytes": bytes(p, d.t[7])?,
         "row_scale_is_out": d.t[7] == d.t[0], "row_scale_is_residual": d.t[7] == d.t[5],

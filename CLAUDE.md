@@ -123,6 +123,10 @@ Before coding:
 
 ## Performance
 
+Order is strict (`docs/bringup/agent-tools.md`, both HARD RULES), for every model and stage:
+block-vs-roofline table first, then op fusion, then each kernel to its roofline on a single block,
+and only then scheduling, admission or serving knobs. Peer serving grids confirm; they never pick the work.
+
 For `plowrt`:
 
 * Performance > abstraction/convenience.

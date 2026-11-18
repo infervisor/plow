@@ -92,6 +92,93 @@ a perf campaign (extend the harness as its own change):
   ([05](05-single-block-sweep.md) "What tier 2 cannot score"): they go to `step_bench` per rung,
   still before any grid.
 
+## HARD RULE: optimisation order — fusion, then kernels to the roofline, then everything else
+
+Applies to every model and every stage of it: LLM blocks, speech encoders, depth / code-predictor
+stages, codecs, vocoders. No exceptions for "serving" or "capacity" work: a throughput or latency
+gap is first a statement about the programs and kernels that run per request.
+
+1. **Roofline table first.** Before any change, produce the block-vs-roofline table above for every
+   stage on the request path, per op, from the production packet on calibrated ceilings. Rank stages
+   by `share of device time x distance from floor`. No candidate is designed, and no serving number
+   is reported, before this table exists.
+2. **Op fusion.** From the disassembly of each ranked program, list every op that runs as its own
+   device pass over rows another op of the same program already owns (residual adds, norms, casts,
+   activations, packs, bias, split epilogues) and every sibling group that could share a launch.
+   Fuse what preserves the numeric contract; record the rest with the reason it cannot fuse.
+3. **Kernels to the roofline.** Each remaining hot op goes through [04](04-kernel-tuning.md):
+   ISA reference, design consult, single-op A/B with an oracle, then single block
+   ([05](05-single-block-sweep.md)), generator search when a hand pass stalls. State the target
+   fraction of the floor and the measured one. An op left more than 2x from its floor carries a
+   written reason (latency-bound size, numeric contract, measured generator result).
+4. **Only then** scheduling, holds, batching windows, admission, queue sizes, ladder widths or any
+   other runtime or serving knob. A knob change proposed while step 2 or 3 is open for a stage on
+   the request path is out of order and is not measured, except to restore correctness.
+5. **Peer comparison last.** The serving grid against the reference stack confirms steps 1-4; it
+   does not choose what to work on. It runs only after the per-stage precision parity table below
+   exists.
+
+Invariance contracts found on the way (a result that depends on packing, batch position or block
+count) are correctness failures: they stop the candidate at step 3, not at the serving gate.
+
+Speech stages use the same harness with these tools:
+
+| step | tool |
+|---|---|
+| per-op and per-program times | `packet_bench <pkt> <program> <role> N --each\|--sweep\|--seq` (in a queue job) |
+| ops, shapes, flags | `plowrt disasm --format json <pkt>` (CPU) |
+| floor + table | `scripts/campaign/speech_roofline.py DISASM.json PROGRAM SWEEP.jsonl` |
+| single-op oracle, parity and timing | `runtime/tests/speech_f32_op_test.cu` (extend it; `--conv-packing-only` is the packed-vs-alone bitwise case) |
+| encoder packed-vs-single parity | `asr_encoder_pack_check ASSETS PACK AUDIO.wav...` (plowrt example; bitwise, exits 1 on a difference) |
+| demand per bucket | `scripts/campaign/bucket_demand.py` |
+
+A final report that lacks the roofline table, the fusion list or the per-op targets is incomplete,
+whatever its serving numbers say. Speech campaigns also follow §9 "Speech serving campaigns"
+(served split, per-bucket objects, fail-closed variants, codec invariance before timing).
+
+## HARD RULE: precision parity with the peer, stage by stage
+
+A ratio against a peer (vLLM, vLLM-Omni, a provider engine) is valid only when both sides run the
+same arithmetic in every stage. A model-level label such as "bf16" is not enough. Depth and code
+predictor stages, codecs, encoders, attention and KV often run a different precision from the
+backbone, on both sides.
+
+1. **Read the peer's precision from the peer.** Do this before its first served cell. Sources:
+   - its launch log (`dtype=`);
+   - per-stage deploy or stage configs (`dtype`, TF32 switches such as `decode_enable_tf32`);
+   - its engine source: `allow_tf32` and `cudnn.allow_tf32` (framework defaults: cuDNN conv TF32
+     on, matmul TF32 off), explicit casts, and kernel-internal rounding (an add + LayerNorm that
+     writes fp16 makes the activations fp16).
+
+   A CLI default counts: record it when no flag is passed. Never infer precision from the
+   checkpoint or a model card. A stage config can override the checkpoint's dtype, as in a codec
+   whose config says float32 but whose stage runs bf16.
+2. **Read plowrt's precision from the served packet**, not from the recipe. Per stage, take it from
+   `plowrt disasm --format json` op flags:
+   - weight dtype;
+   - half input and half output bits;
+   - split-bf16, bf16 taps, 3xTF32;
+   - KV dtype.
+3. **Write the parity table before any ratio.** Put it in the campaign results doc with the
+   columns Model | Stage | Peer (with the source line or log line) | plowrt | Status, where Status
+   is match, plowrt wider or plowrt narrower. Every report that quotes a peer ratio links this
+   table.
+4. **Never narrower than the peer.** If any plowrt stage runs below the peer's precision, every
+   ratio for that model is NOT MATCHED, whatever the quality gate says. Examples: fp8 against bf16,
+   bf16 against fp16 activations, one-pass TF32 against f32. A quantized checkpoint matches only
+   when the peer serves the same published checkpoint.
+5. **A wider stage is a work item.** Each plowrt-wider stage either moves to the peer's precision or
+   carries a written, measured reason to stay wider, such as a codec PCM contract the narrower
+   arithmetic fails.
+   - The move goes through the kernel harness above and requalifies the CER, WER or FP32-reference
+     gate.
+   - A ratio quoted while a wider stage is open names that stage next to the number.
+6. **Re-audit on any change** to the peer's version or flags, and on any emit flag or pin that
+   changes a stage's arithmetic.
+
+The quality gates decide whether the output is acceptable. The parity table decides whether the
+comparison is fair. A report needs both.
+
 ## Working rules (every agent)
 
 Product invariants:
@@ -411,6 +498,9 @@ Rules (enforced in `serving_comparison.py`, tested in `scripts/bench/test_servin
 * Exactly these 12 rows, in this order. Every cell is filled; missing data is an error, not a blank.
 * "Same as baseline" only when the recorded value is literally identical; otherwise the Infervisor
   value is shown and the cell is **NOT MATCHED**. Matched = the first five rows identical.
+  The Precision row is per stage. It is "Same as baseline" only when the precision parity table
+  (HARD RULE above) shows no plowrt-narrower stage. An open plowrt-wider stage is named in the note
+  under the table.
   Input/output also compares the per-request length lists.
 * Serving stack: Baseline = stack, version and serve flags; Infervisor =
   `Infervisor (plowrt <commit>, packet <model.pkt sha256 prefix>)`.
@@ -919,6 +1009,56 @@ Each rule cost at least one campaign a day of misattributed results.
   `PYTHONPATH` produced results that had to be voided after the lease.
 * Recipe gates serve `--assets` from the emit tree with the prepared checkpoint; they prove the
   packet, not the distribution path (below).
+
+**Speech serving campaigns (lessons from the 2026-11 serving-concurrency campaign)**
+
+Mandatory for ASR/TTS stages (encoder, talker, depth / code predictor, codec, vocoder). Each step
+names its output; a report without it is incomplete.
+
+1. **Served split first.** For every served cell take `/metrics` *deltas* for that cell (the
+   counters are cumulative across cells): launches, mean rows per launch and padded rows per family
+   and capacity, single-row ticks, tick time per phase, playback stalls and underrun seconds. From
+   the full-batch step time compute the ideal rate (`concurrency x audio per step / step time`) and
+   split the gap to the peer into **step time** (kernel work, the roofline table) and **occupancy**
+   (rows per tick below concurrency, single-row ticks, stalls). Report both. Maya2 c128: full-batch
+   tick ~44 ms gives ~230 audio-s/s, the served rate was 141, and half the ticks carried one row.
+   A kernel win that the occupancy term cannot pass through is not reported as a serving win.
+2. **Codec numeric contract before any timing.** Every codec candidate runs `codec_stream_check`
+   (stream / whole / mixed, chunk 2 and random) against the production packet: PCM rel-L2 / SNR and
+   the invariance line. A new DIFFERS that the production packet does not show stops the candidate;
+   a pre-existing one is recorded as an open item, never folded into a verdict.
+3. **Per-packet-bucket objects.** An interpreter object compiles only the bodies its packet's
+   classes use (variant mask symbol such as `PLOW_SPEECH_CONV_BF16_VARIANTS`, conv object
+   ladders). Before timing a new body, read `cuobjdump --dump-resource-usage` for every variant:
+   STACK above the control's or LOCAL spill is fixed first (a second accumulator set spilled at the
+   register cap and slowed every conv 6-10%).
+4. **Fail closed on new arithmetic.** A packet whose ops need a new body sets a capability bit or
+   symbol that the loader checks; an object without it must refuse the packet at load. Prove it once:
+   the old object against the new packet fails with the capability error.
+5. **Pins and knobs must be seen to apply.** After an emit with class pins or a new emit knob, count
+   the affected stages in `plowrt disasm --format json` (flags, units). A pin file that matched no
+   class is an error: a key built from the activation's flag code instead of its class code matched
+   nothing and cost a lease.
+6. **Every binary the lease runs is rebuilt and named.** `plowrt`, each example
+   (`packet_bench`, `codec_stream_check`, `step_bench`) and any lib-test binary are rebuilt from the
+   same tree and their sha256 printed in the lease log. Stale examples computed an old variant mask
+   and refused a valid packet.
+7. **Interleaved arms, frozen inputs.** Program and step timings run A/B/A/B in one lease with >= 2
+   repeats per arm; no compile, emit or cargo build in or beside a timing lease. Attribute a block
+   regression per variant (variant mask bisection) before redesigning it: uncoalesced partial
+   stores, not the suspected arithmetic, cost 120 us at b64.
+8. **Lands only where it wins.** A mechanism that is correct but loses at served rungs lands only
+   as a per-class tuning pin no recipe sets (never a default-off `PLOW_*` knob, "Builds"); the
+   results doc records the loss table.
+9. **Precision parity per stage** (HARD RULE above). The campaign audit found three plowrt stages
+   wider than the peers:
+   - Maya2 depth residual and KV in f32, against provider fp16;
+   - Qwen3-TTS codec attention in 3xTF32, against vLLM-Omni bf16;
+   - Qwen3-ASR encoder convs and attention in 3xTF32, against vLLM bf16.
+
+   Each one was paying for arithmetic the peer skips.
+10. **Disk.** Speech packets are 6+ GB each. Check free space before an emit, remove your own
+   superseded packets when a decision is made (keep any a kept packet symlinks into), never others'.
 
 **Release and distribution**
 

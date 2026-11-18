@@ -8,7 +8,9 @@ use nn_graph::viz::{
     VizSummary, VizTensor,
 };
 use nn_graph::{DType, NodeId, Origin, TensorId};
+#[cfg(test)]
 use plow_asset::packet_pipeline::PacketPipelines;
+use plow_asset::packet_pipeline::PipelineMetadata;
 use plowrt::asset::devblob::{DevBlobMetadata, DevProg};
 
 pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
@@ -81,9 +83,7 @@ pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
             .sections
             .iter()
             .find(|(_, n, _)| n == plow_asset::packet_pipeline::SECTION)
-            .map(|(_, _, bytes)| {
-                serde_json::from_slice::<PacketPipelines>(bytes).map_err(|e| e.to_string())
-            })
+            .map(|(_, _, bytes)| PipelineMetadata::parse(bytes))
             .transpose()?;
         if let Some(metadata) = &metadata {
             metadata.validate(blob.progs.len(), |name| {
@@ -92,7 +92,7 @@ pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
                     .find(|t| t.name == name)
                     .map(|t| t.bytes)
             })?;
-            for pipeline in &metadata.pipelines {
+            for pipeline in metadata.pipelines() {
                 if pipeline.driver.starts_with("tts.") {
                     bundle.modality = ModelModality::Tts;
                 } else if (pipeline.driver.starts_with("rnnt.")
@@ -190,7 +190,7 @@ pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
         });
         let stage_name = metadata
             .as_ref()
-            .and_then(|m| m.pipelines.first())
+            .and_then(|m| m.pipelines().first())
             .map(|p| {
                 if p.driver.starts_with("vad.") {
                     "Voice activity detector"
@@ -253,8 +253,8 @@ pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
         }
         let dependency = overview.nodes[from].output;
         overview.nodes[to].inputs.push(dependency);
-        for left in packet_contracts[from].iter().flat_map(|m| &m.pipelines) {
-            for right in packet_contracts[to].iter().flat_map(|m| &m.pipelines) {
+        for left in packet_contracts[from].iter().flat_map(|m| m.pipelines()) {
+            for right in packet_contracts[to].iter().flat_map(|m| m.pipelines()) {
                 for key in [
                     "codec.frame_codes",
                     "codec.frame_samples",
@@ -297,10 +297,10 @@ pub fn bundle_from_path(path: &Path) -> Result<VizModelBundle, String> {
     Ok(bundle)
 }
 
-fn program_label(index: usize, metadata: Option<&PacketPipelines>) -> String {
+fn program_label(index: usize, metadata: Option<&PipelineMetadata>) -> String {
     let roles: Vec<_> = metadata
         .into_iter()
-        .flat_map(|m| &m.pipelines)
+        .flat_map(|m| m.pipelines())
         .flat_map(|p| {
             p.programs
                 .iter()
@@ -353,7 +353,7 @@ fn program_network(
     program: &DevProg,
     id: &str,
     title: &str,
-    metadata: Option<&PacketPipelines>,
+    metadata: Option<&PipelineMetadata>,
 ) -> Result<VizNetwork, String> {
     program_graph(
         blob,
@@ -438,7 +438,7 @@ fn program_graph(
     program: ProgramView<'_>,
     id: &str,
     title: &str,
-    metadata: Option<&PacketPipelines>,
+    metadata: Option<&PipelineMetadata>,
 ) -> Result<VizNetwork, String> {
     let mut graph = empty_graph();
     let names: Vec<_> = blob.tensors.iter().map(|t| t.name.as_str()).collect();
@@ -494,7 +494,7 @@ fn program_graph(
             let handle = t.handle? as usize;
             let buffer = blob.tensors.get(handle)?;
             buffers.insert(handle);
-            let shape = metadata.into_iter().flat_map(|m| &m.pipelines).flat_map(|p| p.tensors.values()).find(|t| t.name == buffer.name);
+            let shape = metadata.into_iter().flat_map(|m| m.pipelines()).flat_map(|p| p.tensors.values()).find(|t| t.name == buffer.name);
             Some(serde_json::json!({"slot":t.slot,"role":t.name,"name":buffer.name,"bytes":buffer.bytes,"dtype":shape.map(|s|s.dtype),"shape":shape.map(|s|&s.shape)}))
         }).collect();
         let block = format!("ops.{}", index / 48);
@@ -1026,6 +1026,7 @@ mod tests {
             .find(|(_, name, _)| name == plow_asset::packet_pipeline::SECTION)
             .unwrap();
         let metadata: PacketPipelines = serde_json::from_slice(&section.2).unwrap();
+        let metadata = PipelineMetadata::V1(metadata);
         let net = program_network(&blob, &blob.progs[0], "vad", "VAD", Some(&metadata)).unwrap();
         assert_eq!(net.graph.nodes.len(), vad.model.progs[0].insts.len());
         assert!(net.graph.nodes.iter().any(|n| n.op == "LstmCellF32"));

@@ -9,7 +9,7 @@
 use super::*;
 
 fn tmp(name: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
+    let p = portable_temp_dir().join(format!(
         "plow-manifest-{}-{}-{name}",
         std::process::id(),
         std::time::SystemTime::now()

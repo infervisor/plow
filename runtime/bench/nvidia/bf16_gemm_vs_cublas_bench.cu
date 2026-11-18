@@ -123,6 +123,11 @@ static const Shape SHAPES[] = {
     {"m31_local_o",5376,8192,0}, {"m31_global_q",16384,5376,0},
     {"m31_global_k",2048,5376,0}, {"m31_global_o",5376,16384,0},
 #endif
+#ifdef PLOW_BENCH_QWEN_ASR
+    /* Qwen3-ASR 1.7B audio encoder layer (d 1024): projections, fc1, fc2, and the conv-out
+     * projection; a 128-chunk pack is 1664 rows. */
+    {"asr_proj",1024,1024,0}, {"asr_fc1",4096,1024,0}, {"asr_fc2",1024,4096,0}, {"asr_conv_out",1024,7680,0},
+#endif
 #elif defined(PLOW_BENCH_GEMM_ODOWN)
     {"g12_o_local",3840,4096,0}, {"g12_o_full",3840,8192,0}, {"g12_down",3840,15360,0},
     {"g31_o_local",5376,8192,0}, {"g31_o_full",5376,16384,0}, {"g31_down",5376,21504,0},

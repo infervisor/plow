@@ -1184,6 +1184,13 @@ fastconformer RNNT, fish-s2.
   Other backends need their own producer retention/pool implementation. This establishes no
   timing win or whole-model quality qualification.
 
+- **Versioned packet handoffs**: pipeline metadata v2 carries backend-neutral typed views,
+  row maps, ordering, bind writes and readback declarations, checked against independent native
+  facts. The CUDA owned executor reuses component resources, orders shared views and copies,
+  and retains bounded pinned completions through delivery. Unsupported plans and overlap are
+  refused; no production caller is enabled. AMD and CPU need native providers and an executor
+  with equivalent ownership, completion and quarantine guarantees. Metadata v1 remains supported.
+
 ### NVIDIA → AMD candidates
 
 Runtime features that exist on CUDA and are absent or partial on AMD (`exec/amd*`).

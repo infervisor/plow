@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use plow_asset::packet_pipeline::{PacketPipeline, PacketPipelines, SECTION};
+#[cfg(test)]
+use plow_asset::packet_pipeline::PacketPipelines;
+use plow_asset::packet_pipeline::{PacketPipeline, PipelineMetadata, SECTION};
 
 use crate::{Result, RuntimeError};
 
@@ -15,6 +17,10 @@ pub struct PacketTensor {
 
 enum BufferStorage {
     Host(Vec<u8>),
+    #[cfg(test)]
+    TestPinned(Vec<u8>),
+    #[cfg(feature = "cuda")]
+    Pinned(crate::device::cuda::PinnedHost),
     #[cfg(feature = "cuda")]
     Cuda {
         memory: std::sync::Arc<crate::device::DeviceMem>,
@@ -51,6 +57,38 @@ impl From<Vec<u8>> for PacketBuffer {
 }
 
 impl PacketBuffer {
+    pub(crate) fn host_slice(&self) -> Option<&[u8]> {
+        let data = match self.storage.as_ref() {
+            BufferStorage::Host(data) => &data[..],
+            #[cfg(test)]
+            BufferStorage::TestPinned(data) => &data[..],
+            #[cfg(feature = "cuda")]
+            BufferStorage::Pinned(data) => data.as_slice(),
+            #[cfg(feature = "cuda")]
+            BufferStorage::Cuda { .. } => return None,
+        };
+        Some(&data[self.offset..self.offset + self.bytes])
+    }
+
+    pub(crate) fn pinned_host(&self) -> bool {
+        #[cfg(test)]
+        if matches!(self.storage.as_ref(), BufferStorage::TestPinned(_)) {
+            return true;
+        }
+        #[cfg(feature = "cuda")]
+        if matches!(self.storage.as_ref(), BufferStorage::Pinned(_)) {
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn host_identity(&self) -> (usize, usize, usize) {
+        (
+            std::sync::Arc::as_ptr(&self.storage) as usize,
+            self.offset,
+            self.bytes,
+        )
+    }
     pub fn len(&self) -> usize {
         self.bytes
     }
@@ -84,6 +122,14 @@ impl PacketBuffer {
         match self.storage.as_ref() {
             BufferStorage::Host(data) => {
                 output.copy_from_slice(&data[self.offset..self.offset + self.bytes])
+            }
+            #[cfg(test)]
+            BufferStorage::TestPinned(data) => {
+                output.copy_from_slice(&data[self.offset..self.offset + self.bytes]);
+            }
+            #[cfg(feature = "cuda")]
+            BufferStorage::Pinned(data) => {
+                output.copy_from_slice(&data.as_slice()[self.offset..self.offset + self.bytes]);
             }
             #[cfg(feature = "cuda")]
             BufferStorage::Cuda {
@@ -123,6 +169,100 @@ impl PacketBuffer {
             } => Some((backend, memory.base + self.offset as u64)),
             _ => None,
         }
+    }
+}
+
+pub(crate) struct PacketHostBufferPool {
+    slots: Vec<PacketBuffer>,
+    capacity: usize,
+    next: usize,
+    pending: Option<usize>,
+}
+
+impl PacketHostBufferPool {
+    #[cfg(feature = "cuda")]
+    pub(crate) fn pinned(
+        backend: &crate::device::cuda::CudaBackend,
+        bytes: usize,
+        slots: usize,
+    ) -> Result<Self> {
+        if bytes == 0 || slots == 0 {
+            return Err(RuntimeError::Rejected("empty host readback pool".into()));
+        }
+        let slots = (0..slots)
+            .map(|_| {
+                Ok(PacketBuffer {
+                    storage: std::sync::Arc::new(BufferStorage::Pinned(
+                        backend.host_alloc_pinned(bytes)?,
+                    )),
+                    offset: 0,
+                    bytes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            slots,
+            capacity: bytes,
+            next: 0,
+            pending: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host(bytes: usize, slots: usize) -> Self {
+        Self {
+            slots: (0..slots)
+                .map(|_| PacketBuffer {
+                    storage: std::sync::Arc::new(BufferStorage::TestPinned(vec![0; bytes])),
+                    offset: 0,
+                    bytes,
+                })
+                .collect(),
+            capacity: bytes,
+            next: 0,
+            pending: None,
+        }
+    }
+
+    pub(crate) fn begin(&mut self, bytes: usize) -> bool {
+        if bytes > self.capacity || self.pending.is_some() {
+            return false;
+        }
+        for _ in 0..self.slots.len() {
+            let index = self.next;
+            self.next = (index + 1) % self.slots.len();
+            let slot = &mut self.slots[index];
+            if std::sync::Arc::get_mut(&mut slot.storage).is_some() {
+                slot.bytes = bytes;
+                self.pending = Some(index);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn writable(&mut self) -> &mut [u8] {
+        let slot = &mut self.slots[self.pending.expect("reserved readback")];
+        let storage = std::sync::Arc::get_mut(&mut slot.storage).expect("exclusive readback slot");
+        match storage {
+            BufferStorage::Host(data) => &mut data[..slot.bytes],
+            #[cfg(test)]
+            BufferStorage::TestPinned(data) => &mut data[..slot.bytes],
+            #[cfg(feature = "cuda")]
+            BufferStorage::Pinned(data) => &mut data.as_mut_slice()[..slot.bytes],
+            #[cfg(feature = "cuda")]
+            BufferStorage::Cuda { .. } => unreachable!("host readback storage"),
+        }
+    }
+
+    // The caller must retire every asynchronous write before publishing this immutable view.
+    pub(crate) unsafe fn complete(&mut self) -> PacketBuffer {
+        self.slots[self.pending.take().expect("reserved readback")].clone()
+    }
+
+    // No asynchronous write may have been submitted into the reserved slot.
+    pub(crate) unsafe fn cancel_unsubmitted(&mut self) {
+        self.pending = None;
     }
 }
 
@@ -391,7 +531,7 @@ pub trait PacketRuntime: Send {
 }
 
 pub struct PacketAsset {
-    pipelines: PacketPipelines,
+    pipelines: PipelineMetadata,
     /// The speech contract's own metadata sections (`asr_vocabulary.json`), by name.
     sections: std::collections::BTreeMap<String, Vec<u8>>,
 }
@@ -654,7 +794,8 @@ impl PacketAsset {
             pipelines: PacketPipelines {
                 version: 1,
                 pipelines,
-            },
+            }
+            .into(),
             sections: Default::default(),
         }
     }
@@ -687,7 +828,7 @@ impl PacketAsset {
         if raw.len() > 1024 * 1024 {
             return Err(RuntimeError::Rejected(format!("{SECTION} is too large")));
         }
-        let pipelines: PacketPipelines = serde_json::from_slice(raw)
+        let pipelines = PipelineMetadata::parse(raw)
             .map_err(|error| RuntimeError::Rejected(format!("invalid {SECTION}: {error}")))?;
         pipelines
             .validate(blob.progs.len(), |name| {
@@ -718,7 +859,13 @@ impl PacketAsset {
     }
 
     pub fn pipelines(&self) -> &[PacketPipeline] {
-        &self.pipelines.pipelines
+        self.pipelines.pipelines()
+    }
+
+    pub fn handoff_plans(
+        &self,
+    ) -> Option<&BTreeMap<String, plow_asset::packet_pipeline::HandoffPlan>> {
+        self.pipelines.handoff_plans()
     }
 
     /// The sidecar packet a pipeline names under `key` (e.g. `encoder.packet`), else `legacy`
@@ -775,8 +922,7 @@ impl PacketAsset {
 
     pub fn bind(&self, name: &str, runtime: &dyn PacketRuntime) -> Result<BoundPacketPipeline> {
         let pipeline = self
-            .pipelines
-            .pipelines
+            .pipelines()
             .iter()
             .find(|pipeline| pipeline.name == name)
             .ok_or_else(|| {
@@ -791,8 +937,7 @@ impl PacketAsset {
         runtime: &dyn PacketRuntime,
     ) -> Result<BoundPacketPipeline> {
         let mut matches = self
-            .pipelines
-            .pipelines
+            .pipelines()
             .iter()
             .filter(|pipeline| pipeline.driver == driver);
         let pipeline = matches.next().ok_or_else(|| {
@@ -1087,6 +1232,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_readback_pool_preserves_held_generations_and_bounds_reuse() {
+        let mut pool = PacketHostBufferPool::host(16, 2);
+        assert!(pool.begin(8));
+        assert!(!pool.begin(8));
+        pool.writable().fill(1);
+        let first = unsafe { pool.complete() };
+        let part = first.slice(2..6).unwrap();
+        assert!(pool.begin(16));
+        pool.writable().fill(2);
+        let second = unsafe { pool.complete() };
+        assert!(!pool.begin(1));
+        drop(first);
+        assert!(!pool.begin(1));
+        assert_eq!(part.host_slice().unwrap(), [1; 4]);
+        drop(part);
+        assert!(pool.begin(4));
+        pool.writable().fill(3);
+        let third = unsafe { pool.complete() };
+        assert_eq!(third.host_slice().unwrap(), [3; 4]);
+        assert_eq!(second.host_slice().unwrap(), [2; 16]);
+        assert!(!pool.begin(17));
+    }
+
+    #[test]
     fn stage_files_include_conditioning_sidecars() {
         use plow_asset::dual_stream::CONDITIONING_KEY;
         let mut asset = PacketAsset {
@@ -1112,7 +1281,8 @@ mod tests {
                     tensors: BTreeMap::new(),
                     parameters: BTreeMap::new(),
                 }],
-            },
+            }
+            .into(),
             sections: BTreeMap::new(),
         };
         assert_eq!(
@@ -1130,7 +1300,10 @@ mod tests {
                 ),
             ])
         );
-        asset.pipelines.pipelines[0].strings.insert(
+        let PipelineMetadata::V1(metadata) = &mut asset.pipelines else {
+            unreachable!()
+        };
+        metadata.pipelines[0].strings.insert(
             CONDITIONING_KEY.into(),
             serde_json::json!({"version": 1, "speaker_packet": "../speaker.pkt",
                 "reference_packet": "ref_encoder.pkt"})
