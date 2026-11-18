@@ -12296,21 +12296,12 @@ impl AmdEngine {
         }
         let mut shared_prefix = shared_layout
             .map(|layout| {
-                let free = VmmOps::free_bytes(&*be).unwrap_or_else(|| be.vram_bytes());
-                let budget = crate::memory::budget::GpuMemoryBudget::compute(
-                    be.vram_bytes(),
-                    free,
-                    0,
-                    max_decode_batch as u32,
-                    0,
-                    config,
-                );
                 shared_prefix::SharedPrefix::new(
                     be.clone(),
                     layout,
-                    budget.kv_cache_cap_bytes,
+                    config.prefix_cache_cap_bytes(be.vram_bytes()),
                     crate::memory::vmm::kv_pool_cap(),
-                    if budget.floor_bytes > 0 { Some(budget.floor_bytes) } else { None },
+                    config.vmm_cache_min_free_bytes(be.vram_bytes(), None),
                 )
             })
             .transpose()?;
@@ -19570,22 +19561,11 @@ impl AmdEngine {
                 || self.prefix_snap.get(slot).is_some_and(Option::is_some))
     }
 
-    /// Snapshot budget for this rank: a fraction of the card's VRAM
-    /// (`--vmm-cache-memory-utilization`) or an explicit `--vmm-cache-mib`. `vram_bytes`
-    /// is a ROCr pool attribute read, not a device round trip, and this runs per
+    /// Snapshot budget for this rank: an explicit `--vmm-cache-mib` or 0 (no fixed cap).
+    /// `vram_bytes` is a ROCr pool attribute read, not a device round trip, and this runs per
     /// admission, not per step.
     fn prefix_cache_cap(&self) -> u64 {
-        let free = VmmOps::free_bytes(&*self.be).unwrap_or_else(|| self.be.vram_bytes());
-        let config = crate::config::RuntimeConfig::get();
-        let budget = crate::memory::budget::GpuMemoryBudget::compute(
-            self.be.vram_bytes(),
-            free,
-            0,
-            self.batch as u32,
-            0,
-            config,
-        );
-        budget.kv_cache_cap_bytes
+        crate::config::RuntimeConfig::get().prefix_cache_cap_bytes(self.be.vram_bytes())
     }
 
     pub fn prefix_cache_capable(&self) -> bool {

@@ -7953,8 +7953,9 @@ impl GpuEngine {
             tm.print_flame(total);
         }
 
-        // Unified GPU memory budget: partition device DRAM deterministically across
-        // static weights, active concurrency sliding rings, and dynamic KV block cache.
+        // Prefix cache: evict on real device pressure (`cuMemGetInfo`), not the static budget.
+        // The floor is 2% of the device, at most half of what is free after load; a card the
+        // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
         let mut cache_floor = 0;
         let mut store_floor_band = None;
@@ -7971,12 +7972,13 @@ impl GpuEngine {
                 .map(|r| r.slots() as u32)
                 .unwrap_or(batch as u32);
             let budget = crate::memory::budget::GpuMemoryBudget::compute(
-                total,
-                free,
-                wb,
-                packet_batch,
-                ring_charge,
-                config,
+                crate::memory::budget::GpuMemoryBudgetParams {
+                    total_bytes: total,
+                    free_bytes: free,
+                    packet_batch,
+                    ring_slot_charge: ring_charge,
+                    config,
+                },
             );
 
             if let Some(kv) = vmm
@@ -7987,32 +7989,50 @@ impl GpuEngine {
                 if budget.floor_bytes > 0 {
                     kv.enable_pressure_eviction(budget.floor_bytes);
                     cache_floor = budget.floor_bytes;
+                    let cache_cap = config.prefix_cache_cap_bytes(total);
                     tracing::info!(
                         floor_mib = budget.floor_bytes >> 20,
                         free_mib = free >> 20,
-                        kv_cache_cap_mib = budget.kv_cache_cap_bytes >> 20,
-                        ring_park_cap_mib = budget.ring_park_cap_bytes >> 20,
-                        concurrency_cap = budget.concurrency_cap,
-                        "vmm memory budget: pressure eviction armed with unified budget"
+                        cache_cap_mib = cache_cap >> 20,
+                        "vmm prefix cache: pressure eviction armed (static cap is the fallback)"
                     );
-                    if let Some(bs) = blocks.as_ref() {
-                        bs.set_device_cap(budget.kv_cache_cap_bytes);
+                    // The store may reserve what the pool could have grown to; pressure
+                    // shrinks it below that when the rings grow.
+                    if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
+                        bs.set_device_cap(budget.usable_room_bytes);
+                        // Slot growth beyond the block pool creates blocks from free memory:
+                        // the store stops a pool's worth above the floor so that does not
+                        // trip the OOM path on every new slot.
                         bs.set_device_floor(budget.floor_bytes + (config.kv_pool_mib() << 20));
                         store_floor_band = Some(config.kv_pool_mib() << 20);
                     }
                 }
             }
 
+            // Parked ring units come out of the free memory the store grows into: they may hold at
+            // most half of its device tier, and clamp to decode_max_rung so wide compiled batches
+            // never park more slots than the server is admitted to run concurrently.
             if let Some(rings) = vmm.as_mut().and_then(|v| v.rings.as_mut()) {
                 rings.set_park_cap(budget.ring_park_cap_bytes);
                 tracing::info!(
                     park_slots = budget.ring_park_slots,
                     slots = rings.slots(),
                     park_mib = budget.ring_park_cap_bytes >> 20,
-                    kv_cap_mib = budget.kv_cache_cap_bytes >> 20,
-                    "vmm memory budget: live ring park bounded by unified budget"
+                    store_cap_mib = budget.usable_room_bytes >> 20,
+                    "vmm prefix: live ring park bounded by the block store"
                 );
             }
+        } else if let Some(rings) = vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+            let config = crate::config::RuntimeConfig::get();
+            let max_park = config.decode_max_rung.unwrap_or(rings.slots() as u32) as u64;
+            let park_slots = (rings.slots() as u64).min(max_park);
+            rings.set_park_cap(park_slots * rings.slot_charge());
+            tracing::info!(
+                park_slots,
+                slots = rings.slots(),
+                park_mib = (park_slots * rings.slot_charge()) >> 20,
+                "vmm prefix: live ring park unbounded (no pressure-sized block store)"
+            );
         }
         if let Some(v) = vmm.as_ref() {
             prefix::trace_init(v);

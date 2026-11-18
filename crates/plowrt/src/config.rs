@@ -613,21 +613,17 @@ pub struct RuntimeConfig {
     )]
     pub encode_split_min: Option<u32>,
 
-    /// Optional soft cap on prefix blocks and boundary snapshots as a fraction of the device's
-    /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to the
-    /// prefix cache. Default 0: no static cap; the cache grows into free memory and pressure
-    /// eviction (`--vmm-cache-min-free-mib`) or allocation OOM evicts it, as vLLM's prefix
     /// Explicit soft cap on prefix blocks and boundary snapshots in MiB.
-    /// 0 or unset = dynamic unified headroom budgeting (OOM-driven pressure eviction only).
+    /// Unset or 0 = dynamic headroom budgeting (OOM-driven pressure eviction only).
     #[arg(long = "vmm-cache-mib", env = "PLOW_VMM_CACHE_MIB", global = true)]
     pub vmm_cache_mib: Option<u32>,
 
     /// Keep every cached prefix (whole shared blocks and private boundary snapshots alike)
     /// until free device memory would drop below this many MiB, instead of trimming as soon
-    /// as `--vmm-cache-mib`/`--vmm-cache-memory-utilization` bytes of cache are held. Unset
-    /// (the default) derives 4% of the device; `=0` is the rollback to the static byte budget
-    /// as the only trim trigger. Needs the backend to report free device memory cheaply
-    /// (`VmmOps::free_bytes`); a backend that cannot degrades to the static budget unchanged.
+    /// as `--vmm-cache-mib` bytes of cache are held. Unset (the default) derives 4% of the
+    /// device; `=0` is the rollback to the static byte budget as the only trim trigger.
+    /// Needs the backend to report free device memory cheaply (`VmmOps::free_bytes`); a
+    /// backend that cannot degrades to the static budget unchanged.
     #[arg(
         long = "vmm-cache-min-free-mib",
         env = "PLOW_VMM_CACHE_MIN_FREE_MIB",
