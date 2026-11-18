@@ -114,7 +114,7 @@ All synchronization — within an SM, across SMs, across GPUs — uses the same 
 
 The semantic rewrite rules and scheduler are intended to be hardware-agnostic. A port is not complete by adding a `GpuSpec`: the compiler must select only kernel variants that the target interpreter actually instantiates. The target design therefore combines a generated kernel-capability registry, the analytical cost model for cold-start ranking, and offline measurements keyed by hardware and interpreter build.
 
-**Current implementation:** this boundary is incomplete. Generic `OpKind` selection coexists with model-specific `DevOp` emitters and duplicated `pick_tile` functions; some model-specific selection still names a particular GPU spec directly. Until those paths use one registry-backed selector, “swap the cost model” is a design goal rather than a portability guarantee.
+**Current implementation:** the dense GEMM tile pickers (`devgen::pick_tile`, `llama3::pick_tile`, and `plowc tune select`) and the schedule-path `CompilerOracle` now route through the capability-filtered `kernelcaps::select_kernel` selector backed by `tunedb` measurements and per-target `hwspec` cost models; extending registry-backed selection beyond dense GEMM to all remaining operator families is ongoing.
 
 ### 6. Formal Verification as Compile-Time Check
 

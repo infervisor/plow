@@ -52,9 +52,9 @@ use std::path::PathBuf;
 
 use kernelcaps::{
     dense_gemm_inventory, dense_gemm_tuning_build, select_kernel, HardwareFingerprint, Inventory,
-    NoMeasurements, OpSignature, Phase, ProfileId, Rationale,
+    KernelId, MeasuredCosts, OpSignature, Phase, ProfileId, Rationale,
 };
-use tunedb::Digests;
+use tunedb::{Digests, TuneStore};
 
 pub mod demand;
 pub mod gemm;
@@ -185,20 +185,23 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
     warn_if_root_disagrees_with_the_compiler(&opts.root, hw.isa, &tuning_build);
     println!();
 
+    let want = Digests {
+        execution: None,
+        implementation: tuning_build.label(),
+        interpreter: tuning_build.label(),
+        toolchain: tuning_build.toolchain.clone(),
+        oracle: tunedb::gemm_oracle(hw.isa).to_string(),
+    };
+
     match &opts.action {
         TuneAction::Inventory => inventory(&reg, &hw),
-        TuneAction::Select { m, n, k } => select(&reg, &hw, opts.profile, *m, *n, *k)?,
+        TuneAction::Select { m, n, k } => {
+            select(&reg, &hw, opts.profile, &opts.db, &want, *m, *n, *k)?
+        }
         TuneAction::Status { coverage_from } => {
             // Reported against the PROBED build, not against the records' own digests. The old
             // version keyed off `all.first()`'s digests, which made a fully stale store report
             // itself as healthy — it compared the store to itself.
-            let want = Digests {
-                execution: None,
-                implementation: tuning_build.label(),
-                interpreter: tuning_build.label(),
-                toolchain: tuning_build.toolchain.clone(),
-                oracle: tunedb::gemm_oracle(hw.isa).to_string(),
-            };
             status::status(&opts.db, &hw.tuning_path(), &want, coverage_from.as_ref())?
         }
         TuneAction::Shapes(spec) => shapes(spec)?,
@@ -311,10 +314,81 @@ fn inventory(reg: &Inventory, hw: &HardwareFingerprint) {
     }
 }
 
+struct SelectMeasurements {
+    costs: std::collections::HashMap<u16, f64>,
+}
+
+impl SelectMeasurements {
+    fn load(
+        db: &std::path::Path,
+        spec: &hwspec::GpuSpec,
+        hw: &HardwareFingerprint,
+        profile: ProfileId,
+        want: &Digests,
+        op: &OpSignature,
+    ) -> Self {
+        let cell = if matches!(
+            hw.isa,
+            hwspec::IsaLevel::Gfx942 | hwspec::IsaLevel::Gfx950 | hwspec::IsaLevel::Gfx1201
+        ) {
+            tunedb::amd_tuning_cell(spec)
+        } else {
+            hw.tuning_path()
+        };
+        let case = tunedb::gemm_op_case(op.shape.m, op.shape.n, op.shape.k, op.quant);
+        let store = TuneStore::new(db.to_path_buf());
+        let Ok(records) = store.load_kernels(&cell) else {
+            return Self {
+                costs: Default::default(),
+            };
+        };
+        let mut current: std::collections::HashMap<u16, f64> = Default::default();
+        let mut parked: std::collections::HashMap<u16, f64> = Default::default();
+        let allow_parked = std::env::var("PLOW_TUNE_IGNORE_DIGEST")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        for r in records {
+            if !r.state.is_selectable()
+                || !r.qualification_blockers().is_empty()
+                || r.hardware != cell
+                || r.profile != profile.label()
+                || r.op_case != case
+            {
+                continue;
+            }
+            let target = if r.digests.stale_against(want).is_empty() {
+                &mut current
+            } else if allow_parked {
+                &mut parked
+            } else {
+                continue;
+            };
+            let cur = target.entry(r.kernel_id).or_insert(f64::INFINITY);
+            *cur = cur.min(r.stats.median_ns);
+        }
+        let costs = if !current.is_empty() { current } else { parked };
+        Self { costs }
+    }
+}
+
+impl MeasuredCosts for SelectMeasurements {
+    fn median_ns(
+        &self,
+        _hw: &HardwareFingerprint,
+        _op: &OpSignature,
+        kernel: KernelId,
+    ) -> Option<f64> {
+        self.costs.get(&kernel.raw()).copied()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn select(
     reg: &Inventory,
     hw: &HardwareFingerprint,
     profile: ProfileId,
+    db: &std::path::Path,
+    want: &Digests,
     m: i64,
     n: i64,
     k: i64,
@@ -325,12 +399,14 @@ fn select(
         op.shape.class()
     );
 
-    // The SAME ranking the compiler uses. A tune command that reports a
-    // different kernel than the build would emit is worse than no command: it
-    // looks authoritative and quietly disagrees.
+    // The SAME ranking the compiler uses — including qualified `tunedb`
+    // measurements when present, with the analytical cost model as fallback.
+    // Passing `NoMeasurements` here previously caused `plowc tune select` to
+    // report the cold-start tile even when a campaign had calibrated the shape.
     let spec = hwspec::registry::lookup(&hw.sku).expect("fingerprint came from this spec");
     let n_units = hw.units;
-    let realization = select_kernel(reg, &op, hw, profile, &NoMeasurements, |kernel| {
+    let measured = SelectMeasurements::load(db, spec, hw, profile, want, &op);
+    let realization = select_kernel(reg, &op, hw, profile, &measured, |kernel| {
         tile_cost(spec, kernel, m, n, k, n_units)
     })?;
 

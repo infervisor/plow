@@ -1,10 +1,11 @@
 //! Kernel selection: registry filter, then rank.
 //!
-//! This replaces per-model `pick_tile` functions. Two of those exist today
-//! (`plowc/src/bin/gemma4.rs:479`, `plowc/src/bin/llama3.rs:78`), they disagree
-//! with each other, and the Gemma one resolves `hwspec::registry::lookup(
-//! "MI350X")` unconditionally — so compiling Gemma for an H100 ranks tiles using
-//! an AMD cost model. It then returns one of three opcodes that, on NVIDIA, all
+//! This replaces ad-hoc per-model `pick_tile` heuristics with a single
+//! capability-filtered selector shared by `devgen` (`pick_tile` /
+//! `gfx950_prefill_tile` / `gfx950_glu_fusion_wins`), `crates/plowc/src/bin/llama3.rs`,
+//! and `plowc tune select`. Previously, `gemma4` and `llama3` carried separate
+//! `pick_tile` implementations that disagreed with each other, resolved
+//! `"MI350X"` unconditionally, and ranked three opcodes that on NVIDIA all
 //! dispatch to the same `d_gemm` body.
 //!
 //! The order here follows the tuning architecture's selection pipeline:
