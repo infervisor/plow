@@ -2139,7 +2139,7 @@ fn spawn_scoped(
                 .store(prefilling as u64, Ordering::Relaxed);
             // The budget follows device memory (other models load, grow and leave); memory
             // pressure asks the planner to evict an idle co-tenant so this model can grow.
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "hsa"))]
             if kv_budget.is_some() && kv_refreshed.elapsed() >= KV_BUDGET_REFRESH {
                 kv_refreshed = Instant::now();
                 let pressure = state.gpu_engine(&slug).map(|e| {
