@@ -117,6 +117,7 @@ struct Kv {
     scale_row: u64,
     /// Turn-end re-publishes that had to copy (the prompt end was evicted while decoding) / all.
     republish: std::cell::Cell<(u64, u64)>,
+    cache_turn_end: bool,
 }
 
 impl Kv {
@@ -196,6 +197,7 @@ impl Kv {
         if !prompt_end && rows < prompt && !self.kv.checkpoint_awaited(toks, p_a) {
             return;
         }
+        let end = prompt.saturating_sub(1 + slack) / 32 * 32;
         let turn_end = rows > prompt;
         if !turn_end {
             let kind = if prompt_end {
@@ -204,12 +206,15 @@ impl Kv {
                 Kind::CHECKPOINT
             };
             self.boundary(b, toks, p_a, kind);
-        }
-        let end = prompt.saturating_sub(1 + slack) / 32 * 32;
-        if turn_end && end > 0 && end < p_a {
-            let (_, copied) = self.boundary_copied(b, toks, end, Kind::PROMPT_END);
-            let (c, n) = self.republish.get();
-            self.republish.set((c + u64::from(copied), n + 1));
+        } else {
+            if end > 0 && end <= p_a {
+                let (_, copied) = self.boundary_copied(b, toks, end, Kind::PROMPT_END);
+                let (c, n) = self.republish.get();
+                self.republish.set((c + u64::from(copied), n + 1));
+            }
+            if self.cache_turn_end && p_a > end {
+                self.boundary(b, toks, p_a, Kind::TURN_END);
+            }
         }
     }
 }
@@ -335,6 +340,7 @@ fn vmm_sim_agentic() {
         full_row: 16 * 512 * elem as u64,
         scale_row: if fp8 { 64 } else { 0 },
         republish: std::cell::Cell::new((0, 0)),
+        cache_turn_end: false,
     };
     // `GpuEngine::admission_rows` on a masked-padding packet: one decode quantum (K = 8) + 1.
     let margin = env_u64("SIM_MARGIN", 9) as usize;
@@ -665,6 +671,7 @@ impl Rig {
                 full_row: 8,
                 scale_row: 0,
                 republish: std::cell::Cell::new((0, 0)),
+                cache_turn_end: false,
             },
             pos: vec![0; batch as usize],
             lookback: 64,
@@ -736,6 +743,9 @@ impl Rig {
             .collect();
         toks.extend_from_slice(&out);
         self.pos[b] = toks.len() as u32;
+        if self.k.cache_turn_end {
+            self.k.kv.ensure_rows(b, toks.len() as u32).expect("rows");
+        }
         self.k.publish(b, toks, toks.len() as u32);
         self.k.kv.begin_seq(b);
         self.pos[b] = 0;
@@ -905,6 +915,46 @@ fn cell_no_session_conversation_keeps_one_boundary() {
         assert_eq!(s.snapshots_retired, 5);
         assert_eq!(s.publishes_turn_end, 0, "no output boundary");
     }
+}
+
+/// Decode output caching: turn 1 decodes reply tokens, which are cached as a TURN_END boundary.
+/// Turn 2 continues the conversation (prompt + reply + user query) and attaches through the
+/// decoded tokens rather than only the turn 1 prompt end.
+#[test]
+fn cell_decode_turn_end_caches_reply_tokens_for_next_turn() {
+    let mut r = Rig::new(false, 1 << 20, 64, 2);
+    r.k.cache_turn_end = true;
+    let p = conv_prompt(1, 40, 200); // 240 tokens
+    // Turn 1: 240 tokens prompt, decodes 32 tokens reply
+    let (rows0, reply0) = r.turn(0, &p, 32);
+    assert_eq!(rows0, 0, "turn 1 is cold");
+    assert_eq!(reply0.len(), 32);
+    let s = r.kv().stats();
+    assert_eq!(s.publishes_turn_end, 1);
+
+    // Turn 2: continues with previous prompt + previous reply + 64 new user tokens
+    let mut p2 = p.clone();
+    p2.extend_from_slice(&reply0);
+    p2.extend((0..64u32).map(|i| 50_000 + i));
+    let (rows1, reply1) = r.turn(0, &p2, 32);
+    assert_eq!(rows1, 256, "turn 2 attaches through previous turn decoded tokens");
+    assert_eq!(reply1.len(), 32);
+    let s2 = r.kv().stats();
+    assert_eq!(s2.attach_prompt_end, 1);
+    assert_eq!(s2.tokens_attached_prompt_end, 256);
+
+    // Turn 3: continues conversation with Turn 2 prompt + Turn 2 reply + 64 new user tokens
+    let mut p3 = p2.clone();
+    p3.extend_from_slice(&reply1);
+    p3.extend((0..64u32).map(|i| 60_000 + i));
+    let (rows2, reply2) = r.turn(0, &p3, 32);
+    // 336 prompt + 32 decoded reply = 368 tokens; (368 / 32) * 32 = 352
+    assert_eq!(rows2, 352, "turn 3 attaches through turn 2 decoded tokens");
+    assert_eq!(reply2.len(), 32);
+    let s3 = r.kv().stats();
+    assert_eq!(s3.attach_prompt_end, 2);
+    assert_eq!(s3.tokens_attached_prompt_end, 256 + 352);
+    assert_eq!(s3.publishes_turn_end, 3);
 }
 
 /// Production's loss: a conversation's prompt end is evicted by other traffic before its next

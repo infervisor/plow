@@ -1200,9 +1200,7 @@ impl GpuEngine {
         if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) && !aborted {
             return;
         }
-        // A turn end (prompt + reply) is never published: the next prompt re-renders the reply
-        // and diverges before it (0 of 1223 attaches on Gemma 4); the prompt end below is
-        // restored or touched instead. The boundary tree retires structurally inside the publish.
+        let end = session_prompt_end(prompt) / 32 * 32;
         let turn_end = rows > prompt;
         if !turn_end {
             let kind = if prompt_end {
@@ -1211,14 +1209,17 @@ impl GpuEngine {
                 Kind::CHECKPOINT
             };
             self.publish_boundary(b, p_a, kind);
-        }
-        // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
-        // while this turn decoded. The rings still hold its window, so restore it now, newest in
-        // LRU just before the next request; a surviving one is only touched. A client without
-        // `X-Session-Id` continues its conversation the same way.
-        let end = session_prompt_end(prompt) / 32 * 32;
-        if rows > prompt && end > 0 && end < p_a {
-            self.publish_boundary(b, end, Kind::PROMPT_END);
+        } else {
+            // Turn end: restore or touch the prompt end first so it is present as the parent
+            // and fallback attach point if a future turn diverges.
+            if end > 0 && end <= p_a {
+                self.publish_boundary(b, end, Kind::PROMPT_END);
+            }
+            // Publish the decoded tokens up to the 32-token boundary as TURN_END, caching
+            // the assistant reply for the next turn.
+            if p_a > end {
+                self.publish_boundary(b, p_a, Kind::TURN_END);
+            }
         }
     }
 
