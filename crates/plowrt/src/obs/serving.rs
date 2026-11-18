@@ -395,6 +395,9 @@ pub struct ServingMetrics {
     /// Aborts that came before the first generated token, and arrival-to-abort time of every abort.
     pub aborted_before_first: AtomicU64,
     pub aborted_elapsed: Histogram,
+    pub prefill_tokens_discarded_on_abort: AtomicU64,
+    pub prefix_published_on_abort: AtomicU64,
+    pub prefill_adopted: AtomicU64,
     pub preempted: AtomicU64,
     pub tick_errors: AtomicU64,
     /// Completed requests judged against `PLOW_TTFT_SLO_MS` / `PLOW_TBT_SLO_MS`, and how many
@@ -702,6 +705,24 @@ impl ServingMetrics {
             "counter",
             "Aborted requests that had not produced a token (client gave up while queued or in prefill).",
             |m: &Metrics, _| m.serving.aborted_before_first.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_prefill_tokens_discarded_on_abort_total",
+            "counter",
+            "Tokens discarded when a prefill request aborts without completion.",
+            |m: &Metrics, _| m.serving.prefill_tokens_discarded_on_abort.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_prefix_published_on_abort_total",
+            "counter",
+            "Prefix checkpoints published upon request abort.",
+            |m: &Metrics, _| m.serving.prefix_published_on_abort.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_prefill_adopted_total",
+            "counter",
+            "Completed prefill chunks adopted or attached by requests.",
+            |m: &Metrics, _| m.serving.prefill_adopted.load(Relaxed)
         );
         scalar!(
             "plowrt_requests_thinking_total",

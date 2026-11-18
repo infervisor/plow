@@ -1836,18 +1836,15 @@ fn spawn_scoped(
     let rung_widths = gpu_shape.map(|x| x.1);
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let rung_widths: Option<Box<[u32]>> = None;
+    let min_rung = crate::config::RuntimeConfig::get().amd.decode_min_rung;
     let (capacity, rung_widths) = {
         let max_rung = crate::config::RuntimeConfig::get().decode_max_rung;
-        let min_rung = crate::config::RuntimeConfig::get().amd.decode_min_rung;
-        if max_rung.is_some() || min_rung.is_some() {
+        if let Some(max) = max_rung {
             if let Some(widths) = rung_widths {
                 let filtered: Box<[u32]> = widths
                     .iter()
                     .copied()
-                    .filter(|&w| {
-                        max_rung.map_or(true, |max| w <= max)
-                            && min_rung.map_or(true, |min| w >= min)
-                    })
+                    .filter(|&w| w <= max)
                     .collect();
                 if let Some(&widest) = filtered.last() {
                     (capacity.min(widest as usize), Some(filtered))
@@ -1855,8 +1852,7 @@ fn spawn_scoped(
                     (capacity, Some(widths))
                 }
             } else {
-                let cap = max_rung.map_or(capacity, |m| capacity.min(m as usize));
-                (cap, None)
+                (capacity.min(max as usize), None)
             }
         } else {
             (capacity, rung_widths)
@@ -1866,9 +1862,14 @@ fn spawn_scoped(
         rung_widths
             .as_deref()
             .and_then(|widths| match DecodeRungs::new(widths, capacity) {
-                Ok(rungs) if rungs.len() > 1 => Some(
-                    RungController::new(rungs).with_fast_probe(crate::serve::policy::fast_probe()),
-                ),
+                Ok(rungs) if rungs.len() > 1 => {
+                    let min_seat = min_rung.map(|m| rungs.covering(m as usize)).unwrap_or(0);
+                    Some(
+                        RungController::new(rungs)
+                            .with_min_seat(min_seat)
+                            .with_fast_probe(crate::serve::policy::fast_probe()),
+                    )
+                }
                 Ok(_) => None,
                 Err(err) => {
                     tracing::warn!(?err, ?widths, capacity, "decode rung policy disabled");
@@ -2287,14 +2288,43 @@ fn spawn_scoped(
             // New jobs use only the low slot prefix under `admission_limit`;
             // existing high slots are never moved and continue to pin the
             // engine's occupied-extent rung until they drain.
+            let occupied_extent = slots
+                .iter()
+                .rposition(Option::is_some)
+                .map(|i| i + 1)
+                .unwrap_or(1);
+            let prefilling = slots.iter().flatten().filter(|s| s.step == 0).count();
+            // Read receiver, waiting queue, and prefilling slots for accurate admission demand snapshot.
+            let queued = rx
+                .len()
+                .saturating_add(waiting.len())
+                .saturating_add(prefilling);
+            let kv_used = kv_used(kv_budget, &slots);
+            metrics
+                .decode_occupied_extent
+                .store(occupied_extent as u64, Ordering::Relaxed);
+            metrics
+                .kv_used_milli
+                .store((kv_used * 1000.0) as u64, Ordering::Relaxed);
+            if crate::serve::policy::observe(crate::serve::policy::Load {
+                width: occupied_extent,
+                queued,
+                kv_used,
+            }) {
+                Metrics::inc(&metrics.serve_mode_switches);
+            }
+            metrics.serve_mode.store(
+                u64::from(
+                    crate::serve::policy::class()
+                        == crate::serve::policy::Class::HighConcurrency,
+                ),
+                Ordering::Relaxed,
+            );
+            if let Some(rc) = rung_controller.as_mut() {
+                rc.set_fast_probe(crate::serve::policy::fast_probe());
+            }
+
             let admission_limit = if let Some(controller) = rung_controller.as_mut() {
-                let occupied_extent = slots
-                    .iter()
-                    .rposition(Option::is_some)
-                    .map(|i| i + 1)
-                    .unwrap_or(1);
-                // Read the receiver directly for an exact local admission snapshot.
-                let queued = rx.len().saturating_add(waiting.len());
                 let (sum, n) = slots
                     .iter()
                     .flatten()
@@ -2329,30 +2359,6 @@ fn spawn_scoped(
                 metrics
                     .decode_rung_admission
                     .store(admission as u64, Ordering::Relaxed);
-                metrics
-                    .decode_occupied_extent
-                    .store(occupied_extent as u64, Ordering::Relaxed);
-                let kv_used = kv_used(kv_budget, &slots);
-                metrics
-                    .kv_used_milli
-                    .store((kv_used * 1000.0) as u64, Ordering::Relaxed);
-                if crate::serve::policy::observe(crate::serve::policy::Load {
-                    width: occupied_extent,
-                    queued: waiting.len(),
-                    kv_used,
-                }) {
-                    Metrics::inc(&metrics.serve_mode_switches);
-                }
-                metrics.serve_mode.store(
-                    u64::from(
-                        crate::serve::policy::class()
-                            == crate::serve::policy::Class::HighConcurrency,
-                    ),
-                    Ordering::Relaxed,
-                );
-                if let Some(rc) = rung_controller.as_mut() {
-                    rc.set_fast_probe(crate::serve::policy::fast_probe());
-                }
                 if admission != before {
                     Metrics::inc(&metrics.decode_rung_switches);
                     tracing::info!(
@@ -2360,12 +2366,17 @@ fn spawn_scoped(
                         to = admission,
                         occupied_extent,
                         queued,
+                        waiting = waiting.len(),
+                        prefilling,
                         reason = ?decision.reason,
                         "decode admission rung"
                     );
                 }
                 admission
             } else {
+                metrics
+                    .decode_rung_admission
+                    .store(capacity as u64, Ordering::Relaxed);
                 capacity
             };
             #[cfg(feature = "cuda")]
@@ -2385,7 +2396,7 @@ fn spawn_scoped(
                     overflow_rows,
                     queued: waiting.len() + rx.len(),
                     top_rows,
-                    kv_used: kv_used(kv_budget, &slots),
+                    kv_used,
                 });
                 metrics.prefill_launch_rows.store(
                     pf_launch_rows(request_rows, top_rows).0 as u64,
@@ -4164,6 +4175,7 @@ fn run_one_tick(
     Option<DecodeProgress>,
 ) {
     obs.pd_import_work = false;
+    let model_metrics = state.model_metrics(slug);
     let bucket = key.and_then(|k| bundle.bucket(k));
     for slot in slots.iter_mut() {
         if slot.as_ref().is_some_and(|s| s.parked_at.is_some()) {
@@ -4435,6 +4447,12 @@ fn run_one_tick(
                                         let request = slots[i].as_mut().expect("checked Some");
                                         request.pf_pos = frontier;
                                         request.cached_tokens = e.attached_rows(i) as usize;
+                                        if request.cached_tokens > 0 {
+                                            model_metrics
+                                                .serving
+                                                .prefill_adopted
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                     Err(err) => {
                                         note_fault(&mut tick_fault, &err);
@@ -4667,6 +4685,7 @@ fn run_one_tick(
                         aging,
                         obs.host.queued_prefill_rows,
                         &mut obs.host.ride_spans,
+                        &model_metrics,
                     ) {
                         if tick_fault.is_none() {
                             tick_fault = Some(f);
@@ -4803,6 +4822,20 @@ fn run_one_tick(
                             }
                             if s.respond.is_closed() {
                                 disconnected[i] = true;
+                                if s.pf_pos > 0 {
+                                    model_metrics
+                                        .serving
+                                        .prefix_published_on_abort
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                let discarded = s.prompt_ids.len().saturating_sub(s.pf_pos);
+                                if discarded > 0 {
+                                    model_metrics
+                                        .serving
+                                        .prefill_tokens_discarded_on_abort
+                                        .fetch_add(discarded as u64, Ordering::Relaxed);
+                                }
+                                e.retire_slot(i, true);
                                 if let Some(taken) = slots[i].take() {
                                     release_kv(&arena, taken.kv);
                                 }
@@ -4857,9 +4890,18 @@ fn run_one_tick(
                     // whole prompt); the decode launch below runs between chunks. With no
                     // decoders live, stop once a request becomes ready for decode,
                     // unless the caller explicitly defers decode.
+                    let prefilling_slots = slots
+                        .iter()
+                        .take(cap)
+                        .flatten()
+                        .filter(|s| s.needs_prefill())
+                        .count();
                     let cap_rows = if co_scheduled {
                         co_sched_prefill_rows(e.pf_max_rows(), pf_interleave_rows())
-                    } else if feeds.is_empty() {
+                    } else if feeds.is_empty()
+                        && prefilling_slots <= 1
+                        && obs.host.queued_prefill_rows == 0
+                    {
                         usize::MAX
                     } else {
                         pf_interleave_rows()
@@ -4882,6 +4924,22 @@ fn run_one_tick(
                             .unwrap_or(false)
                         {
                             disconnected[i] = true;
+                            if let Some(s) = slots[i].as_ref() {
+                                if s.pf_pos > 0 {
+                                    model_metrics
+                                        .serving
+                                        .prefix_published_on_abort
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                let discarded = s.prompt_ids.len().saturating_sub(s.pf_pos);
+                                if discarded > 0 {
+                                    model_metrics
+                                        .serving
+                                        .prefill_tokens_discarded_on_abort
+                                        .fetch_add(discarded as u64, Ordering::Relaxed);
+                                }
+                            }
+                            e.retire_slot(i, true);
                             if let Some(taken) = slots[i].take() {
                                 release_kv(&arena, taken.kv);
                             }
@@ -7982,6 +8040,7 @@ fn gpu_prefill_batched_pass(
     aging: std::time::Duration,
     queued_rows: usize,
     spans: &mut Vec<smallvec::SmallVec<[u32; 8]>>,
+    metrics: &crate::obs::Metrics,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -8061,10 +8120,23 @@ fn gpu_prefill_batched_pass(
                 continue;
             };
             if request.respond.is_closed() {
+                if request.pf_pos > 0 {
+                    metrics
+                        .serving
+                        .prefix_published_on_abort
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let discarded = request.prompt_ids.len().saturating_sub(request.pf_pos);
+                if discarded > 0 {
+                    metrics
+                        .serving
+                        .prefill_tokens_discarded_on_abort
+                        .fetch_add(discarded as u64, Ordering::Relaxed);
+                }
+                e.retire_slot(i, true);
                 if let Some(taken) = slot.take() {
                     release_kv(arena, taken.kv);
                 }
-                e.retire_slot(i, false);
                 continue;
             }
             if request.prompt_ids.is_empty() {
@@ -8163,8 +8235,15 @@ fn gpu_prefill_batched_pass(
                         Some(run) => run.partner_pf = frontier,
                         None => {
                             request.pf_pos = frontier;
+                            let prev_cached = request.cached_tokens;
                             request.cached_tokens =
                                 (e.attached_rows(i) as usize).max(request.resume.min(frontier));
+                            if request.cached_tokens > 0 && prev_cached == 0 {
+                                metrics
+                                    .serving
+                                    .prefill_adopted
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -15146,6 +15225,7 @@ mod tests {
                 std::time::Duration::ZERO,
                 0,
                 &mut Vec::new(),
+                &crate::obs::Metrics::default(),
             )
             .is_none());
             assert!(completed.is_empty() && unified.is_empty());

@@ -1196,7 +1196,8 @@ impl GpuEngine {
             }
             p += step;
         }
-        if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
+        let aborted = self.disconnected[b];
+        if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) && !aborted {
             return;
         }
         // A turn end (prompt + reply) is never published: the next prompt re-renders the reply

@@ -6,7 +6,7 @@ use super::admission::Ewma;
 
 const WIDEN_UTIL: f64 = 0.85;
 const NARROW_UTIL: f64 = 0.60;
-const NARROW_TICKS: u32 = 32;
+const NARROW_TICKS: u32 = 128;
 const MIN_DWELL_TICKS: u32 = 64;
 const MIN_THROUGHPUT_SAMPLES: u64 = 4;
 const THROUGHPUT_HYSTERESIS: f64 = 1.03;
@@ -143,6 +143,7 @@ pub struct RungController {
     rungs: DecodeRungs,
     stats: Box<[RungStat]>,
     target: usize,
+    min_seat: usize,
     dwell_ticks: u32,
     low_load_ticks: u32,
     fast_probe: bool,
@@ -156,11 +157,19 @@ impl RungController {
             rungs,
             stats,
             target: 0,
+            min_seat: 0,
             dwell_ticks: 0,
             low_load_ticks: 0,
             fast_probe: false,
             throughput: true,
         }
+    }
+
+    /// Set minimum admission rung floor (cannot downshift below this seat).
+    pub fn with_min_seat(mut self, min_seat: usize) -> Self {
+        self.min_seat = min_seat.min(self.rungs.len().saturating_sub(1));
+        self.target = self.target.max(self.min_seat);
+        self
     }
 
     /// Probe the widest rung after one penultimate sample instead of four (the throughput
@@ -235,7 +244,9 @@ impl RungController {
             .saturating_add(load.queued)
             .min(self.rungs.width(self.rungs.len() - 1));
         let demand_seat = self.rungs.covering(demanded);
-        let seat = self.throughput_seat(demand_seat, load.queued);
+        let seat = self
+            .throughput_seat(demand_seat, load.queued)
+            .max(self.min_seat);
         let mut reason = if actual > self.target {
             RungReason::Occupied
         } else {
@@ -267,13 +278,14 @@ impl RungController {
             self.low_load_ticks = 0;
             reason = RungReason::Utilization;
         } else if load.queued == 0
-            && self.target > 0
-            && load.occupied_extent < self.rungs.width(self.target)
+            && self.target > self.min_seat
+            && load.occupied_extent <= self.rungs.width(self.target) / 2
+            && load.occupied_extent <= self.rungs.width(self.target - 1)
             && self.utilization(self.target - 1, load) <= NARROW_UTIL
         {
             self.low_load_ticks = self.low_load_ticks.saturating_add(1);
             if self.low_load_ticks >= NARROW_TICKS && self.dwell_ticks >= MIN_DWELL_TICKS {
-                self.target -= 1;
+                self.target = (self.target - 1).max(self.min_seat);
                 self.dwell_ticks = 0;
                 self.low_load_ticks = 0;
                 reason = RungReason::LowLoad;
@@ -354,16 +366,16 @@ impl RungController {
             && self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
             && self.stats[demand_seat - 1].samples < probe_after
         {
-            return demand_seat - 1;
+            return (demand_seat - 1).max(self.min_seat);
         }
         if self.stats[demand_seat].samples < MIN_THROUGHPUT_SAMPLES
             || self.stats[demand_seat - 1].samples < MIN_THROUGHPUT_SAMPLES
         {
-            return demand_seat;
+            return demand_seat.max(self.min_seat);
         }
         let capacity = |rung: usize| self.rungs.width(rung) as f64 * 1000.0 / self.step_ms(rung);
         let demanded_capacity = capacity(demand_seat);
-        (0..demand_seat)
+        (self.min_seat..demand_seat)
             .filter(|&rung| self.stats[rung].samples >= MIN_THROUGHPUT_SAMPLES)
             .max_by(|&a, &b| capacity(a).total_cmp(&capacity(b)))
             .filter(|&rung| {
@@ -375,6 +387,7 @@ impl RungController {
                 capacity(rung) > demanded_capacity * margin
             })
             .unwrap_or(demand_seat)
+            .max(self.min_seat)
     }
 }
 
@@ -448,6 +461,46 @@ mod tests {
         c.target = 1;
         let decision = c.decide(load(192, 0));
         assert_eq!(c.admission_limit(), 192, "{decision:?}");
+    }
+
+    #[test]
+    fn occupied_extent_over_half_rung_does_not_narrow_on_low_load() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]);
+        for rung in 0..6 {
+            for _ in 0..20 {
+                c.observe_decode(rung, 10.0, NonZeroUsize::MIN);
+            }
+        }
+        c.target = 5; // 32
+        for _ in 0..200 {
+            let decision = c.decide(load(30, 0));
+            assert_eq!(c.admission_limit(), 32, "occupied 30/32 must not downshift: {decision:?}");
+        }
+    }
+
+    #[test]
+    fn queued_work_does_not_narrow_on_low_load() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]);
+        for rung in 0..6 {
+            for _ in 0..20 {
+                c.observe_decode(rung, 10.0, NonZeroUsize::MIN);
+            }
+        }
+        c.target = 5; // 32
+        for _ in 0..200 {
+            let decision = c.decide(load(8, 2));
+            assert_eq!(c.admission_limit(), 32, "queued work must not downshift: {decision:?}");
+        }
+    }
+
+    #[test]
+    fn min_seat_floor_prevents_downshift() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]).with_min_seat(5);
+        c.target = 5; // 32
+        for _ in 0..500 {
+            let decision = c.decide(load(0, 0));
+            assert_eq!(c.admission_limit(), 32, "min_seat 5 must pin rung 32: {decision:?}");
+        }
     }
 
     /// A burst must widen the admission window and a QUIET PERIOD must narrow it back.
@@ -800,5 +853,28 @@ mod tests {
             "cold start on width 4 ladder must admit width 4 directly"
         );
         assert_eq!(d.reason, RungReason::Backlog);
+    }
+
+    #[test]
+    fn min_seat_prevents_false_throughput_downshift_and_dwell_reset() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32]).with_min_seat(5); // pinned to 32
+        // Observe faster token throughput on rung 4 (width 16) than rung 5 (width 32)
+        for _ in 0..10 {
+            c.observe_decode(4, 10.0, NonZeroUsize::new(1).unwrap());
+            c.observe_decode(5, 50.0, NonZeroUsize::new(1).unwrap());
+        }
+        c.decide(load(32, 0));
+        assert_eq!(c.admission_limit(), 32);
+        let d = c.decide(load(32, 0));
+        assert_eq!(c.admission_limit(), 32);
+        assert_ne!(
+            d.reason,
+            RungReason::Throughput,
+            "min_seat floor must not report Throughput downshift"
+        );
+        assert!(
+            c.dwell_ticks > 1,
+            "dwell ticks must not reset when min_seat clamps"
+        );
     }
 }
