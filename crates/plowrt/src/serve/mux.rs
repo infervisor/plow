@@ -13863,8 +13863,8 @@ mod tests {
 
     #[test]
     fn kv_reservation_keeps_generated_rows() {
-        assert_eq!(reserved_kv_rows(70_000, 700, 0), 70_700);
-        assert_eq!(reserved_kv_rows(70_000, 700, 512), 70_700);
+        assert_eq!(reserved_kv_rows(70_000, 700, 0), 70_256);
+        assert_eq!(reserved_kv_rows(70_000, 700, 512), 70_640);
         assert_eq!(reserved_kv_rows(4, 0, 0), 5);
         assert_eq!(reserved_kv_rows(4, 2, 9), 13);
     }

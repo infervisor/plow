@@ -330,8 +330,22 @@ impl DownstreamCredit {
 /// them back admitted past the budget: on block-granular KV a sequence whose prompt + budget
 /// straddles a block boundary dropped to one block's charge while it mapped two (Qwen3.8-27B at
 /// 4K c32 under PLOW_KV_MEM_UTIL 0.91: 31 slots, 15.9 GiB mapped against an 11.3 GiB budget).
+/// Adaptive KV output token reservation for admission budgeting: bounds initial output token
+/// reservation against the KV budget to `min(max_tokens, max(generated + 128, cap))` instead of
+/// locking down the full client `max_tokens` (e.g. 4096) upfront.
+#[inline]
+pub fn output_token_reservation(max_tokens: usize, generated_tokens: usize) -> usize {
+    let cap = crate::config::RuntimeConfig::get().kv_reserve_output_tokens();
+    if cap == 0 {
+        max_tokens.max(generated_tokens).max(1)
+    } else {
+        let dynamic = generated_tokens.saturating_add(cap.min(128)).max(cap);
+        max_tokens.min(dynamic).max(generated_tokens).max(1)
+    }
+}
+
 pub fn reserved_kv_rows(prompt_tokens: usize, max_tokens: usize, generated_tokens: usize) -> u64 {
-    prompt_tokens.saturating_add(max_tokens.max(generated_tokens).max(1)) as u64
+    prompt_tokens.saturating_add(output_token_reservation(max_tokens, generated_tokens)) as u64
 }
 
 /// THE seat decision, in one place and in this order: liveness, then a slot, then the whole-device

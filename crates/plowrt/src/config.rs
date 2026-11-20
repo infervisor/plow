@@ -727,6 +727,19 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-admit-overlap", env = "PLOW_PF_ADMIT_OVERLAP", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_admit_overlap: bool,
 
+    /// Adaptive KV output token reservation cap: when nonzero, bounds initial output token
+    /// reservation against the KV budget to min(max_tokens, max(generated + 128, cap))
+    /// instead of locking down the full client `max_tokens` (e.g. 4096) upfront.
+    /// `0` restores full static `max_tokens` reservation.
+    #[arg(
+        long = "kv-reserve-output-tokens",
+        env = "PLOW_KV_RESERVE_OUTPUT_TOKENS",
+        default_value_t = 256,
+        hide = true,
+        global = true
+    )]
+    pub kv_reserve_output_tokens: u32,
+
     /// Load shedding at the capacity knee: refuse a new request with 429 + `Retry-After` while
     /// this many requests already wait for their first token (queued plus seated in prefill),
     /// so a load balancer spills it to another backend instead of queueing it into a long
@@ -2117,6 +2130,12 @@ impl RuntimeConfig {
         } else {
             self.pf_chunk as usize
         }
+    }
+
+    /// Adaptive KV output token reservation cap.
+    #[inline]
+    pub fn kv_reserve_output_tokens(&self) -> usize {
+        self.kv_reserve_output_tokens as usize
     }
 }
 
