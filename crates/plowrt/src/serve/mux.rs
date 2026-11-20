@@ -4345,13 +4345,13 @@ fn run_one_tick(
                     }
                 }
                 let import_changes = slots.iter().take(cap).flatten().any(Slot::changes_import);
-                // A pipelined decode step may still be in flight from the previous tick. Anything
-                // but its exact continuation (a prefill, a changed row set, a row the device cannot
-                // sample) completes it first, streams its tokens, and re-gathers.
+                // A pipelined decode step may still be in flight from the previous tick. Non-pipelined
+                // conditions (import changes, a prefill, or rows the device cannot sample)
+                // drain it first, stream tokens, and re-gather. Dynamic slot transitions (join/leave)
+                // are handled within pipe_step via device-state lookahead without draining.
                 if e.pipe_busy()
                     && (import_changes
                         || did_prefill
-                        || !e.pipe_covers(&feeds)
                         || !gpu_pipe_rows(&feeds, &slots))
                 {
                     let mut done = std::mem::take(&mut obs.host.pipe_tokens);

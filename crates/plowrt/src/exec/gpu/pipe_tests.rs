@@ -45,3 +45,41 @@ fn a_direct_retire_forgets_a_deferral_left_by_a_failed_step() {
     q.pop();
     assert!(q.take_retired().is_empty());
 }
+
+#[test]
+fn pipe_queue_holds_tracking_across_dynamic_transitions() {
+    let mut q = PipeQueue::new(16);
+    // Step 0 has slots 0, 1, 2.
+    q.push(step(&[0, 1, 2]));
+    assert!(q.holds(0));
+    assert!(q.holds(1));
+    assert!(q.holds(2));
+    assert!(!q.holds(3));
+
+    // Dynamic join: step 1 enqueues with slots 0, 1, 2, 3 (slot 3 joined).
+    q.push(step(&[0, 1, 2, 3]));
+    assert!(q.holds(3));
+
+    // Complete step 0: slots 0, 1, 2 finished that step.
+    let step0 = q.pop().unwrap();
+    assert_eq!(step0.rows.len(), 3);
+    // Step 1 still in flight holds all 4 slots.
+    assert!(q.holds(0));
+    assert!(q.holds(3));
+
+    // Dynamic leave: slot 1 leaves. Step 2 enqueues slots 0, 2, 3.
+    q.push(step(&[0, 2, 3]));
+    let step1 = q.pop().unwrap();
+    assert_eq!(step1.rows.len(), 4);
+
+    // Step 2 still in flight.
+    assert!(q.holds(0));
+    assert!(!q.holds(1)); // slot 1 no longer held
+    assert!(q.holds(2));
+    assert!(q.holds(3));
+
+    let step2 = q.pop().unwrap();
+    assert_eq!(step2.rows.len(), 3);
+    assert!(!q.holds(0));
+    assert!(q.is_empty());
+}
