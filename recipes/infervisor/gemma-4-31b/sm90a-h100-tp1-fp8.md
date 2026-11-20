@@ -38,7 +38,7 @@ nix develop --command env \
 <!-- plow:recipe:emit -->
 ```bash
 nix develop --command env \
-  NVCC_APPEND_FLAGS=-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1 \
+  NVCC_APPEND_FLAGS=-DPLOW_NV_GLU_QUANT_CACHE=1 -DPLOW_NV_GLU_QUANT_WPR=1 -DPLOW_NV_LIGHT_FP8_ATTN=1 -DPLOW_FP8_LD16=1 -DPLOW_FP8_FAST=1 -DPLOW_NV_FA_RG8=2 -DPLOW_NV_FA_RG8S=1 \
   PLOW_ATTENTION_DECODE_BALANCE_GF=4 \
   PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32 \
   PLOW_EMIT_DECODE_CUBLASLT=0 \
@@ -91,12 +91,14 @@ plowrt serve --model infervisor/gemma-4-31b:sm90a-h100-tp1-fp8 --port 8080
 # Equivalently, from a locally built asset directory:
 nix develop --command env \
   PLOW_DECODE_MAX_RUNG=32 \
+  PLOW_DECODE_PIPELINE=1 \
   PLOW_LT_FP8_FAST_ACCUM_MAX_K=8192 \
+  PLOW_MAX_QUEUED_REQUESTS=4096 \
   PLOW_MULTISTEP=0 \
   PLOW_PF_SEG_FA512=1 \
   PLOW_PF_SEG_PURE=fp8 \
   PLOW_PREFIX_CACHE=1 \
-  PLOW_VMM_LIVE_RINGS=0 \
+  PLOW_VMM_LIVE_RINGS=1 \
   PLOW_VMM_PREFIX=1 \
   ./target/release/plowrt serve --assets $ASSETS --port 8080
 ```
