@@ -727,6 +727,32 @@ pub struct RuntimeConfig {
     #[arg(long = "pf-admit-overlap", env = "PLOW_PF_ADMIT_OVERLAP", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_admit_overlap: bool,
 
+    /// Adaptive KV output token reservation cap: when nonzero, bounds initial output token
+    /// reservation against the KV budget to min(max_tokens, max(generated + 128, cap))
+    /// instead of locking down the full client `max_tokens` (e.g. 4096) upfront.
+    /// `0` restores full static `max_tokens` reservation.
+    #[arg(
+        long = "kv-reserve-output-tokens",
+        env = "PLOW_KV_RESERVE_OUTPUT_TOKENS",
+        default_value_t = 256,
+        hide = true,
+        global = true
+    )]
+    pub kv_reserve_output_tokens: u32,
+
+    /// Soft admission KV output token reservation cap: when the KV pool is under pressure
+    /// and cannot fit the full `kv_reserve_output_tokens` (e.g. 256), a request can be softly
+    /// admitted with this initial output reservation (e.g. 64) so prefill starts immediately
+    /// without stalling in the queue. `0` disables soft admission.
+    #[arg(
+        long = "kv-soft-reserve-output-tokens",
+        env = "PLOW_KV_SOFT_RESERVE_OUTPUT_TOKENS",
+        default_value_t = 64,
+        hide = true,
+        global = true
+    )]
+    pub kv_soft_reserve_output_tokens: u32,
+
     /// Load shedding at the capacity knee: refuse a new request with 429 + `Retry-After` while
     /// this many requests already wait for their first token (queued plus seated in prefill),
     /// so a load balancer spills it to another backend instead of queueing it into a long
@@ -1027,7 +1053,7 @@ pub struct RuntimeConfig {
     /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
     /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
     /// instead of recomputing the shared rows beside it. `0` admits it at once.
-    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_inflight_wait: bool,
 
     /// CUDA token-batch prefill: publish the whole-block checkpoints a prompt chunk completed
@@ -1066,6 +1092,34 @@ pub struct RuntimeConfig {
         global = true
     )]
     pub decode_max_rung: Option<u32>,
+
+    /// Expert: nominal decode rung ceiling during steady-state (e.g. 32).
+    #[arg(
+        long = "decode-nominal-rung",
+        env = "PLOW_DECODE_NOMINAL_RUNG",
+        hide = true,
+        global = true
+    )]
+    pub decode_nominal_rung: Option<u32>,
+
+    /// Expert: elastic burst decode rung ceiling during queue backlog (e.g. 40).
+    #[arg(
+        long = "decode-elastic-rung",
+        env = "PLOW_DECODE_ELASTIC_RUNG",
+        hide = true,
+        global = true
+    )]
+    pub decode_elastic_rung: Option<u32>,
+
+    /// Expert: queue wait time threshold in ms before elastic burst expansion activates (default 250).
+    #[arg(
+        long = "decode-elastic-wait-ms",
+        env = "PLOW_DECODE_ELASTIC_WAIT_MS",
+        default_value_t = 250,
+        hide = true,
+        global = true
+    )]
+    pub decode_elastic_wait_ms: u32,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
@@ -2117,6 +2171,18 @@ impl RuntimeConfig {
         } else {
             self.pf_chunk as usize
         }
+    }
+
+    /// Adaptive KV output token reservation cap.
+    #[inline]
+    pub fn kv_reserve_output_tokens(&self) -> usize {
+        self.kv_reserve_output_tokens as usize
+    }
+
+    /// Soft admission KV output token reservation cap.
+    #[inline]
+    pub fn kv_soft_reserve_output_tokens(&self) -> usize {
+        self.kv_soft_reserve_output_tokens as usize
     }
 }
 

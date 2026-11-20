@@ -1608,6 +1608,8 @@ impl ModelMux {
 
 /// One live request occupying a slot in the engine.
 struct Slot {
+    /// KV output token reservation cap applied at admission (e.g. 256 normal, 64 soft).
+    output_cap: u32,
     telemetry: Option<RequestMetrics>,
     prompt_ids: Vec<u32>,
     out_ids: Vec<u32>,
@@ -1836,18 +1838,15 @@ fn spawn_scoped(
     let rung_widths = gpu_shape.map(|x| x.1);
     #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
     let rung_widths: Option<Box<[u32]>> = None;
+    let min_rung = crate::config::RuntimeConfig::get().amd.decode_min_rung;
     let (capacity, rung_widths) = {
         let max_rung = crate::config::RuntimeConfig::get().decode_max_rung;
-        let min_rung = crate::config::RuntimeConfig::get().amd.decode_min_rung;
-        if max_rung.is_some() || min_rung.is_some() {
+        if let Some(max) = max_rung {
             if let Some(widths) = rung_widths {
                 let filtered: Box<[u32]> = widths
                     .iter()
                     .copied()
-                    .filter(|&w| {
-                        max_rung.map_or(true, |max| w <= max)
-                            && min_rung.map_or(true, |min| w >= min)
-                    })
+                    .filter(|&w| w <= max)
                     .collect();
                 if let Some(&widest) = filtered.last() {
                     (capacity.min(widest as usize), Some(filtered))
@@ -1855,20 +1854,43 @@ fn spawn_scoped(
                     (capacity, Some(widths))
                 }
             } else {
-                let cap = max_rung.map_or(capacity, |m| capacity.min(m as usize));
-                (cap, None)
+                (capacity.min(max as usize), None)
             }
         } else {
             (capacity, rung_widths)
         }
     };
+    let rt_cfg = crate::config::RuntimeConfig::get();
+    let nominal_rung = rt_cfg.decode_nominal_rung.or_else(|| {
+        if capacity >= 32 {
+            Some(32)
+        } else {
+            None
+        }
+    });
+    let elastic_rung = rt_cfg.decode_elastic_rung.or_else(|| {
+        if capacity >= 40 {
+            Some(40)
+        } else {
+            None
+        }
+    });
+    let elastic_wait_ms = rt_cfg.decode_elastic_wait_ms as f64;
     let mut rung_controller =
         rung_widths
             .as_deref()
             .and_then(|widths| match DecodeRungs::new(widths, capacity) {
-                Ok(rungs) if rungs.len() > 1 => Some(
-                    RungController::new(rungs).with_fast_probe(crate::serve::policy::fast_probe()),
-                ),
+                Ok(rungs) if rungs.len() > 1 => {
+                    let min_seat = min_rung.map(|m| rungs.covering(m as usize)).unwrap_or(0);
+                    Some(
+                        RungController::new(rungs)
+                            .with_min_seat(min_seat)
+                            .with_nominal_max(nominal_rung.map(|w| w as usize))
+                            .with_elastic_max(elastic_rung.map(|w| w as usize))
+                            .with_elastic_wait_ms(elastic_wait_ms)
+                            .with_fast_probe(crate::serve::policy::fast_probe()),
+                    )
+                }
                 Ok(_) => None,
                 Err(err) => {
                     tracing::warn!(?err, ?widths, capacity, "decode rung policy disabled");
@@ -2287,14 +2309,43 @@ fn spawn_scoped(
             // New jobs use only the low slot prefix under `admission_limit`;
             // existing high slots are never moved and continue to pin the
             // engine's occupied-extent rung until they drain.
+            let occupied_extent = slots
+                .iter()
+                .rposition(Option::is_some)
+                .map(|i| i + 1)
+                .unwrap_or(1);
+            let prefilling = slots.iter().flatten().filter(|s| s.step == 0).count();
+            // Read receiver, waiting queue, and prefilling slots for accurate admission demand snapshot.
+            let queued = rx
+                .len()
+                .saturating_add(waiting.len())
+                .saturating_add(prefilling);
+            let kv_used = kv_used(kv_budget, &slots);
+            metrics
+                .decode_occupied_extent
+                .store(occupied_extent as u64, Ordering::Relaxed);
+            metrics
+                .kv_used_milli
+                .store((kv_used * 1000.0) as u64, Ordering::Relaxed);
+            if crate::serve::policy::observe(crate::serve::policy::Load {
+                width: occupied_extent,
+                queued,
+                kv_used,
+            }) {
+                Metrics::inc(&metrics.serve_mode_switches);
+            }
+            metrics.serve_mode.store(
+                u64::from(
+                    crate::serve::policy::class()
+                        == crate::serve::policy::Class::HighConcurrency,
+                ),
+                Ordering::Relaxed,
+            );
+            if let Some(rc) = rung_controller.as_mut() {
+                rc.set_fast_probe(crate::serve::policy::fast_probe());
+            }
+
             let admission_limit = if let Some(controller) = rung_controller.as_mut() {
-                let occupied_extent = slots
-                    .iter()
-                    .rposition(Option::is_some)
-                    .map(|i| i + 1)
-                    .unwrap_or(1);
-                // Read the receiver directly for an exact local admission snapshot.
-                let queued = rx.len().saturating_add(waiting.len());
                 let (sum, n) = slots
                     .iter()
                     .flatten()
@@ -2329,30 +2380,6 @@ fn spawn_scoped(
                 metrics
                     .decode_rung_admission
                     .store(admission as u64, Ordering::Relaxed);
-                metrics
-                    .decode_occupied_extent
-                    .store(occupied_extent as u64, Ordering::Relaxed);
-                let kv_used = kv_used(kv_budget, &slots);
-                metrics
-                    .kv_used_milli
-                    .store((kv_used * 1000.0) as u64, Ordering::Relaxed);
-                if crate::serve::policy::observe(crate::serve::policy::Load {
-                    width: occupied_extent,
-                    queued: waiting.len(),
-                    kv_used,
-                }) {
-                    Metrics::inc(&metrics.serve_mode_switches);
-                }
-                metrics.serve_mode.store(
-                    u64::from(
-                        crate::serve::policy::class()
-                            == crate::serve::policy::Class::HighConcurrency,
-                    ),
-                    Ordering::Relaxed,
-                );
-                if let Some(rc) = rung_controller.as_mut() {
-                    rc.set_fast_probe(crate::serve::policy::fast_probe());
-                }
                 if admission != before {
                     Metrics::inc(&metrics.decode_rung_switches);
                     tracing::info!(
@@ -2360,12 +2387,17 @@ fn spawn_scoped(
                         to = admission,
                         occupied_extent,
                         queued,
+                        waiting = waiting.len(),
+                        prefilling,
                         reason = ?decision.reason,
                         "decode admission rung"
                     );
                 }
                 admission
             } else {
+                metrics
+                    .decode_rung_admission
+                    .store(capacity as u64, Ordering::Relaxed);
                 capacity
             };
             #[cfg(feature = "cuda")]
@@ -2385,7 +2417,7 @@ fn spawn_scoped(
                     overflow_rows,
                     queued: waiting.len() + rx.len(),
                     top_rows,
-                    kv_used: kv_used(kv_budget, &slots),
+                    kv_used,
                 });
                 metrics.prefill_launch_rows.store(
                     pf_launch_rows(request_rows, top_rows).0 as u64,
@@ -3128,7 +3160,9 @@ fn note_arrival(now: Instant, load: &mut LoadEstimator, metrics: &Metrics) {
         .store((lambda * 1000.0) as u64, Ordering::Relaxed);
 }
 
-use crate::sched::admission::{reserved_kv_rows, seat, Denied};
+use crate::sched::admission::{
+    reserved_kv_rows, reserved_kv_rows_with_cap, seat, Denied,
+};
 
 /// How long a request may sit in `waiting` before it stops yielding to younger arrivals, as a
 /// multiple of the SLO. The queue is backfill-first on purpose — a small request should take a
@@ -3227,11 +3261,28 @@ fn waiter_seatable(
         return false;
     }
     let pair = head.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
-    let want = reserved_kv_rows(head.prompt_ids.len(), head.gen.max_tokens, 0) * (1 + pair as u64);
+    let normal_reserve = crate::config::RuntimeConfig::get().kv_reserve_output_tokens() as usize;
+    let soft_reserve = crate::config::RuntimeConfig::get().kv_soft_reserve_output_tokens() as usize;
+    let effective_cap =
+        if soft_reserve > 0 && (normal_reserve == 0 || soft_reserve < normal_reserve) {
+            soft_reserve
+        } else {
+            normal_reserve
+        };
+    let want = reserved_kv_rows_with_cap(
+        head.prompt_ids.len(),
+        head.gen.max_tokens,
+        0,
+        effective_cap,
+    ) * (1 + pair as u64);
     kv_budget.is_none_or(|b| {
         let live = slots.iter().flatten().map(|s| {
-            reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
-                * (1 + s.cfg.is_some() as u64)
+            reserved_kv_rows_with_cap(
+                s.prompt_ids.len(),
+                s.gen.max_tokens,
+                s.out_ids.len(),
+                s.output_cap as usize,
+            ) * (1 + s.cfg.is_some() as u64)
         });
         b.fits_requests(live.chain(std::iter::once(want)))
     })
@@ -3637,9 +3688,17 @@ fn admit_session(
     }
 
     let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
-    let seq_upper = reserved_kv_rows(job.prompt_ids.len(), job.gen.max_tokens, 0) as i64;
+    let normal_reserve = crate::config::RuntimeConfig::get().kv_reserve_output_tokens() as usize;
+    let soft_reserve = crate::config::RuntimeConfig::get().kv_soft_reserve_output_tokens() as usize;
+    let seq_upper = reserved_kv_rows_with_cap(job.prompt_ids.len(), job.gen.max_tokens, 0, normal_reserve) as i64;
     // A CFG pair holds two engine slots' KV.
     let want = seq_upper as u64 * (1 + pair as u64);
+    let soft_want = if soft_reserve > 0 && (normal_reserve == 0 || soft_reserve < normal_reserve) {
+        let soft_upper = reserved_kv_rows_with_cap(job.prompt_ids.len(), job.gen.max_tokens, 0, soft_reserve) as i64;
+        Some(soft_upper as u64 * (1 + pair as u64))
+    } else {
+        None
+    };
     let lim = limit.min(slots.len());
     let session = job.opts.session.as_deref().map(|t| t.session.clone());
     let resume = job
@@ -3710,14 +3769,19 @@ fn admit_session(
             .iter()
             .flatten()
             .map(|s| {
-                reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
-                    * (1 + s.cfg.is_some() as u64)
+                reserved_kv_rows_with_cap(
+                    s.prompt_ids.len(),
+                    s.gen.max_tokens,
+                    s.out_ids.len(),
+                    s.output_cap as usize,
+                ) * (1 + s.cfg.is_some() as u64)
             })
             .chain(retention.table.rows_except(session.as_deref()));
         match seat(
             matches!(health, EngineHealth::Dead(_)),
             free_slot,
             want,
+            soft_want,
             committed,
             kv_budget,
             downstream_full,
@@ -3727,13 +3791,18 @@ fn admit_session(
             seated => break seated,
         }
     };
-    let idx = match seated {
-        Ok(idx) => {
+    let (idx, output_cap) = match seated {
+        Ok(seated) => {
             if let Some(budget) = kv_budget {
-                share.reserved = reserved_kv_bytes(budget, slots) + budget.bytes_for_rows(want);
+                share.reserved = reserved_kv_bytes(budget, slots) + budget.bytes_for_rows(seated.admitted_rows);
             }
             drop(share);
-            idx
+            let cap = if seated.is_soft {
+                soft_reserve as u32
+            } else {
+                normal_reserve as u32
+            };
+            (seated.slot, cap)
         }
         Err(denied) => {
             drop(share);
@@ -3854,6 +3923,7 @@ fn admit_session(
     let resume = resume.filter(|r| r.slot == idx).map_or(0, |r| r.rows);
     let speech = job.opts.speech.is_some();
     slots[idx] = Some(Slot {
+        output_cap,
         session_end: job.opts.session_end,
         session: retention.seat(job.opts.session, idx, pair, speech, resume, metrics),
         resume,
@@ -4164,6 +4234,7 @@ fn run_one_tick(
     Option<DecodeProgress>,
 ) {
     obs.pd_import_work = false;
+    let model_metrics = state.model_metrics(slug);
     let bucket = key.and_then(|k| bundle.bucket(k));
     for slot in slots.iter_mut() {
         if slot.as_ref().is_some_and(|s| s.parked_at.is_some()) {
@@ -4435,6 +4506,12 @@ fn run_one_tick(
                                         let request = slots[i].as_mut().expect("checked Some");
                                         request.pf_pos = frontier;
                                         request.cached_tokens = e.attached_rows(i) as usize;
+                                        if request.cached_tokens > 0 {
+                                            model_metrics
+                                                .serving
+                                                .prefill_adopted
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                     Err(err) => {
                                         note_fault(&mut tick_fault, &err);
@@ -4667,6 +4744,7 @@ fn run_one_tick(
                         aging,
                         obs.host.queued_prefill_rows,
                         &mut obs.host.ride_spans,
+                        &model_metrics,
                     ) {
                         if tick_fault.is_none() {
                             tick_fault = Some(f);
@@ -4803,6 +4881,20 @@ fn run_one_tick(
                             }
                             if s.respond.is_closed() {
                                 disconnected[i] = true;
+                                if s.pf_pos > 0 {
+                                    model_metrics
+                                        .serving
+                                        .prefix_published_on_abort
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                let discarded = s.prompt_ids.len().saturating_sub(s.pf_pos);
+                                if discarded > 0 {
+                                    model_metrics
+                                        .serving
+                                        .prefill_tokens_discarded_on_abort
+                                        .fetch_add(discarded as u64, Ordering::Relaxed);
+                                }
+                                e.retire_slot(i, true);
                                 if let Some(taken) = slots[i].take() {
                                     release_kv(&arena, taken.kv);
                                 }
@@ -4857,9 +4949,18 @@ fn run_one_tick(
                     // whole prompt); the decode launch below runs between chunks. With no
                     // decoders live, stop once a request becomes ready for decode,
                     // unless the caller explicitly defers decode.
+                    let prefilling_slots = slots
+                        .iter()
+                        .take(cap)
+                        .flatten()
+                        .filter(|s| s.needs_prefill())
+                        .count();
                     let cap_rows = if co_scheduled {
                         co_sched_prefill_rows(e.pf_max_rows(), pf_interleave_rows())
-                    } else if feeds.is_empty() {
+                    } else if feeds.is_empty()
+                        && prefilling_slots <= 1
+                        && obs.host.queued_prefill_rows == 0
+                    {
                         usize::MAX
                     } else {
                         pf_interleave_rows()
@@ -4882,6 +4983,22 @@ fn run_one_tick(
                             .unwrap_or(false)
                         {
                             disconnected[i] = true;
+                            if let Some(s) = slots[i].as_ref() {
+                                if s.pf_pos > 0 {
+                                    model_metrics
+                                        .serving
+                                        .prefix_published_on_abort
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                let discarded = s.prompt_ids.len().saturating_sub(s.pf_pos);
+                                if discarded > 0 {
+                                    model_metrics
+                                        .serving
+                                        .prefill_tokens_discarded_on_abort
+                                        .fetch_add(discarded as u64, Ordering::Relaxed);
+                                }
+                            }
+                            e.retire_slot(i, true);
                             if let Some(taken) = slots[i].take() {
                                 release_kv(&arena, taken.kv);
                             }
@@ -7161,8 +7278,12 @@ fn reserved_kv_bytes(budget: crate::sched::admission::KvBudget, slots: &[Option<
         .flatten()
         .map(|s| {
             budget.bytes_for_rows(
-                reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
-                    * (1 + s.cfg.is_some() as u64),
+                reserved_kv_rows_with_cap(
+                    s.prompt_ids.len(),
+                    s.gen.max_tokens,
+                    s.out_ids.len(),
+                    s.output_cap as usize,
+                ) * (1 + s.cfg.is_some() as u64),
             )
         })
         .sum()
@@ -7173,7 +7294,14 @@ fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option
         let rows: u64 = slots
             .iter()
             .flatten()
-            .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()))
+            .map(|s| {
+                reserved_kv_rows_with_cap(
+                    s.prompt_ids.len(),
+                    s.gen.max_tokens,
+                    s.out_ids.len(),
+                    s.output_cap as usize,
+                )
+            })
             .sum();
         rows as f64 / b.max_rows() as f64
     })
@@ -7982,6 +8110,7 @@ fn gpu_prefill_batched_pass(
     aging: std::time::Duration,
     queued_rows: usize,
     spans: &mut Vec<smallvec::SmallVec<[u32; 8]>>,
+    metrics: &crate::obs::Metrics,
 ) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
@@ -8019,7 +8148,12 @@ fn gpu_prefill_batched_pass(
     let (launch_cap, launch_max) = if row_body_max.is_some() || (cold && !bounded_tick) {
         (budget_max, budget_max)
     } else {
-        pf_launch_rows(e.pf_request_max_rows(), budget_max)
+        let (cap, max) = pf_launch_rows(e.pf_request_max_rows(), budget_max);
+        if decode_rows > 0 && crate::config::RuntimeConfig::get().pf_interleave.is_none() {
+            (cap.min(4096), max.min(4096))
+        } else {
+            (cap, max)
+        }
     };
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
@@ -8061,10 +8195,23 @@ fn gpu_prefill_batched_pass(
                 continue;
             };
             if request.respond.is_closed() {
+                if request.pf_pos > 0 {
+                    metrics
+                        .serving
+                        .prefix_published_on_abort
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let discarded = request.prompt_ids.len().saturating_sub(request.pf_pos);
+                if discarded > 0 {
+                    metrics
+                        .serving
+                        .prefill_tokens_discarded_on_abort
+                        .fetch_add(discarded as u64, Ordering::Relaxed);
+                }
+                e.retire_slot(i, true);
                 if let Some(taken) = slot.take() {
                     release_kv(arena, taken.kv);
                 }
-                e.retire_slot(i, false);
                 continue;
             }
             if request.prompt_ids.is_empty() {
@@ -8163,8 +8310,15 @@ fn gpu_prefill_batched_pass(
                         Some(run) => run.partner_pf = frontier,
                         None => {
                             request.pf_pos = frontier;
+                            let prev_cached = request.cached_tokens;
                             request.cached_tokens =
                                 (e.attached_rows(i) as usize).max(request.resume.min(frontier));
+                            if request.cached_tokens > 0 && prev_cached == 0 {
+                                metrics
+                                    .serving
+                                    .prefill_adopted
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -8289,7 +8443,11 @@ fn gpu_prefill_batched_pass(
             None => (launch_cap, launch_max),
         };
         let ride_key = e.pf_pack_budget(avail.min(launch_cap));
-        if std::mem::take(&mut ride_open) && !budget_on && !ride.ride(ride_key, feeds.len()) {
+        if std::mem::take(&mut ride_open)
+            && !budget_on
+            && avail.min(launch_cap) > 2048
+            && !ride.ride(ride_key, feeds.len())
+        {
             unified = false;
             decode_rows = 0;
         }
@@ -13775,8 +13933,8 @@ mod tests {
 
     #[test]
     fn kv_reservation_keeps_generated_rows() {
-        assert_eq!(reserved_kv_rows(70_000, 700, 0), 70_700);
-        assert_eq!(reserved_kv_rows(70_000, 700, 512), 70_700);
+        assert_eq!(reserved_kv_rows(70_000, 700, 0), 70_256);
+        assert_eq!(reserved_kv_rows(70_000, 700, 512), 70_640);
         assert_eq!(reserved_kv_rows(4, 0, 0), 5);
         assert_eq!(reserved_kv_rows(4, 2, 9), 13);
     }
@@ -14726,6 +14884,7 @@ mod tests {
         let (respond, rx) = crate::serve::stream::channel();
         (
             Some(Slot {
+                output_cap: 0,
                 session_end: false,
                 telemetry: None,
                 prompt_ids: vec![1, 2, 3],
@@ -15146,6 +15305,7 @@ mod tests {
                 std::time::Duration::ZERO,
                 0,
                 &mut Vec::new(),
+                &crate::obs::Metrics::default(),
             )
             .is_none());
             assert!(completed.is_empty() && unified.is_empty());

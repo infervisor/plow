@@ -1161,14 +1161,31 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             float kf[E];
 #pragma unroll
             for (int c = 0; c < (int)NCH; c++) fp8w2_to_f32(k8[u][c], kf + c * 8);
+            if constexpr (GF == 2) {
+                float d0 = 0.0f, d1 = 0.0f;
 #pragma unroll
-            for (int g = 0; g < GF; g++) {
-                float d = 0.0f;
+                for (int i = 0; i < E; i++) {
+                    d0 = fmaf(kf[i], qf[0][i], d0);
+                    d1 = fmaf(kf[i], qf[1][i], d1);
+                }
 #pragma unroll
-                for (int i = 0; i < E; i++) d = fmaf(kf[i], qf[g][i], d);
+                for (unsigned sh = 16; sh > 0; sh >>= 1) {
+                    d0 += __shfl_xor_sync(0xffffffffu, d0, sh, 32);
+                    d1 += __shfl_xor_sync(0xffffffffu, d1, sh, 32);
+                }
+                const bool valid = r0 + NGRP * (unsigned)u < hi;
+                sc[0][u] = valid ? d0 * ks[u] : FA_NEG_INF;
+                sc[1][u] = valid ? d1 * ks[u] : FA_NEG_INF;
+            } else {
 #pragma unroll
-                for (unsigned sh = 16; sh > 0; sh >>= 1) d += __shfl_xor_sync(0xffffffffu, d, sh, 32);
-                sc[g][u] = r0 + NGRP * (unsigned)u < hi ? d * ks[u] : FA_NEG_INF;
+                for (int g = 0; g < GF; g++) {
+                    float d = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < E; i++) d = fmaf(kf[i], qf[g][i], d);
+#pragma unroll
+                    for (unsigned sh = 16; sh > 0; sh >>= 1) d += __shfl_xor_sync(0xffffffffu, d, sh, 32);
+                    sc[g][u] = r0 + NGRP * (unsigned)u < hi ? d * ks[u] : FA_NEG_INF;
+                }
             }
         }
 #pragma unroll
@@ -1199,10 +1216,18 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             float vf[E];
 #pragma unroll
             for (int c = 0; c < (int)NCH; c++) fp8w2_to_f32(v8[u][c], vf + c * 8);
+            if constexpr (GF == 2) {
 #pragma unroll
-            for (int g = 0; g < GF; g++)
+                for (int i = 0; i < E; i++) {
+                    o[0][i] = fmaf(sc[0][u], vf[i], o[0][i]);
+                    o[1][i] = fmaf(sc[1][u], vf[i], o[1][i]);
+                }
+            } else {
 #pragma unroll
-                for (int i = 0; i < E; i++) o[g][i] = fmaf(sc[g][u], vf[i], o[g][i]);
+                for (int g = 0; g < GF; g++)
+#pragma unroll
+                    for (int i = 0; i < E; i++) o[g][i] = fmaf(sc[g][u], vf[i], o[g][i]);
+            }
         }
     }
     float* go = lds;              /* [NGRP][D] */

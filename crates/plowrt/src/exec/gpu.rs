@@ -9221,16 +9221,16 @@ impl GpuEngine {
             return;
         }
         // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
-        if cache_output {
+        // On abort/disconnect, preserve whatever prefill or decode work was already computed.
+        if cache_output || disconnected {
             self.vmm_publish(b, self.pos[b]);
         }
         // After the publish, so the signal demotes the boundary this turn just touched and the
         // request cannot re-protect it.
         let signal = if session_end {
             Some(crate::memory::vmm::DemoteSignal::Header)
-        } else if disconnected {
-            Some(crate::memory::vmm::DemoteSignal::Abort)
         } else {
+            // Client cancel-and-resend waves re-send immediately; do not demote to cold LRU
             None
         };
         if let (Some(signal), Some((_, kv))) = (signal, self.vmm_prefix()) {
@@ -10137,9 +10137,15 @@ impl GpuEngine {
             self.rank_arm(&plan)?;
         }
         self.launch_decode_program(selection)?;
-        let cap = self
-            .selected_decode(selection)
-            .map_or(self.batch, |r| r.rows);
+        let effective_rungs = self.effective_decode_rungs();
+        let cap = effective_rungs
+            .iter()
+            .copied()
+            .find(|&w| w as usize >= self.decode_extent)
+            .map_or_else(
+                || self.selected_decode(selection).map_or(self.batch, |r| r.rows),
+                |w| w as usize,
+            );
         self.buckets.record(
             crate::obs::bucket::Family::Decode,
             self.decode_extent,
@@ -12817,6 +12823,21 @@ impl GpuEngine {
         }
 
         if c0 + real < n {
+            if self.vmm_prefix_enabled() {
+                let br = self
+                    .vmm
+                    .as_ref()
+                    .and_then(|v| v.kv.as_ref())
+                    .map(|kv| kv.block_rows())
+                    .unwrap_or(32);
+                let prev_blocks = c0 as u32 / br;
+                let new_blocks = (c0 + real) as u32 / br;
+                if new_blocks > prev_blocks {
+                    let chunk_boundary = new_blocks * br;
+                    self.record_prompt_prefix(b, prompt, chunk_boundary as usize);
+                    self.vmm_publish(b, chunk_boundary);
+                }
+            }
             return Ok(PrefillStep::Progress(c0 + real));
         }
         // VMM: prefill finished — publish the prompt's whole sharing blocks

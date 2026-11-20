@@ -34,6 +34,23 @@ impl Histogram {
         self.observe(value as u64, TOKENS);
     }
 
+    /// Latency quantile in milliseconds, or `None` when empty.
+    pub fn quantile_ms(&self, percent: u64) -> Option<f64> {
+        let count: u64 = self.bins.iter().map(|b| b.load(Relaxed)).sum();
+        if count == 0 {
+            return None;
+        }
+        let rank = (count as u128 * percent as u128).div_ceil(100);
+        let mut cumulative = 0u128;
+        for (index, bin) in self.bins.iter().enumerate() {
+            cumulative += bin.load(Relaxed) as u128;
+            if cumulative >= rank {
+                return LATENCY.get(index).map(|us| *us as f64 / 1000.0);
+            }
+        }
+        None
+    }
+
     /// A latency histogram in seconds.
     pub fn write_seconds(&self, out: &mut String, name: &str, labels: &str) {
         self.write(out, name, labels, LATENCY, 1e6);
@@ -395,6 +412,9 @@ pub struct ServingMetrics {
     /// Aborts that came before the first generated token, and arrival-to-abort time of every abort.
     pub aborted_before_first: AtomicU64,
     pub aborted_elapsed: Histogram,
+    pub prefill_tokens_discarded_on_abort: AtomicU64,
+    pub prefix_published_on_abort: AtomicU64,
+    pub prefill_adopted: AtomicU64,
     pub preempted: AtomicU64,
     pub tick_errors: AtomicU64,
     /// Completed requests judged against `PLOW_TTFT_SLO_MS` / `PLOW_TBT_SLO_MS`, and how many
@@ -702,6 +722,24 @@ impl ServingMetrics {
             "counter",
             "Aborted requests that had not produced a token (client gave up while queued or in prefill).",
             |m: &Metrics, _| m.serving.aborted_before_first.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_prefill_tokens_discarded_on_abort_total",
+            "counter",
+            "Tokens discarded when a prefill request aborts without completion.",
+            |m: &Metrics, _| m.serving.prefill_tokens_discarded_on_abort.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_prefix_published_on_abort_total",
+            "counter",
+            "Prefix checkpoints published upon request abort.",
+            |m: &Metrics, _| m.serving.prefix_published_on_abort.load(Relaxed)
+        );
+        scalar!(
+            "plowrt_prefill_adopted_total",
+            "counter",
+            "Completed prefill chunks adopted or attached by requests.",
+            |m: &Metrics, _| m.serving.prefill_adopted.load(Relaxed)
         );
         scalar!(
             "plowrt_requests_thinking_total",

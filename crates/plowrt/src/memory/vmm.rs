@@ -2767,7 +2767,7 @@ impl VmmKv {
         let blocks = snap.store.blocks();
         let lost = prompt.len() as u64 - u64::from(rows);
         let st = &mut inner.stats;
-        let (hits, got, miss) = if kind.has(Kind::PROMPT_END) {
+        let (hits, got, miss) = if kind.has(Kind::PROMPT_END) || kind.has(Kind::TURN_END) {
             (
                 &mut st.attach_prompt_end,
                 &mut st.tokens_attached_prompt_end,
@@ -2981,7 +2981,7 @@ impl VmmKv {
                     inner.stats.attach_misses += 1;
                     inner.stats.tokens_attached -= rows as u64;
                     let st = &mut inner.stats;
-                    let (hits, got, miss) = if kind.has(Kind::PROMPT_END) {
+                    let (hits, got, miss) = if kind.has(Kind::PROMPT_END) || kind.has(Kind::TURN_END) {
                         (
                             &mut st.attach_prompt_end,
                             &mut st.tokens_attached_prompt_end,
@@ -3100,7 +3100,9 @@ impl VmmKv {
         let mut inner = self.shared.inner.lock();
         inner.seqs[seq].session_ttl = Some(ttl);
         if let Some(id) = inner.seqs[seq].attached {
-            if let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END)) {
+            if let Some(snap) = snap_mut(&mut inner, id)
+                .filter(|s| s.kind.has(Kind::PROMPT_END) || s.kind.has(Kind::TURN_END))
+            {
                 snap.protect_until = Some(std::time::Instant::now() + ttl);
             }
         }
@@ -3131,7 +3133,9 @@ impl VmmKv {
         };
         inner.cold_tick += 1;
         let cold = inner.cold_tick;
-        let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END)) else {
+        let Some(snap) = snap_mut(&mut inner, id)
+            .filter(|s| s.kind.has(Kind::PROMPT_END) || s.kind.has(Kind::TURN_END))
+        else {
             return;
         };
         snap.protect_until = None;
@@ -3402,7 +3406,7 @@ impl VmmKv {
                 // used: it is the conversation's next-turn attach point (a first conversation on
                 // a fresh server, or one whose lead is unique, missed its whole turn 2), and an
                 // unique one-shot prompt's copy is the first thing eviction takes.
-                if !kind.has(Kind::PROMPT_END) {
+                if !kind.has(Kind::PROMPT_END) && !kind.has(Kind::TURN_END) {
                     inner.stats.publishes_skipped += 1;
                     return Ok(());
                 }
@@ -3602,7 +3606,7 @@ impl VmmKv {
         if self.shared_publish && rows % s.block_rows != 0 {
             let mut inner = s.inner.lock();
             if !note_lead(&mut inner, seq, tokens) {
-                if !kind.has(Kind::PROMPT_END) {
+                if !kind.has(Kind::PROMPT_END) && !kind.has(Kind::TURN_END) {
                     inner.stats.publishes_skipped += 1;
                     return Ok(());
                 }
@@ -4656,6 +4660,9 @@ fn publish_locked(
     let continued = lineage.filter(|&l| l != id && inner.seqs[seq].lineage.is_none());
     let superseded = note_end(inner, seq, id, kind);
     protect(inner, seq, id, kind);
+    if kind.has(Kind::TURN_END) {
+        inner.seqs[seq].ended = Some(id);
+    }
     if cold {
         trim_cache_cold(s, inner);
     } else {
@@ -5284,7 +5291,7 @@ fn protect(inner: &mut Inner, seq: usize, id: u64, kind: Kind) {
     let Some(ttl) = inner.seqs[seq].session_ttl else {
         return;
     };
-    if !kind.has(Kind::PROMPT_END) {
+    if !kind.has(Kind::PROMPT_END) && !kind.has(Kind::TURN_END) {
         return;
     }
     if let Some(snap) = snap_mut(inner, id) {
