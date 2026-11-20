@@ -198,8 +198,9 @@ fn command_line_settings_resolve_as_the_process_parse() {
 
 /// Once engine configs diverge, engine code reading the config with no engine scope is a
 /// wrong-model read: it panics in a debug build; under a scope (or one its thread inherited) it
-/// reads that scope.
-#[cfg(feature = "hsa")]
+/// reads that scope. A release build warns instead of panicking, so there is nothing to catch
+/// there (the package build runs its tests in release).
+#[cfg(all(feature = "hsa", debug_assertions))]
 #[test]
 fn an_unscoped_engine_read_is_caught_once_engines_diverge() {
     use plowrt::config::{check_engine_scope, inherit, scoped};

@@ -440,7 +440,8 @@
             # libhsa-runtime64), no HIP runtime involved.
             buildFeatures = lib.optionals isLinux [ "cuda" "hsa" ];
             cargoBuildFlags = [ "--package" "plowrt" ];
-            cargoTestFlags = [ "--package" "plowrt" ];
+            # Every test binary runs: a failure in one does not hide the rest.
+            cargoTestFlags = [ "--package" "plowrt" "--no-fail-fast" ];
 
             meta = {
               description = "plow host runtime — CPU + GPU in one binary on Linux (drivers dlopen'd), CPU-only on darwin";
