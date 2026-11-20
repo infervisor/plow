@@ -8078,7 +8078,12 @@ fn gpu_prefill_batched_pass(
     let (launch_cap, launch_max) = if row_body_max.is_some() || (cold && !bounded_tick) {
         (budget_max, budget_max)
     } else {
-        pf_launch_rows(e.pf_request_max_rows(), budget_max)
+        let (cap, max) = pf_launch_rows(e.pf_request_max_rows(), budget_max);
+        if decode_rows > 0 && crate::config::RuntimeConfig::get().pf_interleave.is_none() {
+            (cap.min(4096), max.min(4096))
+        } else {
+            (cap, max)
+        }
     };
     // Bound each candidate before fair sharing. Short requests return unused
     // rows to later candidates in the same launch.
@@ -8368,7 +8373,11 @@ fn gpu_prefill_batched_pass(
             None => (launch_cap, launch_max),
         };
         let ride_key = e.pf_pack_budget(avail.min(launch_cap));
-        if std::mem::take(&mut ride_open) && !budget_on && !ride.ride(ride_key, feeds.len()) {
+        if std::mem::take(&mut ride_open)
+            && !budget_on
+            && avail.min(launch_cap) > 2048
+            && !ride.ride(ride_key, feeds.len())
+        {
             unified = false;
             decode_rows = 0;
         }

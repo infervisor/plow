@@ -14,6 +14,7 @@ const THROUGHPUT_HYSTERESIS: f64 = 1.03;
 /// needs a win above sampling noise: Veena at c128 narrowed 64 -> 32 on a ~3% estimate (samples
 /// taken beside the codec's GPU work) and held 50 requests queued for 10 s.
 const THROUGHPUT_BACKLOG_HYSTERESIS: f64 = 1.10;
+const THROUGHPUT_DWELL_TICKS: u32 = 8;
 
 /// Number of leading slots a decode dispatch must cover.
 ///
@@ -158,7 +159,7 @@ impl RungController {
             stats,
             target: 0,
             min_seat: 0,
-            dwell_ticks: 0,
+            dwell_ticks: MIN_DWELL_TICKS,
             low_load_ticks: 0,
             fast_probe: false,
             throughput: true,
@@ -259,7 +260,10 @@ impl RungController {
             RungReason::Hold
         };
 
-        if seat < demand_seat && seat < self.target {
+        if seat < demand_seat
+            && seat < self.target
+            && (load.queued == 0 || self.dwell_ticks >= THROUGHPUT_DWELL_TICKS)
+        {
             self.target = seat;
             self.dwell_ticks = 0;
             self.low_load_ticks = 0;
