@@ -2857,6 +2857,10 @@ pub struct GpuEngine {
     /// before the chain. One seg graph per bucket/range then serves every slot; per-slot graphs
     /// held ~10 KiB of driver host memory per node (12B FP8, B=128: 15k graphs, 22 GiB).
     d_tens_pf: Option<DeviceMem>,
+    _d_step_stage: Option<DeviceMem>,
+    d_pf_ids: DeviceMem,
+    d_pf_pos: DeviceMem,
+    d_pf_kvlen: DeviceMem,
     _tensor_bindings: Vec<TensorBindings>,
     /// Rank-3 KV descriptors bind slot-specific addresses and outlive every slot table use.
     _kv_tmap_slots: Vec<DeviceMem>,
@@ -5784,6 +5788,56 @@ impl GpuEngine {
             );
         }
 
+        // ---- decode program tables ----
+        let g = blob.decode_prog()?;
+        // Decode batch: the compiler emits the decode program with t == B
+        // (PLOW_DECODE_BATCH). Cross-check against the [B]-sized in.kvlen.
+        let batch = g.t as usize;
+        if batch > 16
+            && decode_roles.contains(&plow_asset::segment_roles::NATIVE_DECODE_TC)
+            && be.module_global_u32(&module, "plow_decode_block_norm_abi")? != Some(1)
+        {
+            return Err(RuntimeError::Rejected(
+                "native B32 decode requires rung-invariant block normalization".into(),
+            ));
+        }
+        let kvlen_bytes = blob.tensors[t_kvlen].bytes;
+        if (mixed_packet.is_none() && kvlen_bytes != (batch * 4) as u64)
+            || kvlen_bytes < (batch * 4) as u64
+        {
+            return Err(RuntimeError::Device(format!(
+                "in.kvlen is {} B but the decode program's batch is {batch} \
+                 (want {} B) — blob/tensor mismatch",
+                kvlen_bytes,
+                batch * 4
+            )));
+        }
+
+        let d_pf_ids = devp[t_ids].subview(0, devp[t_ids].len)?;
+        let d_pf_pos = devp[t_pos].subview(0, devp[t_pos].len)?;
+        let d_pf_kvlen = devp[t_kvlen].subview(0, devp[t_kvlen].len)?;
+        let step_stage_bytes = ((3 + usize::from(recurrent.is_some())) * batch * 4) as u64;
+        let d_step_stage = match be.alloc(0, step_stage_bytes) {
+            Ok(mem) => {
+                let d_ids = mem.subview(0, (batch * 4) as u64)?;
+                let d_pos = mem.subview((batch * 4) as u64, (batch * 4) as u64)?;
+                let d_kvlen = mem.subview((2 * batch * 4) as u64, (batch * 4) as u64)?;
+                devp[t_ids] = d_ids;
+                devp[t_pos] = d_pos;
+                devp[t_kvlen] = d_kvlen;
+                tracing::info!(
+                    batch,
+                    bytes = step_stage_bytes,
+                    "coalesced decode step staging enabled"
+                );
+                Some(mem)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "coalesced step staging allocation failed; fallback to individual copies");
+                None
+            }
+        };
+
         let mut ptrs: Vec<u64> = devp.iter().map(|m| m.base).collect();
         for map in &kv_maps {
             map.encode_slot(&be, &ptrs, 0, &devp[map.tensor])?;
@@ -5828,31 +5882,6 @@ impl GpuEngine {
         bindings.check_pointers(&ptrs)?;
         bindings.upload(|bytes| be.upload(&d_tens, 0, bytes))?;
         let mut tensor_bindings = vec![bindings];
-
-        // ---- decode program tables ----
-        let g = blob.decode_prog()?;
-        // Decode batch: the compiler emits the decode program with t == B
-        // (PLOW_DECODE_BATCH). Cross-check against the [B]-sized in.kvlen.
-        let batch = g.t as usize;
-        if batch > 16
-            && decode_roles.contains(&plow_asset::segment_roles::NATIVE_DECODE_TC)
-            && be.module_global_u32(&module, "plow_decode_block_norm_abi")? != Some(1)
-        {
-            return Err(RuntimeError::Rejected(
-                "native B32 decode requires rung-invariant block normalization".into(),
-            ));
-        }
-        let kvlen_bytes = blob.tensors[t_kvlen].bytes;
-        if (mixed_packet.is_none() && kvlen_bytes != (batch * 4) as u64)
-            || kvlen_bytes < (batch * 4) as u64
-        {
-            return Err(RuntimeError::Device(format!(
-                "in.kvlen is {} B but the decode program's batch is {batch} \
-                 (want {} B) — blob/tensor mismatch",
-                kvlen_bytes,
-                batch * 4
-            )));
-        }
         if decode_packet_roles.contains(&plow_asset::segment_roles::FP8_M1) {
             plow_asset::fp8_m1_role::options(
                 effective_multistep,
@@ -7029,8 +7058,14 @@ impl GpuEngine {
             .unwrap_or_default();
         if batch > 1 && (!kv_slots.is_empty() || !kv_maps.is_empty()) {
             let mut shifted = ptrs.clone();
+            shifted[t_ids] = d_pf_ids.base;
+            shifted[t_pos] = d_pf_pos.base;
+            shifted[t_kvlen] = d_pf_kvlen.base;
             for b in 1..batch {
                 let mut slots = base_bindings()?;
+                slots[t_ids] = TensorBinding::whole(&d_pf_ids)?;
+                slots[t_pos] = TensorBinding::whole(&d_pf_pos)?;
+                slots[t_kvlen] = TensorBinding::whole(&d_pf_kvlen)?;
                 for (i, binding) in
                     crate::exec::tensor_bindings::slot_bindings(&devp, &kv_slots, b)?
                 {
@@ -7062,10 +7097,28 @@ impl GpuEngine {
                 d_tens_slots.push(mem);
             }
         }
-        let d_tens_pf = if d_tens_slots.is_empty() {
-            None
-        } else {
-            Some(be.alloc(0, (ptrs.len() * 8) as u64)?)
+        let d_tens_pf = {
+            let mut pf_ptrs = ptrs.clone();
+            pf_ptrs[t_ids] = d_pf_ids.base;
+            pf_ptrs[t_pos] = d_pf_pos.base;
+            pf_ptrs[t_kvlen] = d_pf_kvlen.base;
+            match be.alloc(0, (pf_ptrs.len() * 8) as u64) {
+                Ok(mem) => {
+                    let mut slots = base_bindings()?;
+                    slots[t_ids] = TensorBinding::whole(&d_pf_ids)?;
+                    slots[t_pos] = TensorBinding::whole(&d_pf_pos)?;
+                    slots[t_kvlen] = TensorBinding::whole(&d_pf_kvlen)?;
+                    let mut bindings = TensorBindings::new(slots)?;
+                    bindings.check_pointers(&pf_ptrs)?;
+                    bindings.upload(|bytes| be.upload(&mem, 0, bytes))?;
+                    tensor_bindings.push(bindings);
+                    Some(mem)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "prefill tensor table allocation failed");
+                    None
+                }
+            }
         };
 
         if let Some(pack) = &packed_prefill {
@@ -8157,6 +8210,10 @@ impl GpuEngine {
             d_tens,
             d_tens_slots,
             d_tens_pf,
+            _d_step_stage: d_step_stage,
+            d_pf_ids,
+            d_pf_pos,
+            d_pf_kvlen,
             _tensor_bindings: tensor_bindings,
             _kv_tmap_slots: kv_tmap_slots,
             _tables: vec![
@@ -9580,6 +9637,38 @@ impl GpuEngine {
     /// advance each fed slot's KV cache by one row, and write the
     /// device-argmax next token per feed (same order) into `toks` — cleared
     /// first; caller-provided so the per-token hot path allocates nothing.
+    /// Upload the step staging slab (`in.ids`, `in.pos`, `in.kvlen`) to the device.
+    /// When contiguous (`step_coalesced`), all three sections transfer in a single
+    /// async DMA call, cutting driver enqueue overhead by 3x.
+    #[inline(always)]
+    unsafe fn upload_step_stage(&self) -> Result<()> {
+        if self.devp[self.t_pos].base == self.devp[self.t_ids].base + (self.batch * 4) as u64
+            && self.devp[self.t_kvlen].base == self.devp[self.t_pos].base + (self.batch * 4) as u64
+        {
+            self.be.memcpy_htod_async(
+                self.devp[self.t_ids].base,
+                &self.stage.slab.as_slice()[..3 * self.batch * 4],
+                &self.stream,
+            )
+        } else {
+            self.be.memcpy_htod_async(
+                self.devp[self.t_ids].base,
+                self.stage.section(0),
+                &self.stream,
+            )?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_pos].base,
+                self.stage.section(1),
+                &self.stream,
+            )?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_kvlen].base,
+                self.stage.section(2),
+                &self.stream,
+            )
+        }
+    }
+
     /// Port of the harness `run_step` (kv-row patch + ids/pos/kvlen + counter
     /// zero + cooperative launch + `in.ids` readback), generalized to B rows:
     /// every row `b` carries its own `pos[b]`/`kvlen[b]`; rows not fed this
@@ -9732,21 +9821,7 @@ impl GpuEngine {
         // SAFETY: the pinned slab lives on `self` past the stream synchronize;
         // each section matches its [B]-sized i32 tensor.
         unsafe {
-            self.be.memcpy_htod_async(
-                self.devp[self.t_ids].base,
-                self.stage.section(0),
-                &self.stream,
-            )?;
-            self.be.memcpy_htod_async(
-                self.devp[self.t_pos].base,
-                self.stage.section(1),
-                &self.stream,
-            )?;
-            self.be.memcpy_htod_async(
-                self.devp[self.t_kvlen].base,
-                self.stage.section(2),
-                &self.stream,
-            )?;
+            self.upload_step_stage()?;
         }
         self.upload_active_slots(feeds.iter().map(|&(slot, _)| slot))?;
         // Counters and the GQ cursor have the same lifecycle (one launch
@@ -10055,21 +10130,7 @@ impl GpuEngine {
         // SAFETY: the pinned slab lives on `self` past the stream synchronize;
         // each section matches its [B]-sized i32 tensor.
         unsafe {
-            self.be.memcpy_htod_async(
-                self.devp[self.t_ids].base,
-                self.stage.section(0),
-                &self.stream,
-            )?;
-            self.be.memcpy_htod_async(
-                self.devp[self.t_pos].base,
-                self.stage.section(1),
-                &self.stream,
-            )?;
-            self.be.memcpy_htod_async(
-                self.devp[self.t_kvlen].base,
-                self.stage.section(2),
-                &self.stream,
-            )?;
+            self.upload_step_stage()?;
         }
         self.upload_active_slots(std::iter::once(slot))?;
         self.be.event_record(&self.h2d_ev, &self.stream)?;
@@ -10432,21 +10493,7 @@ impl GpuEngine {
             let ms = self.multistep.as_ref().expect("checked");
             self.be
                 .memcpy_htod_async(fed_base, ms.fed_host.as_slice(), &self.stream)?;
-            self.be.memcpy_htod_async(
-                self.devp[self.t_ids].base,
-                self.stage.section(0),
-                &self.stream,
-            )?;
-            self.be.memcpy_htod_async(
-                self.devp[self.t_pos].base,
-                self.stage.section(1),
-                &self.stream,
-            )?;
-            self.be.memcpy_htod_async(
-                self.devp[self.t_kvlen].base,
-                self.stage.section(2),
-                &self.stream,
-            )?;
+            self.upload_step_stage()?;
         }
 
         // Sampled quantum: params and all K rows of uniforms go up once.
@@ -10816,21 +10863,7 @@ impl GpuEngine {
                 let ms = self.multistep.as_ref().expect("checked");
                 self.be
                     .memcpy_htod_async(fed_base, ms.fed_host.as_slice(), &self.stream)?;
-                self.be.memcpy_htod_async(
-                    self.devp[self.t_ids].base,
-                    self.stage.section(0),
-                    &self.stream,
-                )?;
-                self.be.memcpy_htod_async(
-                    self.devp[self.t_pos].base,
-                    self.stage.section(1),
-                    &self.stream,
-                )?;
-                self.be.memcpy_htod_async(
-                    self.devp[self.t_kvlen].base,
-                    self.stage.section(2),
-                    &self.stream,
-                )?;
+                self.upload_step_stage()?;
             }
             if upload == PipeUpload::State {
                 let (d_last, held) = {
@@ -12852,7 +12885,7 @@ impl GpuEngine {
         // in.ids[0] now holds the first generated token (argmax over the last
         // real prompt row) — identical to decode-only step n_prompt-1.
         let mut out = [0u8; 4];
-        self.be.download(&self.devp[self.t_ids], 0, &mut out)?;
+        self.be.download(&self.d_pf_ids, 0, &mut out)?;
         Ok(PrefillStep::Done(i32::from_le_bytes(out) as u32))
     }
 
@@ -13083,17 +13116,17 @@ impl GpuEngine {
         let kvlen_bytes = ((c0 + real) as i32).to_le_bytes();
         unsafe {
             self.be.memcpy_htod_async(
-                self.devp[self.t_ids].base,
+                self.d_pf_ids.base,
                 bytemuck::cast_slice(&self.pf_ids[..tc]),
                 &self.stream,
             )?;
             self.be.memcpy_htod_async(
-                self.devp[self.t_pos].base,
+                self.d_pf_pos.base,
                 bytemuck::cast_slice(&self.pf_pos[..tc]),
                 &self.stream,
             )?;
             self.be
-                .memcpy_htod_async(self.devp[self.t_kvlen].base, &kvlen_bytes, &self.stream)?;
+                .memcpy_htod_async(self.d_pf_kvlen.base, &kvlen_bytes, &self.stream)?;
         }
 
         let (ctr_base, ctr_bytes, mut arg) = {
@@ -15144,12 +15177,12 @@ impl GpuEngine {
             // retirement. All device destinations are live ranges.
             unsafe {
                 self.be.memcpy_htod_async(
-                    self.devp[self.t_ids].base,
+                    self.d_pf_ids.base,
                     bytemuck::cast_slice(&self.pf_ids[..tc]),
                     &self.stream,
                 )?;
                 self.be.memcpy_htod_async(
-                    self.devp[self.t_pos].base,
+                    self.d_pf_pos.base,
                     bytemuck::cast_slice(&self.pf_pos[..tc]),
                     &self.stream,
                 )?;
@@ -15169,7 +15202,7 @@ impl GpuEngine {
                     &self.stream,
                 )?;
                 self.be.memcpy_htod_async(
-                    self.devp[self.t_kvlen].base,
+                    self.d_pf_kvlen.base,
                     bytemuck::cast_slice(&pb.kvlen_buf),
                     &self.stream,
                 )?;
@@ -15208,7 +15241,7 @@ impl GpuEngine {
                     })?
                     .d_last
                     .base;
-                let ids_base = self.devp[self.t_ids].base;
+                let ids_base = self.d_pf_ids.base;
                 for &(row, slot) in device_ids {
                     self.be.memcpy_dtod_async(
                         ids_base + u64::from(row) * 4,

@@ -29,6 +29,11 @@ pub trait Tokenize: Send + Sync {
             self.decode(ids)
         });
     }
+    /// Fast-path lookup for a single token that decodes to a standalone valid UTF-8 slice without
+    /// interacting with neighbouring tokens (no byte fallback, no partial multibyte sequence).
+    fn fast_token_text(&self, _id: u32, _keep_special: bool) -> Option<&str> {
+        None
+    }
     /// The text of every token `decode` drops as special.
     fn special_tokens(&self) -> Vec<String> {
         Vec::new()
@@ -71,6 +76,32 @@ impl Tokenize for ByteTokenizer {
             bytes.extend(ids.iter().filter_map(|&id| u8::try_from(id).ok()));
             out.push_str(&String::from_utf8_lossy(bytes));
         });
+    }
+
+    fn fast_token_text(&self, id: u32, _keep_special: bool) -> Option<&str> {
+        if id < 128 {
+            const ASCII: [&str; 128] = [
+                "\x00", "\x01", "\x02", "\x03", "\x04", "\x05", "\x06", "\x07",
+                "\x08", "\t", "\n", "\x0b", "\x0c", "\r", "\x0e", "\x0f",
+                "\x10", "\x11", "\x12", "\x13", "\x14", "\x15", "\x16", "\x17",
+                "\x18", "\x19", "\x1a", "\x1b", "\x1c", "\x1d", "\x1e", "\x1f",
+                " ", "!", "\"", "#", "$", "%", "&", "'",
+                "(", ")", "*", "+", ",", "-", ".", "/",
+                "0", "1", "2", "3", "4", "5", "6", "7",
+                "8", "9", ":", ";", "<", "=", ">", "?",
+                "@", "A", "B", "C", "D", "E", "F", "G",
+                "H", "I", "J", "K", "L", "M", "N", "O",
+                "P", "Q", "R", "S", "T", "U", "V", "W",
+                "X", "Y", "Z", "[", "\\", "]", "^", "_",
+                "`", "a", "b", "c", "d", "e", "f", "g",
+                "h", "i", "j", "k", "l", "m", "n", "o",
+                "p", "q", "r", "s", "t", "u", "v", "w",
+                "x", "y", "z", "{", "|", "}", "~", "\x7f",
+            ];
+            Some(ASCII[id as usize])
+        } else {
+            None
+        }
     }
 
     fn vocab_size(&self) -> usize {
@@ -479,6 +510,12 @@ impl Tokenize for HfTokenizer {
             Some(t) => t.decode_into(ids, !keep_special, out),
             None => out.push_str(&self.inner.decode(ids, !keep_special).unwrap_or_default()),
         }
+    }
+
+    fn fast_token_text(&self, id: u32, keep_special: bool) -> Option<&str> {
+        self.table
+            .as_ref()
+            .and_then(|t| t.fast_text(id as usize, !keep_special))
     }
 
     fn special_tokens(&self) -> Vec<String> {

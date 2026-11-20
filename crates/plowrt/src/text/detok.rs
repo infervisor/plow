@@ -153,6 +153,27 @@ impl DecodeTable {
         &self.bytes[self.start[id] as usize..self.start[id + 1] as usize]
     }
 
+    /// Fast-path lookup for a token that decodes to a standalone valid UTF-8 slice without
+    /// interacting with neighbouring tokens (no byte fallback, no partial multibyte sequence).
+    pub(crate) fn fast_text(&self, id: usize, skip_special: bool) -> Option<&str> {
+        let k = self.kind.get(id).copied()?;
+        if k == 0 || (skip_special && k & SPECIAL != 0) {
+            return None;
+        }
+        if k & SPECIAL != 0 {
+            return None;
+        }
+        match self.chain {
+            Chain::ByteFallback => {
+                if k & BYTE != 0 {
+                    return None;
+                }
+                std::str::from_utf8(self.piece(id)).ok()
+            }
+            Chain::ByteLevel => std::str::from_utf8(self.piece(id)).ok(),
+        }
+    }
+
     /// Append the decode of `ids` to `out`: `t.decode(ids, skip_special)`, byte for byte.
     pub(crate) fn decode_into(&self, ids: &[u32], skip_special: bool, out: &mut String) {
         let live = |id: u32| {

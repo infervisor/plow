@@ -324,6 +324,11 @@ impl ReasoningSplit {
     /// that could still be part of a marker stay held until a later token or
     /// [`Self::finish`] settles them.
     pub fn push(&mut self, text: &str) -> (Option<String>, Option<String>) {
+        if self.state == State::Answer && !self.reenter {
+            let mut c = String::new();
+            let hc = self.emit_answer(text, &mut c);
+            return (None, hc.then_some(c));
+        }
         let (mut r, mut c) = (String::new(), String::new());
         let (hr, hc) = self.push_into(text, &mut r, &mut c);
         (hr.then_some(r), hc.then_some(c))

@@ -2161,7 +2161,7 @@ fn spawn_scoped(
                 .store(prefilling as u64, Ordering::Relaxed);
             // The budget follows device memory (other models load, grow and leave); memory
             // pressure asks the planner to evict an idle co-tenant so this model can grow.
-            #[cfg(any(feature = "cuda", feature = "hsa"))]
+            #[cfg(feature = "cuda")]
             if kv_budget.is_some() && kv_refreshed.elapsed() >= KV_BUDGET_REFRESH {
                 kv_refreshed = Instant::now();
                 let pressure = state.gpu_engine(&slug).map(|e| {
@@ -3545,25 +3545,34 @@ fn drain_waiting_session(
         .iter()
         .any(Option::is_none)
     {
-        if let Some(p) = probe {
+        let (job, arrived) = if let Some(p) = probe {
             if let Some(i) = cache_first(
                 heads.make_contiguous(),
                 rows.make_contiguous(),
                 p.block_rows(),
             ) {
-                let entry = waiting.remove(i).expect("in range");
-                waiting.push_front(entry);
-                let r = rows.remove(i).expect("in range");
-                rows.push_front(r);
-                let h = heads.remove(i).expect("in range");
-                heads.push_front(h);
+                rows.remove(i);
+                heads.remove(i);
                 Metrics::inc(&metrics.cache_first_admissions);
+                match waiting.remove(i) {
+                    Some(entry) => entry,
+                    None => break,
+                }
+            } else {
+                rows.pop_front();
+                heads.pop_front();
+                match waiting.pop_front() {
+                    Some(entry) => entry,
+                    None => break,
+                }
             }
-        }
-        rows.pop_front();
-        heads.pop_front();
-        let Some((job, arrived)) = waiting.pop_front() else {
-            break;
+        } else {
+            rows.pop_front();
+            heads.pop_front();
+            match waiting.pop_front() {
+                Some(entry) => entry,
+                None => break,
+            }
         };
         // A boundary restore in flight (`PrefixProbe::prefetch`): the request waits for the
         // copy here, not in the engine stream where every slot would wait with it. Bounded:
@@ -4619,7 +4628,7 @@ fn run_one_tick(
                                         let Some(request) = slot_opt.as_mut() else {
                                             continue;
                                         };
-                                        match gpu_finish_token(&mut *e, row, request, toks[row]) {
+                                        match gpu_finish_token(&mut *e, row, request, toks[row], false) {
                                             Ok(token) => {
                                                 disconnected[slot] |= handle_produced_token(
                                                     slot_opt,
@@ -9580,7 +9589,7 @@ fn gpu_prefill_advance(
         }
         return Ok(Some(tok[0]));
     }
-    gpu_finish_token(e, 0, slot, tok).map(Some)
+    gpu_finish_token(e, 0, slot, tok, false).map(Some)
 }
 
 /// Refuse a packet with per-row host inputs (`in.encoder_overlay`, `in.pos_base`) whose prefill
@@ -9950,8 +9959,11 @@ fn dev_sample_spec(slot: &Slot, pen: bool) -> Option<crate::exec::gpu::DevSample
     let p = &slot.gen.params;
     let dev_pen = pen && slot.cfg.is_none();
     if p.is_greedy()
-        || p.needs_host_logits_except_repetition()
         || (p.repetition_penalty != 1.0 && !dev_pen)
+        || p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+        || !p.logit_bias.is_empty()
+        || (p.logprobs.is_some() && device_stats_k(p).is_none())
     {
         return None;
     }
@@ -10040,6 +10052,7 @@ fn gpu_finish_token(
     row: usize,
     slot: &mut Slot,
     argmax_tok: u32,
+    was_dev_sampled: bool,
 ) -> Result<u32> {
     if slot
         .speech
@@ -10056,10 +10069,10 @@ fn gpu_finish_token(
     }
     if !gpu_argmax_eligible(&slot.gen.params) {
         // Filled for this step by `gpu_batch_logprobs`.
-        if slot.lp.is_some() && greedy_stats_k(&slot.gen.params).is_some() {
+        if slot.lp.is_some() && device_stats_k(&slot.gen.params).is_some() {
             return Ok(argmax_tok);
         }
-        if let Some(lp) = greedy_device_logprobs(e, row, &slot.gen.params, argmax_tok)? {
+        if let Some(lp) = device_logprobs(e, row, &slot.gen.params, argmax_tok)? {
             slot.lp = Some(Box::new(lp));
             return Ok(argmax_tok);
         }
@@ -10075,6 +10088,7 @@ fn gpu_finish_token(
             || p.frequency_penalty != 0.0
             || !p.logit_bias.is_empty();
         // Greedy logprobs rows keep the device argmax (same bf16 row, same lowest-id tie-break).
+        // Device-sampled rows keep the token sampled on device.
         // `early_exit_rank`: at a trace line end, close when the marker ranks high enough. This
         // runs on a plain host-fed step only, so the choice is the sampled token, not a replacement.
         let close_now = slot
@@ -10088,17 +10102,27 @@ fn gpu_finish_token(
             });
         let tok = if let Some((close, _)) = close_now {
             close
-        } else if p.is_greedy() && !adjusted {
+        } else if (p.is_greedy() || was_dev_sampled) && !adjusted {
             argmax_tok
         } else {
-            let raw = (stats.is_some() && adjusted).then(|| logits.clone());
-            crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
-            let tok =
-                crate::text::sample::sample(&logits, &slot.gen.params, None, slot_rng01(slot));
-            if let Some(raw) = raw {
-                logits = raw;
+            thread_local! {
+                static RAW_SCRATCH: std::cell::RefCell<Vec<f32>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
             }
-            tok
+            let save_raw = stats.is_some() && adjusted;
+            RAW_SCRATCH.with_borrow_mut(|raw| {
+                if save_raw {
+                    raw.clear();
+                    raw.extend_from_slice(&logits);
+                }
+                crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
+                let tok =
+                    crate::text::sample::sample(&logits, &slot.gen.params, None, slot_rng01(slot));
+                if save_raw {
+                    std::mem::swap(&mut logits, raw);
+                }
+                tok
+            })
         };
         if let Some(stats) = stats {
             slot.lp = Some(Box::new(stats.finish(logits[tok as usize])));
@@ -10126,37 +10150,46 @@ fn seq_host_token(
     if !seq_needs_host_row(e, &s.gen.params) {
         return token;
     }
-    let p = &s.gen.params;
-    let adjusted = sampling_adjusted(p);
-    let sample = (!p.is_greedy() || adjusted) && e.host_sampling();
-    let mut logits = Vec::new();
-    if !e.logits_row(i, &mut logits) || (token as usize) >= logits.len() {
-        if sample {
-            tracing::warn!(
-                slot = i,
-                "host sampling: no logits row for this token; serving the device argmax"
-            );
-        }
-        return token;
+    let adjusted = sampling_adjusted(&s.gen.params);
+    let sample = (!s.gen.params.is_greedy() || adjusted) && e.host_sampling();
+    let logprobs_k = s.gen.params.logprobs;
+    thread_local! {
+        static LOGITS_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
     }
-    let stats = p
-        .logprobs
-        .map(|r| crate::text::logprobs::RowStats::of(&logits, r));
-    let tok = if sample {
-        let raw = (stats.is_some() && adjusted).then(|| logits.clone());
-        crate::text::sample::apply_penalties(&mut logits, &s.out_ids, &s.gen.params);
-        let tok = crate::text::sample::sample(&logits, &s.gen.params, None, slot_rng01(s));
-        if let Some(raw) = raw {
-            logits = raw;
+    LOGITS_SCRATCH.with_borrow_mut(|(logits, raw)| {
+        logits.clear();
+        if !e.logits_row(i, logits) || (token as usize) >= logits.len() {
+            if sample {
+                tracing::warn!(
+                    slot = i,
+                    "host sampling: no logits row for this token; serving the device argmax"
+                );
+            }
+            return token;
+        }
+        let stats = logprobs_k.map(|r| crate::text::logprobs::RowStats::of(logits, r));
+        let tok = if sample {
+            let save_raw = stats.is_some() && adjusted;
+            if save_raw {
+                raw.clear();
+                raw.extend_from_slice(logits);
+            }
+            let rng = slot_rng01(s);
+            crate::text::sample::apply_penalties(logits, &s.out_ids, &s.gen.params);
+            let tok = crate::text::sample::sample(logits, &s.gen.params, None, rng);
+            if save_raw {
+                std::mem::swap(logits, raw);
+            }
+            tok
+        } else {
+            token
+        };
+        if let Some(stats) = stats {
+            s.lp = Some(Box::new(stats.finish(logits[tok as usize])));
         }
         tok
-    } else {
-        token
-    };
-    if let Some(stats) = stats {
-        s.lp = Some(Box::new(stats.finish(logits[tok as usize])));
-    }
-    tok
+    })
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
@@ -10177,17 +10210,16 @@ fn seq_needs_host_row(
     p.logprobs.is_some() || ((!p.is_greedy() || sampling_adjusted(p)) && e.host_sampling())
 }
 
-/// The top-k a greedy, unadjusted logprobs row asks the device stats kernel for; `None` when the
+/// The top-k an unadjusted logprobs row asks the device stats kernel for; `None` when the
 /// row needs the host path.
 #[cfg(feature = "cuda")]
-fn greedy_stats_k(p: &crate::text::sample::SamplingParams) -> Option<u32> {
+fn device_stats_k(p: &crate::text::sample::SamplingParams) -> Option<u32> {
     let req = p.logprobs?;
     let adjusted = p.repetition_penalty != 1.0
         || p.presence_penalty != 0.0
         || p.frequency_penalty != 0.0
         || !p.logit_bias.is_empty();
-    (p.is_greedy() && !adjusted)
-        .then(|| u32::from(req.top.min(crate::text::logprobs::MAX_TOP_LOGPROBS)))
+    (!adjusted).then(|| u32::from(req.top.min(crate::text::logprobs::MAX_TOP_LOGPROBS)))
 }
 
 /// Logprobs from device statistics `out` (`plow_logprob_stats` layout) for `k` alternatives.
@@ -10200,7 +10232,7 @@ fn stats_logprobs(out: &[f32], k: usize, raw_logits: bool) -> crate::text::logpr
     crate::text::logprobs::RowStats::from_parts(out[0], raw_logits, top).finish(out[1])
 }
 
-/// Every greedy logprobs row of a step through one `plow_logprob_stats_rows` launch and one
+/// Every unadjusted logprobs row of a step through one `plow_logprob_stats_rows` launch and one
 /// readback, instead of a launch and a synchronous read per row. `rows` = (logits row, slot,
 /// token). Fills `slot.lp` for the rows it serves; the rest (an inexact top-k, an object without
 /// the batched kernel) keep [`gpu_finish_token`]'s per-row path.
@@ -10216,7 +10248,7 @@ fn gpu_batch_logprobs(
         let Some(slot) = slots[i].as_ref().filter(|s| s.cfg.is_none()) else {
             continue;
         };
-        if let Some(k) = greedy_stats_k(&slot.gen.params) {
+        if let Some(k) = device_stats_k(&slot.gen.params) {
             reqs.push((row as u32, tok, k));
             owners.push(i);
         }
@@ -10239,17 +10271,17 @@ fn gpu_batch_logprobs(
     Ok(())
 }
 
-/// A greedy, unadjusted logprobs row: its statistics come from `plow_logprob_stats` on device
+/// An unadjusted logprobs row: its statistics come from `plow_logprob_stats` on device
 /// (43 floats back instead of the 512 KiB row). `None` when the row needs the host path, the
 /// sampler object has no stats kernel, or its top-k is flagged inexact.
 #[cfg(feature = "cuda")]
-fn greedy_device_logprobs(
+fn device_logprobs(
     e: &mut crate::exec::gpu::GpuEngine,
     row: usize,
     p: &crate::text::sample::SamplingParams,
     tok: u32,
 ) -> Result<Option<crate::text::logprobs::TokenLogprobs>> {
-    let (Some(req), Some(k)) = (p.logprobs, greedy_stats_k(p)) else {
+    let (Some(req), Some(k)) = (p.logprobs, device_stats_k(p)) else {
         return Ok(None);
     };
     let mut out = [0f32; crate::exec::gpu::LOGPROB_STATS_MAX];
@@ -10579,10 +10611,10 @@ fn gpu_finish_and_emit_token(
     let Some(slot) = slot_opt.as_mut() else {
         return;
     };
-    let finished = if skip_host_sample {
+    let finished = if skip_host_sample && (!slot.gen.params.logprobs.is_some() || slot.lp.is_some()) {
         Ok(raw_token)
     } else {
-        gpu_finish_token(e, row, slot, raw_token)
+        gpu_finish_token(e, row, slot, raw_token, skip_host_sample)
     };
     match finished {
         Ok(token) => {
@@ -11157,8 +11189,20 @@ fn incremental_delta(
     last: bool,
     keep_special: bool,
 ) -> String {
-    const MAX_DETOKENIZE_WINDOW: usize = 16;
     let len = out_ids.len();
+    // Tier 1 fast path: single-token standalone UTF-8 text with no pending multi-byte sequence.
+    if len > 0 && *read == len - 1 {
+        let token = out_ids[len - 1];
+        if let Some(text) = tok.fast_token_text(token, keep_special) {
+            if !text.is_empty() && (last || !text.ends_with('\u{FFFD}')) {
+                *prefix = *read;
+                *read = len;
+                return text.to_string();
+            }
+        }
+    }
+    // Tier 2: windowed detokenize for multi-byte sequences, byte fallbacks, or partial UTF-8.
+    const MAX_DETOKENIZE_WINDOW: usize = 16;
     let safe_start = len
         .saturating_sub(MAX_DETOKENIZE_WINDOW)
         .max((*prefix).min(len));
@@ -11725,6 +11769,28 @@ mod tests {
             StreamChunk::Token { id, text, .. } => assert_eq!((id, text.as_str()), (104, "")),
             _ => panic!("expected a token"),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn unadjusted_sampled_logprobs_are_device_stats_and_sample_eligible() {
+        let (mut slot, _rx) = prefill_test_slot();
+        let s = slot.as_mut().unwrap();
+        s.gen.params.temperature = 0.7;
+        s.gen.params.top_p = 0.95;
+        s.gen.params.logprobs = Some(crate::text::logprobs::LogprobRequest {
+            top: 5,
+            raw_logits: false,
+        });
+        // Unadjusted sampled request has device_stats_k Some(5)
+        assert_eq!(super::device_stats_k(&s.gen.params), Some(5));
+        // And is eligible for device sampling with DevSample spec
+        assert!(super::dev_sample_spec(s, false).is_some());
+
+        // Penalties/adjustments disqualify from device stats
+        s.gen.params.presence_penalty = 0.5;
+        assert_eq!(super::device_stats_k(&s.gen.params), None);
+        assert!(super::dev_sample_spec(s, false).is_none());
     }
 
     #[test]
