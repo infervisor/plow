@@ -77,8 +77,9 @@ plowrt serve --model infervisor/qwen3.8-27b:sm90a-h100-tp1-fp8 --port 8080
 
 # Equivalently, from a locally built asset directory:
 nix develop --command env \
+  PLOW_DECODE_PIPELINE=1 \
   PLOW_GEN_DECODE_STEP=1 \
-  PLOW_MAX_QUEUED_REQUESTS=128 \
+  PLOW_MAX_QUEUED_REQUESTS=4096 \
   PLOW_PF_INTERLEAVE=0 \
   PLOW_PREFIX_CACHE=1 \
   PLOW_VMM_LIVE=1 \
