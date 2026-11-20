@@ -34,8 +34,10 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h /
       - uses: cachix/install-nix-action@v31
+      # The toolchains come from vendor servers and GitHub; one retry for a
+      # download that fails.
       - name: Enter Nix shell
-        run: nix develop --command true
+        run: nix develop --command true || { sleep 30; nix develop --command true; }
       # Both need the flake's ROCm toolchain (build_gfx942.sh refuses to run without it), and
       # neither compiles a kernel: PLOW_DEFINES_ONLY resolves the axes in seconds. The first
       # asserts the PLOW_HSACO_CONFIG path derives the object set from a packet and refuses a
