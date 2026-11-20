@@ -12932,6 +12932,15 @@ mod tests {
         assert!(slots[0].is_none());
     }
 
+    /// Run a test of the SLO-derived queue TTL under the latency objective. The serving class
+    /// is process-wide under `auto`: a tick in another test can observe load and switch it to
+    /// high concurrency, where nothing waiting is ever shed, while this test runs.
+    fn under_the_slo_ttl<R>(f: impl FnOnce() -> R) -> R {
+        let mut config = crate::config::RuntimeConfig::get().clone();
+        config.objective = crate::serve::policy::Objective::Latency;
+        crate::config::scoped(Some(Box::leak(Box::new(config))), f)
+    }
+
     /// A queued job whose client is still connected; the caller must keep the receiver alive.
     fn queued_job(
         prompt: usize,
@@ -13153,87 +13162,93 @@ mod tests {
     /// started. It answers the stream rather than dropping it silently.
     #[test]
     fn queue_ttl_override_sets_or_disables_the_shed() {
-        assert_eq!(queue_ttl_with(250.0, None), QUEUE_TTL_FLOOR_MS);
-        assert_eq!(queue_ttl_with(1_000.0, None), 40_000.0);
-        assert_eq!(queue_ttl_with(250.0, Some(600_000.0)), 600_000.0);
-        assert!(queue_ttl_with(250.0, Some(0.0)).is_infinite());
-        assert_eq!(
-            queue_verdict(false, 1e9, 250.0, JobClass::Normal),
-            Queued::Expired
-        );
+        under_the_slo_ttl(|| {
+            assert_eq!(queue_ttl_with(250.0, None), QUEUE_TTL_FLOOR_MS);
+            assert_eq!(queue_ttl_with(1_000.0, None), 40_000.0);
+            assert_eq!(queue_ttl_with(250.0, Some(600_000.0)), 600_000.0);
+            assert!(queue_ttl_with(250.0, Some(0.0)).is_infinite());
+            assert_eq!(
+                queue_verdict(false, 1e9, 250.0, JobClass::Normal),
+                Queued::Expired
+            );
+        });
     }
 
     #[test]
     fn a_request_past_the_queue_ttl_is_shed_with_an_answer() {
-        let now = Instant::now();
-        let metrics = Arc::new(Metrics::default());
-        let mut slots: Vec<Option<Slot>> = Vec::new();
-        let mut waiting: std::collections::VecDeque<(Job, Instant)> =
-            std::collections::VecDeque::new();
-        metrics.queued_requests.store(1, Ordering::Relaxed);
-        let ttl = queue_ttl_ms(250.0);
-        let (stale, mut rx) = queued_job(
-            10,
-            now - std::time::Duration::from_secs_f64(ttl / 1e3 + 1.0),
-        );
-        waiting.push_back(stale);
+        under_the_slo_ttl(|| {
+            let now = Instant::now();
+            let metrics = Arc::new(Metrics::default());
+            let mut slots: Vec<Option<Slot>> = Vec::new();
+            let mut waiting: std::collections::VecDeque<(Job, Instant)> =
+                std::collections::VecDeque::new();
+            metrics.queued_requests.store(1, Ordering::Relaxed);
+            let ttl = queue_ttl_ms(250.0);
+            let (stale, mut rx) = queued_job(
+                10,
+                now - std::time::Duration::from_secs_f64(ttl / 1e3 + 1.0),
+            );
+            waiting.push_back(stale);
 
-        drain_waiting(
-            &mut waiting,
-            &mut slots,
-            0,
-            now,
-            250.0,
-            None,
-            &metrics,
-            &EngineHealth::Healthy,
-            None,
-            false,
-        );
+            drain_waiting(
+                &mut waiting,
+                &mut slots,
+                0,
+                now,
+                250.0,
+                None,
+                &metrics,
+                &EngineHealth::Healthy,
+                None,
+                false,
+            );
 
-        assert!(waiting.is_empty());
-        assert_eq!(metrics.admit_shed.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(StreamChunk::Err(crate::RuntimeError::Rejected(_)))
-        ));
+            assert!(waiting.is_empty());
+            assert_eq!(metrics.admit_shed.load(Ordering::Relaxed), 1);
+            assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(StreamChunk::Err(crate::RuntimeError::Rejected(_)))
+            ));
+        });
     }
 
     /// A critical arrival is seated ahead of older normal ones; a bulk one past its (shorter)
     /// TTL is shed while a normal one of the same age still waits.
     #[test]
     fn waiting_is_served_by_class_and_bulk_goes_stale_first() {
-        let now = Instant::now();
-        let metrics = Arc::new(Metrics::default());
-        let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(1).collect();
-        let mut waiting = std::collections::VecDeque::new();
-        let ms = |v: f64| std::time::Duration::from_secs_f64(v / 1e3);
-        let (normal, _rx_n) = queued_job(10, now - ms(50.0));
-        let ((mut critical, t), _rx_c) = queued_job(20, now - ms(10.0));
-        critical.opts.class = JobClass::Critical;
-        let stale = now - ms(queue_ttl_ms(250.0) * 0.5);
-        let ((mut bulk, tb), mut rx_b) = queued_job(30, stale);
-        bulk.opts.class = JobClass::Bulk;
-        let (old_normal, _rx_o) = queued_job(40, stale);
-        waiting.extend([normal, (critical, t), (bulk, tb), old_normal]);
-        metrics.queued_requests.store(4, Ordering::Relaxed);
-        drain_waiting(
-            &mut waiting,
-            &mut slots,
-            1,
-            now,
-            250.0,
-            None,
-            &metrics,
-            &EngineHealth::Healthy,
-            None,
-            false,
-        );
-        assert_eq!(slots[0].as_ref().unwrap().prompt_ids.len(), 20);
-        assert!(matches!(rx_b.try_recv(), Ok(StreamChunk::Err(_))));
-        let left: Vec<_> = waiting.iter().map(|(j, _)| j.prompt_ids.len()).collect();
-        assert_eq!(left, [40, 10], "oldest first within a class");
+        under_the_slo_ttl(|| {
+            let now = Instant::now();
+            let metrics = Arc::new(Metrics::default());
+            let mut slots: Vec<Option<Slot>> = std::iter::repeat_with(|| None).take(1).collect();
+            let mut waiting = std::collections::VecDeque::new();
+            let ms = |v: f64| std::time::Duration::from_secs_f64(v / 1e3);
+            let (normal, _rx_n) = queued_job(10, now - ms(50.0));
+            let ((mut critical, t), _rx_c) = queued_job(20, now - ms(10.0));
+            critical.opts.class = JobClass::Critical;
+            let stale = now - ms(queue_ttl_ms(250.0) * 0.5);
+            let ((mut bulk, tb), mut rx_b) = queued_job(30, stale);
+            bulk.opts.class = JobClass::Bulk;
+            let (old_normal, _rx_o) = queued_job(40, stale);
+            waiting.extend([normal, (critical, t), (bulk, tb), old_normal]);
+            metrics.queued_requests.store(4, Ordering::Relaxed);
+            drain_waiting(
+                &mut waiting,
+                &mut slots,
+                1,
+                now,
+                250.0,
+                None,
+                &metrics,
+                &EngineHealth::Healthy,
+                None,
+                false,
+            );
+            assert_eq!(slots[0].as_ref().unwrap().prompt_ids.len(), 20);
+            assert!(matches!(rx_b.try_recv(), Ok(StreamChunk::Err(_))));
+            let left: Vec<_> = waiting.iter().map(|(j, _)| j.prompt_ids.len()).collect();
+            assert_eq!(left, [40, 10], "oldest first within a class");
+        });
     }
 
     #[test]
@@ -13737,29 +13752,31 @@ mod tests {
     /// backfill and the fairness rule would be unreachable.
     #[test]
     fn the_aging_bound_is_always_inside_the_ttl() {
-        for slo in [0.0, 1.0, 250.0, 5_000.0, 1e9] {
-            assert!(
-                queue_aging_ms(slo) < queue_ttl_ms(slo),
-                "slo {slo}: aging {} ttl {}",
-                queue_aging_ms(slo),
-                queue_ttl_ms(slo)
+        under_the_slo_ttl(|| {
+            for slo in [0.0, 1.0, 250.0, 5_000.0, 1e9] {
+                assert!(
+                    queue_aging_ms(slo) < queue_ttl_ms(slo),
+                    "slo {slo}: aging {} ttl {}",
+                    queue_aging_ms(slo),
+                    queue_ttl_ms(slo)
+                );
+            }
+            // A disconnect outranks a TTL expiry: there is nobody left to answer 429.
+            assert_eq!(
+                queue_verdict(true, 1e9, 250.0, JobClass::Normal),
+                Queued::Disconnected
             );
-        }
-        // A disconnect outranks a TTL expiry: there is nobody left to answer 429.
-        assert_eq!(
-            queue_verdict(true, 1e9, 250.0, JobClass::Normal),
-            Queued::Disconnected
-        );
-        assert_eq!(
-            queue_verdict(false, 1e9, 250.0, JobClass::Normal),
-            Queued::Expired
-        );
-        assert_eq!(
-            queue_verdict(false, 0.0, 250.0, JobClass::Normal),
-            Queued::Retry
-        );
-        // A nonsensical SLO must not produce a zero or negative bound.
-        assert!(queue_aging_ms(f64::NAN).is_finite() && queue_aging_ms(-1.0) > 0.0);
+            assert_eq!(
+                queue_verdict(false, 1e9, 250.0, JobClass::Normal),
+                Queued::Expired
+            );
+            assert_eq!(
+                queue_verdict(false, 0.0, 250.0, JobClass::Normal),
+                Queued::Retry
+            );
+            // A nonsensical SLO must not produce a zero or negative bound.
+            assert!(queue_aging_ms(f64::NAN).is_finite() && queue_aging_ms(-1.0) > 0.0);
+        });
     }
 
     fn fault(fatal: bool) -> crate::DeviceErrorInfo {
