@@ -1608,6 +1608,8 @@ impl ModelMux {
 
 /// One live request occupying a slot in the engine.
 struct Slot {
+    /// KV output token reservation cap applied at admission (e.g. 256 normal, 64 soft).
+    output_cap: u32,
     telemetry: Option<RequestMetrics>,
     prompt_ids: Vec<u32>,
     out_ids: Vec<u32>,
@@ -3139,7 +3141,9 @@ fn note_arrival(now: Instant, load: &mut LoadEstimator, metrics: &Metrics) {
         .store((lambda * 1000.0) as u64, Ordering::Relaxed);
 }
 
-use crate::sched::admission::{reserved_kv_rows, seat, Denied};
+use crate::sched::admission::{
+    reserved_kv_rows, reserved_kv_rows_with_cap, seat, Denied,
+};
 
 /// How long a request may sit in `waiting` before it stops yielding to younger arrivals, as a
 /// multiple of the SLO. The queue is backfill-first on purpose — a small request should take a
@@ -3238,11 +3242,28 @@ fn waiter_seatable(
         return false;
     }
     let pair = head.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
-    let want = reserved_kv_rows(head.prompt_ids.len(), head.gen.max_tokens, 0) * (1 + pair as u64);
+    let normal_reserve = crate::config::RuntimeConfig::get().kv_reserve_output_tokens() as usize;
+    let soft_reserve = crate::config::RuntimeConfig::get().kv_soft_reserve_output_tokens() as usize;
+    let effective_cap =
+        if soft_reserve > 0 && (normal_reserve == 0 || soft_reserve < normal_reserve) {
+            soft_reserve
+        } else {
+            normal_reserve
+        };
+    let want = reserved_kv_rows_with_cap(
+        head.prompt_ids.len(),
+        head.gen.max_tokens,
+        0,
+        effective_cap,
+    ) * (1 + pair as u64);
     kv_budget.is_none_or(|b| {
         let live = slots.iter().flatten().map(|s| {
-            reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
-                * (1 + s.cfg.is_some() as u64)
+            reserved_kv_rows_with_cap(
+                s.prompt_ids.len(),
+                s.gen.max_tokens,
+                s.out_ids.len(),
+                s.output_cap as usize,
+            ) * (1 + s.cfg.is_some() as u64)
         });
         b.fits_requests(live.chain(std::iter::once(want)))
     })
@@ -3648,9 +3669,17 @@ fn admit_session(
     }
 
     let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
-    let seq_upper = reserved_kv_rows(job.prompt_ids.len(), job.gen.max_tokens, 0) as i64;
+    let normal_reserve = crate::config::RuntimeConfig::get().kv_reserve_output_tokens() as usize;
+    let soft_reserve = crate::config::RuntimeConfig::get().kv_soft_reserve_output_tokens() as usize;
+    let seq_upper = reserved_kv_rows_with_cap(job.prompt_ids.len(), job.gen.max_tokens, 0, normal_reserve) as i64;
     // A CFG pair holds two engine slots' KV.
     let want = seq_upper as u64 * (1 + pair as u64);
+    let soft_want = if soft_reserve > 0 && (normal_reserve == 0 || soft_reserve < normal_reserve) {
+        let soft_upper = reserved_kv_rows_with_cap(job.prompt_ids.len(), job.gen.max_tokens, 0, soft_reserve) as i64;
+        Some(soft_upper as u64 * (1 + pair as u64))
+    } else {
+        None
+    };
     let lim = limit.min(slots.len());
     let session = job.opts.session.as_deref().map(|t| t.session.clone());
     let resume = job
@@ -3721,14 +3750,19 @@ fn admit_session(
             .iter()
             .flatten()
             .map(|s| {
-                reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
-                    * (1 + s.cfg.is_some() as u64)
+                reserved_kv_rows_with_cap(
+                    s.prompt_ids.len(),
+                    s.gen.max_tokens,
+                    s.out_ids.len(),
+                    s.output_cap as usize,
+                ) * (1 + s.cfg.is_some() as u64)
             })
             .chain(retention.table.rows_except(session.as_deref()));
         match seat(
             matches!(health, EngineHealth::Dead(_)),
             free_slot,
             want,
+            soft_want,
             committed,
             kv_budget,
             downstream_full,
@@ -3738,13 +3772,18 @@ fn admit_session(
             seated => break seated,
         }
     };
-    let idx = match seated {
-        Ok(idx) => {
+    let (idx, output_cap) = match seated {
+        Ok(seated) => {
             if let Some(budget) = kv_budget {
-                share.reserved = reserved_kv_bytes(budget, slots) + budget.bytes_for_rows(want);
+                share.reserved = reserved_kv_bytes(budget, slots) + budget.bytes_for_rows(seated.admitted_rows);
             }
             drop(share);
-            idx
+            let cap = if seated.is_soft {
+                soft_reserve as u32
+            } else {
+                normal_reserve as u32
+            };
+            (seated.slot, cap)
         }
         Err(denied) => {
             drop(share);
@@ -3865,6 +3904,7 @@ fn admit_session(
     let resume = resume.filter(|r| r.slot == idx).map_or(0, |r| r.rows);
     let speech = job.opts.speech.is_some();
     slots[idx] = Some(Slot {
+        output_cap,
         session_end: job.opts.session_end,
         session: retention.seat(job.opts.session, idx, pair, speech, resume, metrics),
         resume,
@@ -7219,8 +7259,12 @@ fn reserved_kv_bytes(budget: crate::sched::admission::KvBudget, slots: &[Option<
         .flatten()
         .map(|s| {
             budget.bytes_for_rows(
-                reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len())
-                    * (1 + s.cfg.is_some() as u64),
+                reserved_kv_rows_with_cap(
+                    s.prompt_ids.len(),
+                    s.gen.max_tokens,
+                    s.out_ids.len(),
+                    s.output_cap as usize,
+                ) * (1 + s.cfg.is_some() as u64),
             )
         })
         .sum()
@@ -7231,7 +7275,14 @@ fn kv_used(kv_budget: Option<crate::sched::admission::KvBudget>, slots: &[Option
         let rows: u64 = slots
             .iter()
             .flatten()
-            .map(|s| reserved_kv_rows(s.prompt_ids.len(), s.gen.max_tokens, s.out_ids.len()))
+            .map(|s| {
+                reserved_kv_rows_with_cap(
+                    s.prompt_ids.len(),
+                    s.gen.max_tokens,
+                    s.out_ids.len(),
+                    s.output_cap as usize,
+                )
+            })
             .sum();
         rows as f64 / b.max_rows() as f64
     })
@@ -14814,6 +14865,7 @@ mod tests {
         let (respond, rx) = crate::serve::stream::channel();
         (
             Some(Slot {
+                output_cap: 0,
                 session_end: false,
                 telemetry: None,
                 prompt_ids: vec![1, 2, 3],

@@ -740,6 +740,19 @@ pub struct RuntimeConfig {
     )]
     pub kv_reserve_output_tokens: u32,
 
+    /// Soft admission KV output token reservation cap: when the KV pool is under pressure
+    /// and cannot fit the full `kv_reserve_output_tokens` (e.g. 256), a request can be softly
+    /// admitted with this initial output reservation (e.g. 64) so prefill starts immediately
+    /// without stalling in the queue. `0` disables soft admission.
+    #[arg(
+        long = "kv-soft-reserve-output-tokens",
+        env = "PLOW_KV_SOFT_RESERVE_OUTPUT_TOKENS",
+        default_value_t = 64,
+        hide = true,
+        global = true
+    )]
+    pub kv_soft_reserve_output_tokens: u32,
+
     /// Load shedding at the capacity knee: refuse a new request with 429 + `Retry-After` while
     /// this many requests already wait for their first token (queued plus seated in prefill),
     /// so a load balancer spills it to another backend instead of queueing it into a long
@@ -2136,6 +2149,12 @@ impl RuntimeConfig {
     #[inline]
     pub fn kv_reserve_output_tokens(&self) -> usize {
         self.kv_reserve_output_tokens as usize
+    }
+
+    /// Soft admission KV output token reservation cap.
+    #[inline]
+    pub fn kv_soft_reserve_output_tokens(&self) -> usize {
+        self.kv_soft_reserve_output_tokens as usize
     }
 }
 
