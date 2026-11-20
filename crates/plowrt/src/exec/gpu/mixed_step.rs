@@ -447,21 +447,31 @@ impl GpuEngine {
             let layout = mixed.host.layout.clone();
             let submitted = (|| -> Result<()> {
                 unsafe {
-                    self.be.memcpy_htod_async(
-                        mixed.ids_base,
-                        mixed.host.bytes(layout.ids.clone(), rows as usize),
-                        &self.stream,
-                    )?;
-                    self.be.memcpy_htod_async(
-                        mixed.pos_base,
-                        mixed.host.bytes(layout.pos.clone(), rows as usize),
-                        &self.stream,
-                    )?;
-                    self.be.memcpy_htod_async(
-                        mixed.kvlen_base,
-                        mixed.host.bytes(layout.kvlen.clone(), rows as usize),
-                        &self.stream,
-                    )?;
+                    if mixed.pos_base == mixed.ids_base + (rows * 4) as u64
+                        && mixed.kvlen_base == mixed.pos_base + (rows * 4) as u64
+                    {
+                        self.be.memcpy_htod_async(
+                            mixed.ids_base,
+                            mixed.host.bytes(layout.ids.start..layout.kvlen.end, rows as usize * 3),
+                            &self.stream,
+                        )?;
+                    } else {
+                        self.be.memcpy_htod_async(
+                            mixed.ids_base,
+                            mixed.host.bytes(layout.ids.clone(), rows as usize),
+                            &self.stream,
+                        )?;
+                        self.be.memcpy_htod_async(
+                            mixed.pos_base,
+                            mixed.host.bytes(layout.pos.clone(), rows as usize),
+                            &self.stream,
+                        )?;
+                        self.be.memcpy_htod_async(
+                            mixed.kvlen_base,
+                            mixed.host.bytes(layout.kvlen.clone(), rows as usize),
+                            &self.stream,
+                        )?;
+                    }
                     self.be.memcpy_htod_async(
                         self.devp[program.decode_slot].base,
                         mixed.host.bytes(layout.decode_slot.clone(), decode.len()),
