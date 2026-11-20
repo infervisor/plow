@@ -1860,6 +1860,22 @@ fn spawn_scoped(
             (capacity, rung_widths)
         }
     };
+    let rt_cfg = crate::config::RuntimeConfig::get();
+    let nominal_rung = rt_cfg.decode_nominal_rung.or_else(|| {
+        if capacity >= 32 {
+            Some(32)
+        } else {
+            None
+        }
+    });
+    let elastic_rung = rt_cfg.decode_elastic_rung.or_else(|| {
+        if capacity >= 40 {
+            Some(40)
+        } else {
+            None
+        }
+    });
+    let elastic_wait_ms = rt_cfg.decode_elastic_wait_ms as f64;
     let mut rung_controller =
         rung_widths
             .as_deref()
@@ -1869,6 +1885,9 @@ fn spawn_scoped(
                     Some(
                         RungController::new(rungs)
                             .with_min_seat(min_seat)
+                            .with_nominal_max(nominal_rung.map(|w| w as usize))
+                            .with_elastic_max(elastic_rung.map(|w| w as usize))
+                            .with_elastic_wait_ms(elastic_wait_ms)
                             .with_fast_probe(crate::serve::policy::fast_probe()),
                     )
                 }

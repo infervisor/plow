@@ -45,7 +45,7 @@ pub(super) fn effective_decode_widths(
         .chain(std::iter::once(widest as u32))
         .collect();
     if widest >= 32 {
-        for &finer in &[12u32, 20, 24, 48] {
+        for &finer in &[12u32, 20, 24, 40, 48] {
             if (finer as usize) < widest && !widths.contains(&finer) {
                 widths.push(finer);
             }

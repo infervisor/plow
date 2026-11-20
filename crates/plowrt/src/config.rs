@@ -1093,6 +1093,34 @@ pub struct RuntimeConfig {
     )]
     pub decode_max_rung: Option<u32>,
 
+    /// Expert: nominal decode rung ceiling during steady-state (e.g. 32).
+    #[arg(
+        long = "decode-nominal-rung",
+        env = "PLOW_DECODE_NOMINAL_RUNG",
+        hide = true,
+        global = true
+    )]
+    pub decode_nominal_rung: Option<u32>,
+
+    /// Expert: elastic burst decode rung ceiling during queue backlog (e.g. 40).
+    #[arg(
+        long = "decode-elastic-rung",
+        env = "PLOW_DECODE_ELASTIC_RUNG",
+        hide = true,
+        global = true
+    )]
+    pub decode_elastic_rung: Option<u32>,
+
+    /// Expert: queue wait time threshold in ms before elastic burst expansion activates (default 250).
+    #[arg(
+        long = "decode-elastic-wait-ms",
+        env = "PLOW_DECODE_ELASTIC_WAIT_MS",
+        default_value_t = 250,
+        hide = true,
+        global = true
+    )]
+    pub decode_elastic_wait_ms: u32,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
     // ──────────────────────────────────────────────────────────────────────────

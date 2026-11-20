@@ -149,6 +149,9 @@ pub struct RungController {
     low_load_ticks: u32,
     fast_probe: bool,
     throughput: bool,
+    nominal_seat: Option<usize>,
+    elastic_seat: Option<usize>,
+    elastic_wait_ms: f64,
 }
 
 impl RungController {
@@ -163,6 +166,9 @@ impl RungController {
             low_load_ticks: 0,
             fast_probe: false,
             throughput: true,
+            nominal_seat: None,
+            elastic_seat: None,
+            elastic_wait_ms: 250.0,
         }
     }
 
@@ -170,6 +176,24 @@ impl RungController {
     pub fn with_min_seat(mut self, min_seat: usize) -> Self {
         self.min_seat = min_seat.min(self.rungs.len().saturating_sub(1));
         self.target = self.target.max(self.min_seat);
+        self
+    }
+
+    /// Set nominal steady-state admission ceiling by target width.
+    pub fn with_nominal_max(mut self, width: Option<usize>) -> Self {
+        self.nominal_seat = width.map(|w| self.rungs.covering(w));
+        self
+    }
+
+    /// Set elastic burst admission ceiling by target width.
+    pub fn with_elastic_max(mut self, width: Option<usize>) -> Self {
+        self.elastic_seat = width.map(|w| self.rungs.covering(w));
+        self
+    }
+
+    /// Set queue wait threshold in ms before elastic burst expansion activates.
+    pub fn with_elastic_wait_ms(mut self, ms: f64) -> Self {
+        self.elastic_wait_ms = ms.max(0.0);
         self
     }
 
@@ -246,13 +270,30 @@ impl RungController {
 
         self.dwell_ticks = self.dwell_ticks.saturating_add(1);
         let actual = self.rungs.covering(load.occupied_extent);
+        let widest_idx = self.rungs.len() - 1;
+        let nominal_idx = self.nominal_seat.unwrap_or(widest_idx).min(widest_idx);
+        let elastic_idx = self
+            .elastic_seat
+            .unwrap_or(widest_idx)
+            .min(widest_idx)
+            .max(nominal_idx);
+
+        let is_burst = load.queued > 0
+            && (load.oldest_wait_ms >= self.elastic_wait_ms || load.queued >= 4);
+        let allowed_ceiling_idx = if is_burst {
+            elastic_idx
+        } else {
+            nominal_idx
+        };
+
         let demanded = load
             .occupied_extent
             .saturating_add(load.queued)
-            .min(self.rungs.width(self.rungs.len() - 1));
-        let demand_seat = self.rungs.covering(demanded);
+            .min(self.rungs.width(allowed_ceiling_idx));
+        let demand_seat = self.rungs.covering(demanded).min(allowed_ceiling_idx);
         let seat = self
             .throughput_seat(demand_seat, load.queued)
+            .min(allowed_ceiling_idx)
             .max(self.min_seat);
         let mut reason = if actual > self.target {
             RungReason::Occupied
@@ -260,7 +301,12 @@ impl RungController {
             RungReason::Hold
         };
 
-        if seat < demand_seat
+        if load.queued == 0 && self.target > nominal_idx {
+            self.target = nominal_idx.max(self.min_seat);
+            self.dwell_ticks = 0;
+            self.low_load_ticks = 0;
+            reason = RungReason::Throughput;
+        } else if seat < demand_seat
             && seat < self.target
             && (load.queued == 0 || self.dwell_ticks >= THROUGHPUT_DWELL_TICKS)
         {
@@ -886,5 +932,35 @@ mod tests {
             c.dwell_ticks > 1,
             "dwell ticks must not reset when min_seat clamps"
         );
+    }
+
+    #[test]
+    fn elastic_admission_stretches_under_backlog_and_contracts_when_cleared() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 24, 32, 40, 48])
+            .with_nominal_max(Some(32))
+            .with_elastic_max(Some(40))
+            .with_elastic_wait_ms(250.0);
+
+        // Steady state with no backlog: held at nominal 32
+        let _ = c.decide(load(30, 0));
+        assert!(c.admission_limit() <= 32);
+
+        // Small wait time < 250ms and small queue < 4: holds at nominal 32
+        let mut l = load(32, 2);
+        l.oldest_wait_ms = 100.0;
+        let _ = c.decide(l);
+        assert_eq!(c.admission_limit(), 32);
+
+        // Backlog arrival: queue >= 4 or oldest_wait_ms >= 250ms
+        let mut burst = load(32, 8);
+        burst.oldest_wait_ms = 300.0;
+        let d = c.decide(burst);
+        assert_eq!(c.admission_limit(), 40, "elastic burst stretches to 40");
+        assert!(d.reason == RungReason::Backlog || d.reason == RungReason::Slo);
+
+        // Once queue drains (queued == 0): naturally contracts back to nominal 32
+        let d = c.decide(load(35, 0));
+        assert_eq!(c.admission_limit(), 32, "contracts back to nominal 32");
+        assert_eq!(d.reason, RungReason::Throughput);
     }
 }
