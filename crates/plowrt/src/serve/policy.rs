@@ -123,7 +123,11 @@ fn decide(current: Class, calm_since: u64, now: u64, load: Load) -> (Class, u64)
     } = load;
     if width >= WIDE_ENTER || queued >= QUEUE_ENTER || kv_used >= KV_ENTER {
         (Class::HighConcurrency, NOT_CALM)
-    } else if width <= WIDE_LEAVE && queued <= QUEUE_LEAVE && kv_used < KV_LEAVE && current == Class::HighConcurrency {
+    } else if width <= WIDE_LEAVE
+        && queued <= QUEUE_LEAVE
+        && kv_used < KV_LEAVE
+        && current == Class::HighConcurrency
+    {
         let since = if calm_since == NOT_CALM {
             now
         } else {

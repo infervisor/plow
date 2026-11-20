@@ -925,7 +925,7 @@ fn cell_decode_turn_end_caches_reply_tokens_for_next_turn() {
     let mut r = Rig::new(false, 1 << 20, 64, 2);
     r.k.cache_turn_end = true;
     let p = conv_prompt(1, 40, 200); // 240 tokens
-    // Turn 1: 240 tokens prompt, decodes 32 tokens reply
+                                     // Turn 1: 240 tokens prompt, decodes 32 tokens reply
     let (rows0, reply0) = r.turn(0, &p, 32);
     assert_eq!(rows0, 0, "turn 1 is cold");
     assert_eq!(reply0.len(), 32);
@@ -937,7 +937,10 @@ fn cell_decode_turn_end_caches_reply_tokens_for_next_turn() {
     p2.extend_from_slice(&reply0);
     p2.extend((0..64u32).map(|i| 50_000 + i));
     let (rows1, reply1) = r.turn(0, &p2, 32);
-    assert_eq!(rows1, 256, "turn 2 attaches through previous turn decoded tokens");
+    assert_eq!(
+        rows1, 256,
+        "turn 2 attaches through previous turn decoded tokens"
+    );
     assert_eq!(reply1.len(), 32);
     let s2 = r.kv().stats();
     assert_eq!(s2.attach_prompt_end, 1);

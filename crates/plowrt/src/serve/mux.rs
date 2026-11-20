@@ -1843,11 +1843,7 @@ fn spawn_scoped(
         let max_rung = crate::config::RuntimeConfig::get().decode_max_rung;
         if let Some(max) = max_rung {
             if let Some(widths) = rung_widths {
-                let filtered: Box<[u32]> = widths
-                    .iter()
-                    .copied()
-                    .filter(|&w| w <= max)
-                    .collect();
+                let filtered: Box<[u32]> = widths.iter().copied().filter(|&w| w <= max).collect();
                 if let Some(&widest) = filtered.last() {
                     (capacity.min(widest as usize), Some(filtered))
                 } else {
@@ -1861,20 +1857,14 @@ fn spawn_scoped(
         }
     };
     let rt_cfg = crate::config::RuntimeConfig::get();
-    let nominal_rung = rt_cfg.decode_nominal_rung.or_else(|| {
-        if capacity >= 32 {
-            Some(32)
-        } else {
-            None
-        }
-    });
-    let elastic_rung = rt_cfg.decode_elastic_rung.or_else(|| {
-        if capacity >= 40 {
-            Some(40)
-        } else {
-            None
-        }
-    });
+    let nominal_rung =
+        rt_cfg
+            .decode_nominal_rung
+            .or_else(|| if capacity >= 32 { Some(32) } else { None });
+    let elastic_rung =
+        rt_cfg
+            .decode_elastic_rung
+            .or_else(|| if capacity >= 40 { Some(40) } else { None });
     let elastic_wait_ms = rt_cfg.decode_elastic_wait_ms as f64;
     let mut rung_controller =
         rung_widths
@@ -2336,8 +2326,7 @@ fn spawn_scoped(
             }
             metrics.serve_mode.store(
                 u64::from(
-                    crate::serve::policy::class()
-                        == crate::serve::policy::Class::HighConcurrency,
+                    crate::serve::policy::class() == crate::serve::policy::Class::HighConcurrency,
                 ),
                 Ordering::Relaxed,
             );
@@ -3160,9 +3149,7 @@ fn note_arrival(now: Instant, load: &mut LoadEstimator, metrics: &Metrics) {
         .store((lambda * 1000.0) as u64, Ordering::Relaxed);
 }
 
-use crate::sched::admission::{
-    reserved_kv_rows, reserved_kv_rows_with_cap, seat, Denied,
-};
+use crate::sched::admission::{reserved_kv_rows, reserved_kv_rows_with_cap, seat, Denied};
 
 /// How long a request may sit in `waiting` before it stops yielding to younger arrivals, as a
 /// multiple of the SLO. The queue is backfill-first on purpose — a small request should take a
@@ -3269,12 +3256,9 @@ fn waiter_seatable(
         } else {
             normal_reserve
         };
-    let want = reserved_kv_rows_with_cap(
-        head.prompt_ids.len(),
-        head.gen.max_tokens,
-        0,
-        effective_cap,
-    ) * (1 + pair as u64);
+    let want =
+        reserved_kv_rows_with_cap(head.prompt_ids.len(), head.gen.max_tokens, 0, effective_cap)
+            * (1 + pair as u64);
     kv_budget.is_none_or(|b| {
         let live = slots.iter().flatten().map(|s| {
             reserved_kv_rows_with_cap(
@@ -3690,11 +3674,15 @@ fn admit_session(
     let pair = job.opts.speech.as_ref().is_some_and(|s| s.cfg.is_some());
     let normal_reserve = crate::config::RuntimeConfig::get().kv_reserve_output_tokens() as usize;
     let soft_reserve = crate::config::RuntimeConfig::get().kv_soft_reserve_output_tokens() as usize;
-    let seq_upper = reserved_kv_rows_with_cap(job.prompt_ids.len(), job.gen.max_tokens, 0, normal_reserve) as i64;
+    let seq_upper =
+        reserved_kv_rows_with_cap(job.prompt_ids.len(), job.gen.max_tokens, 0, normal_reserve)
+            as i64;
     // A CFG pair holds two engine slots' KV.
     let want = seq_upper as u64 * (1 + pair as u64);
     let soft_want = if soft_reserve > 0 && (normal_reserve == 0 || soft_reserve < normal_reserve) {
-        let soft_upper = reserved_kv_rows_with_cap(job.prompt_ids.len(), job.gen.max_tokens, 0, soft_reserve) as i64;
+        let soft_upper =
+            reserved_kv_rows_with_cap(job.prompt_ids.len(), job.gen.max_tokens, 0, soft_reserve)
+                as i64;
         Some(soft_upper as u64 * (1 + pair as u64))
     } else {
         None
@@ -3794,7 +3782,8 @@ fn admit_session(
     let (idx, output_cap) = match seated {
         Ok(seated) => {
             if let Some(budget) = kv_budget {
-                share.reserved = reserved_kv_bytes(budget, slots) + budget.bytes_for_rows(seated.admitted_rows);
+                share.reserved =
+                    reserved_kv_bytes(budget, slots) + budget.bytes_for_rows(seated.admitted_rows);
             }
             drop(share);
             let cap = if seated.is_soft {

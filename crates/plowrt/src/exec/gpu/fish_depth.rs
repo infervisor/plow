@@ -627,10 +627,11 @@ impl FishDepth {
                 let speech = SpeechFn::load(e, assets, &section.programs, packet)?;
                 let control_cubin = assets.join("control_sample.cubin");
                 let control_mod = if control_cubin.exists() {
-                    let bytes = std::fs::read(&control_cubin).map_err(|source| RuntimeError::Io {
-                        path: control_cubin.clone(),
-                        source,
-                    })?;
+                    let bytes =
+                        std::fs::read(&control_cubin).map_err(|source| RuntimeError::Io {
+                            path: control_cubin.clone(),
+                            source,
+                        })?;
                     Some(e.be.module_load(&bytes)?)
                 } else {
                     None
