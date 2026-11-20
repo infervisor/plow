@@ -600,6 +600,14 @@
             ];
           };
 
+          # The lean-correctness lane on a hosted runner: the CI tools plus the
+          # Lean toolchain manager (lean-plow/lean-toolchain pins the version).
+          lean = pkgs.mkShell {
+            name = "plow-lean";
+            inputsFrom = [ self.devShells.${system}.ci ];
+            packages = [ pkgs.elan ];
+          };
+
           default = pkgs.mkShell {
             name = "plow-dev";
             packages = [
