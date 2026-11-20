@@ -1027,7 +1027,7 @@ pub struct RuntimeConfig {
     /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
     /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
     /// instead of recomputing the shared rows beside it. `0` admits it at once.
-    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_inflight_wait: bool,
 
     /// CUDA token-batch prefill: publish the whole-block checkpoints a prompt chunk completed

@@ -34,6 +34,23 @@ impl Histogram {
         self.observe(value as u64, TOKENS);
     }
 
+    /// Latency quantile in milliseconds, or `None` when empty.
+    pub fn quantile_ms(&self, percent: u64) -> Option<f64> {
+        let count: u64 = self.bins.iter().map(|b| b.load(Relaxed)).sum();
+        if count == 0 {
+            return None;
+        }
+        let rank = (count as u128 * percent as u128).div_ceil(100);
+        let mut cumulative = 0u128;
+        for (index, bin) in self.bins.iter().enumerate() {
+            cumulative += bin.load(Relaxed) as u128;
+            if cumulative >= rank {
+                return LATENCY.get(index).map(|us| *us as f64 / 1000.0);
+            }
+        }
+        None
+    }
+
     /// A latency histogram in seconds.
     pub fn write_seconds(&self, out: &mut String, name: &str, labels: &str) {
         self.write(out, name, labels, LATENCY, 1e6);

@@ -1980,11 +1980,9 @@ static __device__ void d_moe_fp8_tc_any(void* out, const bf16* x, const unsigned
                                         unsigned n_exp, unsigned slice, unsigned nblk, unsigned nrow,
                                         float* red) {
 #if PLOW_MOE_FP8_DEDUP && PLOW_MOE_FP8_TC_DD
-    if constexpr (Glu) {
-        if (nrow >= PLOW_MOE_FP8_TC_DD && n_exp <= PLOW_DD_MAXE && nrow * k <= PLOW_DD_MAXS) {
-            d_moe_fp8_tc<Glu, true>(out, x, table, ewt, est, k, N, K, I_moe, n_exp, slice, nblk, nrow, red);
-            return;
-        }
+    if (nrow >= PLOW_MOE_FP8_TC_DD && n_exp <= PLOW_DD_MAXE && nrow * k <= PLOW_DD_MAXS) {
+        d_moe_fp8_tc<Glu, true>(out, x, table, ewt, est, k, N, K, I_moe, n_exp, slice, nblk, nrow, red);
+        return;
     }
 #endif
     d_moe_fp8_tc<Glu, false>(out, x, table, ewt, est, k, N, K, I_moe, n_exp, slice, nblk, nrow, red);

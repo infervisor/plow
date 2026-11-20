@@ -10137,9 +10137,15 @@ impl GpuEngine {
             self.rank_arm(&plan)?;
         }
         self.launch_decode_program(selection)?;
-        let cap = self
-            .selected_decode(selection)
-            .map_or(self.batch, |r| r.rows);
+        let effective_rungs = self.effective_decode_rungs();
+        let cap = effective_rungs
+            .iter()
+            .copied()
+            .find(|&w| w as usize >= self.decode_extent)
+            .map_or_else(
+                || self.selected_decode(selection).map_or(self.batch, |r| r.rows),
+                |w| w as usize,
+            );
         self.buckets.record(
             crate::obs::bucket::Family::Decode,
             self.decode_extent,

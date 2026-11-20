@@ -192,6 +192,12 @@ impl RungController {
         self.fast_probe = on;
     }
 
+    /// Clamp the admission target to at most `seat` (e.g. when ITL rises).
+    #[inline]
+    pub fn clamp_target(&mut self, seat: usize) {
+        self.target = self.target.min(seat).max(self.min_seat);
+    }
+
     #[inline]
     pub fn is_legacy(&self) -> bool {
         self.rungs.len() == 1
