@@ -8396,8 +8396,12 @@ impl GpuEngine {
         // admission budget and store cap are sized as before, the planner's load measurement
         // includes it: 2 x Gemma-4-E4B (4 GiB each, 128 slots) was admitted on a measurement
         // without it and both engines ran out of device memory on first use.
+        // Clamped to `decode_max_rung` since wider decode rungs never run past the max rung.
         if let Some(v) = engine.vmm.as_ref().filter(|v| v.prefix_kv().is_some()) {
-            for b in 0..engine.vmm_active.len() {
+            let max_slots = config
+                .decode_max_rung
+                .map_or(engine.vmm_active.len(), |r| (r as usize).min(engine.vmm_active.len()));
+            for b in 0..max_slots {
                 v.ensure_rows(b, 1)?;
             }
         }
@@ -10684,17 +10688,24 @@ impl GpuEngine {
         }
         let mut fed: smallvec::SmallVec<[(usize, u32); 32]> = feeds.iter().copied().collect();
         if self.pipe_busy() && !self.pipe_covers(feeds) {
-            // A mixed launch can leave a step in flight whose rows are not these feeds: read it
-            // out first — its tokens belong to the same sink — then start a fresh step.
-            self.pipe_drain(out)?;
-            // The mux gathered `feeds` before this drain and cannot re-gather from in here (its
-            // own drain path does, at the call site). For a row the drain just produced a token
-            // for, the caller's token is one step stale, and feeding it back would resample the
-            // token that was already emitted.
-            for (b, token) in fed.iter_mut() {
-                if let Some(&(_, fresh)) = out.iter().rev().find(|&&(slot, _)| slot == *b) {
-                    *token = fresh;
+            if lookahead {
+                // Dynamic slot transition: step N-1 is in flight.
+                // Enqueue step N with PipeUpload::State: held slots stream from d_last on device,
+                // newly arrived slots stage from host.
+                self.pipe_enqueue(feeds, PipeUpload::State)?;
+                // Now complete step N-1, leaving step N in flight.
+                return self.pipe_complete(out);
+            } else {
+                // Lookahead disabled: drain the in-flight step first.
+                self.pipe_drain(out)?;
+                for (b, token) in fed.iter_mut() {
+                    if let Some(&(_, fresh)) = out.iter().rev().find(|&&(slot, _)| slot == *b) {
+                        *token = fresh;
+                    }
                 }
+                let feeds: &[(usize, u32)] = &fed;
+                self.pipe_enqueue(feeds, PipeUpload::All)?;
+                return self.pipe_complete(out);
             }
         }
         let feeds: &[(usize, u32)] = &fed;

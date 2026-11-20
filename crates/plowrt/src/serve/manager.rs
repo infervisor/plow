@@ -435,24 +435,20 @@ const GRAPH_BYTES_PER_PROGRAM: u64 = 320 << 10;
 /// (Gemma-4 E4B BF16), 8.1 KiB (12B FP8), 9.3 KiB (26B FP8).
 const SEG_GRAPH_BYTES_PER_SEGMENT_SLOT: u64 = 12 << 10;
 
-/// Bound on the device memory `GpuEngine::load` takes warming prefill segment graphs: every
-/// segmented prefill program is captured for every decode slot. Up to 8.9 GiB on an H100, the
-/// bulk of a CUDA engine's non-tensor overhead.
+/// Bound on the device memory `GpuEngine::load` takes warming prefill segment graphs.
+/// Graphs are shared per bucket/range across slots (one seg graph per bucket/range serves every slot).
 fn seg_graph_bound(blob: &DevBlob) -> u64 {
     let nv = &crate::config::RuntimeConfig::get().nv;
     if !nv.pf_seg_graph || nv.pf_seg_time {
         return 0;
     }
-    let slots = blob.decode_prog().map_or(0, |g| u64::from(g.t));
     let segments: u64 = blob
         .prefill_progs()
         .iter()
         .map(|p| p.stream.iter().map(|e| e.seg as u64 + 1).max().unwrap_or(1))
         .filter(|&n| n > 1)
         .fold(0, u64::saturating_add);
-    segments
-        .saturating_mul(slots)
-        .saturating_mul(SEG_GRAPH_BYTES_PER_SEGMENT_SLOT)
+    segments.saturating_mul(SEG_GRAPH_BYTES_PER_SEGMENT_SLOT)
 }
 
 /// Device bytes of the speech pipeline's sibling packets beside `pkt` ([`sidecar_files`]),
