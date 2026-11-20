@@ -1385,36 +1385,39 @@ impl HsaBackend {
         dependency: Option<u64>,
     ) -> Result<u64> {
         self.guard()?;
-        let mut tier_lock = self.copy_tier.lock();
-        let tier = match tier_lock.as_mut() {
-            Some(t) => t,
-            None => tier_lock.insert(HsaCopyTier {
-                signals: rustc_hash::FxHashMap::default(),
-                spare: Vec::new(),
-                failed: rustc_hash::FxHashSet::default(),
-                image_lists: Default::default(),
-            }),
-        };
-        let dependency = dependency
-            .map(|f| {
-                tier.signals
-                    .get(&f)
-                    .copied()
-                    .ok_or_else(|| RuntimeError::Device("staging: unknown dependency".into()))
-            })
-            .transpose()?;
-        let sig = match tier.spare.pop() {
-            Some(s) => {
-                unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
-                s
-            }
-            None => {
-                let mut s = HsaSignal { handle: 0 };
-                let rc =
-                    unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
-                self.check(rc, "hsa_signal_create (vmm spill)")?;
-                s
-            }
+        let (sig, dependency_sig) = {
+            let mut tier_lock = self.copy_tier.lock();
+            let tier = match tier_lock.as_mut() {
+                Some(t) => t,
+                None => tier_lock.insert(HsaCopyTier {
+                    signals: rustc_hash::FxHashMap::default(),
+                    spare: Vec::new(),
+                    failed: rustc_hash::FxHashSet::default(),
+                    image_lists: Default::default(),
+                }),
+            };
+            let dependency_sig = dependency
+                .map(|f| {
+                    tier.signals
+                        .get(&f)
+                        .copied()
+                        .ok_or_else(|| RuntimeError::Device("staging: unknown dependency".into()))
+                })
+                .transpose()?;
+            let sig = match tier.spare.pop() {
+                Some(s) => {
+                    unsafe { (self.shared.drv.hsa_signal_store_screlease)(s, 1) };
+                    s
+                }
+                None => {
+                    let mut s = HsaSignal { handle: 0 };
+                    let rc =
+                        unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
+                    self.check(rc, "hsa_signal_create (vmm spill)")?;
+                    s
+                }
+            };
+            (sig, dependency_sig)
         };
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -1423,14 +1426,18 @@ impl HsaBackend {
                 src as *const c_void,
                 src_agent,
                 bytes as usize,
-                u32::from(dependency.is_some()),
-                dependency
+                u32::from(dependency_sig.is_some()),
+                dependency_sig
                     .as_ref()
                     .map_or(std::ptr::null(), |s| s as *const HsaSignal),
                 sig,
             )
         };
         let fence = sig.handle as u64;
+        let mut tier_lock = self.copy_tier.lock();
+        let Some(tier) = tier_lock.as_mut() else {
+            return Err(RuntimeError::Rejected("vmm spill: no copy tier".into()));
+        };
         if rc != HSA_STATUS_SUCCESS {
             tier.spare.push(sig);
             return Err(self.fault(rc, what));
@@ -5302,19 +5309,44 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
     }
 
     fn fence_wait(&self, fence: u64) -> Result<()> {
-        let mut tier_lock = self.copy_tier.lock();
-        let Some(tier) = tier_lock.as_mut() else {
-            return Err(RuntimeError::Rejected("vmm spill: no copy tier".into()));
+        let sig = {
+            let mut tier_lock = self.copy_tier.lock();
+            let Some(tier) = tier_lock.as_mut() else {
+                return Err(RuntimeError::Rejected("vmm spill: no copy tier".into()));
+            };
+            if tier.failed.remove(&fence) {
+                return Err(RuntimeError::Device("vmm spill: unfenced copy".into()));
+            }
+            let Some(sig) = tier.signals.remove(&fence) else {
+                return Err(RuntimeError::Device("vmm spill: unknown fence".into()));
+            };
+            tier.image_lists.remove(&fence);
+            sig
         };
-        tier.wait_copy(fence, |sig| unsafe {
-            (self.shared.drv.hsa_signal_wait_scacquire)(
-                sig,
-                HSA_SIGNAL_CONDITION_LT,
-                1,
-                u64::MAX,
-                HSA_WAIT_STATE_BLOCKED,
-            )
-        })
+        let val = loop {
+            let value = unsafe {
+                (self.shared.drv.hsa_signal_wait_scacquire)(
+                    sig,
+                    HSA_SIGNAL_CONDITION_LT,
+                    1,
+                    u64::MAX,
+                    HSA_WAIT_STATE_BLOCKED,
+                )
+            };
+            if value < 1 {
+                break value;
+            }
+        };
+        if val < 0 {
+            return Err(RuntimeError::Device(format!(
+                "async copy failed (signal {val})"
+            )));
+        }
+        let mut tier_lock = self.copy_tier.lock();
+        if let Some(tier) = tier_lock.as_mut() {
+            tier.spare.push(sig);
+        }
+        Ok(())
     }
 
     fn copy_htod(&self, va: u64, host_ptr: u64, bytes: u64) -> Result<()> {
