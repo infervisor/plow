@@ -1544,12 +1544,12 @@ async fn buffer_and_reply(
                         }
                     }
                     None => {
-                        let (r, c) = split.push(&delta);
-                        reasoning_buf.push_str(&r.unwrap_or_default());
-                        if c.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+                        let prev_len = answer_buf.len();
+                        let (_, emitted_content) =
+                            split.push_into(&delta, &mut reasoning_buf, &mut answer_buf);
+                        if emitted_content && !answer_buf[prev_len..].trim().is_empty() {
                             tally.reply_started();
                         }
-                        answer_buf.push_str(&c.unwrap_or_default());
                     }
                 }
             }

@@ -3545,25 +3545,34 @@ fn drain_waiting_session(
         .iter()
         .any(Option::is_none)
     {
-        if let Some(p) = probe {
+        let (job, arrived) = if let Some(p) = probe {
             if let Some(i) = cache_first(
                 heads.make_contiguous(),
                 rows.make_contiguous(),
                 p.block_rows(),
             ) {
-                let entry = waiting.remove(i).expect("in range");
-                waiting.push_front(entry);
-                let r = rows.remove(i).expect("in range");
-                rows.push_front(r);
-                let h = heads.remove(i).expect("in range");
-                heads.push_front(h);
+                rows.remove(i);
+                heads.remove(i);
                 Metrics::inc(&metrics.cache_first_admissions);
+                match waiting.remove(i) {
+                    Some(entry) => entry,
+                    None => break,
+                }
+            } else {
+                rows.pop_front();
+                heads.pop_front();
+                match waiting.pop_front() {
+                    Some(entry) => entry,
+                    None => break,
+                }
             }
-        }
-        rows.pop_front();
-        heads.pop_front();
-        let Some((job, arrived)) = waiting.pop_front() else {
-            break;
+        } else {
+            rows.pop_front();
+            heads.pop_front();
+            match waiting.pop_front() {
+                Some(entry) => entry,
+                None => break,
+            }
         };
         // A boundary restore in flight (`PrefixProbe::prefetch`): the request waits for the
         // copy here, not in the engine stream where every slot would wait with it. Bounded:
@@ -10091,14 +10100,24 @@ fn gpu_finish_token(
         } else if p.is_greedy() && !adjusted {
             argmax_tok
         } else {
-            let raw = (stats.is_some() && adjusted).then(|| logits.clone());
-            crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
-            let tok =
-                crate::text::sample::sample(&logits, &slot.gen.params, None, slot_rng01(slot));
-            if let Some(raw) = raw {
-                logits = raw;
+            thread_local! {
+                static RAW_SCRATCH: std::cell::RefCell<Vec<f32>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
             }
-            tok
+            let save_raw = stats.is_some() && adjusted;
+            RAW_SCRATCH.with_borrow_mut(|raw| {
+                if save_raw {
+                    raw.clear();
+                    raw.extend_from_slice(&logits);
+                }
+                crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
+                let tok =
+                    crate::text::sample::sample(&logits, &slot.gen.params, None, slot_rng01(slot));
+                if save_raw {
+                    std::mem::swap(&mut logits, raw);
+                }
+                tok
+            })
         };
         if let Some(stats) = stats {
             slot.lp = Some(Box::new(stats.finish(logits[tok as usize])));
@@ -10126,37 +10145,46 @@ fn seq_host_token(
     if !seq_needs_host_row(e, &s.gen.params) {
         return token;
     }
-    let p = &s.gen.params;
-    let adjusted = sampling_adjusted(p);
-    let sample = (!p.is_greedy() || adjusted) && e.host_sampling();
-    let mut logits = Vec::new();
-    if !e.logits_row(i, &mut logits) || (token as usize) >= logits.len() {
-        if sample {
-            tracing::warn!(
-                slot = i,
-                "host sampling: no logits row for this token; serving the device argmax"
-            );
-        }
-        return token;
+    let adjusted = sampling_adjusted(&s.gen.params);
+    let sample = (!s.gen.params.is_greedy() || adjusted) && e.host_sampling();
+    let logprobs_k = s.gen.params.logprobs;
+    thread_local! {
+        static LOGITS_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
     }
-    let stats = p
-        .logprobs
-        .map(|r| crate::text::logprobs::RowStats::of(&logits, r));
-    let tok = if sample {
-        let raw = (stats.is_some() && adjusted).then(|| logits.clone());
-        crate::text::sample::apply_penalties(&mut logits, &s.out_ids, &s.gen.params);
-        let tok = crate::text::sample::sample(&logits, &s.gen.params, None, slot_rng01(s));
-        if let Some(raw) = raw {
-            logits = raw;
+    LOGITS_SCRATCH.with_borrow_mut(|(logits, raw)| {
+        logits.clear();
+        if !e.logits_row(i, logits) || (token as usize) >= logits.len() {
+            if sample {
+                tracing::warn!(
+                    slot = i,
+                    "host sampling: no logits row for this token; serving the device argmax"
+                );
+            }
+            return token;
+        }
+        let stats = logprobs_k.map(|r| crate::text::logprobs::RowStats::of(logits, r));
+        let tok = if sample {
+            let save_raw = stats.is_some() && adjusted;
+            if save_raw {
+                raw.clear();
+                raw.extend_from_slice(logits);
+            }
+            let rng = slot_rng01(s);
+            crate::text::sample::apply_penalties(logits, &s.out_ids, &s.gen.params);
+            let tok = crate::text::sample::sample(logits, &s.gen.params, None, rng);
+            if save_raw {
+                std::mem::swap(logits, raw);
+            }
+            tok
+        } else {
+            token
+        };
+        if let Some(stats) = stats {
+            s.lp = Some(Box::new(stats.finish(logits[tok as usize])));
         }
         tok
-    } else {
-        token
-    };
-    if let Some(stats) = stats {
-        s.lp = Some(Box::new(stats.finish(logits[tok as usize])));
-    }
-    tok
+    })
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]

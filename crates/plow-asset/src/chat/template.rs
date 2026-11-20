@@ -409,7 +409,7 @@ impl ChatTemplate {
             ctx.insert(k.clone(), Value::from_serialize(v));
         }
 
-        let rendered = tmpl.render(Value::from_serialize(&ctx)).map_err(|e| {
+        let rendered = tmpl.render(&ctx).map_err(|e| {
             // minijinja chains the cause; the innermost is the template's own
             // `raise_exception` message, which is the useful half.
             let mut msg = e.to_string();
