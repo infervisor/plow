@@ -161,7 +161,7 @@ PLOW_FUSE_ARGMAX = "1"
 # B1..B128 and ctx 4094/4095/8191; replay A/B (2 interleaved rounds) TPOT p50 9.85 -> 9.79 ms, 0 errors.
 # Evidence: <lab scratch>/g26-perf-push/g26-router (runs/gb*, replay.txt).
 # -DPLOW_NV_FA_RG8S=1: the RG8 decode body streams each iteration's K/V rows and scales through a warp-private
-# two-stage cp.async smem ring (launch arena 40960 -> 82560 B); same lane map and arithmetic, bit-identical.
+# two-stage cp.async smem ring (launch arena capped <= 65536 B to preserve full 164 KiB Hopper L1 cache); same lane map and arithmetic, bit-identical.
 # Qualified 2026-10-18 (g26-attn): step_bench ctx 6144 B1/B2/B4/B8/B16 4.38/5.07/6.08/7.11/9.59 -> 4.37/5.01/5.89/6.86/
 # 9.02 ms (with the RG8 word-convert commit), TOK_STREAM digests identical on every rung and at VMM kv_len
 # 4094/4095/4096/8191/8192 x B1/B4/B16; prod-fidelity replay 1.8/s TPOT p50/p99 10.02/20.71 -> 9.47/19.18 ms, TTFT
