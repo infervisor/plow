@@ -11185,8 +11185,20 @@ fn incremental_delta(
     last: bool,
     keep_special: bool,
 ) -> String {
-    const MAX_DETOKENIZE_WINDOW: usize = 16;
     let len = out_ids.len();
+    // Tier 1 fast path: single-token standalone UTF-8 text with no pending multi-byte sequence.
+    if len > 0 && *read == len - 1 {
+        let token = out_ids[len - 1];
+        if let Some(text) = tok.fast_token_text(token, keep_special) {
+            if !text.is_empty() && (last || !text.ends_with('\u{FFFD}')) {
+                *prefix = *read;
+                *read = len;
+                return text.to_string();
+            }
+        }
+    }
+    // Tier 2: windowed detokenize for multi-byte sequences, byte fallbacks, or partial UTF-8.
+    const MAX_DETOKENIZE_WINDOW: usize = 16;
     let safe_start = len
         .saturating_sub(MAX_DETOKENIZE_WINDOW)
         .max((*prefix).min(len));
