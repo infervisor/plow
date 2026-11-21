@@ -75,6 +75,33 @@ pub struct UnloadRequest {
     pub drain_timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HibernateRequest {
+    pub model: String,
+    #[serde(default)]
+    pub drain_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HibernateResponse {
+    pub model: String,
+    pub state: &'static str,
+    pub freed_mib: u64,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AwakenRequest {
+    pub model: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AwakenResponse {
+    pub model: String,
+    pub state: &'static str,
+    pub elapsed_ms: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LoadResponse {
     pub model: String,
@@ -783,6 +810,108 @@ async fn unload_locked(state: &Arc<AppState>, req: UnloadRequest) -> Response {
             freed_mib: report.freed / MIB,
             pool_trimmed_mib: report.pool_trimmed / MIB,
             deregistered: req.deregister,
+        })
+        .into_response();
+    }
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    {
+        let _ = state;
+        err(
+            StatusCode::NOT_FOUND,
+            format_args!("unknown model {:?}", req.model),
+        )
+    }
+}
+
+/// `POST /v1/models/hibernate` — hibernate a resident model to warm dormancy.
+pub async fn hibernate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<HibernateRequest>,
+) -> Response {
+    match tokio::spawn(hibernate_inner(state, req)).await {
+        Ok(response) => response,
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn hibernate_inner(state: Arc<AppState>, mut req: HibernateRequest) -> Response {
+    req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
+    let _control = state.control_lock(&req.model).await;
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    {
+        let Some(mgr) = state.manager_for(&req.model).cloned() else {
+            return err(
+                StatusCode::NOT_FOUND,
+                format_args!("no model manager serves {:?}", req.model),
+            );
+        };
+        if !mgr.manages(&req.model) {
+            return err(
+                StatusCode::NOT_FOUND,
+                format_args!("unknown model {:?}", req.model),
+            );
+        }
+        let report = match mgr
+            .hibernate(&req.model, unload_drain(req.drain_timeout_ms))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+        return Json(HibernateResponse {
+            model: req.model,
+            state: "dormant",
+            freed_mib: report.freed / MIB,
+            elapsed_ms: report.stop_ms + report.hibernate_ms,
+        })
+        .into_response();
+    }
+    #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+    {
+        let _ = state;
+        err(
+            StatusCode::NOT_FOUND,
+            format_args!("unknown model {:?}", req.model),
+        )
+    }
+}
+
+/// `POST /v1/models/awaken` — awaken a dormant model from warm dormancy.
+pub async fn awaken(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AwakenRequest>,
+) -> Response {
+    match tokio::spawn(awaken_inner(state, req)).await {
+        Ok(response) => response,
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn awaken_inner(state: Arc<AppState>, mut req: AwakenRequest) -> Response {
+    req.model = state.registry.resolve(&req.model).unwrap_or(req.model);
+    let _control = state.control_lock(&req.model).await;
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    {
+        let Some(mgr) = state.manager_for(&req.model).cloned() else {
+            return err(
+                StatusCode::NOT_FOUND,
+                format_args!("no model manager serves {:?}", req.model),
+            );
+        };
+        if !mgr.manages(&req.model) {
+            return err(
+                StatusCode::NOT_FOUND,
+                format_args!("unknown model {:?}", req.model),
+            );
+        }
+        let report = match mgr.awaken(&req.model).await {
+            Ok(r) => r,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+        return Json(AwakenResponse {
+            model: req.model,
+            state: "resident",
+            elapsed_ms: report.awaken_ms,
         })
         .into_response();
     }

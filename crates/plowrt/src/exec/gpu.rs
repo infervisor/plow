@@ -3084,6 +3084,12 @@ pub struct GpuEngine {
     debug_nsplit_kvlen: Option<u32>,
     /// This engine's rank in a process rank group (tensor or pipeline parallel), if any.
     rank_bind: Option<rank::RankBind>,
+    checkpoint_dir: std::path::PathBuf,
+    assets_dir: std::path::PathBuf,
+    blob: Arc<DevBlob>,
+    derived_weights: Option<plow_asset::derived_weights::DerivedWeights>,
+    tp_declared_shards: Option<crate::asset::shard::DeclaredShards>,
+    hibernated: bool,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -4184,6 +4190,176 @@ impl GpuEngine {
         shared: handoff_causal::SharedCausalTensors,
     ) -> Result<Self> {
         Self::load_rank_inner(be, assets_dir, checkpoint_dir, None, Some(shared))
+    }
+
+    /// Hibernate the model to warm dormancy: unmap physical pages of weights, activations,
+    /// and dynamic KV cache while keeping device virtual addresses, CUDA graphs,
+    /// cuBLASLt algorithm profiles, and cubin modules resident in driver context.
+    pub fn hibernate(&mut self) -> Result<u64> {
+        if self.hibernated {
+            return Ok(0);
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let freed_bytes = self._weight_slab.hibernate()?;
+        if let Some(vmm) = &mut self.vmm {
+            vmm.evict_all();
+        }
+        self.pos.fill(0);
+        self.vmm_attached.fill(0);
+        self.resume_rows.fill(0);
+        self.seq_tokens.iter_mut().for_each(|v| v.clear());
+        self.vmm_active.fill(false);
+        self.rewind_snapshots.iter_mut().for_each(|s| *s = None);
+        self.kv_hw.fill(0);
+        self.slot_generations
+            .iter_mut()
+            .for_each(|g| *g = g.wrapping_add(1));
+        self.hibernated = true;
+        Ok(freed_bytes)
+    }
+
+    /// Whether the engine is currently hibernated in warm dormancy.
+    pub fn is_hibernated(&self) -> bool {
+        self.hibernated
+    }
+
+    /// Awaken the model from warm dormancy: remap physical backing for weights and activations
+    /// into the exact same reserved virtual address space, stream weights and init data from
+    /// `checkpoint_dir`, and zero activation buffers. CUDA graphs, cuBLASLt algorithm profiles,
+    /// and cubin modules remain fully valid without re-capture or re-profiling.
+    pub fn awaken(&mut self, checkpoint_dir: &Path) -> Result<()> {
+        if !self.hibernated {
+            return Ok(());
+        }
+        self._weight_slab.awaken(WEIGHT_SLAB_CHUNK)?;
+        let ckpt = Arc::new(Checkpoint::open(checkpoint_dir)?);
+        let mut pipe = UploadPipe::new(&self.be, false)?;
+
+        let gen_by_tensor: std::collections::HashMap<u32, &packet::rope::GenTensor> =
+            self.blob.gen.iter().map(|g| (g.tensor, g)).collect();
+
+        let tp_shards = match (self.blob.tp, self.rank_bind.as_ref()) {
+            (Some(_), Some(r)) => {
+                let decl = self.tp_declared_shards.clone().unwrap_or_default();
+                Some((r.tp_rank, r.tp, decl))
+            }
+            _ => None,
+        };
+
+        for (i, td) in self.blob.tensors.iter().enumerate() {
+            let mem = &self.devp[i];
+            if !self._weight_slab.contains(mem.base) {
+                continue;
+            }
+            if td.init.is_none()
+                && is_checkpoint_tensor(i, &td.name, self.packed_prefill.as_ref())
+            {
+                let assembled = if td.name.starts_with(packet::names::CONCAT_PREFIX) {
+                    let spec = self
+                        .derived_weights
+                        .as_ref()
+                        .and_then(|d| d.get(&td.name))
+                        .ok_or_else(|| {
+                            RuntimeError::Rejected(format!(
+                                "{}: no {} entry",
+                                td.name,
+                                plow_asset::derived_weights::SECTION
+                            ))
+                        })?;
+                    Some(ckpt.concatenated(spec, td.bytes))
+                } else {
+                    ckpt.widened_f32(&td.name, td.bytes)
+                };
+                if let Some(wide) = assembled {
+                    if tp_shards.is_some() {
+                        return Err(RuntimeError::Rejected(format!(
+                            "{}: assembled weights are not sharded for tensor parallelism",
+                            td.name
+                        )));
+                    }
+                    let wide = wide?;
+                    for (o, chunk) in wide.chunks(STAGE).enumerate() {
+                        let dst = mem.base + (o * STAGE) as u64;
+                        pipe.push(dst, chunk)?;
+                    }
+                    continue;
+                }
+                let missing = || RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name));
+                let src: std::borrow::Cow<[u8]> = match &tp_shards {
+                    Some((r, n, decl)) => {
+                        let (bytes, shape) = ckpt.tensor_ex(&td.name).ok_or_else(missing)?;
+                        crate::asset::shard::slice_for_as(
+                            &td.name,
+                            decl.axis(&td.name),
+                            bytes,
+                            shape,
+                            td.bytes,
+                            *r,
+                            *n,
+                        )?
+                    }
+                    None => {
+                        std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?)
+                    }
+                };
+                if src.len() as u64 != td.bytes {
+                    return Err(RuntimeError::Device(format!(
+                        "SIZE MISMATCH {} (want {} got {})",
+                        td.name,
+                        td.bytes,
+                        src.len()
+                    )));
+                }
+                for (o, chunk) in src.chunks(STAGE).enumerate() {
+                    let dst = mem.base + (o * STAGE) as u64;
+                    if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
+                        unsafe { pipe.push_direct(dst, chunk)? }
+                    } else {
+                        pipe.push(dst, chunk)?;
+                    }
+                }
+            } else if let Some(r) = &td.init {
+                for (o, chunk) in self.blob.init[r.clone()].chunks(STAGE).enumerate() {
+                    let dst = mem.base + (o * STAGE) as u64;
+                    if pipe.is_direct() {
+                        unsafe { pipe.push_direct(dst, chunk)? }
+                    } else {
+                        pipe.push(dst, chunk)?;
+                    }
+                }
+            } else if let Some(g) = gen_by_tensor.get(&(i as u32)) {
+                let data = g.generate().ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "devblob: gen recipe for `{}` has unknown kind {}",
+                        td.name, g.kind
+                    ))
+                })?;
+                if data.len() as u64 != td.bytes {
+                    return Err(RuntimeError::Device(format!(
+                        "devblob: gen recipe for `{}` produced {} B, decl says {}",
+                        td.name,
+                        data.len(),
+                        td.bytes
+                    )));
+                }
+                for (o, chunk) in data.chunks(STAGE).enumerate() {
+                    let dst = mem.base + (o * STAGE) as u64;
+                    pipe.push(dst, chunk)?;
+                }
+            } else {
+                self.be.memset_d8(mem.base, 0, td.bytes as usize)?;
+            }
+        }
+        pipe.finish()?;
+        if let WeightSlab::Vmm(slab) = &*self._weight_slab {
+            slab.wait_mapped(slab.len())?;
+        }
+        self.be
+            .memset_d8(self._ctr_block.base, 0, self.ctr_bytes + self.cursor_bytes)?;
+        self.be.stream_synchronize(&self.stream)?;
+        self.checkpoint_dir = checkpoint_dir.to_path_buf();
+        self.hibernated = false;
+        Ok(())
     }
 
     fn load_rank_inner(
@@ -8098,6 +8274,7 @@ impl GpuEngine {
                 .map(|c| c.stride.saturating_sub(c.window))
                 .min()
         });
+        let blob = Arc::new(blob);
         let mut engine = GpuEngine {
             be,
             f,
@@ -8276,6 +8453,12 @@ impl GpuEngine {
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
             rank_bind,
+            checkpoint_dir: checkpoint_dir.to_path_buf(),
+            assets_dir: assets_dir.to_path_buf(),
+            blob: Arc::clone(&blob),
+            derived_weights,
+            tp_declared_shards: tp_shards.as_ref().map(|(.., decl, _)| decl.clone()),
+            hibernated: false,
         };
         engine.spec_upload_identity()?;
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();

@@ -618,12 +618,16 @@ pub enum Residency {
     /// Explicitly unloaded. `ensure_resident` refuses and the preloader skips
     /// it until an explicit load returns it to `Auto`.
     Unloaded,
+    /// Hibernated in warm dormancy: driver VMM virtual addresses, CUDA graphs,
+    /// cuBLASLt algorithm profiles, and cubin modules stay resident, while weights,
+    /// activations, and KV cache physical memory are unmapped (0 MiB VRAM).
+    Dormant,
 }
 
 impl Residency {
     /// Whether new requests for this slug may be admitted.
     pub fn admits(self) -> bool {
-        matches!(self, Residency::Auto)
+        matches!(self, Residency::Auto | Residency::Dormant)
     }
 
     /// The wire spelling, shared by the admin status and the model card.
@@ -632,6 +636,7 @@ impl Residency {
             Residency::Auto => "auto",
             Residency::Unloading => "unloading",
             Residency::Unloaded => "unloaded",
+            Residency::Dormant => "dormant",
         }
     }
 }
@@ -2633,6 +2638,8 @@ pub fn admin_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/models/load", post(admin::load))
         .route("/v1/models/unload", post(admin::unload))
+        .route("/v1/models/hibernate", post(admin::hibernate))
+        .route("/v1/models/awaken", post(admin::awaken))
         .route("/v1/models/status", get(admin::status))
         .route("/v1/models/available", get(admin::available))
         .with_state(state)

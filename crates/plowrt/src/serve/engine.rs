@@ -728,6 +728,30 @@ impl ServeEngine {
             ServeEngine::Cpu(_) => None,
         }
     }
+
+    pub fn hibernate(&mut self) -> crate::Result<u64> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.hibernate(),
+            _ => Ok(0),
+        }
+    }
+
+    pub fn awaken(&mut self, checkpoint_dir: &std::path::Path) -> crate::Result<()> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.awaken(checkpoint_dir),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn is_hibernated(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => e.is_hibernated(),
+            _ => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

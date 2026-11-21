@@ -175,6 +175,15 @@ pub(super) struct VmmServe {
 }
 
 impl VmmServe {
+    pub(super) fn evict_all(&mut self) {
+        if let Some(rings) = &mut self.rings {
+            rings.release_all();
+        }
+        if let Some(kv) = &self.kv {
+            kv.evict_all();
+        }
+    }
+
     pub(super) fn prefix_kv(&self) -> Option<&crate::memory::vmm::VmmKv> {
         self.kv.as_ref().filter(|kv| kv.prefix_reuse())
     }
