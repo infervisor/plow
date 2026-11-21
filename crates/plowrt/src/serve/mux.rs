@@ -1857,14 +1857,14 @@ fn spawn_scoped(
         }
     };
     let rt_cfg = crate::config::RuntimeConfig::get();
-    let nominal_rung =
-        rt_cfg
-            .decode_nominal_rung
-            .or_else(|| if capacity >= 32 { Some(32) } else { None });
-    let elastic_rung =
-        rt_cfg
-            .decode_elastic_rung
-            .or_else(|| if capacity >= 40 { Some(40) } else { None });
+    let nominal_rung = rt_cfg.decode_nominal_rung.or_else(|| {
+        if capacity >= 32 {
+            Some(32)
+        } else {
+            None
+        }
+    });
+    let elastic_rung = rt_cfg.decode_elastic_rung;
     let elastic_wait_ms = rt_cfg.decode_elastic_wait_ms as f64;
     let mut rung_controller =
         rung_widths

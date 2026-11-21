@@ -10,6 +10,7 @@ const NARROW_TICKS: u32 = 128;
 const MIN_DWELL_TICKS: u32 = 64;
 const MIN_THROUGHPUT_SAMPLES: u64 = 4;
 const THROUGHPUT_HYSTERESIS: f64 = 1.03;
+const THROUGHPUT_BACKLOG_UPSHIFT_MARGIN: f64 = 1.05;
 /// Narrowing under a backlog idles the slots it takes back while requests wait for them, so it
 /// needs a win above sampling noise: Veena at c128 narrowed 64 -> 32 on a ~3% estimate (samples
 /// taken beside the codec's GPU work) and held 50 requests queued for 10 s.
@@ -288,7 +289,7 @@ impl RungController {
             .min(self.rungs.width(allowed_ceiling_idx));
         let demand_seat = self.rungs.covering(demanded).min(allowed_ceiling_idx);
         let seat = self
-            .throughput_seat(demand_seat, load.queued)
+            .throughput_seat(demand_seat, demanded, load.queued, self.target)
             .min(allowed_ceiling_idx)
             .max(self.min_seat);
         let mut reason = if actual > self.target {
@@ -302,8 +303,8 @@ impl RungController {
             self.dwell_ticks = 0;
             self.low_load_ticks = 0;
             reason = RungReason::Throughput;
-        } else if seat < demand_seat
-            && seat < self.target
+        } else if seat < self.target
+            && (seat < demand_seat || self.target > allowed_ceiling_idx)
             && (load.queued == 0 || self.dwell_ticks >= THROUGHPUT_DWELL_TICKS)
         {
             self.target = seat;
@@ -393,7 +394,13 @@ impl RungController {
         load.oldest_wait_ms.max(0.0) + waves as f64 * self.service_ms(rung)
     }
 
-    fn throughput_seat(&self, demand_seat: usize, queued: usize) -> usize {
+    fn throughput_seat(
+        &self,
+        demand_seat: usize,
+        demanded: usize,
+        queued: usize,
+        current_target: usize,
+    ) -> usize {
         if demand_seat == 0 || !self.throughput {
             return demand_seat;
         }
@@ -425,14 +432,30 @@ impl RungController {
         {
             return demand_seat.max(self.min_seat);
         }
-        let capacity = |rung: usize| self.rungs.width(rung) as f64 * 1000.0 / self.step_ms(rung);
-        let demanded_capacity = capacity(demand_seat);
+        let demand_step_ms = self.step_ms(demand_seat);
+        if demand_step_ms <= 0.0 {
+            return demand_seat.max(self.min_seat);
+        }
+        let capacity = |rung: usize| {
+            let ms = self.step_ms(rung);
+            if ms > 0.0 {
+                self.rungs.width(rung) as f64 * 1000.0 / ms
+            } else {
+                0.0
+            }
+        };
+        let demanded_capacity =
+            (demanded.min(self.rungs.width(demand_seat)) as f64) * 1000.0 / demand_step_ms;
         (self.min_seat..demand_seat)
             .filter(|&rung| self.stats[rung].samples >= MIN_THROUGHPUT_SAMPLES)
             .max_by(|&a, &b| capacity(a).total_cmp(&capacity(b)))
             .filter(|&rung| {
                 let margin = if queued > 0 {
-                    THROUGHPUT_BACKLOG_HYSTERESIS
+                    if current_target < demand_seat {
+                        THROUGHPUT_BACKLOG_UPSHIFT_MARGIN
+                    } else {
+                        THROUGHPUT_BACKLOG_HYSTERESIS
+                    }
                 } else {
                     THROUGHPUT_HYSTERESIS
                 };
@@ -969,6 +992,63 @@ mod tests {
         // Once queue drains (queued == 0): naturally contracts back to nominal 32
         let d = c.decide(load(35, 0));
         assert_eq!(c.admission_limit(), 32, "contracts back to nominal 32");
+        assert_eq!(d.reason, RungReason::Throughput);
+    }
+
+    #[test]
+    fn partially_occupied_wide_rung_does_not_beat_fully_occupied_narrow_rung_when_throughput_is_lower() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32, 64]);
+        // Observe rung 5 (32) at 18ms and rung 6 (64) at 26ms
+        for _ in 0..10 {
+            c.observe_decode(5, 18.0, NonZeroUsize::new(1).unwrap());
+            c.observe_decode(6, 26.0, NonZeroUsize::new(1).unwrap());
+        }
+        // At 34 demanded tokens:
+        // Rung 64 useful throughput = 34 * 1000 / 26 = 1307.7 tok/s
+        // Rung 32 useful throughput = 32 * 1000 / 18 = 1777.7 tok/s
+        // 1777.7 > 1307.7 * 1.10 = 1438.5 -> rung 32 must win!
+        let seat_34 = c.throughput_seat(6, 34, 2, c.target);
+        assert_eq!(
+            seat_34, 5,
+            "at 34 demanded, rung 32 has higher useful throughput than rung 64"
+        );
+
+        // At 50 demanded tokens:
+        // Rung 64 useful throughput = 50 * 1000 / 26 = 1923.1 tok/s
+        // 1777.7 < 1923.1 * 1.10 = 2115.4 -> rung 64 must win!
+        let seat_50 = c.throughput_seat(6, 50, 18, c.target);
+        assert_eq!(
+            seat_50, 6,
+            "at 50 demanded, rung 64 has genuinely higher throughput than rung 32"
+        );
+    }
+
+    #[test]
+    fn elastic_burst_contracts_even_with_residual_queued_work() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 24, 32, 40, 48])
+            .with_nominal_max(Some(32))
+            .with_elastic_max(Some(40))
+            .with_elastic_wait_ms(250.0);
+
+        // Burst expands to 40
+        let mut burst = load(32, 8);
+        burst.oldest_wait_ms = 300.0;
+        let _ = c.decide(burst);
+        assert_eq!(c.admission_limit(), 40);
+
+        // Burst subsides: queued drops below burst threshold (queued < 4 and wait < 250ms)
+        // Even with residual queued work (queued = 1), after THROUGHPUT_DWELL_TICKS it must contract to 32
+        let mut residual = load(32, 1);
+        residual.oldest_wait_ms = 10.0;
+        let mut d = c.decide(residual);
+        for _ in 1..THROUGHPUT_DWELL_TICKS {
+            d = c.decide(residual);
+        }
+        assert_eq!(
+            c.admission_limit(),
+            32,
+            "must contract to nominal 32 even with residual queued work"
+        );
         assert_eq!(d.reason, RungReason::Throughput);
     }
 }
