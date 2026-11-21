@@ -68,7 +68,11 @@ expect "unmapped requires are named, not dropped" \
 expect "every row is stamped with the config" python3 - "$D" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-bad = [k for k, v in d.items() if k != "test_kernels" and '-DPLOW_CONFIG="plow_config.h"' not in v.split()]
+# The two fixed objects build_gfx942.sh compiles without packet axes.
+fixed = ("test_kernels", "gemma4_gemm_glu_gfx942")
+bad = [k for k, v in d.items() if k not in fixed and '-DPLOW_CONFIG="plow_config.h"' not in v.split()]
+if bad:
+    print("rows without the config:", sorted(bad), file=sys.stderr)
 sys.exit(1 if bad else 0)
 PY
 expect "decode bucket is the walk-capped ceiling of the packet batch" has_define "$D" interp_decode -DPLOW_GEMV_MM=16

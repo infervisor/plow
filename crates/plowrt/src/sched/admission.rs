@@ -680,7 +680,16 @@ mod seat_tests {
         let b = glm_budget();
         // 11 sequences of 70,700 committed.
         // A 12th sequence wanting 70,700 fits:
-        let res = seat(false, Some(0), 70_700, Some(5_000), [70_700; 11], Some(b), false).unwrap();
+        let res = seat(
+            false,
+            Some(0),
+            70_700,
+            Some(5_000),
+            [70_700; 11],
+            Some(b),
+            false,
+        )
+        .unwrap();
         assert_eq!(res.slot, 0);
         assert_eq!(res.admitted_rows, 70_700);
         assert!(!res.is_soft);
@@ -692,14 +701,32 @@ mod seat_tests {
         let soft_rows = 100;
         assert!(b.bytes_for_rows(soft_rows) <= remaining_bytes);
 
-        let res = seat(false, Some(1), 70_700, Some(soft_rows), [70_700; 12], Some(b), false).unwrap();
+        let res = seat(
+            false,
+            Some(1),
+            70_700,
+            Some(soft_rows),
+            [70_700; 12],
+            Some(b),
+            false,
+        )
+        .unwrap();
         assert_eq!(res.slot, 1);
         assert_eq!(res.admitted_rows, soft_rows);
         assert!(res.is_soft);
 
         // If even the soft reservation does not fit:
         let too_big_soft = 70_000;
-        let err = seat(false, Some(1), 70_700, Some(too_big_soft), [70_700; 12], Some(b), false).unwrap_err();
+        let err = seat(
+            false,
+            Some(1),
+            70_700,
+            Some(too_big_soft),
+            [70_700; 12],
+            Some(b),
+            false,
+        )
+        .unwrap_err();
         assert_eq!(err, Denied::KvBudgetFull { want: too_big_soft });
     }
 

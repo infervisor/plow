@@ -10143,7 +10143,10 @@ impl GpuEngine {
             .copied()
             .find(|&w| w as usize >= self.decode_extent)
             .map_or_else(
-                || self.selected_decode(selection).map_or(self.batch, |r| r.rows),
+                || {
+                    self.selected_decode(selection)
+                        .map_or(self.batch, |r| r.rows)
+                },
                 |w| w as usize,
             );
         self.buckets.record(

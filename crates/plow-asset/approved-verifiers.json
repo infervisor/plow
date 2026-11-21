@@ -63,6 +63,13 @@
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "e313efda3",
       "note": "page_envelope.v1 (paged library attention table pad vs split cap); user-approved 2026-10-31"
+    },
+    {
+      "sha256": "0f9d5d06feb9e04685496837dcecd8d0ac2db78c0b389f4f08343d13808802f8",
+      "lean_sources_sha256": "3d1a6fbc386170f2a3d5834f52376f0ba3bd77a6d273a60233bea6d2566a8153",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "e313efda3",
+      "note": "the same sources built by the lean CI job on a GitHub-hosted ubuntu-24.04 runner (identical on two runs); user-approved 2026-11-21"
     }
   ]
 }

@@ -240,11 +240,12 @@ static void demote_rows(const plow_bf16* C, size_t ldc, uint32_t M, uint32_t n0,
     }
 }
 
+/* `oc`: the column stride of `out` (OC for the bf16 dots, 16 for the quantized ones). */
 static void store_span(plow_bf16* C, size_t ldc, uint32_t n, uint32_t rows, uint32_t M, const float* out,
-                       const plow_bf16* bias) {
+                       uint32_t oc, const plow_bf16* bias) {
     for (uint32_t r = 0; r < rows; r++) {
         const float b = bias ? plow_bf2f(bias[n + r]) : 0.0f;
-        for (uint32_t m = 0; m < M; m++) C[m * ldc + n + r] = plow_f2bf(out[r * OC + m] + b);
+        for (uint32_t m = 0; m < M; m++) C[m * ldc + n + r] = plow_f2bf(out[r * oc + m] + b);
     }
 }
 
@@ -256,7 +257,7 @@ static void gemv_span_amx(plow_bf16* C, size_t ldc, const plow_bf16* W, const pl
     for (uint32_t n = n0; n < n1;) {
         const uint32_t rows = n1 - n < 32u ? n1 - n : 32u;
         dot_rows(W, K, X, xp, M, K, n, rows, out);
-        store_span(C, ldc, n, rows, M, out, bias);
+        store_span(C, ldc, n, rows, M, out, OC, bias);
         n += rows;
     }
 }
@@ -445,7 +446,7 @@ X_K(x_gemv_mxfp4) {
     for (uint32_t n = n0; n < n1;) {
         const uint32_t rows = n1 - n < 32u ? n1 - n : 32u;
         dot_rows_q(1, W, K / 2u, S, K / 32u, x, xp, M, K, n, rows, out);
-        store_span(C, N, n, rows, M, out, bias);
+        store_span(C, N, n, rows, M, out, 16u, bias);
         n += rows;
     }
 }

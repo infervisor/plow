@@ -2981,25 +2981,26 @@ impl VmmKv {
                     inner.stats.attach_misses += 1;
                     inner.stats.tokens_attached -= rows as u64;
                     let st = &mut inner.stats;
-                    let (hits, got, miss) = if kind.has(Kind::PROMPT_END) || kind.has(Kind::TURN_END) {
-                        (
-                            &mut st.attach_prompt_end,
-                            &mut st.tokens_attached_prompt_end,
-                            &mut st.tokens_lost_prompt_end,
-                        )
-                    } else if kind.has(Kind::SHARED_END) {
-                        (
-                            &mut st.attach_shared,
-                            &mut st.tokens_attached_shared,
-                            &mut st.tokens_lost_shared,
-                        )
-                    } else {
-                        (
-                            &mut st.attach_block,
-                            &mut st.tokens_attached_block,
-                            &mut st.tokens_lost_block,
-                        )
-                    };
+                    let (hits, got, miss) =
+                        if kind.has(Kind::PROMPT_END) || kind.has(Kind::TURN_END) {
+                            (
+                                &mut st.attach_prompt_end,
+                                &mut st.tokens_attached_prompt_end,
+                                &mut st.tokens_lost_prompt_end,
+                            )
+                        } else if kind.has(Kind::SHARED_END) {
+                            (
+                                &mut st.attach_shared,
+                                &mut st.tokens_attached_shared,
+                                &mut st.tokens_lost_shared,
+                            )
+                        } else {
+                            (
+                                &mut st.attach_block,
+                                &mut st.tokens_attached_block,
+                                &mut st.tokens_lost_block,
+                            )
+                        };
                     *hits -= 1;
                     *got -= u64::from(rows);
                     *miss -= prompt.len() as u64 - u64::from(rows);

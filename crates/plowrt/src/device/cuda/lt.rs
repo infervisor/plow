@@ -461,7 +461,12 @@ impl Lt {
                         tracing::info!(m, n, k, "cuBLASLt FP8 stored algorithm pinned");
                         return Ok(());
                     }
-                    tracing::warn!(m, n, k, "cuBLASLt FP8 stored algorithm rejected; falling back");
+                    tracing::warn!(
+                        m,
+                        n,
+                        k,
+                        "cuBLASLt FP8 stored algorithm rejected; falling back"
+                    );
                 }
                 plan.algo = results
                     .get(..count as usize)

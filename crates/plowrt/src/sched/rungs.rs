@@ -278,13 +278,9 @@ impl RungController {
             .min(widest_idx)
             .max(nominal_idx);
 
-        let is_burst = load.queued > 0
-            && (load.oldest_wait_ms >= self.elastic_wait_ms || load.queued >= 4);
-        let allowed_ceiling_idx = if is_burst {
-            elastic_idx
-        } else {
-            nominal_idx
-        };
+        let is_burst =
+            load.queued > 0 && (load.oldest_wait_ms >= self.elastic_wait_ms || load.queued >= 4);
+        let allowed_ceiling_idx = if is_burst { elastic_idx } else { nominal_idx };
 
         let demanded = load
             .occupied_extent
@@ -530,7 +526,11 @@ mod tests {
         c.target = 5; // 32
         for _ in 0..200 {
             let decision = c.decide(load(30, 0));
-            assert_eq!(c.admission_limit(), 32, "occupied 30/32 must not downshift: {decision:?}");
+            assert_eq!(
+                c.admission_limit(),
+                32,
+                "occupied 30/32 must not downshift: {decision:?}"
+            );
         }
     }
 
@@ -545,7 +545,11 @@ mod tests {
         c.target = 5; // 32
         for _ in 0..200 {
             let decision = c.decide(load(8, 2));
-            assert_eq!(c.admission_limit(), 32, "queued work must not downshift: {decision:?}");
+            assert_eq!(
+                c.admission_limit(),
+                32,
+                "queued work must not downshift: {decision:?}"
+            );
         }
     }
 
@@ -555,7 +559,11 @@ mod tests {
         c.target = 5; // 32
         for _ in 0..500 {
             let decision = c.decide(load(0, 0));
-            assert_eq!(c.admission_limit(), 32, "min_seat 5 must pin rung 32: {decision:?}");
+            assert_eq!(
+                c.admission_limit(),
+                32,
+                "min_seat 5 must pin rung 32: {decision:?}"
+            );
         }
     }
 
@@ -914,7 +922,7 @@ mod tests {
     #[test]
     fn min_seat_prevents_false_throughput_downshift_and_dwell_reset() {
         let mut c = controller(&[1, 2, 4, 8, 16, 32]).with_min_seat(5); // pinned to 32
-        // Observe faster token throughput on rung 4 (width 16) than rung 5 (width 32)
+                                                                        // Observe faster token throughput on rung 4 (width 16) than rung 5 (width 32)
         for _ in 0..10 {
             c.observe_decode(4, 10.0, NonZeroUsize::new(1).unwrap());
             c.observe_decode(5, 50.0, NonZeroUsize::new(1).unwrap());
