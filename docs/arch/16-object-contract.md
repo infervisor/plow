@@ -235,3 +235,28 @@ says so rather than passing silently.
   derives the required set from the object's own axes (`hd=64` is `#if !PLOW_FP8_KV`) rather
   than from the blob. Making the AMD interpreter consume the packet's head-dim capability the
   way the NVIDIA one does would let the two halves agree; that is the follow-up.
+
+---
+
+## Cross-Hardware Scaling & Unified ISA Matrix Capabilities
+
+Plow brings up models portably across all target architectures by keeping a strict separation between target-agnostic graph emission and hardware-specific matrix instruction mappings:
+
+| Architecture | Target ISA | Core Matrix Instruction | Memory & Async Hierarchy | Precision / Dtypes |
+|---|---|---|---|---|
+| **NVIDIA Hopper** | `sm_90a` | `wgmma.mma_async` (m64n128k16 / k32) | Tensor Memory Accelerator (TMA), 228 KiB shared memory | BF16, FP8 (E4M3, E5M2) |
+| **NVIDIA Blackwell** | `sm_100` / `sm_120` | `tcgen05.mma` Tensor Memory | Asynchronous Tensor Memory, unified 2:4 structured sparsity | FP4 (NVFP4, MXFP4), FP8, BF16 |
+| **NVIDIA Ada** | `sm_89` | `mma.sync.aligned.m16n8k32` | Async copy (`cp.async`), 100 KiB shared memory | FP8, BF16, INT8 |
+| **AMD CDNA 3** | `gfx942` (MI300X/325X) | `v_mfma_f32_32x32x16_bf16`, `v_mfma_f32_16x16x32_fp8` | 128 KiB Local Data Share (LDS), CDNA XGMI | BF16, FP8, MXFP4 |
+| **AMD CDNA 4** | `gfx950` (MI350X) | `v_mfma_*` (doubled matrix rate) | 160 KiB LDS, dedicated FP4 matrix pipeline | FP4, FP8, BF16 |
+| **AMD RDNA 4** | `gfx1201` (Navi 4x) | `v_wmma_*` Wave32 matrix instructions | Dual-issue VALU, Wave32 execution | BF16, FP16, INT8 |
+| **Apple Silicon** | `metal3` (M4 Pro/Max) | `simdgroup_matrix` | Unified Memory Architecture (UMA) zero-copy | BF16, FP16 |
+| **Intel Xeon 6** | `xeon6` | `AMX-BF16` / `AMX-INT8` (`tdpbf16ps`, `tdpbssd`) | 2-level cache hierarchy, AVX-512 VNNI | BF16, INT8 |
+
+### Architectural Invariant: Clean Layering
+
+1. **`hwspec`:** Encapsulates physical hardware invariants (CU/SM counts, peak FLOPs, memory bandwidth, LDS/shared memory limits).
+2. **`costmodel`:** Computes analytical arithmetic intensity and sets the roofline floor via `BlockContract`.
+3. **`kernelcaps`:** Encapsulates opcode-to-instruction mapping rules and sweepable parameter spaces.
+4. **`devgen`:** Generates target-agnostic packet streams via strongly typed `InstructionBuilder`.
+5. **`tunedb`:** Enforces empirical roofline certification ($\ge 80\%$ memory, $\ge 75\%$ compute) prior to recipe generation.

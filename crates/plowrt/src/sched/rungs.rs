@@ -307,11 +307,35 @@ impl RungController {
                 .min(allowed_ceiling_idx)
                 .max(self.min_seat)
         };
+
+        // Invariant 2: Nominal Steady-State Floor Under Saturated Demand.
+        // When queued > 0 and occupied_extent >= nominal width, scheduler is forbidden
+        // from downshifting below nominal_idx due to intermediate rung throughput noise.
+        let seat = if load.queued > 0 && load.occupied_extent >= self.rungs.width(nominal_idx) {
+            seat.max(nominal_idx)
+        } else {
+            seat
+        };
+
         let mut reason = if actual > self.target {
             RungReason::Occupied
         } else {
             RungReason::Hold
         };
+
+        // Invariant 1: Monotonic Elastic Burst Draining.
+        // When active in elastic burst (target > nominal_idx) and queue has drained (queued == 0),
+        // the admission ceiling monotonically tracks draining active requests down to nominal floor:
+        // C_admit(t) = max(C_nominal, covering(occupied_extent)).
+        if self.target > nominal_idx && load.queued == 0 {
+            let drain_seat = self.rungs.covering(load.occupied_extent).max(nominal_idx);
+            if drain_seat < self.target {
+                self.target = drain_seat;
+                self.dwell_ticks = 0;
+                self.low_load_ticks = 0;
+                reason = RungReason::Throughput;
+            }
+        }
 
         if self.target > allowed_ceiling_idx && self.dwell_ticks >= THROUGHPUT_DWELL_TICKS {
             self.target = allowed_ceiling_idx.max(self.min_seat);
@@ -1165,5 +1189,271 @@ mod tests {
                 "must not report throughput downshift"
             );
         }
+    }
+
+    #[test]
+    fn test_discrete_event_simulation_fuzz_invariants() {
+        // Deterministic pseudo-random generator
+        struct Rng(u64);
+        impl Rng {
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn gen_range(&mut self, low: usize, high: usize) -> usize {
+                if low >= high {
+                    return low;
+                }
+                low + (self.next_u64() as usize % (high - low + 1))
+            }
+            fn gen_f64(&mut self) -> f64 {
+                (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+            }
+        }
+
+        let mut rng = Rng(0x5EED_CAFE_DEAD_BEEF);
+        let widths = [1, 2, 4, 8, 16, 24, 32, 40, 48, 64];
+        let nominal_cap = 32;
+        let elastic_cap = 48;
+        let mut controller = DecodeRungs::new(&widths, 64)
+            .map(|r| {
+                RungController::new(r)
+                    .with_nominal_max(Some(nominal_cap))
+                    .with_elastic_max(Some(elastic_cap))
+                    .with_elastic_wait_ms(200.0)
+            })
+            .unwrap();
+
+        // Seed baseline EWMA samples
+        for (i, &w) in widths.iter().enumerate() {
+            let base_lat = 2.0 + (w as f64) * 0.45;
+            for _ in 0..10 {
+                controller.observe_decode(i, base_lat, NonZeroUsize::new(1).unwrap());
+            }
+        }
+
+        let mut active = 0usize;
+        let mut queued = 0usize;
+        let mut oldest_wait_ms = 0.0f64;
+        let mut prev_admit_limit = controller.admission_limit();
+        let mut in_burst_drain = false;
+
+        // Execute 10,000 synthetic discrete-event transitions
+        for step in 0..10_000 {
+            let regime = (step / 500) % 4;
+            match regime {
+                0 => {
+                    // Steady-state Poisson
+                    if rng.gen_f64() < 0.4 {
+                        queued = queued.saturating_add(rng.gen_range(1, 3));
+                    }
+                }
+                1 => {
+                    // Burst spike
+                    if step % 50 == 0 {
+                        queued = queued.saturating_add(rng.gen_range(20, 50));
+                        oldest_wait_ms = 350.0;
+                    }
+                }
+                2 => {
+                    // Burst drain phase
+                    queued = 0;
+                    oldest_wait_ms = 0.0;
+                }
+                _ => {
+                    // Random churn
+                    if rng.gen_f64() < 0.25 {
+                        queued = rng.gen_range(0, 30);
+                        oldest_wait_ms = rng.gen_f64() * 400.0;
+                    }
+                }
+            }
+
+            let observed_rung = controller.covering(active.max(1));
+            let noise = if rng.gen_f64() < 0.05 { 2.5 } else { 1.0 };
+            let lat = (2.0 + (widths[observed_rung] as f64) * 0.45) * noise;
+            controller.observe_decode(observed_rung, lat, NonZeroUsize::new(1).unwrap());
+
+            let load = RungLoad {
+                occupied_extent: active,
+                queued,
+                oldest_wait_ms,
+                arrival_rps: if queued > 0 { 50.0 } else { 5.0 },
+                mean_output_tokens: 30.0,
+                slo_ms: 1000.0,
+                kv_used: if regime == 1 { 0.70 } else { 0.40 },
+            };
+
+            let decision = controller.decide(load);
+            let admit_limit = controller.admission_limit();
+
+            // Invariant 1: Monotonic Burst Drain
+            if active > nominal_cap && queued == 0 {
+                if in_burst_drain {
+                    assert!(
+                        admit_limit <= prev_admit_limit,
+                        "step {step}: Invariant 1 violation: burst drain flared admit_limit from {prev_admit_limit} up to {admit_limit}"
+                    );
+                }
+                in_burst_drain = true;
+            } else if queued > 0 {
+                in_burst_drain = false;
+            }
+
+            // Invariant 2: Nominal Steady-State Floor Under Saturated Demand
+            if queued > 0 && active >= nominal_cap {
+                assert!(
+                    admit_limit >= nominal_cap,
+                    "step {step}: Invariant 2 violation: admit_limit {admit_limit} fell below nominal {nominal_cap} with queue {queued} and active {active}"
+                );
+            }
+
+            // Invariant 3: Strict Capacity Bound
+            assert!(
+                admit_limit <= elastic_cap,
+                "step {step}: Invariant 3 violation: admit_limit {admit_limit} exceeded elastic ceiling {elastic_cap}"
+            );
+            assert!(
+                decision.actual <= widths.len() - 1,
+                "step {step}: Invariant 3 violation: actual rung index out of bounds"
+            );
+
+            // Lifecycle transitions
+            let completions = rng.gen_range(0, (active / 4).max(1));
+            active = active.saturating_sub(completions);
+
+            if queued > 0 && active < admit_limit {
+                let admits = queued.min(admit_limit - active);
+                active += admits;
+                queued -= admits;
+            }
+
+            if queued == 0 {
+                oldest_wait_ms = 0.0;
+            } else {
+                oldest_wait_ms += lat;
+            }
+            prev_admit_limit = admit_limit;
+        }
+    }
+
+    #[test]
+    fn program_ladder_hot_plugging() {
+        let ladder = ProgramLadder::new(vec![128, 512, 2048], vec![1, 4, 8, 16, 64]);
+        let controller = LadderController::new(ladder, 64, 8192);
+
+        // Verify initial state
+        assert_eq!(controller.current().prefill_rungs, vec![128, 512, 2048]);
+        assert_eq!(controller.current().decode_rungs, vec![1, 4, 8, 16, 64]);
+
+        // Hot plug a new prefill bucket
+        assert!(controller
+            .hot_plug_bucket(plow_asset::bucket::BucketRole::PrefillBucket(1024))
+            .is_ok());
+        assert_eq!(
+            controller.current().prefill_rungs,
+            vec![128, 512, 1024, 2048]
+        );
+
+        // Hot plug a new decode rung
+        assert!(controller
+            .hot_plug_bucket(plow_asset::bucket::BucketRole::DecodeRung(12))
+            .is_ok());
+        assert_eq!(controller.current().decode_rungs, vec![1, 4, 8, 12, 16, 64]);
+
+        // Attempt to exceed envelope
+        assert!(controller
+            .hot_plug_bucket(plow_asset::bucket::BucketRole::DecodeRung(128))
+            .is_err());
+        assert!(controller
+            .hot_plug_bucket(plow_asset::bucket::BucketRole::PrefillBucket(16384))
+            .is_err());
+    }
+}
+
+/// Active program execution ladder across prefill buckets and decode rungs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramLadder {
+    pub prefill_rungs: Vec<u32>,
+    pub decode_rungs: Vec<u32>,
+}
+
+impl ProgramLadder {
+    pub fn new(mut prefill_rungs: Vec<u32>, mut decode_rungs: Vec<u32>) -> Self {
+        prefill_rungs.sort_unstable();
+        prefill_rungs.dedup();
+        decode_rungs.sort_unstable();
+        decode_rungs.dedup();
+        Self {
+            prefill_rungs,
+            decode_rungs,
+        }
+    }
+
+    /// Insert or update a bucket into the active ladder, validating capacity envelopes.
+    pub fn insert_bucket(
+        &mut self,
+        role: plow_asset::bucket::BucketRole,
+        max_decode_batch: u32,
+        max_chunk_rows: u32,
+    ) -> Result<(), String> {
+        match role {
+            plow_asset::bucket::BucketRole::PrefillBucket(rows) => {
+                if rows > max_chunk_rows {
+                    return Err(format!(
+                        "prefill bucket rows {rows} exceeds max_chunk_rows {max_chunk_rows}"
+                    ));
+                }
+                if !self.prefill_rungs.contains(&rows) {
+                    self.prefill_rungs.push(rows);
+                    self.prefill_rungs.sort_unstable();
+                }
+            }
+            plow_asset::bucket::BucketRole::DecodeRung(rows) => {
+                if rows > max_decode_batch {
+                    return Err(format!(
+                        "decode rung rows {rows} exceeds max_decode_batch {max_decode_batch}"
+                    ));
+                }
+                if !self.decode_rungs.contains(&rows) {
+                    self.decode_rungs.push(rows);
+                    self.decode_rungs.sort_unstable();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Lock-free / atomic thread-safe program ladder controller supporting zero-downtime hot-plugging.
+pub struct LadderController {
+    ladder: parking_lot::RwLock<std::sync::Arc<ProgramLadder>>,
+    max_decode_batch: u32,
+    max_chunk_rows: u32,
+}
+
+impl LadderController {
+    pub fn new(ladder: ProgramLadder, max_decode_batch: u32, max_chunk_rows: u32) -> Self {
+        Self {
+            ladder: parking_lot::RwLock::new(std::sync::Arc::new(ladder)),
+            max_decode_batch,
+            max_chunk_rows,
+        }
+    }
+
+    /// Read the active program ladder (fast uncontended read).
+    pub fn current(&self) -> std::sync::Arc<ProgramLadder> {
+        self.ladder.read().clone()
+    }
+
+    /// Hot-plug a bucket into the ladder atomically with zero downtime.
+    pub fn hot_plug_bucket(&self, role: plow_asset::bucket::BucketRole) -> Result<(), String> {
+        let current = self.current();
+        let mut updated = (*current).clone();
+        updated.insert_bucket(role, self.max_decode_batch, self.max_chunk_rows)?;
+        let mut lock = self.ladder.write();
+        *lock = std::sync::Arc::new(updated);
+        Ok(())
     }
 }

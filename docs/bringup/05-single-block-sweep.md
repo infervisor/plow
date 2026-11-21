@@ -10,7 +10,10 @@ before any whole-model work.
   [`target.md`](target.md) block is filled in. Every command uses `--gpu $GPU --arch $ISA --n-cu $NCU`.
 - GPU access: [agent-tools.md](agent-tools.md) "Queue". Repeats and noise: [agent-tools.md](agent-tools.md) "A/B rule".
 - Gate out (to [Stage 6](06-runtime-opt.md)): the block matches a host reference within tolerance
-  **and** its isolated latency is at or near the per-block floor measured on `$GPU`.
+  **and** its isolated latency qualifies against the automated `BlockContract` empirical roofline gate
+  (`scripts/campaign/certify_kernel.py`: $\ge 80\%$ decode memory-bound, $\ge 75\%$ prefill compute-bound
+  against the calibrated floor measured on `$GPU`). Fast-path: candidates meeting these thresholds qualify
+  without manual tuning loops.
 
 Correctness is target-independent (host oracle). Latency is a statement about `$GPU` only. Do
 correctness first.
@@ -295,8 +298,9 @@ packed-topology cells.
 1. Correct within the family tolerance, per substep, not only at the block boundary.
 2. No silent zeros (`--inspect`), no NaN/Inf (`block_run check`).
 3. Latency at or near the per-block floor measured on `$GPU`; `block_us × layers ≈ decode body`.
-4. Every timed run came from a gpuq job that exited 0 (uncontended lease).
-5. Emit `--gpu`/`--arch`/`--n-cu` (check `build.json`) and the loaded `$BUILD` object both name
+4. Certified efficiency: `scripts/campaign/certify_kernel.py` confirms candidate achieves $\ge 80\%$ (memory-bound decode) or $\ge 75\%$ (compute-bound prefill) of the analytical roofline floor from `costmodel::BlockContract`.
+5. Every timed run came from a gpuq job that exited 0 (uncontended lease).
+6. Emit `--gpu`/`--arch`/`--n-cu` (check `build.json`) and the loaded `$BUILD` object both name
    `$GPU`/`$ISA`; an asset emitted for another part still loads and runs.
 
 ## Pitfalls

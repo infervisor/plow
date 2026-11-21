@@ -19,6 +19,8 @@ pub struct GpuMemoryBudgetParams<'a> {
 pub struct GpuMemoryBudget {
     /// Minimum emergency free memory floor (typically 2-4% of total).
     pub floor_bytes: u64,
+    /// Guaranteed elastic burst headroom reserve (5% of total physical memory).
+    pub burst_reserve_bytes: u64,
     /// Usable headroom above the emergency floor (`free_bytes.saturating_sub(floor_bytes)`).
     pub usable_room_bytes: u64,
     /// Concurrency cap: bounded by `decode_max_rung` if specified, else `packet_batch`.
@@ -39,6 +41,9 @@ impl GpuMemoryBudget {
             .config
             .vmm_cache_min_free_bytes(params.total_bytes, Some(params.free_bytes))
             .unwrap_or(0);
+
+        // Tier 3: Guaranteed 5% physical pool reserve for elastic burst headroom
+        let burst_reserve_bytes = (params.total_bytes * 5) / 100;
 
         // 2. Usable headroom above the emergency floor.
         let usable_room_bytes = params.free_bytes.saturating_sub(floor_bytes);
@@ -81,12 +86,25 @@ impl GpuMemoryBudget {
 
         Self {
             floor_bytes,
+            burst_reserve_bytes,
             usable_room_bytes,
             concurrency_cap,
             ring_slot_charge: params.ring_slot_charge,
             ring_park_cap_bytes,
             ring_park_slots,
         }
+    }
+
+    /// Check whether an elastic burst slot can be safely admitted without encroaching on Tier 2 KV blocks.
+    pub fn can_admit_burst_slot(&self, active_slots: u32, burst_allocated_bytes: u64) -> bool {
+        if active_slots <= self.ring_park_slots {
+            return true;
+        }
+        if self.ring_slot_charge == 0 {
+            return active_slots < self.concurrency_cap;
+        }
+        let needed = burst_allocated_bytes.saturating_add(self.ring_slot_charge);
+        needed <= self.burst_reserve_bytes && active_slots < self.concurrency_cap
     }
 }
 

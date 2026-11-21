@@ -47,6 +47,7 @@ use packet::rope::{GenTensor, RopeScale};
 use serde_json::Value;
 
 mod checkpoint;
+pub mod consolidated;
 pub mod cost_inputs;
 pub mod gemm_policy;
 use checkpoint::{layer_scalars, validate_coverage};

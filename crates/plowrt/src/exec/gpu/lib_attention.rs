@@ -50,7 +50,7 @@ const STATS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 const PAGE: u32 = 64;
 /// Pool rows per KV head: one launch's summed kv lengths, page-rounded. A launch past it runs the
 /// native role.
-pub(super) const POOL_ROWS: u32 = 65536;
+pub(super) const POOL_ROWS: u32 = 262144;
 const POOL_PAGES: u32 = POOL_ROWS / PAGE;
 /// Requests one launch may carry (the device table is sized for it).
 const MAX_REQUESTS: usize = 256;

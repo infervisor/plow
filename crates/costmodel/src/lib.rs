@@ -6,6 +6,7 @@
 //! cost model is what keeps egg's choices and the scheduler's realizations
 //! consistent.
 
+pub mod contract;
 pub mod cost;
 pub mod dominance;
 pub mod dtype_cost;
@@ -16,6 +17,7 @@ pub mod sram;
 pub mod tile;
 pub mod unit;
 
+pub use contract::{BlockContract, BoundCategory};
 pub use cost::{handoff_costs, xunit_handoff_costs, Cycles, HandoffCosts, XunitHandoffCosts};
 pub use dtype_cost::{to_mma_dtype, CostParams};
 pub use hwspec::MmaDtype;
