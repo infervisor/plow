@@ -724,6 +724,9 @@ pub mod decode_coverage;
 /// (docs/arch/19, phases 2 and 3).
 pub mod extension;
 
+/// Modular bucket packets and manifests (`buckets.json`, `buckets/*.pkt`) — docs/arch/31.
+pub mod bucket;
+
 pub mod aux_program;
 pub mod program;
 pub mod splitk;

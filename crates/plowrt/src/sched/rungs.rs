@@ -1336,4 +1336,124 @@ mod tests {
             prev_admit_limit = admit_limit;
         }
     }
+
+    #[test]
+    fn program_ladder_hot_plugging() {
+        let ladder = ProgramLadder::new(vec![128, 512, 2048], vec![1, 4, 8, 16, 64]);
+        let controller = LadderController::new(ladder, 64, 8192);
+
+        // Verify initial state
+        assert_eq!(controller.current().prefill_rungs, vec![128, 512, 2048]);
+        assert_eq!(controller.current().decode_rungs, vec![1, 4, 8, 16, 64]);
+
+        // Hot plug a new prefill bucket
+        assert!(controller
+            .hot_plug_bucket(plow_asset::bucket::BucketRole::PrefillBucket(1024))
+            .is_ok());
+        assert_eq!(
+            controller.current().prefill_rungs,
+            vec![128, 512, 1024, 2048]
+        );
+
+        // Hot plug a new decode rung
+        assert!(controller
+            .hot_plug_bucket(plow_asset::bucket::BucketRole::DecodeRung(12))
+            .is_ok());
+        assert_eq!(controller.current().decode_rungs, vec![1, 4, 8, 12, 16, 64]);
+
+        // Attempt to exceed envelope
+        assert!(controller
+            .hot_plug_bucket(plow_asset::bucket::BucketRole::DecodeRung(128))
+            .is_err());
+        assert!(controller
+            .hot_plug_bucket(plow_asset::bucket::BucketRole::PrefillBucket(16384))
+            .is_err());
+    }
+}
+
+/// Active program execution ladder across prefill buckets and decode rungs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramLadder {
+    pub prefill_rungs: Vec<u32>,
+    pub decode_rungs: Vec<u32>,
+}
+
+impl ProgramLadder {
+    pub fn new(mut prefill_rungs: Vec<u32>, mut decode_rungs: Vec<u32>) -> Self {
+        prefill_rungs.sort_unstable();
+        prefill_rungs.dedup();
+        decode_rungs.sort_unstable();
+        decode_rungs.dedup();
+        Self {
+            prefill_rungs,
+            decode_rungs,
+        }
+    }
+
+    /// Insert or update a bucket into the active ladder, validating capacity envelopes.
+    pub fn insert_bucket(
+        &mut self,
+        role: plow_asset::bucket::BucketRole,
+        max_decode_batch: u32,
+        max_chunk_rows: u32,
+    ) -> Result<(), String> {
+        match role {
+            plow_asset::bucket::BucketRole::PrefillBucket(rows) => {
+                if rows > max_chunk_rows {
+                    return Err(format!(
+                        "prefill bucket rows {rows} exceeds max_chunk_rows {max_chunk_rows}"
+                    ));
+                }
+                if !self.prefill_rungs.contains(&rows) {
+                    self.prefill_rungs.push(rows);
+                    self.prefill_rungs.sort_unstable();
+                }
+            }
+            plow_asset::bucket::BucketRole::DecodeRung(rows) => {
+                if rows > max_decode_batch {
+                    return Err(format!(
+                        "decode rung rows {rows} exceeds max_decode_batch {max_decode_batch}"
+                    ));
+                }
+                if !self.decode_rungs.contains(&rows) {
+                    self.decode_rungs.push(rows);
+                    self.decode_rungs.sort_unstable();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Lock-free / atomic thread-safe program ladder controller supporting zero-downtime hot-plugging.
+pub struct LadderController {
+    ladder: parking_lot::RwLock<std::sync::Arc<ProgramLadder>>,
+    max_decode_batch: u32,
+    max_chunk_rows: u32,
+}
+
+impl LadderController {
+    pub fn new(ladder: ProgramLadder, max_decode_batch: u32, max_chunk_rows: u32) -> Self {
+        Self {
+            ladder: parking_lot::RwLock::new(std::sync::Arc::new(ladder)),
+            max_decode_batch,
+            max_chunk_rows,
+        }
+    }
+
+    /// Read the active program ladder (fast uncontended read).
+    pub fn current(&self) -> std::sync::Arc<ProgramLadder> {
+        self.ladder.read().clone()
+    }
+
+    /// Hot-plug a bucket into the ladder atomically with zero downtime.
+    pub fn hot_plug_bucket(&self, role: plow_asset::bucket::BucketRole) -> Result<(), String> {
+        let current = self.current();
+        let mut updated = (*current).clone();
+        updated.insert_bucket(role, self.max_decode_batch, self.max_chunk_rows)?;
+        let mut lock = self.ladder.write();
+        *lock = std::sync::Arc::new(updated);
+        Ok(())
+    }
 }

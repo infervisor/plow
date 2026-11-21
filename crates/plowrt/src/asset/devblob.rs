@@ -523,6 +523,128 @@ impl DevBlob {
         Ok(blob)
     }
 
+    /// Parse a modular bucket container (`buckets/*.pkt`, docs/arch/31).
+    ///
+    /// Returns the parsed bucket header and the single decoded executable program.
+    pub fn parse_bucket(buf: &[u8]) -> Result<(plow_asset::bucket::PlowBucketHeader, DevProg)> {
+        let hdr = plow_asset::bucket::PlowBucketHeader::from_bytes(buf)
+            .map_err(|e| RuntimeError::Device(format!("devblob: invalid bucket: {e}")))?;
+        let mut off = plow_asset::bucket::BUCKET_HEADER_SIZE;
+        let ph: BlobProgHeader = take::<BlobProgHeader>(buf, &mut off, 1, "bucket prog header")?[0];
+        let role = hdr
+            .role()
+            .unwrap_or(plow_asset::bucket::BucketRole::PrefillBucket(hdr.role_rows));
+        let prog_role = match role {
+            plow_asset::bucket::BucketRole::PrefillBucket(m) => {
+                packet::devbuild::ProgramRole::PrefillBucket { rows: m }
+            }
+            plow_asset::bucket::BucketRole::DecodeRung(b) => {
+                packet::devbuild::ProgramRole::DecodeRung { rows: b }
+            }
+            plow_asset::bucket::BucketRole::TokenBatch(b) => {
+                packet::devbuild::ProgramRole::TokenBatchBody { band: 0, rows: b }
+            }
+            plow_asset::bucket::BucketRole::SpecDraft(k) => {
+                packet::devbuild::ProgramRole::ModularBlock { rows: k }
+            }
+        };
+        let what = |s: &str| format!("bucket prog {s}");
+        let prog = DevProg {
+            t: packet::devbuild::program_rows(ph.t),
+            role: prog_role,
+            n_counter: ph.n_counter,
+            insts: take(buf, &mut off, ph.n_inst as usize, &what("insts"))?,
+            stream: take(buf, &mut off, ph.n_stream as usize, &what("stream"))?,
+            stream_ofs: take(buf, &mut off, hdr.n_cu as usize, &what("stream_ofs"))?,
+            stream_len: take(buf, &mut off, hdr.n_cu as usize, &what("stream_len"))?,
+            waits: take(buf, &mut off, ph.n_wait as usize, &what("waits"))?,
+            succs: take(buf, &mut off, ph.n_succ as usize, &what("succs"))?,
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        Ok((hdr, prog))
+    }
+
+    /// Load modular bucket programs from `buckets.json` in `dir`, validating all
+    /// fail-closed invariants against `base` (docs/arch/31).
+    pub fn load_bucket_directory(
+        dir: &Path,
+        base: &DevBlob,
+        base_hash: &[u8; 32],
+    ) -> Result<Vec<(plow_asset::bucket::PlowBucketHeader, DevProg)>> {
+        let manifest_path = dir.join("buckets.json");
+        if !manifest_path.exists() {
+            return Ok(Vec::new());
+        }
+        let manifest_src =
+            std::fs::read_to_string(&manifest_path).map_err(|source| RuntimeError::Io {
+                path: manifest_path.clone(),
+                source,
+            })?;
+        let manifest: plow_asset::bucket::BucketManifest = serde_json::from_str(&manifest_src)
+            .map_err(|e| RuntimeError::Device(format!("buckets.json parse error: {e}")))?;
+
+        let base_hash_hex = plow_asset::extension::hex(base_hash);
+        let tensor_digest_hex = plow_asset::extension::hex(&base.tensor_table_digest());
+
+        manifest
+            .validate_against_base(&base_hash_hex, &tensor_digest_hex, base.n_cu)
+            .map_err(|e| {
+                RuntimeError::Rejected(format!("bucket manifest validation failed: {e}"))
+            })?;
+
+        let mut loaded = Vec::with_capacity(manifest.buckets.len());
+        for entry in &manifest.buckets {
+            let pkt_path = dir.join(&entry.path);
+            let pkt_bytes =
+                std::fs::read(&pkt_path).map_err(|source| RuntimeError::Io {
+                    path: pkt_path.clone(),
+                    source,
+                })?;
+            let (bhdr, prog) = Self::parse_bucket(&pkt_bytes)?;
+
+            // Invariant 1: Parent base packet hash identity
+            if bhdr.base_packet_hash != *base_hash {
+                return Err(RuntimeError::Rejected(format!(
+                    "bucket {}: parent base packet hash mismatch",
+                    entry.id
+                )));
+            }
+            // Invariant 2: Tensor table digest identity
+            if bhdr.tensor_table_digest != base.tensor_table_digest() {
+                return Err(RuntimeError::Rejected(format!(
+                    "bucket {}: tensor table digest mismatch",
+                    entry.id
+                )));
+            }
+            // Invariant 3: CU count match
+            if bhdr.n_cu != base.n_cu {
+                return Err(RuntimeError::Rejected(format!(
+                    "bucket {}: CU count mismatch ({} vs base {})",
+                    entry.id, bhdr.n_cu, base.n_cu
+                )));
+            }
+
+            // Invariant 4: Check tensor handles don't exceed base.tensors.len()
+            let n_tensor = base.tensors.len();
+            for (i, inst) in prog.insts.iter().enumerate() {
+                for (slot, &t) in inst.t.iter().enumerate() {
+                    if t != packet::dev::TENSOR_NONE16 && t as usize >= n_tensor {
+                        return Err(RuntimeError::Rejected(format!(
+                            "bucket {} inst {} slot {}: tensor handle {} out of bounds (base has {})",
+                            entry.id, i, slot, t, n_tensor
+                        )));
+                    }
+                }
+            }
+
+            loaded.push((bhdr, prog));
+        }
+
+        Ok(loaded)
+    }
+
     /// PLOW_L2_PLACE guard: a placed blob requires physical-domain queue dispatch.
     pub fn check_l2_dispatch(&self, l2_dispatch_ok: bool) -> Result<()> {
         if self.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
