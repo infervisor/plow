@@ -19,7 +19,13 @@ pub struct ConsolidatedRope {
 }
 
 impl ConsolidatedRope {
-    pub fn new(head_dim: u32, rotary_fraction: f64, theta: f64, scale: RopeScale, max_ctx: u32) -> Self {
+    pub fn new(
+        head_dim: u32,
+        rotary_fraction: f64,
+        theta: f64,
+        scale: RopeScale,
+        max_ctx: u32,
+    ) -> Self {
         let rotary_dim = ((head_dim as f64) * rotary_fraction).round() as u32;
         assert!(
             rotary_dim <= head_dim && rotary_dim % 2 == 0,
@@ -59,16 +65,7 @@ impl ConsolidatedRope {
         seq_len: u32,
         deps: &[u32],
     ) -> u32 {
-        let args = RopeArgs::simple_rope(
-            out,
-            x,
-            cos,
-            sin,
-            pos,
-            seq_len,
-            heads,
-            self.head_dim,
-        );
+        let args = RopeArgs::simple_rope(out, x, cos, sin, pos, seq_len, heads, self.head_dim);
         b.emit(DevOp::HeadNormRope, cus, deps, |d| {
             args.apply(d);
         })
@@ -114,7 +111,10 @@ impl ConsolidatedRmsNorm {
         hidden: u32,
         deps: &[u32],
     ) -> u32 {
-        assert!(hidden > 0 && hidden % 8 == 0, "hidden dimension must be a multiple of 8");
+        assert!(
+            hidden > 0 && hidden % 8 == 0,
+            "hidden dimension must be a multiple of 8"
+        );
         assert!(out != TENSOR_NONE && x != TENSOR_NONE && weight != TENSOR_NONE);
 
         let args = RmsNormArgs {
@@ -187,19 +187,27 @@ impl ConsolidatedWeightLayout {
         c_row0: u32,
         deps: &[u32],
     ) -> u32 {
-        assert!(wt != TENSOR_NONE && scale != TENSOR_NONE, "GemmFp8Mx requires weight and scale");
-        assert!(k % 32 == 0, "K must be divisible by 32 for FP8 MX block scale");
+        assert!(
+            wt != TENSOR_NONE && scale != TENSOR_NONE,
+            "GemmFp8Mx requires weight and scale"
+        );
+        assert!(
+            k % 32 == 0,
+            "K must be divisible by 32 for FP8 MX block scale"
+        );
 
         let (want_wt, want_sc) = Self::fp8_mx_bytes(n, k);
         let actual_wt = b.tensor_bytes(wt);
         let actual_sc = b.tensor_bytes(scale);
         assert_eq!(
-            actual_wt, want_wt,
+            actual_wt,
+            want_wt,
             "weight tensor {:?} declared {actual_wt} bytes, want {want_wt}",
             b.tensor_name(wt)
         );
         assert_eq!(
-            actual_sc, want_sc,
+            actual_sc,
+            want_sc,
             "scale tensor {:?} declared {actual_sc} bytes, want {want_sc}",
             b.tensor_name(scale)
         );

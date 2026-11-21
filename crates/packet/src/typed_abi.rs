@@ -32,7 +32,11 @@ pub struct FlashPrefillArgs {
 
 impl FlashPrefillArgs {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.out == TENSOR_NONE || self.q == TENSOR_NONE || self.k == TENSOR_NONE || self.v == TENSOR_NONE {
+        if self.out == TENSOR_NONE
+            || self.q == TENSOR_NONE
+            || self.k == TENSOR_NONE
+            || self.v == TENSOR_NONE
+        {
             return Err("FlashPrefill requires valid out, q, k, v tensor handles");
         }
         if self.head_dim == 0 || self.head_dim % 8 != 0 {

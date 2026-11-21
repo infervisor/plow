@@ -162,6 +162,32 @@ impl KernelMeasurement {
         }
         blockers
     }
+
+    /// Check whether this measurement satisfies the empirical roofline certification threshold:
+    /// >= 80% for memory-bound ops, >= 75% for compute-bound ops.
+    pub fn contract_blockers(
+        &self,
+        contract: &kernelcaps::BlockContract,
+        gpu: &hwspec::GpuSpec,
+    ) -> Vec<String> {
+        let mut blockers = Vec::new();
+        let latency_secs = self.stats.median_ns * 1e-9;
+        let efficiency = contract.empirical_efficiency(gpu, latency_secs);
+        if !contract.satisfies_certification(gpu, latency_secs) {
+            let threshold = match contract.bound_category {
+                kernelcaps::BoundCategory::MemoryBoundHbm
+                | kernelcaps::BoundCategory::MemoryBoundL2 => 0.80,
+                kernelcaps::BoundCategory::ComputeBoundTensorCore
+                | kernelcaps::BoundCategory::ComputeBoundVectorAlu => 0.75,
+            };
+            blockers.push(format!(
+                "attained roofline efficiency {:.2}% is below the required {:.2}% certification threshold",
+                efficiency * 100.0,
+                threshold * 100.0
+            ));
+        }
+        blockers
+    }
 }
 
 /// The two gates every record kind shares: correct before fast, and never on a
@@ -376,5 +402,29 @@ mod tests {
                 "mutation {mutation}"
             );
         }
+    }
+
+    #[test]
+    fn contract_certification_gate_evaluates_efficiency() {
+        let mut record = measurement(Correctness::Pass);
+        let gpu = hwspec::registry::lookup("H100 SXM5").unwrap();
+        let contract = kernelcaps::BlockContract::new(
+            "gemv_test",
+            kernelcaps::BoundCategory::MemoryBoundHbm,
+            hwspec::MmaDtype::Bf16,
+            2 * 4096 * 4096,
+            4096 * 4096 * 2,
+        );
+
+        let t_min = contract.theoretical_min_latency_secs(gpu);
+        // Fast enough: 1.1x t_min -> ~91% efficiency >= 80%
+        record.stats.median_ns = t_min * 1.1 * 1e9;
+        assert!(record.contract_blockers(&contract, gpu).is_empty());
+
+        // Too slow: 1.5x t_min -> ~67% efficiency < 80%
+        record.stats.median_ns = t_min * 1.5 * 1e9;
+        let blockers = record.contract_blockers(&contract, gpu);
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("certification threshold"));
     }
 }
