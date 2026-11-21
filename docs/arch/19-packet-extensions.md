@@ -33,6 +33,8 @@ An extension may only **add**. It cannot edit an existing program, cannot add a 
 parent does not already declare (except host-filled pointer tables, which are derived, not data),
 and cannot change any emit knob that the parent's shared state depends on.
 
+For decomposed per-bucket standalone packet files (`buckets/*.pkt`) with separate metadata descriptors and lock-free hot-plugging, see [31 — Modular Packet Buckets & Sharded Rung Architecture](31-modular-packet-buckets.md).
+
 ## What has to change, in order
 
 ### Phase 1 — programs carry a role, and the ladders derive from roles

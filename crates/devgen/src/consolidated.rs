@@ -3,7 +3,7 @@
 //! Replaces duplicated emitter logic for RoPE tables, RMSNorm parameter packing,
 //! attention scale factor absorption, and weight layout verification.
 
-use packet::dev::{DevInst, DevOp, RESIDUAL_F32_FLAG, TENSOR_NONE};
+use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::Builder;
 use packet::rope::{GenTensor, RopeScale};
 use packet::typed_abi::{GemmFp8MxArgs, RmsNormArgs, RopeArgs};

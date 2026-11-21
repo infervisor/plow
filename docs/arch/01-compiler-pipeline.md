@@ -374,3 +374,24 @@ Applied after the main schedule, before emission:
 **Design Decision:** Greedy-per-candidate, not bulk-promote.
 
 **Rationale:** Phase 2 showed bulk promotion regresses 100% of the time — forcing full colocation trades away too much compute parallelism. Greedy gives the scheduler freedom to reject promotions that hurt.
+
+---
+
+## §9 Strongly Typed Instruction ABI & Consolidated Transforms
+
+To eliminate cross-target opcode drift and brittle architecture-specific compiler branches during model bringup:
+
+1. **Strongly Typed `InstructionBuilder` (`crates/packet/src/typed_abi.rs`):**
+   - Replaces raw byte array / pointer casting with type-safe argument constructors:
+     - `InstructionBuilder::gemm(...)`, `gemm_fp8_mx(...)`, `flash_decode(...)`, `flash_prefill(...)`
+     - `InstructionBuilder::rope(...)`, `rms_norm(...)`, `add(...)`, `mul(...)`
+   - Enforces opcode alignment, tensor index bounds, and immediate bitfield invariants at compile time.
+   - Decouples higher-level graph lowering from device-specific byte layout.
+
+2. **Consolidated Architecture Transforms (`crates/devgen/src/consolidated.rs`):**
+   - Consolidates duplicated emitter logic across Gemma, Llama, Qwen, DeepSeek, GLM, and Kimi:
+     - `pack_rms_norm`: Canonical RMSNorm weight unpacking and epsilon scaling.
+     - `pack_rope_tables`: Unified rotary embedding generation supporting Standard, Linear, Dynamic NTK, and YaRN scaling.
+     - `absorb_attn_scale`: Pre-multiplication and scaling factor folding into projection weights.
+     - `verify_weight_layout`: Verifies contiguous strides, channel alignments, and FP8 scale layouts before emission.
+   - New architectures map directly into standard block topologies without new compiler branches.
