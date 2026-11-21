@@ -137,6 +137,13 @@ pub struct ModelStatus {
     pub weights_mib: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_mib: Option<u64>,
+    /// Physical weights + activations memory currently committed in VRAM (MiB).
+    /// 0 when dormant or unloaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_weights_mib: Option<u64>,
+    /// Whether the model is hibernating in dormant state (0 MiB physical weights/KV).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_dormant: Option<bool>,
     /// Device ordinals this model is placed on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub devices: Option<Vec<u32>>,
@@ -163,6 +170,10 @@ pub struct RankStatus {
     pub active: u64,
     pub capacity: u64,
     pub load: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_weights_mib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_dormant: Option<bool>,
 }
 
 /// One device group: its ordinals, its memory, and what is resident on it.
@@ -1061,6 +1072,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
     let mut models = Vec::new();
     for slug in state.registry.slugs() {
         let residency = state.residency(&slug).as_str();
+        let is_dormant = state.residency(&slug) == crate::serve::Residency::Dormant;
         let dp = state.dp_set(&slug);
         #[allow(unused_mut)]
         let mut entry = ModelStatus {
@@ -1071,6 +1083,8 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             required_mib: None,
             weights_mib: None,
             kv_mib: None,
+            physical_weights_mib: None,
+            is_dormant: if is_dormant { Some(true) } else { None },
             devices: None,
             group: None,
             model: slug.clone(),
@@ -1079,6 +1093,20 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
                     .iter()
                     .map(|r| {
                         let c = r.cand();
+                        let r_dorm = state.residency(&r.key) == crate::serve::Residency::Dormant;
+                        #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+                        let phys = if r_dorm {
+                            Some(0)
+                        } else if state.has_gpu_engine(&r.key) {
+                            state
+                                .manager_for(&r.key)
+                                .and_then(|m| m.plan(&r.key))
+                                .map(|p| p.weights_bytes / MIB)
+                        } else {
+                            None
+                        };
+                        #[cfg(not(any(feature = "cuda", feature = "hsa", feature = "cpu")))]
+                        let phys = None;
                         RankStatus {
                             rank: r.rank,
                             key: r.key.clone(),
@@ -1091,6 +1119,8 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
                             active: c.active.into(),
                             capacity: c.capacity.into(),
                             load: crate::serve::dp::load(&c),
+                            physical_weights_mib: phys,
+                            is_dormant: if r_dorm { Some(true) } else { None },
                         }
                     })
                     .collect()
@@ -1102,6 +1132,15 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             entry.required_mib = mgr
                 .and_then(|m| m.required(&set.ranks[0].key))
                 .map(|b| b / MIB);
+            let r_dorm = state.residency(&set.ranks[0].key) == crate::serve::Residency::Dormant;
+            entry.is_dormant = if r_dorm { Some(true) } else { None };
+            if r_dorm {
+                entry.physical_weights_mib = Some(0);
+            } else if state.has_gpu_engine(&set.ranks[0].key) {
+                entry.physical_weights_mib = mgr
+                    .and_then(|m| m.plan(&set.ranks[0].key))
+                    .map(|p| p.weights_bytes / MIB);
+            }
             entry.devices = Some(set.ranks.iter().map(|r| r.ordinal).collect());
             models.push(entry);
             continue;
@@ -1112,6 +1151,11 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             if let Some(plan) = mgr.plan(&slug) {
                 entry.weights_mib = Some(plan.weights_bytes / MIB);
                 entry.kv_mib = Some(plan.kv_bytes / MIB);
+                if is_dormant {
+                    entry.physical_weights_mib = Some(0);
+                } else if state.has_gpu_engine(&slug) {
+                    entry.physical_weights_mib = Some(plan.weights_bytes / MIB);
+                }
             }
             entry.devices = Some(mgr.ordinals());
             entry.group = state.slug_group(&slug);

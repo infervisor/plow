@@ -1984,6 +1984,70 @@ pub fn spawn_bucket_demand_log(state: Arc<AppState>) {
     });
 }
 
+/// Model memory & hibernation metrics for Prometheus (`/metrics`).
+fn model_memory_metrics(out: &mut String, state: &AppState) {
+    use std::fmt::Write;
+
+    crate::obs::serving::family(
+        out,
+        "plowrt_model_is_dormant",
+        "gauge",
+        "Whether the model is hibernating in dormant state (1 = dormant, 0 = otherwise).",
+    );
+    for slug in state.registry.slugs() {
+        let is_dormant = u8::from(state.residency(&slug) == Residency::Dormant);
+        let label = crate::obs::serving::escape_label(&slug);
+        let _ = writeln!(out, "plowrt_model_is_dormant{{model=\"{label}\"}} {is_dormant}");
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    {
+        crate::obs::serving::family(
+            out,
+            "plowrt_model_physical_weights_bytes",
+            "gauge",
+            "Committed physical VRAM for weights and activations in bytes (0 when dormant or unloaded).",
+        );
+        for slug in state.registry.slugs() {
+            let label = crate::obs::serving::escape_label(&slug);
+            let bytes = if state.residency(&slug) == Residency::Dormant || !state.has_gpu_engine(&slug) {
+                0u64
+            } else {
+                state
+                    .manager_for(&slug)
+                    .and_then(|m| m.plan(&slug))
+                    .map_or(0, |p| p.weights_bytes)
+            };
+            let _ = writeln!(
+                out,
+                "plowrt_model_physical_weights_bytes{{model=\"{label}\"}} {bytes}"
+            );
+        }
+
+        crate::obs::serving::family(
+            out,
+            "plowrt_model_reserved_weights_bytes",
+            "gauge",
+            "Virtual address reservation for weights and activations in bytes (retained across hibernation).",
+        );
+        for slug in state.registry.slugs() {
+            let label = crate::obs::serving::escape_label(&slug);
+            let bytes = if state.has_gpu_engine(&slug) {
+                state
+                    .manager_for(&slug)
+                    .and_then(|m| m.plan(&slug))
+                    .map_or(0, |p| p.weights_bytes)
+            } else {
+                0u64
+            };
+            let _ = writeln!(
+                out,
+                "plowrt_model_reserved_weights_bytes{{model=\"{label}\"}} {bytes}"
+            );
+        }
+    }
+}
+
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::response::Response {
@@ -2022,6 +2086,7 @@ async fn metrics_handler(
         dp_metrics(&mut out, router, &state);
     }
     mm_metrics(&mut out, &state);
+    model_memory_metrics(&mut out, &state);
     // Prefix-cache (VMM) counters, one block per GPU-served model, read
     // through the engine-lock-free stats handles — series stay continuous
     // under sustained inference (only the pool mutex is taken, µs holds).
