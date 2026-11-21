@@ -198,7 +198,10 @@ SEED_TTS_SOURCE = "https://github.com/BytedanceSpeech/seed-tts-eval/blob/752f429
 
 
 def norm_seed_en(text):
-    from zhon.hanzi import punctuation
+    try:
+        from zhon.hanzi import punctuation
+    except ImportError:
+        punctuation = "！？｡。＂＃＄％＆＇（）＊＋，－／：；＜＝＞＠［＼］＾＿｀｛｜｝～｟｠｢｣､、〃》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟〰〾〿–—‘’‛“”„‟…‧﹏﹑﹔·"
     return text.translate(str.maketrans("", "", (punctuation + string.punctuation).replace("'", ""))).replace("  ", " ").lower()
 
 
