@@ -4163,6 +4163,170 @@ pub enum PrefillStep {
     Done(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadedTensorKind {
+    CheckpointWeight,
+    Init,
+    Generated,
+}
+
+/// Advance checkpoint prefetch cursor over up to `budget` weight tensors.
+fn prefetch_tensor_spans(
+    cur: &mut usize,
+    budget: usize,
+    tensors: &[crate::asset::devblob::DevTensor],
+    ckpt: &Checkpoint,
+    prefetch: Option<&crate::asset::checkpoint::Prefetcher>,
+    packed_prefill: Option<&plow_asset::packed_prefill::Manifest>,
+) {
+    let Some(pool) = prefetch else {
+        return;
+    };
+    let mut n = 0;
+    while *cur < tensors.len() && n < budget {
+        let td = &tensors[*cur];
+        *cur += 1;
+        if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill) {
+            continue;
+        }
+        if let Some(s) = ckpt.span(&td.name, 0, td.bytes as usize) {
+            pool.push(s);
+        }
+        n += 1;
+    }
+}
+
+/// Upload or stream a single tensor's contents (checkpoint weight, init slice, or generated
+/// RoPE/table) into the upload pipeline, waiting on slab commitment for each chunk.
+/// Returns `Ok(Some(kind))` if data was pushed to `pipe`, or `Ok(None)` if this tensor
+/// is uninitialized/scratch.
+fn upload_single_tensor(
+    td: &crate::asset::devblob::DevTensor,
+    i: usize,
+    dst_base: u64,
+    ckpt: &Checkpoint,
+    derived_weights: Option<&plow_asset::derived_weights::DerivedWeights>,
+    tp_shards: Option<(u32, u32, &crate::asset::shard::DeclaredShards)>,
+    packed_prefill: Option<&plow_asset::packed_prefill::Manifest>,
+    blob_init: &[u8],
+    gen: Option<&packet::rope::GenTensor>,
+    pipe: &mut UploadPipe,
+    mut commit: impl FnMut(u64) -> Result<()>,
+    mut prefetch_tick: impl FnMut(),
+) -> Result<Option<UploadedTensorKind>> {
+    if td.init.is_none() && is_checkpoint_tensor(i, &td.name, packed_prefill) {
+        let assembled = if td.name.starts_with(packet::names::CONCAT_PREFIX) {
+            let spec = derived_weights
+                .and_then(|d| d.get(&td.name))
+                .ok_or_else(|| {
+                    RuntimeError::Rejected(format!(
+                        "{}: no {} entry",
+                        td.name,
+                        plow_asset::derived_weights::SECTION
+                    ))
+                })?;
+            Some(ckpt.concatenated(spec, td.bytes))
+        } else {
+            ckpt.widened_f32(&td.name, td.bytes)
+        };
+        if let Some(wide) = assembled {
+            if tp_shards.is_some() {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: assembled weights are not sharded for tensor parallelism",
+                    td.name
+                )));
+            }
+            let wide = wide?;
+            for (o, chunk) in wide.chunks(STAGE).enumerate() {
+                let dst = dst_base + (o * STAGE) as u64;
+                commit(dst + chunk.len() as u64)?;
+                pipe.push(dst, chunk)?;
+            }
+            return Ok(Some(UploadedTensorKind::CheckpointWeight));
+        }
+        let missing = || RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name));
+        let src: std::borrow::Cow<[u8]> = match &tp_shards {
+            Some((r, n, decl)) => {
+                let (bytes, shape) = ckpt.tensor_ex(&td.name).ok_or_else(missing)?;
+                crate::asset::shard::slice_for_as(
+                    &td.name,
+                    decl.axis(&td.name),
+                    bytes,
+                    shape,
+                    td.bytes,
+                    *r,
+                    *n,
+                )?
+            }
+            None => std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?),
+        };
+        if src.len() as u64 != td.bytes {
+            return Err(RuntimeError::Device(format!(
+                "SIZE MISMATCH {} (want {} got {})",
+                td.name,
+                td.bytes,
+                src.len()
+            )));
+        }
+        tracing::debug!(
+            tensor = %td.name,
+            bytes = td.bytes,
+            mib = td.bytes / (1 << 20),
+            "uploading weight tensor"
+        );
+        prefetch_tick();
+        for (o, chunk) in src.chunks(STAGE).enumerate() {
+            let dst = dst_base + (o * STAGE) as u64;
+            commit(dst + chunk.len() as u64)?;
+            if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
+                // SAFETY: `chunk` borrows the checkpoint mmap (`ckpt`, whose Arc outlives pipe.finish()).
+                unsafe { pipe.push_direct(dst, chunk)? }
+            } else {
+                pipe.push(dst, chunk)?;
+            }
+        }
+        return Ok(Some(UploadedTensorKind::CheckpointWeight));
+    } else if let Some(r) = &td.init {
+        for (o, chunk) in blob_init[r.clone()].chunks(STAGE).enumerate() {
+            let dst = dst_base + (o * STAGE) as u64;
+            commit(dst + chunk.len() as u64)?;
+            if pipe.is_direct() {
+                // SAFETY: `chunk` borrows `blob.init`, which lives past pipe.finish().
+                unsafe { pipe.push_direct(dst, chunk)? }
+            } else {
+                pipe.push(dst, chunk)?;
+            }
+        }
+        return Ok(Some(UploadedTensorKind::Init));
+    } else if let Some(g) = gen {
+        let data = g.generate().ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "devblob: gen recipe for `{}` has unknown kind {}",
+                td.name, g.kind
+            ))
+        })?;
+        if data.len() as u64 != td.bytes {
+            return Err(RuntimeError::Device(format!(
+                "devblob: gen recipe for `{}` produced {} B, decl says {}",
+                td.name,
+                data.len(),
+                td.bytes
+            )));
+        }
+        for (o, chunk) in data.chunks(STAGE).enumerate() {
+            let dst = dst_base + (o * STAGE) as u64;
+            commit(dst + chunk.len() as u64)?;
+            pipe.push(dst, chunk)?;
+        }
+        tracing::debug!(
+            tensor = %td.name, bytes = td.bytes, kind = g.kind,
+            "materialised generated tensor"
+        );
+        return Ok(Some(UploadedTensorKind::Generated));
+    }
+    Ok(None)
+}
+
 impl GpuEngine {
     /// Bring the model up on the device: blob + cubin + weights + decode
     /// tables. Slow (a 12B checkpoint is ~22 GiB of H2D) — called once at
@@ -4235,6 +4399,24 @@ impl GpuEngine {
         let ckpt = Arc::new(Checkpoint::open(checkpoint_dir)?);
         let mut pipe = UploadPipe::new(&self.be, false)?;
 
+        let depth = crate::asset::checkpoint::prefetch_depth();
+        let pref_threads = crate::asset::checkpoint::prefetch_threads();
+        let prefetch = crate::asset::checkpoint::Prefetcher::start(
+            Arc::clone(&ckpt),
+            pref_threads,
+            depth,
+            None,
+        );
+        let mut pf = 0usize;
+        prefetch_tensor_spans(
+            &mut pf,
+            depth,
+            &self.blob.tensors,
+            &ckpt,
+            prefetch.as_ref(),
+            self.packed_prefill.as_ref(),
+        );
+
         let gen_by_tensor: std::collections::HashMap<u32, &packet::rope::GenTensor> =
             self.blob.gen.iter().map(|g| (g.tensor, g)).collect();
 
@@ -4246,107 +4428,37 @@ impl GpuEngine {
             _ => None,
         };
 
+        let mut slab_wait_ms = 0f64;
         for (i, td) in self.blob.tensors.iter().enumerate() {
             let mem = &self.devp[i];
             if !self._weight_slab.contains(mem.base) {
                 continue;
             }
-            if td.init.is_none()
-                && is_checkpoint_tensor(i, &td.name, self.packed_prefill.as_ref())
-            {
-                let assembled = if td.name.starts_with(packet::names::CONCAT_PREFIX) {
-                    let spec = self
-                        .derived_weights
-                        .as_ref()
-                        .and_then(|d| d.get(&td.name))
-                        .ok_or_else(|| {
-                            RuntimeError::Rejected(format!(
-                                "{}: no {} entry",
-                                td.name,
-                                plow_asset::derived_weights::SECTION
-                            ))
-                        })?;
-                    Some(ckpt.concatenated(spec, td.bytes))
-                } else {
-                    ckpt.widened_f32(&td.name, td.bytes)
-                };
-                if let Some(wide) = assembled {
-                    if tp_shards.is_some() {
-                        return Err(RuntimeError::Rejected(format!(
-                            "{}: assembled weights are not sharded for tensor parallelism",
-                            td.name
-                        )));
-                    }
-                    let wide = wide?;
-                    for (o, chunk) in wide.chunks(STAGE).enumerate() {
-                        let dst = mem.base + (o * STAGE) as u64;
-                        pipe.push(dst, chunk)?;
-                    }
-                    continue;
-                }
-                let missing = || RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name));
-                let src: std::borrow::Cow<[u8]> = match &tp_shards {
-                    Some((r, n, decl)) => {
-                        let (bytes, shape) = ckpt.tensor_ex(&td.name).ok_or_else(missing)?;
-                        crate::asset::shard::slice_for_as(
-                            &td.name,
-                            decl.axis(&td.name),
-                            bytes,
-                            shape,
-                            td.bytes,
-                            *r,
-                            *n,
-                        )?
-                    }
-                    None => {
-                        std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?)
-                    }
-                };
-                if src.len() as u64 != td.bytes {
-                    return Err(RuntimeError::Device(format!(
-                        "SIZE MISMATCH {} (want {} got {})",
-                        td.name,
-                        td.bytes,
-                        src.len()
-                    )));
-                }
-                for (o, chunk) in src.chunks(STAGE).enumerate() {
-                    let dst = mem.base + (o * STAGE) as u64;
-                    if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
-                        unsafe { pipe.push_direct(dst, chunk)? }
-                    } else {
-                        pipe.push(dst, chunk)?;
-                    }
-                }
-            } else if let Some(r) = &td.init {
-                for (o, chunk) in self.blob.init[r.clone()].chunks(STAGE).enumerate() {
-                    let dst = mem.base + (o * STAGE) as u64;
-                    if pipe.is_direct() {
-                        unsafe { pipe.push_direct(dst, chunk)? }
-                    } else {
-                        pipe.push(dst, chunk)?;
-                    }
-                }
-            } else if let Some(g) = gen_by_tensor.get(&(i as u32)) {
-                let data = g.generate().ok_or_else(|| {
-                    RuntimeError::Device(format!(
-                        "devblob: gen recipe for `{}` has unknown kind {}",
-                        td.name, g.kind
-                    ))
-                })?;
-                if data.len() as u64 != td.bytes {
-                    return Err(RuntimeError::Device(format!(
-                        "devblob: gen recipe for `{}` produced {} B, decl says {}",
-                        td.name,
-                        data.len(),
-                        td.bytes
-                    )));
-                }
-                for (o, chunk) in data.chunks(STAGE).enumerate() {
-                    let dst = mem.base + (o * STAGE) as u64;
-                    pipe.push(dst, chunk)?;
-                }
-            } else {
+            let kind = upload_single_tensor(
+                td,
+                i,
+                mem.base,
+                &ckpt,
+                self.derived_weights.as_ref(),
+                tp_shards.as_ref().map(|(r, n, decl)| (*r, *n, decl)),
+                self.packed_prefill.as_ref(),
+                &self.blob.init,
+                gen_by_tensor.get(&(i as u32)).copied(),
+                &mut pipe,
+                |end| slab_commit_wait(&self._weight_slab, end, &mut slab_wait_ms),
+                || {
+                    prefetch_tensor_spans(
+                        &mut pf,
+                        1,
+                        &self.blob.tensors,
+                        &ckpt,
+                        prefetch.as_ref(),
+                        self.packed_prefill.as_ref(),
+                    )
+                },
+            )?;
+            if kind.is_none() {
+                slab_commit_wait(&self._weight_slab, mem.base + td.bytes, &mut slab_wait_ms)?;
                 self.be.memset_d8(mem.base, 0, td.bytes as usize)?;
             }
         }
@@ -5442,30 +5554,15 @@ impl GpuEngine {
                 )
             }
         };
-        // Runs `depth` WEIGHT tensors ahead of the copy over the same list in the
-        // same order, so the cursor only moves forward and each tensor is queued
-        // exactly once. Non-weights are skipped so the depth counts reads, not
-        // table entries — most of a blob's tensors are scratch that touches no
-        // checkpoint at all. TP1 here, so the touched bytes are the whole tensor.
-        let prefetch_ahead = |cur: &mut usize, budget: usize| {
-            let Some(pool) = prefetch.as_ref() else {
-                return;
-            };
-            let mut n = 0;
-            while *cur < blob.tensors.len() && n < budget {
-                let td = &blob.tensors[*cur];
-                *cur += 1;
-                if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill_metadata.as_ref()) {
-                    continue;
-                }
-                if let Some(s) = ckpt.span(&td.name, 0, td.bytes as usize) {
-                    pool.push(s);
-                }
-                n += 1;
-            }
-        };
         let mut pf = 0usize;
-        prefetch_ahead(&mut pf, depth);
+        prefetch_tensor_spans(
+            &mut pf,
+            depth,
+            &blob.tensors,
+            &ckpt,
+            prefetch.as_ref(),
+            packed_prefill_metadata.as_ref(),
+        );
 
         let gen_by_tensor: std::collections::HashMap<u32, &packet::rope::GenTensor> =
             blob.gen.iter().map(|g| (g.tensor, g)).collect();
@@ -5560,131 +5657,46 @@ impl GpuEngine {
                         slab_commit_wait(&weight_slab, end, wait)
                     }
                 };
-                if !packet_cache
-                    && td.init.is_none()
-                    && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
-                {
-                    let assembled = if td.name.starts_with(packet::names::CONCAT_PREFIX) {
-                        let spec = derived_weights
-                            .as_ref()
-                            .and_then(|d| d.get(&td.name))
-                            .ok_or_else(|| {
-                                RuntimeError::Rejected(format!(
-                                    "{}: no {} entry",
-                                    td.name,
-                                    plow_asset::derived_weights::SECTION
-                                ))
-                            })?;
-                        Some(ckpt.concatenated(spec, td.bytes))
-                    } else {
-                        ckpt.widened_f32(&td.name, td.bytes)
-                    };
-                    if let Some(wide) = assembled {
-                        if tp_shards.is_some() {
-                            return Err(RuntimeError::Rejected(format!(
-                                "{}: assembled weights are not sharded for tensor parallelism",
-                                td.name
-                            )));
+                if !packet_cache {
+                    let uploaded = upload_single_tensor(
+                        td,
+                        i,
+                        mem.base,
+                        &ckpt,
+                        derived_weights.as_ref(),
+                        tp_shards.as_ref().map(|(r, n, decl, _)| (*r, *n, decl)),
+                        packed_prefill_metadata.as_ref(),
+                        &blob.init,
+                        gen_by_tensor.get(&(i as u32)).copied(),
+                        &mut pipe,
+                        |end| commit(end, &mut slab_wait_ms),
+                        || {
+                            prefetch_tensor_spans(
+                                &mut pf,
+                                1,
+                                &blob.tensors,
+                                &ckpt,
+                                prefetch.as_ref(),
+                                packed_prefill_metadata.as_ref(),
+                            )
+                        },
+                    )?;
+                    match uploaded {
+                        Some(UploadedTensorKind::CheckpointWeight) => {
+                            wb += td.bytes;
+                            nw += 1;
                         }
-                        let wide = wide?;
-                        for (o, chunk) in wide.chunks(STAGE).enumerate() {
-                            let dst = mem.base + (o * STAGE) as u64;
-                            commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
-                            pipe.push(dst, chunk)?;
-                        }
-                        wb += td.bytes;
-                        nw += 1;
-                        devp.push(mem);
-                        continue;
-                    }
-                    let missing = || RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name));
-                    let src: std::borrow::Cow<[u8]> = match &tp_shards {
-                        Some((r, n, decl, ..)) => {
-                            let (bytes, shape) = ckpt.tensor_ex(&td.name).ok_or_else(missing)?;
-                            crate::asset::shard::slice_for_as(
-                                &td.name,
-                                decl.axis(&td.name),
-                                bytes,
-                                shape,
-                                td.bytes,
-                                *r,
-                                *n,
-                            )?
-                        }
+                        Some(UploadedTensorKind::Init | UploadedTensorKind::Generated) => {}
                         None => {
-                            std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?)
+                            if vmm_va.is_none() && !td.name.starts_with("kv.") {
+                                commit(mem.base + td.bytes, &mut slab_wait_ms)?;
+                                let t_ms = load_prof.then(std::time::Instant::now);
+                                be.memset_d8(mem.base, 0, td.bytes as usize)?;
+                                if let (Some(t), Some(tm)) = (t_ms, load_tim.as_mut()) {
+                                    tm.memset_ms += t.elapsed().as_secs_f64() * 1e3;
+                                }
+                            }
                         }
-                    };
-                    if src.len() as u64 != td.bytes {
-                        return Err(RuntimeError::Device(format!(
-                            "SIZE MISMATCH {} (want {} got {})",
-                            td.name,
-                            td.bytes,
-                            src.len()
-                        )));
-                    }
-                    tracing::debug!(
-                        tensor = %td.name,
-                        bytes = td.bytes,
-                        mib = td.bytes / (1 << 20),
-                        "uploading weight tensor"
-                    );
-                    prefetch_ahead(&mut pf, 1);
-                    for (o, chunk) in src.chunks(STAGE).enumerate() {
-                        let dst = mem.base + (o * STAGE) as u64;
-                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
-                        if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
-                            // SAFETY: `chunk` borrows the checkpoint mmap
-                            // (`ckpt`, whose Arc outlives pipe.finish()).
-                            unsafe { pipe.push_direct(dst, chunk)? }
-                        } else {
-                            pipe.push(dst, chunk)?;
-                        }
-                    }
-                    wb += td.bytes;
-                    nw += 1;
-                } else if let Some(r) = &td.init {
-                    for (o, chunk) in blob.init[r.clone()].chunks(STAGE).enumerate() {
-                        let dst = mem.base + (o * STAGE) as u64;
-                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
-                        if pipe.is_direct() {
-                            // SAFETY: `chunk` borrows `blob.init`, which lives
-                            // past pipe.finish().
-                            unsafe { pipe.push_direct(dst, chunk)? }
-                        } else {
-                            pipe.push(dst, chunk)?;
-                        }
-                    }
-                } else if let Some(g) = gen_by_tensor.get(&(i as u32)) {
-                    let data = g.generate().ok_or_else(|| {
-                        RuntimeError::Device(format!(
-                            "devblob: gen recipe for `{}` has unknown kind {}",
-                            td.name, g.kind
-                        ))
-                    })?;
-                    if data.len() as u64 != td.bytes {
-                        return Err(RuntimeError::Device(format!(
-                            "devblob: gen recipe for `{}` produced {} B, decl says {}",
-                            td.name,
-                            data.len(),
-                            td.bytes
-                        )));
-                    }
-                    for (o, chunk) in data.chunks(STAGE).enumerate() {
-                        let dst = mem.base + (o * STAGE) as u64;
-                        commit(dst + chunk.len() as u64, &mut slab_wait_ms)?;
-                        pipe.push(dst, chunk)?;
-                    }
-                    tracing::debug!(
-                        tensor = %td.name, bytes = td.bytes, kind = g.kind,
-                        "materialised generated tensor"
-                    );
-                } else if vmm_va.is_none() && !packet_cache && !td.name.starts_with("kv.") {
-                    commit(mem.base + td.bytes, &mut slab_wait_ms)?;
-                    let t_ms = load_prof.then(std::time::Instant::now);
-                    be.memset_d8(mem.base, 0, td.bytes as usize)?;
-                    if let (Some(t), Some(tm)) = (t_ms, load_tim.as_mut()) {
-                        tm.memset_ms += t.elapsed().as_secs_f64() * 1e3;
                     }
                 }
                 devp.push(mem);

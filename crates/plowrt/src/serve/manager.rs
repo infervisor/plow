@@ -1511,6 +1511,45 @@ impl ModelManager {
         Ok(())
     }
 
+    async fn fit_and_evict(
+        &self,
+        slug: &str,
+        m: &Managed,
+        need: u64,
+        evicted: &mut Vec<(String, f64, f64)>,
+    ) -> std::result::Result<(), EnsureError> {
+        let reusable_cap = m.plan.slab_reusable();
+        loop {
+            let trimmed = self.device.pool_trim(reusable_cap);
+            if trimmed > 0 {
+                tracing::info!(
+                    trimmed_mib = trimmed >> 20,
+                    "planner: released pooled chunks the target cannot reuse"
+                );
+            }
+            let mut avail = self
+                .fit_capacity(self.device.pool_bytes())
+                .map_err(EnsureError::Load)?;
+            if !residency_contract::admits(need, avail) {
+                avail = self.reclaim_caches(need, avail).await?;
+            }
+            if residency_contract::admits(need, avail) {
+                return Ok(());
+            }
+            let Some(victim) = self.lru_victim(slug) else {
+                tracing::warn!(
+                    %slug,
+                    need_gib = gib(need),
+                    free_gib = gib(avail),
+                    "planner: capacity cannot fit — shedding"
+                );
+                return Err(EnsureError::WontFit { need, free: avail });
+            };
+            let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
+            evicted.push((victim, drain_ms, unload_ms));
+        }
+    }
+
     async fn ensure_resident_locked(
         self: &Arc<Self>,
         slug: &str,
@@ -1552,37 +1591,8 @@ impl ModelManager {
         // overhead all allocate fresh — and holding them uncredited squeezed
         // a fitting switch into WontFit (a 30 GiB victim pool credited at a
         // 24 GiB target's cap left 5.7 GiB dead).
-        let reusable_cap = m.plan.slab_reusable();
         loop {
-            loop {
-                let trimmed = self.device.pool_trim(reusable_cap);
-                if trimmed > 0 {
-                    tracing::info!(
-                        trimmed_mib = trimmed >> 20,
-                        "planner: released pooled chunks the target cannot reuse"
-                    );
-                }
-                let mut avail = self
-                    .fit_capacity(self.device.pool_bytes())
-                    .map_err(EnsureError::Load)?;
-                if !residency_contract::admits(need, avail) {
-                    avail = self.reclaim_caches(need, avail).await?;
-                }
-                if residency_contract::admits(need, avail) {
-                    break;
-                }
-                let Some(victim) = self.lru_victim(slug) else {
-                    tracing::warn!(
-                        %slug,
-                        need_gib = gib(need),
-                        free_gib = gib(avail),
-                        "planner: switch cannot fit — shedding"
-                    );
-                    return Err(EnsureError::WontFit { need, free: avail });
-                };
-                let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
-                report.evicted.push((victim, drain_ms, unload_ms));
-            }
+            self.fit_and_evict(slug, &m, need, &mut report.evicted).await?;
 
             let t0 = Instant::now();
             match self.load_model(&m).await {
@@ -1884,72 +1894,51 @@ impl ModelManager {
             .managed(slug)
             .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
         let need = sum_bytes([self.required(slug).expect("managed"), RESERVE]);
-        let reusable_cap = m.plan.slab_reusable();
+        let mut evicted = Vec::new();
         loop {
-            let trimmed = self.device.pool_trim(reusable_cap);
-            if trimmed > 0 {
-                tracing::info!(
-                    trimmed_mib = trimmed >> 20,
-                    "planner: released pooled chunks the target cannot reuse"
-                );
-            }
-            let mut avail = self
-                .fit_capacity(self.device.pool_bytes())
-                .map_err(EnsureError::Load)?;
-            if !residency_contract::admits(need, avail) {
-                avail = self.reclaim_caches(need, avail).await?;
-            }
-            if residency_contract::admits(need, avail) {
-                break;
-            }
-            let Some(victim) = self.lru_victim(slug) else {
-                tracing::warn!(
-                    %slug,
-                    need_gib = gib(need),
-                    free_gib = gib(avail),
-                    "planner: awaken cannot fit — shedding"
-                );
-                return Err(EnsureError::WontFit { need, free: avail });
-            };
-            let _ = self.evict(&victim, Stop::Graceful).await?;
-        }
+            self.fit_and_evict(slug, &m, need, &mut evicted).await?;
 
-        let t0 = Instant::now();
-        let engine = state.gpu_engine(slug).ok_or_else(|| {
-            EnsureError::Load(RuntimeError::Msg(format!("{slug} has no gpu engine")))
-        })?;
-        let engine_clone = Arc::clone(&engine);
-        let ckpt = m.ckpt.clone();
-        on_own_thread("plow-awaken", move || {
-            let mut guard = engine_clone.lock();
-            guard.awaken(&ckpt)
-        })
-        .await
-        .and_then(|r| r)
-        .map_err(EnsureError::Load)?;
+            let t0 = Instant::now();
+            let engine = state.gpu_engine(slug).ok_or_else(|| {
+                EnsureError::Load(RuntimeError::Msg(format!("{slug} has no gpu engine")))
+            })?;
+            let engine_clone = Arc::clone(&engine);
+            let ckpt = m.ckpt.clone();
+            let res = on_own_thread("plow-awaken", move || {
+                let mut guard = engine_clone.lock();
+                guard.awaken(&ckpt)
+            })
+            .await
+            .and_then(|r| r);
 
-        let cfg = state
-            .engine_config(&m.slug)
-            .unwrap_or_else(crate::config::RuntimeConfig::get);
-        if let Err(e) = self.claim_kv_reclaiming(&state, &m.slug, cfg).await {
-            tracing::warn!(slug = %m.slug, error = %e, "planner: awakened model left without KV room — unloading");
-            let _ = self.evict(&m.slug, Stop::Now).await;
-            return Err(e);
+            match res {
+                Ok(()) => {
+                    let cfg = state
+                        .engine_config(&m.slug)
+                        .unwrap_or_else(crate::config::RuntimeConfig::get);
+                    self.activate_serving(&state, slug, cfg).await?;
+                    state.set_residency(slug, crate::serve::Residency::Auto);
+                    self.touch(slug);
+                    let awaken_ms = ms(t0);
+                    tracing::info!(%slug, awaken_ms, "model awakened from warm hibernation");
+                    return Ok(AwakenReport {
+                        slug: slug.to_string(),
+                        awaken_ms,
+                    });
+                }
+                Err(e) if is_oom(&e) => {
+                    let Some(victim) = self.lru_victim(slug) else {
+                        tracing::warn!(%slug, error = %e, "planner: awaken out of memory — shedding");
+                        let free = self.free_vram().map_err(EnsureError::Load)?;
+                        return Err(EnsureError::WontFit { need, free });
+                    };
+                    tracing::warn!(%slug, %victim, error = %e, "planner: awaken out of memory — evicting");
+                    let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
+                    evicted.push((victim, drain_ms, unload_ms));
+                }
+                Err(e) => return Err(EnsureError::Load(e)),
+            }
         }
-        let bundle = state
-            .registry
-            .bundle_for(state.model_of(&m.slug), self.vendor())
-            .map_err(EnsureError::Load)?;
-        let mux = mux::spawn(m.slug.clone(), bundle, Arc::clone(&state), self.mux_cfg);
-        state.install_mux(m.slug.clone(), mux);
-        state.set_residency(slug, crate::serve::Residency::Auto);
-        self.touch(slug);
-        let awaken_ms = ms(t0);
-        tracing::info!(%slug, awaken_ms, "model awakened from warm hibernation");
-        Ok(AwakenReport {
-            slug: slug.to_string(),
-            awaken_ms,
-        })
     }
 
     /// Control-plane load: make `slug` resident now and clear any operator
@@ -2366,13 +2355,27 @@ impl ModelManager {
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(EnsureError::Load(e));
         }
-        if let Err(e) = self.claim_kv_reclaiming(&state, &m.slug, cfg).await {
-            tracing::warn!(slug = %m.slug, error = %e, "planner: loaded model left without KV room — unloading");
-            let _ = self.evict(&m.slug, Stop::Now).await;
+        self.activate_serving(&state, &m.slug, cfg).await?;
+        Ok(())
+    }
+
+    async fn activate_serving(
+        &self,
+        state: &Arc<AppState>,
+        slug: &str,
+        cfg: &'static crate::config::RuntimeConfig,
+    ) -> std::result::Result<(), EnsureError> {
+        if let Err(e) = self.claim_kv_reclaiming(state, slug, cfg).await {
+            tracing::warn!(%slug, error = %e, "planner: model left without KV room — unloading");
+            let _ = self.evict(slug, Stop::Now).await;
             return Err(e);
         }
-        let mux = mux::spawn(m.slug.clone(), bundle, Arc::clone(&state), self.mux_cfg);
-        state.install_mux(m.slug.clone(), mux);
+        let bundle = state
+            .registry
+            .bundle_for(state.model_of(slug), self.vendor())
+            .map_err(EnsureError::Load)?;
+        let mux = mux::spawn(slug.to_string(), bundle, Arc::clone(state), self.mux_cfg);
+        state.install_mux(slug.to_string(), mux);
         Ok(())
     }
 
