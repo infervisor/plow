@@ -1411,8 +1411,9 @@ impl HsaBackend {
                 }
                 None => {
                     let mut s = HsaSignal { handle: 0 };
-                    let rc =
-                        unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s) };
+                    let rc = unsafe {
+                        (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut s)
+                    };
                     self.check(rc, "hsa_signal_create (vmm spill)")?;
                     s
                 }

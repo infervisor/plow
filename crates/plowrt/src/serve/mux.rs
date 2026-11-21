@@ -1857,21 +1857,18 @@ fn spawn_scoped(
         }
     };
     let rt_cfg = crate::config::RuntimeConfig::get();
-    let nominal_rung = rt_cfg.decode_nominal_rung.or_else(|| {
-        if capacity >= 32 {
-            Some(32)
-        } else {
-            None
-        }
-    });
+    let nominal_rung =
+        rt_cfg
+            .decode_nominal_rung
+            .or_else(|| if capacity >= 32 { Some(32) } else { None });
     let elastic_rung = rt_cfg.decode_elastic_rung.or_else(|| {
-        if capacity >= 48 {
-            Some(48)
-        } else if capacity >= 40 {
-            Some(40)
-        } else {
-            None
-        }
+        rt_cfg.decode_max_rung.filter(|&m| m > 32).or_else(|| {
+            if capacity > 32 {
+                Some(capacity as u32)
+            } else {
+                None
+            }
+        })
     });
     let elastic_wait_ms = rt_cfg.decode_elastic_wait_ms as f64;
     let mut rung_controller =
@@ -3711,7 +3708,7 @@ fn admit_session(
         .and_then(|t| {
             retention
                 .table
-                .lookup(&t.session, &t.keys, pair, slots.len(), Instant::now())
+                .lookup(&t.session, &t.keys, pair, lim, Instant::now())
         })
         .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()))
         // Frame rows are not keyed by their ids: a retained sequence cannot vouch for them.
@@ -3738,7 +3735,7 @@ fn admit_session(
     // recently used retained slot below it instead, and resume only where a fresh seat would not
     // sit lower.
     let floor = retention.floor(slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1));
-    let resume = resume.filter(|r| r.slot < slots.len());
+    let resume = resume.filter(|r| r.slot < floor || slots[..r.slot].iter().all(Option::is_some));
     let mut free_slot = match resume {
         Some(r) => Some(r.slot),
         None => find_free(slots, &retention.table),
@@ -4356,9 +4353,7 @@ fn run_one_tick(
                 // drain it first, stream tokens, and re-gather. Dynamic slot transitions (join/leave)
                 // are handled within pipe_step via device-state lookahead without draining.
                 if e.pipe_busy()
-                    && (import_changes
-                        || did_prefill
-                        || !gpu_pipe_rows(&feeds, &slots))
+                    && (import_changes || did_prefill || !gpu_pipe_rows(&feeds, &slots))
                 {
                     let mut done = std::mem::take(&mut obs.host.pipe_tokens);
                     match e.pipe_drain(&mut done) {

@@ -8398,9 +8398,9 @@ impl GpuEngine {
         // without it and both engines ran out of device memory on first use.
         // Clamped to `decode_max_rung` since wider decode rungs never run past the max rung.
         if let Some(v) = engine.vmm.as_ref().filter(|v| v.prefix_kv().is_some()) {
-            let max_slots = config
-                .decode_max_rung
-                .map_or(engine.vmm_active.len(), |r| (r as usize).min(engine.vmm_active.len()));
+            let max_slots = config.decode_max_rung.map_or(engine.vmm_active.len(), |r| {
+                (r as usize).min(engine.vmm_active.len())
+            });
             for b in 0..max_slots {
                 v.ensure_rows(b, 1)?;
             }

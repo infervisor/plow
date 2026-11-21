@@ -313,16 +313,14 @@ impl RungController {
             RungReason::Hold
         };
 
-        if self.target > allowed_ceiling_idx
-            && (load.queued == 0 || self.dwell_ticks >= THROUGHPUT_DWELL_TICKS)
-        {
+        if self.target > allowed_ceiling_idx && self.dwell_ticks >= THROUGHPUT_DWELL_TICKS {
             self.target = allowed_ceiling_idx.max(self.min_seat);
             self.dwell_ticks = 0;
             self.low_load_ticks = 0;
             reason = RungReason::Throughput;
         } else if seat < demand_seat
             && seat < self.target
-            && (load.queued == 0 || self.dwell_ticks >= THROUGHPUT_DWELL_TICKS)
+            && self.dwell_ticks >= THROUGHPUT_DWELL_TICKS
         {
             self.target = seat;
             self.dwell_ticks = 0;
@@ -462,12 +460,20 @@ impl RungController {
             }
         };
         let nominal_idx = self.nominal_idx();
+        if self.nominal_seat.is_some() && demand_seat <= nominal_idx {
+            return demand_seat.max(self.min_seat);
+        }
         let demanded_capacity = if demand_seat <= nominal_idx {
             capacity(demand_seat)
         } else {
             (demanded.min(self.rungs.width(demand_seat)) as f64) * 1000.0 / demand_step_ms
         };
-        (self.min_seat..demand_seat)
+        let min_candidate = if self.nominal_seat.is_some() {
+            nominal_idx
+        } else {
+            self.min_seat
+        };
+        (min_candidate..demand_seat)
             .filter(|&rung| self.stats[rung].samples >= MIN_THROUGHPUT_SAMPLES)
             .max_by(|&a, &b| capacity(a).total_cmp(&capacity(b)))
             .filter(|&rung| {
@@ -1015,14 +1021,21 @@ mod tests {
             "burst ceiling stays open while work occupies elastic slots"
         );
 
-        // Once burst work drains to nominal (occupied <= 32) and queue is clear: contracts back to nominal 32
-        let d = c.decide(load(32, 0));
+        // Once burst work drains to nominal (occupied <= 32) and queue is clear: contracts back to nominal 32 after dwell
+        let mut contracted = false;
+        for _ in 0..THROUGHPUT_DWELL_TICKS {
+            if c.decide(load(32, 0)).reason == RungReason::Throughput {
+                contracted = true;
+                break;
+            }
+        }
+        assert!(contracted, "must contract with Throughput reason");
         assert_eq!(c.admission_limit(), 32, "contracts back to nominal 32");
-        assert_eq!(d.reason, RungReason::Throughput);
     }
 
     #[test]
-    fn partially_occupied_wide_rung_does_not_beat_fully_occupied_narrow_rung_when_throughput_is_lower() {
+    fn partially_occupied_wide_rung_does_not_beat_fully_occupied_narrow_rung_when_throughput_is_lower(
+    ) {
         let mut c = controller(&[1, 2, 4, 8, 16, 32, 64]).with_nominal_max(Some(32));
         // Observe rung 5 (32) at 18ms and rung 6 (64) at 26ms
         for _ in 0..10 {
@@ -1087,14 +1100,22 @@ mod tests {
 
         // Steady state with 32 occupied, 0 queued: must stay at nominal 32, NOT expand to 48
         let _ = c.decide(load(32, 0));
-        assert_eq!(c.admission_limit(), 32, "steady state must govern at nominal 32");
+        assert_eq!(
+            c.admission_limit(),
+            32,
+            "steady state must govern at nominal 32"
+        );
 
         // High KV pressure (kv_used = 0.90) with queued requests: burst must be INHIBITED
         let mut kv_pressured = load(32, 8);
         kv_pressured.oldest_wait_ms = 300.0;
         kv_pressured.kv_used = 0.90;
         let _ = c.decide(kv_pressured);
-        assert_eq!(c.admission_limit(), 32, "burst must be inhibited when kv_used >= 0.85");
+        assert_eq!(
+            c.admission_limit(),
+            32,
+            "burst must be inhibited when kv_used >= 0.85"
+        );
 
         // Normal KV pressure (kv_used = 0.50) with queued requests: burst stretches past nominal
         let mut burst = load(32, 8);
@@ -1103,9 +1124,46 @@ mod tests {
         let _ = c.decide(burst);
         assert!(c.admission_limit() > 32, "burst stretches past nominal 32");
 
-        // Once queue clears: contracts back to nominal 32
-        let d = c.decide(load(32, 0));
+        // Once queue clears: contracts back to nominal 32 after dwell
+        let mut contracted = false;
+        for _ in 0..THROUGHPUT_DWELL_TICKS {
+            if c.decide(load(32, 0)).reason == RungReason::Throughput {
+                contracted = true;
+                break;
+            }
+        }
+        assert!(contracted, "must contract with Throughput reason");
         assert_eq!(c.admission_limit(), 32, "contracts back to nominal 32");
-        assert_eq!(d.reason, RungReason::Throughput);
+    }
+
+    #[test]
+    fn nominal_seat_prevents_throughput_downshift_under_steady_load() {
+        let mut c = controller(&[1, 2, 4, 8, 16, 32, 64])
+            .with_nominal_max(Some(32))
+            .with_elastic_max(Some(64));
+        c.target = 5; // width 32
+
+        // Observe rung 4 (16) faster in per-token throughput than rung 5 (32):
+        // 16 rows at 8.2ms (1951 tok/s) vs 32 rows at 17.5ms (1828 tok/s)
+        for _ in 0..10 {
+            c.observe_decode(4, 8.2, NonZeroUsize::new(1).unwrap());
+            c.observe_decode(5, 17.5, NonZeroUsize::new(1).unwrap());
+        }
+
+        // Even though rung 16 has 6.7% higher token rate, nominal steady state (32)
+        // must NOT downshift to 16 when occupied extent is 32 and queued is 0!
+        for _ in 0..20 {
+            let d = c.decide(load(32, 0));
+            assert_eq!(
+                c.admission_limit(),
+                32,
+                "steady state must not throttle below nominal"
+            );
+            assert_ne!(
+                d.reason,
+                RungReason::Throughput,
+                "must not report throughput downshift"
+            );
+        }
     }
 }
