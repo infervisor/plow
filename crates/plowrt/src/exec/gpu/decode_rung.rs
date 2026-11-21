@@ -40,10 +40,18 @@ pub(super) fn effective_decode_widths(
     if widest_only {
         return vec![widest as u32].into_boxed_slice();
     }
-    let widths: Vec<u32> = narrow
+    let mut widths: Vec<u32> = narrow
         .map(|rows| rows as u32)
         .chain(std::iter::once(widest as u32))
         .collect();
+    if widest >= 32 {
+        for &finer in &[12u32, 20, 24, 40, 48] {
+            if (finer as usize) < widest && !widths.contains(&finer) {
+                widths.push(finer);
+            }
+        }
+        widths.sort_unstable();
+    }
     widths.into_boxed_slice()
 }
 

@@ -1865,8 +1865,10 @@ fn spawn_scoped(
         }
     });
     let elastic_rung = rt_cfg.decode_elastic_rung.or_else(|| {
-        if capacity > 0 {
-            Some(capacity as u32)
+        if capacity >= 48 {
+            Some(48)
+        } else if capacity >= 40 {
+            Some(40)
         } else {
             None
         }
@@ -3709,7 +3711,7 @@ fn admit_session(
         .and_then(|t| {
             retention
                 .table
-                .lookup(&t.session, &t.keys, pair, lim, Instant::now())
+                .lookup(&t.session, &t.keys, pair, slots.len(), Instant::now())
         })
         .filter(|r| slots[r.slot].is_none() && (!pair || slots[r.slot + 1].is_none()))
         // Frame rows are not keyed by their ids: a retained sequence cannot vouch for them.
@@ -3736,7 +3738,7 @@ fn admit_session(
     // recently used retained slot below it instead, and resume only where a fresh seat would not
     // sit lower.
     let floor = retention.floor(slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1));
-    let resume = resume.filter(|r| r.slot < floor || slots[..r.slot].iter().all(Option::is_some));
+    let resume = resume.filter(|r| r.slot < slots.len());
     let mut free_slot = match resume {
         Some(r) => Some(r.slot),
         None => find_free(slots, &retention.table),
