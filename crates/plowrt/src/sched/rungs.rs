@@ -284,10 +284,12 @@ impl RungController {
             .min(widest_idx)
             .max(nominal_idx);
 
-        let is_burst = load.kv_used < 0.85
-            && load.queued > 0
-            && (load.oldest_wait_ms >= self.elastic_wait_ms || load.queued >= 4);
-        let allowed_ceiling_idx = if is_burst {
+        let burst_active = load.kv_used < 0.85
+            && ((load.queued > 0
+                && (load.oldest_wait_ms >= self.elastic_wait_ms || load.queued >= 4))
+                || (self.target > nominal_idx
+                    && load.occupied_extent > self.rungs.width(nominal_idx)));
+        let allowed_ceiling_idx = if burst_active {
             elastic_idx
         } else {
             nominal_idx
@@ -298,10 +300,13 @@ impl RungController {
             .saturating_add(load.queued)
             .min(self.rungs.width(allowed_ceiling_idx));
         let demand_seat = self.rungs.covering(demanded).min(allowed_ceiling_idx);
-        let seat = self
-            .throughput_seat(demand_seat, demanded, load.queued, self.target)
-            .min(allowed_ceiling_idx)
-            .max(self.min_seat);
+        let seat = if burst_active && demand_seat > nominal_idx {
+            demand_seat
+        } else {
+            self.throughput_seat(demand_seat, demanded, load.queued, self.target)
+                .min(allowed_ceiling_idx)
+                .max(self.min_seat)
+        };
         let mut reason = if actual > self.target {
             RungReason::Occupied
         } else {
@@ -1002,8 +1007,16 @@ mod tests {
         assert_eq!(c.admission_limit(), 40, "elastic burst stretches to 40");
         assert!(d.reason == RungReason::Backlog || d.reason == RungReason::Slo);
 
-        // Once queue drains (queued == 0): naturally contracts back to nominal 32
+        // While burst work is still in flight (occupied 35 > nominal 32), burst ceiling stays active to avoid admission lock
         let d = c.decide(load(35, 0));
+        assert_eq!(
+            c.admission_limit(),
+            40,
+            "burst ceiling stays open while work occupies elastic slots"
+        );
+
+        // Once burst work drains to nominal (occupied <= 32) and queue is clear: contracts back to nominal 32
+        let d = c.decide(load(32, 0));
         assert_eq!(c.admission_limit(), 32, "contracts back to nominal 32");
         assert_eq!(d.reason, RungReason::Throughput);
     }
