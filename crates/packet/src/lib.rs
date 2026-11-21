@@ -42,6 +42,12 @@ pub mod opclass;
 pub mod rope;
 pub mod rowclass;
 pub mod slots;
+pub mod typed_abi;
+
+pub use typed_abi::{
+    FlashMergeArgs, FlashPrefillArgs, GemmArgs, GemmFp8MxArgs, InstructionBuilder, KdaScanArgs,
+    MoeRouterArgs, RmsNormArgs, RopeArgs, SwiGluArgs,
+};
 
 use core::mem::size_of;
 
