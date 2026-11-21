@@ -144,9 +144,10 @@ pub(crate) fn prompt_bytes_overflow(
     })
 }
 
-/// Prompts at least this long encode with [`tokio::task::block_in_place`]: a 64 KiB prompt already
-/// takes tens of ms, and a 64 MiB one stalled every connection on its worker, `/health` included.
-const BLOCKING_ENCODE_BYTES: usize = 64 * 1024;
+/// Prompts at least this long encode with [`tokio::task::block_in_place`]: a 4 KiB prompt (~1k tokens)
+/// already takes a millisecond or more, and stalling the Tokio worker thread starves the async reactor
+/// (TCP accepts, SSE flushes, and `/health` checks).
+const BLOCKING_ENCODE_BYTES: usize = 4 * 1024;
 
 pub(crate) fn encode_prompt(text: &str, encode: impl FnOnce(&str) -> Vec<u32>) -> Vec<u32> {
     let multi_thread = || {

@@ -1049,11 +1049,14 @@ __device__ __forceinline__ void fa_decode_rg_item(
 #define PLOW_NV_FA_RG8S_STAGES 2
 #endif
 #define FA_RG8_U(D) ((D) == 256 ? PLOW_NV_FA_RG8_U256 : PLOW_NV_FA_RG8_U)
-/* One warp's stage: U rows of K, U of V, then U k scales and U v scales. */
-#define FA_RG8S_WST(D) ((2u * (unsigned)FA_RG8_U(D) * (D) + 8u * (unsigned)FA_RG8_U(D) + 15u) / 16u * 16u)
-#define FA_RG8S_RING_OFF(D) ((PLOW_NV_WARPS * ((D) + 2u) + 31u) / 32u * 32u)
+/* One warp's stage: U rows of K, U of V (2 * U * D bytes). Row scales are uniform across the warp
+ * and read directly through L1 cache, avoiding SMEM overhead that exceeds 64 KiB.
+ * The fold scratch reuses the ring buffer after the streaming loop finishes. */
+#define FA_RG8S_WST(D) (2u * (unsigned)FA_RG8_U(D) * (D))
+#define FA_RG8S_RING_OFF(D) 0u
 #define FA_RG8S_SMEM_FLOATS(D) \
-    (PLOW_NV_FA_RG8S ? FA_RG8S_RING_OFF(D) + PLOW_NV_WARPS * PLOW_NV_FA_RG8S_STAGES * FA_RG8S_WST(D) / 4u : 0u)
+    (PLOW_NV_FA_RG8S ? (PLOW_NV_WARPS * ((D) + 2u) > (PLOW_NV_WARPS * PLOW_NV_FA_RG8S_STAGES * FA_RG8S_WST(D) / 4u) ? \
+                        PLOW_NV_WARPS * ((D) + 2u) : (PLOW_NV_WARPS * PLOW_NV_FA_RG8S_STAGES * FA_RG8S_WST(D) / 4u)) : 0u)
 __device__ __forceinline__ void fa_rg8s_cp16(unsigned dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
 }
@@ -1077,7 +1080,7 @@ __device__ __forceinline__ void fa_decode_rg8_item(
 #if PLOW_NV_FA_RG8S
     constexpr unsigned NSTG = PLOW_NV_FA_RG8S_STAGES, KB = (unsigned)U * D, WST = FA_RG8S_WST(D);
     static_assert(NSTG >= 2 && NSTG <= 8 && KB % 512u == 0 && 2u * U <= 32u, "RG8S stage shape");
-    const unsigned char* const wring = (const unsigned char*)(lds + FA_RG8S_RING_OFF(D)) + grp * NSTG * WST;
+    const unsigned char* const wring = (const unsigned char*)lds + grp * NSTG * WST;
     const unsigned wring_s = (unsigned)__cvta_generic_to_shared(wring);
     const unsigned nit = hi > lo ? (hi - lo + NGRP * U - 1u) / (NGRP * U) : 0u;
     /* One commit group per iteration (empty past the last), so wait_group<NSTG-1> retires `it`. */
@@ -1090,10 +1093,6 @@ __device__ __forceinline__ void fa_decode_rg8_item(
                 const unsigned r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
                 fa_rg8s_cp16(dst + (i * 512u >= KB ? KB : 0u) + u * D + col * 16u,
                              (i * 512u >= KB ? vb8 : kb8) + (size_t)r * D + col * 16u);
-            }
-            if (lane < 2u * U) {
-                const unsigned u = lane % U, r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
-                fa_rg8s_cp4(dst + 2u * KB + lane * 4u, (lane < (unsigned)U ? ksc : vsc) + r);
             }
         }
         fa_cp_commit();
@@ -1128,17 +1127,17 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             __syncwarp(); /* every lane has read the stage the next issue overwrites */
             issue(it + NSTG - 1u);
             fa_rg8s_wait<NSTG - 1>();
-            __syncwarp(); /* the scales were copied by other lanes */
             const unsigned char* st = wring + (it % NSTG) * WST;
 #pragma unroll
             for (int u = 0; u < U; u++) {
+                const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u) & kv_mask;
 #pragma unroll
                 for (int c = 0; c < (int)NCH; c++) {
                     k8[u][c] = *(const uint2*)(st + u * D + c * 256u + lane * 8u);
                     v8[u][c] = *(const uint2*)(st + KB + u * D + c * 256u + lane * 8u);
                 }
-                ks[u] = ((const float*)(st + 2u * KB))[u];
-                vs[u] = ((const float*)(st + 2u * KB))[U + u];
+                ks[u] = ksc[r];
+                vs[u] = vsc[r];
             }
         }
 #else
@@ -1230,6 +1229,9 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             }
         }
     }
+#if PLOW_NV_FA_RG8S
+    __syncthreads(); /* all warps finish streaming before lds is reused as fold scratch */
+#endif
     float* go = lds;              /* [NGRP][D] */
     float* gm = lds + NGRP * D;   /* [NGRP] */
     float* gl = gm + NGRP;        /* [NGRP] */

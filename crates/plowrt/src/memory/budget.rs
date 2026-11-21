@@ -47,17 +47,33 @@ impl GpuMemoryBudget {
         let concurrency_cap = params
             .config
             .decode_max_rung
+            .or(params.config.decode_elastic_rung)
+            .or(params.config.decode_nominal_rung)
             .unwrap_or(params.packet_batch)
             .min(params.packet_batch);
 
         // 4. Sliding ring park cap:
         // When ring_slot_charge == 0 (e.g. full-attention LLMs, TTS models), park cap is 0.
-        // When ring_slot_charge > 0 (Gemma hybrid), cap to concurrency_cap and at most half of usable room.
+        // When ring_slot_charge > 0 (Gemma hybrid), cap to nominal concurrency (preserving prefix cache headroom)
+        // and at most half of usable room.
+        let park_nominal = params
+            .config
+            .decode_nominal_rung
+            .unwrap_or_else(|| {
+                if params.config.decode_max_rung.is_some()
+                    || params.config.decode_elastic_rung.is_some()
+                {
+                    32.min(concurrency_cap)
+                } else {
+                    concurrency_cap
+                }
+            })
+            .min(concurrency_cap);
         let (ring_park_slots, ring_park_cap_bytes) = if params.ring_slot_charge > 0 {
             let max_slots_in_half_room = (usable_room_bytes / 2) / params.ring_slot_charge.max(1);
             let slots = max_slots_in_half_room
                 .min(params.packet_batch as u64)
-                .min(concurrency_cap as u64) as u32;
+                .min(park_nominal as u64) as u32;
             (slots, slots as u64 * params.ring_slot_charge)
         } else {
             (0, 0)

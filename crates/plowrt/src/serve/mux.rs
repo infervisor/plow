@@ -1861,10 +1861,15 @@ fn spawn_scoped(
         rt_cfg
             .decode_nominal_rung
             .or_else(|| if capacity >= 32 { Some(32) } else { None });
-    let elastic_rung =
-        rt_cfg
-            .decode_elastic_rung
-            .or_else(|| if capacity >= 40 { Some(40) } else { None });
+    let elastic_rung = rt_cfg.decode_elastic_rung.or_else(|| {
+        rt_cfg.decode_max_rung.filter(|&m| m > 32).or_else(|| {
+            if capacity > 32 {
+                Some(capacity as u32)
+            } else {
+                None
+            }
+        })
+    });
     let elastic_wait_ms = rt_cfg.decode_elastic_wait_ms as f64;
     let mut rung_controller =
         rung_widths
@@ -2151,7 +2156,7 @@ fn spawn_scoped(
                 .store(prefilling as u64, Ordering::Relaxed);
             // The budget follows device memory (other models load, grow and leave); memory
             // pressure asks the planner to evict an idle co-tenant so this model can grow.
-            #[cfg(any(feature = "cuda", feature = "hsa"))]
+            #[cfg(feature = "cuda")]
             if kv_budget.is_some() && kv_refreshed.elapsed() >= KV_BUDGET_REFRESH {
                 kv_refreshed = Instant::now();
                 let pressure = state.gpu_engine(&slug).map(|e| {
@@ -2304,12 +2309,9 @@ fn spawn_scoped(
                 .rposition(Option::is_some)
                 .map(|i| i + 1)
                 .unwrap_or(1);
-            let prefilling = slots.iter().flatten().filter(|s| s.step == 0).count();
-            // Read receiver, waiting queue, and prefilling slots for accurate admission demand snapshot.
-            let queued = rx
-                .len()
-                .saturating_add(waiting.len())
-                .saturating_add(prefilling);
+            // Read receiver and waiting queue for accurate admission demand snapshot.
+            // Prefilling slots are already counted in occupied_extent and must not be double-counted in queued.
+            let queued = rx.len().saturating_add(waiting.len());
             let kv_used = kv_used(kv_budget, &slots);
             metrics
                 .decode_occupied_extent
@@ -2364,6 +2366,7 @@ fn spawn_scoped(
                     arrival_rps: load.lambda.rate(now),
                     mean_output_tokens,
                     slo_ms: cfg.slo_ms,
+                    kv_used,
                 });
                 let admission = controller.admission_limit();
                 metrics
@@ -3529,25 +3532,34 @@ fn drain_waiting_session(
         .iter()
         .any(Option::is_none)
     {
-        if let Some(p) = probe {
+        let (job, arrived) = if let Some(p) = probe {
             if let Some(i) = cache_first(
                 heads.make_contiguous(),
                 rows.make_contiguous(),
                 p.block_rows(),
             ) {
-                let entry = waiting.remove(i).expect("in range");
-                waiting.push_front(entry);
-                let r = rows.remove(i).expect("in range");
-                rows.push_front(r);
-                let h = heads.remove(i).expect("in range");
-                heads.push_front(h);
+                rows.remove(i);
+                heads.remove(i);
                 Metrics::inc(&metrics.cache_first_admissions);
+                match waiting.remove(i) {
+                    Some(entry) => entry,
+                    None => break,
+                }
+            } else {
+                rows.pop_front();
+                heads.pop_front();
+                match waiting.pop_front() {
+                    Some(entry) => entry,
+                    None => break,
+                }
             }
-        }
-        rows.pop_front();
-        heads.pop_front();
-        let Some((job, arrived)) = waiting.pop_front() else {
-            break;
+        } else {
+            rows.pop_front();
+            heads.pop_front();
+            match waiting.pop_front() {
+                Some(entry) => entry,
+                None => break,
+            }
         };
         // A boundary restore in flight (`PrefixProbe::prefetch`): the request waits for the
         // copy here, not in the engine stream where every slot would wait with it. Bounded:
@@ -4336,14 +4348,12 @@ fn run_one_tick(
                     }
                 }
                 let import_changes = slots.iter().take(cap).flatten().any(Slot::changes_import);
-                // A pipelined decode step may still be in flight from the previous tick. Anything
-                // but its exact continuation (a prefill, a changed row set, a row the device cannot
-                // sample) completes it first, streams its tokens, and re-gathers.
+                // A pipelined decode step may still be in flight from the previous tick. Non-pipelined
+                // conditions (import changes, a prefill, or rows the device cannot sample)
+                // drain it first, stream tokens, and re-gather. Dynamic slot transitions (join/leave)
+                // are handled within pipe_step via device-state lookahead without draining.
                 if e.pipe_busy()
-                    && (import_changes
-                        || did_prefill
-                        || !e.pipe_covers(&feeds)
-                        || !gpu_pipe_rows(&feeds, &slots))
+                    && (import_changes || did_prefill || !gpu_pipe_rows(&feeds, &slots))
                 {
                     let mut done = std::mem::take(&mut obs.host.pipe_tokens);
                     match e.pipe_drain(&mut done) {
@@ -10080,14 +10090,24 @@ fn gpu_finish_token(
         } else if p.is_greedy() && !adjusted {
             argmax_tok
         } else {
-            let raw = (stats.is_some() && adjusted).then(|| logits.clone());
-            crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
-            let tok =
-                crate::text::sample::sample(&logits, &slot.gen.params, None, slot_rng01(slot));
-            if let Some(raw) = raw {
-                logits = raw;
+            thread_local! {
+                static RAW_SCRATCH: std::cell::RefCell<Vec<f32>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
             }
-            tok
+            let save_raw = stats.is_some() && adjusted;
+            RAW_SCRATCH.with_borrow_mut(|raw| {
+                if save_raw {
+                    raw.clear();
+                    raw.extend_from_slice(&logits);
+                }
+                crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
+                let tok =
+                    crate::text::sample::sample(&logits, &slot.gen.params, None, slot_rng01(slot));
+                if save_raw {
+                    std::mem::swap(&mut logits, raw);
+                }
+                tok
+            })
         };
         if let Some(stats) = stats {
             slot.lp = Some(Box::new(stats.finish(logits[tok as usize])));
@@ -10115,37 +10135,46 @@ fn seq_host_token(
     if !seq_needs_host_row(e, &s.gen.params) {
         return token;
     }
-    let p = &s.gen.params;
-    let adjusted = sampling_adjusted(p);
-    let sample = (!p.is_greedy() || adjusted) && e.host_sampling();
-    let mut logits = Vec::new();
-    if !e.logits_row(i, &mut logits) || (token as usize) >= logits.len() {
-        if sample {
-            tracing::warn!(
-                slot = i,
-                "host sampling: no logits row for this token; serving the device argmax"
-            );
-        }
-        return token;
+    let adjusted = sampling_adjusted(&s.gen.params);
+    let sample = (!s.gen.params.is_greedy() || adjusted) && e.host_sampling();
+    let logprobs_k = s.gen.params.logprobs;
+    thread_local! {
+        static LOGITS_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
     }
-    let stats = p
-        .logprobs
-        .map(|r| crate::text::logprobs::RowStats::of(&logits, r));
-    let tok = if sample {
-        let raw = (stats.is_some() && adjusted).then(|| logits.clone());
-        crate::text::sample::apply_penalties(&mut logits, &s.out_ids, &s.gen.params);
-        let tok = crate::text::sample::sample(&logits, &s.gen.params, None, slot_rng01(s));
-        if let Some(raw) = raw {
-            logits = raw;
+    LOGITS_SCRATCH.with_borrow_mut(|(logits, raw)| {
+        logits.clear();
+        if !e.logits_row(i, logits) || (token as usize) >= logits.len() {
+            if sample {
+                tracing::warn!(
+                    slot = i,
+                    "host sampling: no logits row for this token; serving the device argmax"
+                );
+            }
+            return token;
+        }
+        let stats = logprobs_k.map(|r| crate::text::logprobs::RowStats::of(logits, r));
+        let tok = if sample {
+            let save_raw = stats.is_some() && adjusted;
+            if save_raw {
+                raw.clear();
+                raw.extend_from_slice(logits);
+            }
+            let rng = slot_rng01(s);
+            crate::text::sample::apply_penalties(logits, &s.out_ids, &s.gen.params);
+            let tok = crate::text::sample::sample(logits, &s.gen.params, None, rng);
+            if save_raw {
+                std::mem::swap(logits, raw);
+            }
+            tok
+        } else {
+            token
+        };
+        if let Some(stats) = stats {
+            s.lp = Some(Box::new(stats.finish(logits[tok as usize])));
         }
         tok
-    } else {
-        token
-    };
-    if let Some(stats) = stats {
-        s.lp = Some(Box::new(stats.finish(logits[tok as usize])));
-    }
-    tok
+    })
 }
 
 #[cfg(any(feature = "hsa", feature = "cpu", feature = "cuda"))]
@@ -11146,8 +11175,20 @@ fn incremental_delta(
     last: bool,
     keep_special: bool,
 ) -> String {
-    const MAX_DETOKENIZE_WINDOW: usize = 16;
     let len = out_ids.len();
+    // Tier 1 fast path: single-token standalone UTF-8 text with no pending multi-byte sequence.
+    if len > 0 && *read == len - 1 {
+        let token = out_ids[len - 1];
+        if let Some(text) = tok.fast_token_text(token, keep_special) {
+            if !text.is_empty() && (last || !text.ends_with('\u{FFFD}')) {
+                *prefix = *read;
+                *read = len;
+                return text.to_string();
+            }
+        }
+    }
+    // Tier 2: windowed detokenize for multi-byte sequences, byte fallbacks, or partial UTF-8.
+    const MAX_DETOKENIZE_WINDOW: usize = 16;
     let safe_start = len
         .saturating_sub(MAX_DETOKENIZE_WINDOW)
         .max((*prefix).min(len));
