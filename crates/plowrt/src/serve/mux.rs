@@ -1864,7 +1864,13 @@ fn spawn_scoped(
             None
         }
     });
-    let elastic_rung = rt_cfg.decode_elastic_rung;
+    let elastic_rung = rt_cfg.decode_elastic_rung.or_else(|| {
+        if capacity > 0 {
+            Some(capacity as u32)
+        } else {
+            None
+        }
+    });
     let elastic_wait_ms = rt_cfg.decode_elastic_wait_ms as f64;
     let mut rung_controller =
         rung_widths
@@ -2304,12 +2310,9 @@ fn spawn_scoped(
                 .rposition(Option::is_some)
                 .map(|i| i + 1)
                 .unwrap_or(1);
-            let prefilling = slots.iter().flatten().filter(|s| s.step == 0).count();
-            // Read receiver, waiting queue, and prefilling slots for accurate admission demand snapshot.
-            let queued = rx
-                .len()
-                .saturating_add(waiting.len())
-                .saturating_add(prefilling);
+            // Read receiver and waiting queue for accurate admission demand snapshot.
+            // Prefilling slots are already counted in occupied_extent and must not be double-counted in queued.
+            let queued = rx.len().saturating_add(waiting.len());
             let kv_used = kv_used(kv_budget, &slots);
             metrics
                 .decode_occupied_extent
@@ -2364,6 +2367,7 @@ fn spawn_scoped(
                     arrival_rps: load.lambda.rate(now),
                     mean_output_tokens,
                     slo_ms: cfg.slo_ms,
+                    kv_used,
                 });
                 let admission = controller.admission_limit();
                 metrics
