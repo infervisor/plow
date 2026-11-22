@@ -1371,8 +1371,15 @@ impl GpuEngine {
 
     /// Copy the state tensors slot `b` still reads from its attached block (`tensor`, or every
     /// one) into the slot: whatever reads the slot's state other than the packed prefill's
-    /// gather (an unpacked chunk, a rider step, a publish) reads it there.
+    /// gather (an unpacked chunk, a rider step, a publish) reads it there, after any deferred
+    /// verify commit is replayed.
     pub(crate) fn state_materialize(&self, b: usize, tensor: Option<usize>) -> Result<()> {
+        self.recurrent_replay_flush()?;
+        self.state_materialize_attached(b, tensor)
+    }
+
+    /// [`Self::state_materialize`] without the replay (a verify replays deferred commits itself).
+    pub(crate) fn state_materialize_attached(&self, b: usize, tensor: Option<usize>) -> Result<()> {
         let Some(bs) = self.kv_blocks() else {
             return Ok(());
         };

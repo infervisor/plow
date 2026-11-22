@@ -1,0 +1,107 @@
+# Experimental, NOT qualified: NVIDIA Nemotron-3.5-Super (120B-A12B, the text tower of the
+# `nemotron_h_omni` VL checkpoint) on GB10 (DGX Spark, sm_121a, 48 SMs, LPDDR5X), 256K context,
+# native sm_120-interpreter arms only (devgen `nemotron_h`).
+#
+# Layers: 40 Mamba-2 / 8 NoPE GQA (32q / 2kv, hd128) / 40 latent NVFP4 MoE (512 experts, top-22
+# sigmoid with correction bias, routed scale 5.0, latent 1024, one shared expert), 88 total.
+# Precision route, checkpoint bytes as shipped (no re-quantization):
+#   FP8 per-tensor linears (mamba in/out, q/k/v/o, lm_head): the rank-0 weight_scale is tiled to
+#     the per-channel vector the FP8 GEMV/GEMM read (derived_weights `repeat`).
+#     decode  GemvFp8, bf16 activations (W8A16)
+#     prefill QuantFp8 (dynamic per-row e4m3) + GemmFp8 (native w8a8); the static input_scale is
+#             not used (per-row dynamic is at least as fine as the static per-tensor quant)
+#   NVFP4 experts + shared expert: W4A16 (ops 232-238, latent combine op 87), expert tensors
+#     concatenated along the expert axis at load (derived_weights concat)
+#   Mamba-2: ops 240-245 (conv + SiLU, decode SSD step, chunk-128 prefill scan continuing from the
+#     slot state, grouped gated RMSNorm), fp16 SSM state 2 MiB (decode stochastic rounding, the
+#     peer's) + conv history 60 KiB per slot and layer (recurrent_state section; 1.3 GiB at 16 slots)
+#   KV: E4M3 at unit scales (`PLOW_FP8_KV`, the backbone and the MTP drafter cache; vLLM
+#     `--kv-cache-dtype fp8`), FA2 hd128 prefill over E4M3 staging; 512 B per token and attention
+#     layer, committed per admitted row under PLOW_VMM_LIVE.
+# Gaps: the vision tower is not emitted.
+#
+#   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/nemotron-3.5-super.gb10.nvfp4.toml \
+#     --out <dir> --no-probe
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "nemotron-3.5-super"
+label = "sm121a-gb10-tp1-nvfp4"
+status = "emits"
+plow_git = "250a657510af6df6d753f4db673385737c0af41d"
+network = "nemotron_h"
+
+[target]
+vendor = "nvidia"
+isa = "sm_121a"
+sku = "GB10"
+units = 48
+num_gpus = 1
+parallel = "tp"
+max_ctx = 262144
+toolchain = "cuda-12.9-nix"
+
+[checkpoint]
+# A local copy of the hub repo whose commit was not recorded: pin `hf:` + the 40-hex revision
+# before this recipe is packed.
+source = "local:nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"
+layout = "hf-modelopt-mixed-nvfp4-fp8"
+
+[cell]
+name = "nemotron-3.5-super.gb10.nvfp4-256k"
+model = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"
+revision = "local"
+hf_dir = "{env:NEMOTRON35_CHECKPOINT}"
+gpu = "GB10"
+arch = "sm_121a"
+n_cu = 48
+max_ctx = 262144
+precision = "nvfp4"
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "nemotron-3.5-super"]
+[emit.env]
+# 32: at c8 the MTP k=3 verify launch is 8 x 4 = 32 rows.
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16,32"
+# plowc's sm_12x default (one cooperative launch per program), stated because build.json replays it.
+PLOW_UNISEG = "1"
+# FP8 projection GEMVs on the tensor cores from rung 4 (full model, GB10, ctx 1024, ms/step FFMA ->
+# TC: B=1 50.81 -> 52.81, B=2 61.00 -> 62.82, B=4 78.67 -> 69.12).
+PLOW_FP8_DECODE_TC = "4"
+# Packed prefill: the Mamba-2 chain, attention and first-token terminal per request, so concurrent
+# prompts share one launch (bit-identical per request to a launch of its own). 1536 / 2048 rungs
+# keep a ~1K-2K pack out of the 4096 bucket. Serve 32K, MTP k=3, serial -> packed: TTFT mean c2
+# 1.54 -> 1.33 s, c4 1.84 -> 1.53 s, c8 2.95 -> 2.15 s; tok/s/req c8 12.32 -> 13.58
+# (docs/bringup/results/nemotron-3.5-super-gb10/comparison.md, "Packed prefill").
+PLOW_EMIT_PACKED_PREFILL = "1"
+PLOW_PF_LADDER_APPEND = "1536,2048"
+# E4M3 KV: TTFT at parity with bf16 at 32K / 128K / 261K (cold-start matched: 261K 128.13 vs
+# 128.78 s).
+PLOW_FP8_KV = "1"
+
+# Native MTP head (language_model.mtp.*: eh_proj + BF16 NoPE attention + latent NVFP4 MoE, the
+# target's embeddings and FP8 lm_head): draft programs, span verify on the decode rungs with
+# per-row Mamba-2 snapshots (k_max = the rollback depth). vLLM peer: `mtp`, k=3.
+[spec]
+kind = "nemotron_h_mtp"
+k_max = 3
+rows = [1, 2, 4, 8, 16]
+emit = true
+serve = false
+
+[serve.env]
+PLOW_VMM_LIVE = "1"
+# GB10 is integrated: a pinned host KV tier would only move KV within the same LPDDR5X pool.
+PLOW_HOST_KVCACHE_SIZE = "0"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:NEMOTRON35_CHECKPOINT}"
+model_id = "nemotron-3.5-super"

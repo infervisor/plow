@@ -292,6 +292,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::RowRms => a_rows("i0=rows"),
         DevOp::Residual | DevOp::Sum4Bf16 => a_elem("i0=n"),
         DevOp::Glu | DevOp::GluPitched => a_elem("i0=n"),
+        DevOp::RowColScale => a_rows("i0=M"),
         DevOp::Embed => a_rows("i0=ntok, t2=ids per row"),
         DevOp::SoftCap => a_elem("i0=n"),
         DevOp::NormResidual => a_rows("i0=rows"),
@@ -576,6 +577,14 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::MoeGluMxPf => b("t5=row_token"),
         DevOp::MoeDownMxPf => b("t6=row_partidx / t7=row_gate"),
         DevOp::MoeCombinePf => a_rows("i2=T, i3=t_row0 (contiguous row band)"),
+        DevOp::MoeRouterLogitsF32 => a_rows("i0=T"),
+        DevOp::MoeRouterSigmoidTopk => a_rows("i0=T"),
+        DevOp::MoeUpNvfp4 => a_rows("i0=T; slot s reads x row s/k"),
+        DevOp::MoeDownNvfp4 => a_rows("i0=T"),
+        DevOp::MoeAlignNvfp4 => b("i0=T; builds row_token / row_partidx / row_gate maps"),
+        DevOp::MoeUpNvfp4Pf => b("t6=row_token"),
+        DevOp::MoeDownNvfp4Pf => b("t6=row_partidx / t7=row_gate"),
+        DevOp::MoeQuantNvfp4 => a_rows("i0=R"),
         DevOp::MoeCombineNormGemmaPf => a_rows("i2=T"),
 
         // ---- selection ---------------------------------------------------
@@ -644,6 +653,17 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::QwenGdnGatePrep => a_rows("i1=T"),
         DevOp::QwenGdnConvPrefill => d("t3=history[1,C,W-1] for exactly T valid tokens"),
         DevOp::QwenGdnPrefill => d("t6=state / t7=outstate [1,HV,V,K]"),
+
+        // ---- recurrent: Mamba-2 (Nemotron-H) ----------------------------
+        DevOp::Mamba2Conv => note(
+            d("i4=1: t4=history[1,C,W-1] for the real rows i2 of one sequence"),
+            "class B in decode mode (i4=0): t4=history[B,C,W-1], t5=active[B]",
+        ),
+        DevOp::Mamba2Step => b("t6=state[B,H,P,N], t7=active[B]"),
+        DevOp::Mamba2GatedNorm => a_rows("i2=rows; t4=active[B] masks decode rows"),
+        DevOp::Mamba2ChunkState => d("one sequence, chunked over i3=T rows, i2 real"),
+        DevOp::Mamba2ChunkPass => d("t2=state[1,H,P,N], serial over chunks"),
+        DevOp::Mamba2ChunkOut => d("one sequence, chunked over i3=T rows, i2 real"),
 
         // ---- recurrent: KDA (Kimi K3) -----------------------------------
         DevOp::KdaConv => d("t3=conv_state[3*H*D,W], no batch axis"),

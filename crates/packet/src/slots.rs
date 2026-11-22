@@ -122,23 +122,30 @@ const DOC: &[S] = &[
     S { op: DevOp::GemmSplitK, t: &["P", "A", "W"], i: &["M", "N", "K", "S"], f: &[], j: &[] },
     S { op: DevOp::CastF32Bf16, t: &["C", "P"], i: &["M", "N"], f: &[], j: &[] },
     S { op: DevOp::RowGather, t: &["out", "x", "rows"], i: &["S", "H", "M"], f: &[], j: &[] },
-    S { op: DevOp::QwenGdnConv, t: &["out", "x", "weight", "history", "active?"], i: &["C", "W", "B"], f: &[], j: &["", "source?"] },
-    S { op: DevOp::QwenGdnStep, t: &["out", "qkv", "a", "b", "A_log", "dt_bias", "state", "active?"], i: &["HK", "HV", "K", "V", "B", "alog_f32"], f: &["q_scale", "l2_eps"], j: &[] },
+    S { op: DevOp::QwenGdnConv, t: &["out", "x", "weight", "history", "active?", "rowslot?", "snap?"], i: &["C", "W", "B", "depth?"], f: &[], j: &["", "source?"] },
+    S { op: DevOp::QwenGdnStep, t: &["out", "qkv", "a", "b", "A_log", "dt_bias", "state", "active?"], i: &["HK", "HV", "K", "V", "B", "alog_f32", "snap?", "depth?"], f: &["q_scale", "l2_eps"], j: &["", "rowslot?"] },
     S { op: DevOp::QwenGatedNorm, t: &["out", "core", "z", "gamma", "active?"], i: &["HV", "V", "B"], f: &["eps"], j: &["", "source?"] },
     S { op: DevOp::QwenQGateSplit, t: &["Q", "gate", "packed", "active?"], i: &["H", "D", "B", "in_stride?"], f: &[], j: &[] },
     S { op: DevOp::QwenSigmoidGate, t: &["out", "x", "gate", "active?"], i: &["width", "B"], f: &[], j: &[] },
-    S { op: DevOp::QwenRmsNorm, t: &["out", "x", "gamma", "active?"], i: &["width", "B"], f: &["eps", "gamma_offset"], j: &[] },
-    S { op: DevOp::QwenHeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos?", "active?"], i: &["H", "D", "rotary", "rows", "ctx", "normalize", "prefill"], f: &["eps", "gamma_offset"], j: &["", "source?"] },
+    S { op: DevOp::QwenRmsNorm, t: &["out", "x", "gamma", "active?", "radd?"], i: &["width", "B"], f: &["eps", "gamma_offset"], j: &[] },
+    S { op: DevOp::QwenHeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos?", "active?", "rowslot?"], i: &["H", "D", "rotary", "rows", "ctx", "normalize", "prefill", "layout"], f: &["eps", "gamma_offset"], j: &["", "source?"] },
     S { op: DevOp::QwenGdnConvPrefill, t: &["out", "x", "weight", "history"], i: &["C", "W", "T"], f: &[], j: &["", "source?"] },
     S { op: DevOp::QwenGdnQkvPrep, t: &["Q", "K", "V", "packed"], i: &["HK", "HV", "K", "V", "T"], f: &["l2_eps"], j: &[] },
     S { op: DevOp::QwenGdnGatePrep, t: &["alpha", "beta", "a", "b", "A_log", "dt_bias"], i: &["HV", "T"], f: &[], j: &[] },
     S { op: DevOp::QwenGdnPrefill, t: &["core", "Q", "K", "V", "alpha", "beta", "state", "outstate"], i: &["T", "HK", "HV", "K", "V"], f: &["q_scale"], j: &[] },
+    S { op: DevOp::Mamba2Conv, t: &["out", "x", "weight", "bias?", "history", "active?", "rowslot?", "rec?"], i: &["C", "W", "rows", "T", "prefill", "depth?"], f: &[], j: &["", "source?"] },
+    S { op: DevOp::Mamba2Step, t: &["y", "xbc", "proj", "A_log", "D", "dt_bias", "state", "active?"], i: &["H", "P", "N", "G", "B", "state_bytes", "seed_word", "layer"], f: &["dt_lo", "dt_hi"], j: &["", "dt_source"] },
+    S { op: DevOp::Mamba2GatedNorm, t: &["out", "y", "z", "gamma", "active?", "in_scale?"], i: &["groups", "group", "rows", "fp8_out"], f: &["eps"], j: &["", "source?"] },
+    S { op: DevOp::Mamba2ChunkState, t: &["cstate", "xbc", "proj", "A_log", "dt_bias", "dtv", "cum"], i: &["H", "P", "R", "T", "N", "G"], f: &["dt_lo", "dt_hi"], j: &["", "dt_source"] },
+    S { op: DevOp::Mamba2ChunkPass, t: &["cstate", "cum", "state"], i: &["H", "P", "R", "T", "N", "state_bytes"], f: &[], j: &[] },
+    S { op: DevOp::Mamba2ChunkOut, t: &["y", "xbc", "cstate", "cum", "dtv", "D"], i: &["H", "P", "R", "T", "N", "G"], f: &[], j: &[] },
     S { op: DevOp::RmsNorm, t: &["out", "x", "gamma?", "xq?", "ascale?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::RowRms, t: &["rms", "x"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "pair_mode", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
     S { op: DevOp::Residual, t: &["out", "a", "b", "pre?"], i: &["n"], f: &["scale"], j: &[] },
     S { op: DevOp::Glu, t: &["out", "gate", "up"], i: &["n", "act"], f: &["alpha", "limit"], j: &[] },
     S { op: DevOp::GluPitched, t: &["out", "gu"], i: &["n", "act", "width", "in_stride", "up_col"], f: &["alpha", "limit"], j: &[] },
+    S { op: DevOp::RowColScale, t: &["out", "x", "row", "col"], i: &["M", "N"], f: &[], j: &[] },
     S { op: DevOp::Embed, t: &["out", "table", "ids"], i: &["ntok", "hidden", "pad"], f: &["scale"], j: &[] },
     S { op: DevOp::SoftCap, t: &["out", "x"], i: &["n"], f: &["cap"], j: &[] },
     S { op: DevOp::Gemm, t: &["C", "A", "B", "", "", "", "", "bias?"], i: &["M", "N", "K"], f: &[], j: &[] },
@@ -148,7 +155,7 @@ const DOC: &[S] = &[
     // f0 = eps, f1 = gamma offset. GemvGlu takes the same fold with the stream in at i4.
     S { op: DevOp::Gemv, t: &["C", "x", "W", "rms?", "gamma?", "", "", "bias?"], i: &["M", "N", "K", "norm"], f: &["eps"], j: &[] },
     S { op: DevOp::FlashPrefill, t: &["Opart", "mlpart", "Q", "K", "V", "O_final?"], i: &["n_q", "n_kv", "n_head", "n_kv_head", "q_pos0", "window", "hd", "nsplit"], f: &["scale"], j: &["kv_stride", "kv_mask"] },
-    S { op: DevOp::FlashDecode, t: &["Opart", "mlpart", "Q", "K", "V", "kv_len", "decode_slot?"], i: &["n_batch", "n_head", "n_kv_head", "kv_stride", "window", "nsplit", "hd"], f: &["scale"], j: &[] },
+    S { op: DevOp::FlashDecode, t: &["Opart", "mlpart", "Q", "K", "V", "kv_len", "decode_slot?", "kv_scale?"], i: &["n_batch", "n_head", "n_kv_head", "kv_stride", "window", "nsplit", "hd", "kv_mask"], f: &["scale"], j: &[] },
     S { op: DevOp::FlashMerge, t: &["O", "Opart", "mlpart", "sinks?"], i: &["n_batch", "n_head", "nsplit", "hd"], f: &[], j: &[] },
     S { op: DevOp::NormResidual, t: &["out", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::AddNorm, t: &["out", "resid", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
@@ -172,7 +179,7 @@ const DOC: &[S] = &[
     // resid_out/b/gamma_b/gamma_n, f0=eps f1=layer_scale. See gemv_nrn_lds in op_gemm.h.
     S { op: DevOp::GemvFp8, t: &["C", "x", "W", "resid_out?", "b?", "w_scale", "gamma_b?", "gamma_n?"], i: &["M", "N", "K", "nrn", "a_row0"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::GemvGluFp8, t: &["fu", "x", "W_gate", "gate_scale", "up_scale", "W_up"], i: &["M", "N", "K", "resid_out", "b", "act", "gamma_b", "gamma_n"], f: &["eps", "scale"], j: &["", "nrn"] },
-    S { op: DevOp::QuantFp8, t: &["xq", "x", "a_scale", "gate?", "up?"], i: &["M", "K", "act"], f: &[], j: &[] },
+    S { op: DevOp::QuantFp8, t: &["xq", "x", "a_scale", "gate?", "up?"], i: &["M", "K", "act", "", "", "scale_mode"], f: &[], j: &[] },
     S { op: DevOp::QuantFp8Block128, t: &["xq", "x", "a_scale"], i: &["M", "K"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Block128, t: &["C", "A", "W", "a_scale", "w_scale", "C1", "C2"], i: &["M", "N", "K", "MFMA", "N0", "N1", "QB_live_split"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Block128Split4, t: &["C0", "A", "W", "a_scale", "w_scale", "C1", "C2", "C3"], i: &["M", "N", "K"], f: &[], j: &[] },
@@ -183,7 +190,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MlaBmmFp8, t: &["C", "X", "W", "scale", "raw_rope?"], i: &["M", "heads", "N", "K", "copy_rope64", "x_head_stride"], f: &[], j: &[] },
     S { op: DevOp::IndexFp8Decode, t: &["score", "q", "k", "weights", "packed_cache", "pos", "kv_len", "parked"], i: &["M", "ctx"], f: &[], j: &[] },
     S { op: DevOp::IndexFp8Prefill, t: &["score?", "q?", "k", "weights?", "packed_cache", "pos", "kv_len"], i: &["T", "ctx", "append_only"], f: &[], j: &[] },
-    S { op: DevOp::GemmFp8, t: &["C", "A", "B", "a_scale", "w_scale"], i: &["M", "N", "K", "", "a_row0"], f: &[], j: &[] },
+    S { op: DevOp::GemmFp8, t: &["C", "A", "B", "a_scale", "w_scale"], i: &["M", "N", "K", "", "a_row0", "scale_mode"], f: &[], j: &[] },
     S { op: DevOp::GemmGluFp8, t: &["fu", "A", "Wg", "a_scale", "g_scale", "Wu", "u_scale"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::NormResidualNorm, t: &["out", "resid", "a", "b", "gamma_b?", "gamma_n?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::XReduce, t: &["out"], i: &["H", "n_gpu", "slot", "gate", "gslot?", "gcols?", "row_w?"], f: &[], j: &[] },
@@ -243,7 +250,7 @@ const DOC: &[S] = &[
     S { op: DevOp::MoeAlignPf, t: &["meta", "table", "row_token", "row_partidx", "row_gate"], i: &["T", "n_exp", "k"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupGluPf, t: &["fu_g", "xn2", "expert_weight_table", "expert_scale_table", "meta", "row_token"], i: &["I_moe", "H", "n_exp", "fp8", "", "act"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupDownPf, t: &["part", "fu_g", "expert_weight_table", "expert_scale_table", "meta", "", "row_partidx", "row_gate"], i: &["H", "I_moe", "n_exp", "fp8", "atom_ksh", "det_ksh"], f: &[], j: &[] },
-    S { op: DevOp::MoeCombinePf, t: &["out", "residual?", "shared?", "part"], i: &["H", "k", "T", "t_row0", "det"], f: &[], j: &[] },
+    S { op: DevOp::MoeCombinePf, t: &["out", "residual?", "shared?", "part", "table?"], i: &["H", "k", "T", "t_row0", "det", "bf16"], f: &[], j: &[] },
     S { op: DevOp::KdaConv, t: &["out", "x", "w", "conv_state"], i: &["T", "conv_dim", "W", "act"], f: &[], j: &[] },
     S { op: DevOp::KdaGate, t: &["g", "beta", "g_raw", "beta_raw", "A_log", "dt_bias"], i: &["T", "H", "D", "gate_mode"], f: &["lower_bound"], j: &[] },
     S { op: DevOp::GemvMxfp4, t: &["C", "x", "W", "S", "", "", "", "bias"], i: &["M", "N", "K"], f: &[], j: &[] },
@@ -288,6 +295,14 @@ const DOC: &[S] = &[
     S { op: DevOp::GemvF32, t: &["C", "x", "W"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::GemmF32, t: &["C", "A", "W"], i: &["M", "N", "K"], f: &[], j: &[] },
     // GPT-OSS flat MXFP4 MoE. No pointer tables: expert strides derive from i[].
+    S { op: DevOp::MoeRouterLogitsF32, t: &["logits", "x", "W"], i: &["T", "E", "H", "KS"], f: &[], j: &[] },
+    S { op: DevOp::MoeRouterSigmoidTopk, t: &["table", "logits", "bias?", "active?"], i: &["T", "E", "k", "KS", "flags"], f: &["scale"], j: &[] },
+    S { op: DevOp::MoeUpNvfp4, t: &["fu", "x", "table?", "W", "S", "gs"], i: &["T", "k", "I", "K", "E"], f: &[], j: &[] },
+    S { op: DevOp::MoeDownNvfp4, t: &["out", "fu", "table?", "W", "S", "gs"], i: &["T", "k", "H", "I", "E", "mode"], f: &[], j: &[] },
+    S { op: DevOp::MoeAlignNvfp4, t: &["meta", "table", "row_token", "row_partidx", "row_gate"], i: &["T", "E", "k"], f: &[], j: &[] },
+    S { op: DevOp::MoeUpNvfp4Pf, t: &["fu_g", "x", "meta?", "W", "S", "gs", "row_token?", "s2?"], i: &["T", "k", "I", "K", "E", "w4a4", "n2"], f: &[], j: &[] },
+    S { op: DevOp::MoeDownNvfp4Pf, t: &["out", "fu_g", "meta?", "W", "S", "gs", "row_partidx?", "row_gate?"], i: &["T", "k", "H", "I", "E", "mode", "w4a4"], f: &[], j: &[] },
+    S { op: DevOp::MoeQuantNvfp4, t: &["q", "x", "in_scale"], i: &["R", "K", "n"], f: &[], j: &[] },
     S { op: DevOp::MoeGluMx, t: &["fu", "x", "table", "W_gu", "S_gu", "bias_gu?"], i: &["k", "I", "K", "n_exp", "layout", "act", "n_batch"], f: &["alpha", "limit"], j: &[] },
     S { op: DevOp::MoeDownMx, t: &["part", "fu", "table", "W_d", "S_d", "bias_d?"], i: &["k", "H", "I", "n_exp", "", "", "n_batch"], f: &[], j: &[] },
     S { op: DevOp::MoeGluMxPf, t: &["fu_g", "xn2", "W_gu", "S_gu", "meta", "row_token", "bias_gu?"], i: &["I", "K", "n_exp", "layout", "", "act"], f: &["alpha", "limit"], j: &[] },
@@ -506,8 +521,102 @@ pub fn slots_for(op: DevOp) -> OpSlots {
     }
 }
 
+/// Where an op carries its row count: the decode rung width `B` (or token rows `T`) a decode
+/// ladder normalises, and the real rows a padded prefill launch patches. One table for both, so a
+/// family's new op is a row here rather than an arm in each consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowsImm {
+    /// `i[rows]` holds the count.
+    pub rows: usize,
+    /// The count is written 0 at one row (a spare immediate the decode emitter fills only for
+    /// B > 1: devgen's Gemma MoE `nb`).
+    pub zero_at_one: bool,
+    /// The op's padded-prefill form: `i[rows]` = the real rows, `i[bucket]` = the launch width.
+    pub bucket: Option<usize>,
+    /// `i[prefill]` != 0 marks that form on an op that also has a decode form (which carries 0 in
+    /// both `i[prefill]` and `i[bucket]`).
+    pub prefill: Option<usize>,
+}
+
+impl RowsImm {
+    const fn at(rows: usize) -> Option<Self> {
+        Some(RowsImm { rows, zero_at_one: false, bucket: None, prefill: None })
+    }
+
+    /// The op runs in a decode program (it is not a prefill-only padded op).
+    pub fn has_decode_form(&self) -> bool {
+        self.bucket.is_none() || self.prefill.is_some()
+    }
+
+    /// The instruction is in its padded-prefill form.
+    pub fn is_prefill_form(&self, i: &[u32; 8]) -> bool {
+        match (self.bucket, self.prefill) {
+            (Some(_), None) => true,
+            (Some(b), Some(f)) => i[f] != 0 || i[b] != 0,
+            (None, _) => false,
+        }
+    }
+}
+
+/// [`RowsImm`] of `op`, `None` for an op with no row count (or one not yet normalised: a decode
+/// ladder keeps its widest rung for a packet carrying it). Element-count ops (`Residual`,
+/// `Glu`, ...) and ops whose row field needs more than a rewrite (the FP8 GEMM family, the KV
+/// writers, the flash family, `Argmax`) are handled by their consumers directly.
+pub const fn rows_imm(op: DevOp) -> Option<RowsImm> {
+    use DevOp::*;
+    match op {
+        RmsNorm | RowRms | GluStrided | Gemm | GemmNorm | Gemv | GemvArgmax | GemvFp8 | GemvQkv
+        | GemvGlu | GemvGluFp8 | GemmGlu | NormResidual | NormResidualNorm | AddNorm | Embed
+        | EmbedPosBf16 | EmbedFrameBf16 | RowGather | MoeAlignGemmaPf | MoeRouterLogitsF32
+        | MoeRouterSigmoidTopk | MoeUpNvfp4 | MoeDownNvfp4 => RowsImm::at(0),
+        QwenRmsNorm | QwenSigmoidGate => RowsImm::at(1),
+        QwenGdnConv | QwenGatedNorm | QwenQGateSplit | Mamba2GatedNorm | MoeCombinePf => {
+            RowsImm::at(2)
+        }
+        QwenHeadNormRope => RowsImm::at(3),
+        QwenGdnStep | Mamba2Step | MoeRouterTopkPf => RowsImm::at(4),
+        MoeGluMx | MoeDownMx => RowsImm::at(6),
+        MoeRouterGemmaScore | MoeRouterGemmaScoreFast | MoeCombineNormGemma
+        | MoeCombineResidNormGemma => Some(RowsImm { rows: 2, zero_at_one: true, bucket: None, prefill: None }),
+        MoeRouterGemmaTopk => Some(RowsImm { rows: 3, zero_at_one: true, bucket: None, prefill: None }),
+        MoeExpertGluNormGemma | MoeExpertDownGemma | MoeExpertGluGemmaFp8
+        | MoeExpertDownGemmaFp8 => Some(RowsImm { rows: 5, zero_at_one: true, bucket: None, prefill: None }),
+        Mamba2Conv => Some(RowsImm { rows: 2, zero_at_one: false, bucket: Some(3), prefill: Some(4) }),
+        Mamba2ChunkState | Mamba2ChunkPass | Mamba2ChunkOut | QwenGdnConvPrefill => {
+            Some(RowsImm { rows: 2, zero_at_one: false, bucket: Some(3), prefill: None })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// [`rows_imm`] names the slot the op's own spec names a row count, and a spare immediate for
+    /// the zero-at-one form: a reflowed spec or a moved operand fails here, not as a silent
+    /// widest-rung fallback.
+    #[test]
+    fn rows_imm_agrees_with_the_slot_names() {
+        const ROW_NAMES: &[&str] = &["B", "rows", "T", "M", "R", "S", "n_batch", "ntok", "1"];
+        for raw in 0..crate::dev::DevOp::COUNT {
+            let Some(op) = DevOp::from_u16(raw) else { continue };
+            let Some(r) = rows_imm(op) else { continue };
+            let s = slots_for(op);
+            let name = s.i[r.rows];
+            if r.zero_at_one {
+                assert!(name.is_none(), "{op:?}: i{} is named {name:?}, not spare", r.rows);
+            } else {
+                assert!(
+                    name.is_some_and(|n| ROW_NAMES.contains(&n)),
+                    "{op:?}: i{} is {name:?}, not a row count",
+                    r.rows
+                );
+            }
+            if let Some(b) = r.bucket {
+                assert!(b != r.rows && r.prefill != Some(b), "{op:?}");
+            }
+        }
+    }
+
     use super::*;
 
     /// `dev.rs` read at compile time. Parsing the doc comments here — rather

@@ -2,8 +2,10 @@
 //!
 //! Each entry names a declared tensor (spelled `cat/...`, `packet::names::CONCAT_PREFIX`) and the
 //! checkpoint tensors whose bytes it is, back to back along axis 0 (same dtype and trailing dims),
-//! optionally widened BF16 -> F32 (`widen_f32`). The tensor name is only a label; the sources
-//! here are the contract. Packets carrying the section require `RUNTIME_CONTRACT_CONCAT`.
+//! optionally widened BF16 -> F32 (`widen_f32`), or, with `cols = [lo, hi]`, the columns
+//! `lo..hi` of one 2-D source (every row's slice back to back: a Linear weight's input-feature
+//! block), or, with `repeat = n`, one source's bytes tiled `n` times. The tensor name is only a label; the sources here are the contract. Packets carrying
+//! the section require `RUNTIME_CONTRACT_CONCAT`.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +26,12 @@ pub struct DerivedTensor {
     pub sources: Vec<String>,
     #[serde(default)]
     pub widen_f32: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<[u64; 2]>,
+    /// The one source's bytes tiled this many times (a per-tensor FP8 `weight_scale` widened to
+    /// the per-output-channel vector the FP8 GEMV/GEMM read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<u64>,
 }
 
 impl DerivedWeights {
@@ -43,6 +51,30 @@ impl DerivedWeights {
                     "{SECTION}: `{}` is not a unique cat/ tensor",
                     t.name
                 ));
+            }
+            if let Some(n) = t.repeat {
+                if t.sources.len() != 1
+                    || t.widen_f32
+                    || t.cols.is_some()
+                    || n < 2
+                    || t.sources[0].is_empty()
+                    || t.sources[0].starts_with("cat/")
+                {
+                    return Err(format!(
+                        "{SECTION}: `{}` tiles exactly one checkpoint source {n} (>= 2) times",
+                        t.name
+                    ));
+                }
+                continue;
+            }
+            if let Some([lo, hi]) = t.cols {
+                if t.sources.len() != 1 || t.widen_f32 || lo >= hi || t.sources[0].is_empty() {
+                    return Err(format!(
+                        "{SECTION}: `{}` slices columns {lo}..{hi} of exactly one source",
+                        t.name
+                    ));
+                }
+                continue;
             }
             if t.sources.len() < 2
                 || t.sources
@@ -72,6 +104,20 @@ mod tests {
         let ok =
             br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a","b"],"widen_f32":true}]}"#;
         let d = DerivedWeights::parse(ok).unwrap();
+        let rep = br#"{"version":1,"tensors":[{"name":"cat/r","sources":["s"],"repeat":4}]}"#;
+        assert_eq!(
+            DerivedWeights::parse(rep).unwrap().get("cat/r").unwrap().repeat,
+            Some(4)
+        );
+        let cols = br#"{"version":1,"tensors":[{"name":"cat/c","sources":["w"],"cols":[2,6]}]}"#;
+        assert_eq!(
+            DerivedWeights::parse(cols)
+                .unwrap()
+                .get("cat/c")
+                .unwrap()
+                .cols,
+            Some([2, 6])
+        );
         assert_eq!(d.get("cat/a").unwrap().sources, ["a", "b"]);
         assert!(d.get("cat/a").unwrap().widen_f32);
         for bad in [
@@ -82,6 +128,12 @@ mod tests {
             br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a",""]}]}"#,
             br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a","b"]},{"name":"cat/a","sources":["a","b"]}]}"#,
             br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a","b"],"axis":1}]}"#,
+            br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a","b"],"cols":[0,4]}]}"#,
+            br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a"],"cols":[4,4]}]}"#,
+            br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a"],"cols":[0,4],"widen_f32":true}]}"#,
+            br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a","b"],"repeat":4}]}"#,
+            br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a"],"repeat":1}]}"#,
+            br#"{"version":1,"tensors":[{"name":"cat/a","sources":["a"],"repeat":4,"cols":[0,2]}]}"#,
         ] {
             assert!(DerivedWeights::parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }

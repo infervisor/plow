@@ -105,6 +105,14 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | MoeDownMx
         | MoeGluMxPf
         | MoeDownMxPf
+        | MoeRouterLogitsF32
+        | MoeRouterSigmoidTopk
+        | MoeUpNvfp4
+        | MoeDownNvfp4
+        | MoeAlignNvfp4
+        | MoeUpNvfp4Pf
+        | MoeDownNvfp4Pf
+        | MoeQuantNvfp4
         | MoeGluFp8Block128
         | MoeQuantFp8Block128
         | MoeDownFp8Block128 => &["moe"],
@@ -150,7 +158,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | GemvAffineQ4 => &["gemv"],
 
         RmsNorm | RowRms | NormResidual | AddNorm | NormResidualNorm | LayerNorm | QwenRmsNorm
-        | QwenGatedNorm | KdaGatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32 | ReduceRowsF32
+        | QwenGatedNorm | KdaGatedNorm | Mamba2GatedNorm | LayerNormF32 | RowStatsF32 | RmsNormF32 | ReduceRowsF32
         | TrimSilenceF32 | MuseRmsNorm | MuseNormGateNorm
         // Engram's gate is two RMS reductions over `hidden` driving a gated residual add, so
         // its cost and its knob scope are a norm's, not the hc machinery's -- it mixes INTO the
@@ -177,6 +185,11 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         | QwenGdnQkvPrep
         | QwenGdnGatePrep
         | QwenGdnPrefill
+        | Mamba2Conv
+        | Mamba2Step
+        | Mamba2ChunkState
+        | Mamba2ChunkPass
+        | Mamba2ChunkOut
         | HyperConnPre
         | HyperConnPost
         | CausalDepthwiseConv1dF32
@@ -189,7 +202,7 @@ pub fn op_classes(op: DevOp) -> &'static [&'static str] {
         // Engram's table read is a gather-and-dequantize, the same shape of work as `Embed`
         // and `RowGather` -- no reduction, no coupling between rows.
         EngramEmbed
-        | Nop | Residual | Sum4Bf16 | Glu | GluPitched | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32
+        | Nop | Residual | Sum4Bf16 | Glu | GluPitched | RowColScale | Embed | SoftCap | QuantFp8 | SituGlu | ZeroF32
         | CastF32Bf16 | PerLayerInput | GluStrided | ScaledAddF32 | GluF32 | SiluF32 | ReluF32
         | BroadcastAddF32 | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16 | EmbedFrameBf16 | SampleFishBf16 | GemvF32Out | SampleSmallF32 | PackNcfwRowsF32
         | QuantFp8Block128 | GatherRowsF32 | CopyColsF32 | UnaryF32 | BinaryF32 | RandF32

@@ -190,6 +190,10 @@
         # Classic single-prefix layout: bin/nvcc, bin/cuobjdump, include/ — the
         # shape the scripts' `$(dirname $NVCC)` discovery expects.
         cudatoolkit = cuda.cudatoolkit;
+        # cuBLASLt 13 (CUDA 13.x libcublas) for the aarch64 CUDA shell: plowrt dlopens
+        # libcublasLt.so.13 before .so.12, and on GB10 (sm_121a) 13.x runs the scalar-scale FP8
+        # prefill GEMMs at up to ~200 TF where 12.9 reaches 120-196.
+        cublasLt13 = pkgs.cudaPackages_13.libcublas;
         # The PATH the scripts' `env -i` nvcc calls run under (PLOW_NVCC_PATH in
         # runtime/cmake/nvcc_cubin.sh and scripts/build_sm90a_cubin.sh): the nix
         # sandbox has no /usr/bin, so nvcc's host compiler must come from here.
@@ -581,9 +585,10 @@
         let
           pkgs = pkgsFor system;
           gpu = gpuToolsFor pkgs;
-          # nixpkgs' ROCm stack is x86_64-linux-only; the GPU dev wiring goes
-          # with it. aarch64-linux gets the plain Rust/CMake shell.
+          # The ROCm SDK tarball is x86_64-linux-only; CUDA also builds for
+          # aarch64-linux (sbsa: GB10 / DGX Spark, sm_121a).
           isGpuHost = system == "x86_64-linux";
+          hasCuda = isGpuHost || system == "aarch64-linux";
         in
         {
           # Hosted CI needs the pinned host tools, not the multi-GB GPU SDKs.
@@ -650,6 +655,8 @@
               pkgs.libdrm
               pkgs.numactl
               pkgs.zlib
+            ] ++ pkgs.lib.optionals (hasCuda && !isGpuHost) [
+              gpu.cudatoolkit
             ];
             shellHook = ''
               echo "plow dev shell — $(cargo --version)"
@@ -706,6 +713,18 @@
               if [ -e /dev/kfd ]; then
                 echo "amd gpu: $(ls /dev/dri/renderD* 2>/dev/null | wc -l) render node(s), ROCm ${rocmVersion} (nix)"
               fi
+            '' + pkgs.lib.optionalString (hasCuda && !isGpuHost) ''
+              # CUDA-only GPU shell (no ROCm on this platform). PLOW_NIX_GPU is
+              # the in-shell marker the tools accept in place of ROCM_PATH.
+              export PLOW_NIX_GPU=cuda
+              export CUDA_PATH=${gpu.cudatoolkit}
+              export PLOW_NVCC=${gpu.cudatoolkit}/bin/nvcc
+              export PLOW_NVCC_PATH=${gpu.nvccPath}
+              export NVCC_PREPEND_FLAGS='${gpu.nvccCcbin}'
+              export PLOW_TOOLCHAIN_LABEL=cuda-${gpu.cudatoolkit.version}-nix
+              # The runtime cuBLASLt plowrt binds (the loader's libcublasLt.so.13): the x86 lab
+              # ships 13.4 beside the binary, this shell provides nixpkgs' CUDA 13 libcublas.
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ gpu.cublasLt13 ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             '';
           };
 

@@ -7,16 +7,20 @@
 //!                              [--dump-tensors name,name --dump-dir dir]
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
+//!                              [--decode-in rows.npy]
 //!                              [--pf-chunk N] [--pf-cap ROWS] [--fixed-ctx 1]
 //!   block_run <asset-dir> decode-check [--batch B --ctx T --steps N | --batch-seq 48,1,8]
+//!                              [--in x.npy] [--rows r.npy]
 //!                              [--out y.npy] [--poison name,name]
 //!                              [--dump-tensors name,name --dump-dir dir]
 //!   block_run <asset-dir> mixed-check --rows 128 --decode 1
 //!   block_run <asset-dir> packed-check [--requests 16 --query-rows 128 --kv-base 4096]
+//!                                      [--lens 1,130,7 [--starts 0,300,0]] [--exact 1]
 //!                                      [--dump-dir dir] [--dump-tensors name,name]
 //!   block_run <asset-dir> prefill-bench --query-rows 512,2048 --prior 0,4096,16384
 //!                                      [--requests N] [--riders D --rider-ctx C]
 //!                                      [--iters 20] [--warmup 3] [--out-dir dir]
+//!                                      [--in x.npy]
 //!
 //! `check` feeds a hidden-state into `act.x` (an .npy or a seeded synthetic),
 //! launches one prefill bucket, reads `act.x` back, and prints shape / min /
@@ -35,6 +39,8 @@
 //! one-row decode requests at `--rider-ctx` riding the same packed launch. Rows land in
 //! `sweep.json` as `{"phase": "prefill", ...}` for `scripts/campaign/block_roofline.py`. Without
 //! a packed-prefill contract only one request without riders is timed (the serial chunk path).
+//! `--in` times the leading rows of a recorded hidden state instead of the synthetic one: an MoE
+//! block's expert union, and so its time, depends on the routing the rows produce.
 //!
 //! Every `sweep.json` carries `provenance`: packet and binary sha256, device, the block
 //! descriptor, the packet's static route inventory and the library-attention launch counts
@@ -251,13 +257,24 @@ mod cuda {
                 Ok(())
             }
             "decode-check" => decode_check(&mut e, hidden, &out_name, &flag),
-            "mixed-check" => mixed_check(&mut e, &desc, hidden, &out_name, &flag),
-            "packed-check" => packed_check(&mut e, &desc, hidden, &out_name, &flag),
+            "mixed-check" => mixed_check(&mut e, &desc, kv_e4m3(&asset)?, hidden, &out_name, &flag),
+            "packed-check" => packed_check(&mut e, &desc, kv_e4m3(&asset)?, hidden, &out_name, &flag),
             other => Err(format!(
                 "unknown verb {other:?} (check|bench|prefill-bench|decode-check|mixed-check|packed-check)"
             )
             .into()),
         }
+    }
+
+    /// The packet's cache writers store unit-scale E4M3 rows (`live_kv::KV_E4M3`, object-wide, no
+    /// scale tensors).
+    fn kv_e4m3(asset: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+        let raw = std::fs::read(asset.join("model.pkt"))?;
+        let blob = plowrt::asset::devblob::DevBlob::parse_l2(&raw, true)?;
+        Ok(blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
+            inst.op == packet::dev::DevOp::QwenHeadNormRope as u16
+                && inst.i[7] & plow_asset::live_kv::KV_E4M3 != 0
+        }))
     }
 
     fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -328,6 +345,24 @@ mod cuda {
         let rider_ctx_flag = flag("--rider-ctx")
             .map(|s| s.parse::<usize>())
             .transpose()?;
+        let xin = flag("--in")
+            .map(|p| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+                let (shape, data) = npy::read_f32(Path::new(&p))?;
+                if shape.len() != 2 || shape[1] != hidden {
+                    return Err(format!("--in must be [rows, {hidden}], got {shape:?}").into());
+                }
+                Ok(data)
+            })
+            .transpose()?;
+        let timed_x = |t: usize| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+            match &xin {
+                Some(x) if x.len() >= t * hidden => Ok(x[..t * hidden].to_vec()),
+                Some(x) => {
+                    Err(format!("--in has {} rows, the point needs {t}", x.len() / hidden).into())
+                }
+                None => Ok(synth(t, hidden)),
+            }
+        };
         let packed = e.pf_batch_enabled();
         if requests == 0 || requests + riders > e.batch() {
             return Err(format!(
@@ -390,7 +425,7 @@ mod cuda {
                             len: lens[slot],
                         })
                         .collect();
-                    let x = synth(total, hidden);
+                    let x = timed_x(total)?;
                     for pass in 0..warmup + iters {
                         for (slot, (p, &start)) in prompts.iter().zip(&starts).enumerate() {
                             e.begin_slot(slot, p.len() + 1)?;
@@ -426,7 +461,7 @@ mod cuda {
                                 PrefillStep::Done(_)
                             ) {}
                         }
-                        e.upload_activation("act.x", &synth(q, hidden))?;
+                        e.upload_activation("act.x", &timed_x(q)?)?;
                         let t0 = Instant::now();
                         let mut launches = 0;
                         while !matches!(
@@ -472,13 +507,29 @@ mod cuda {
     fn packed_check(
         e: &mut plowrt::exec::gpu::GpuEngine,
         desc: &plow_asset::BlockDescriptor,
+        e4m3: bool,
         hidden: usize,
         out_name: &str,
         flag: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use plowrt::exec::gpu::PfBatchReq;
 
-        let (slots, starts, rows) = if let Some(count) = flag("--requests") {
+        let list = |name: &str| -> Result<Option<Vec<usize>>, Box<dyn std::error::Error>> {
+            flag(name)
+                .map(|v| v.split(',').map(|x| x.trim().parse::<usize>()).collect::<Result<Vec<_>, _>>())
+                .transpose()
+                .map_err(|e| format!("{name}: {e}").into())
+        };
+        let (slots, starts, rows) = if let Some(lens) = list("--lens")? {
+            // Mixed lengths, each request continuing from its own prior rows (`--starts`, default
+            // 0) on its own slot.
+            let starts = list("--starts")?.unwrap_or_else(|| vec![0; lens.len()]);
+            if lens.is_empty() || lens.len() > e.batch() || starts.len() != lens.len() || lens.contains(&0) {
+                return Err("packed-check --lens needs 1..=batch non-zero lengths and matching --starts".into());
+            }
+            let slots = (0..lens.len()).map(|r| (3 + 5 * r) % e.batch()).collect::<Vec<_>>();
+            (slots, starts, lens)
+        } else if let Some(count) = flag("--requests") {
             let count: usize = count.parse()?;
             let query_rows: usize = flag("--query-rows")
                 .ok_or("packed-check --requests needs --query-rows")?
@@ -561,7 +612,8 @@ mod cuda {
         let ranges: Vec<_> = (0..slots.len())
             .map(|request| (slots[request], starts[request], rows[request]))
             .collect();
-        let reference_kv = snapshot_kv_requests(e, desc, &ranges)?;
+        let reference_kv = snapshot_kv_requests(e, desc, e4m3, &ranges)?;
+        let reference_state = snapshot_recurrent(e, desc, &slots)?;
         if let Some(dir) = flag("--dump-dir") {
             let dir = Path::new(&dir);
             std::fs::create_dir_all(dir)?;
@@ -592,7 +644,8 @@ mod cuda {
         let packed_ms = started.elapsed().as_secs_f64() * 1e3;
         let packed = e.download_activation(out_name)?;
         dump_packed_stages(e, flag, "packed")?;
-        let packed_kv = snapshot_kv_requests(e, desc, &ranges)?;
+        let packed_kv = snapshot_kv_requests(e, desc, e4m3, &ranges)?;
+        let packed_state = snapshot_recurrent(e, desc, &slots)?;
         if let Some(dir) = flag("--dump-dir") {
             let dir = Path::new(&dir);
             std::fs::create_dir_all(dir)?;
@@ -608,9 +661,41 @@ mod cuda {
             slots.len(), rows.iter().sum::<usize>(), starts[0] + rows[0]
         );
         let mut row0 = 0;
-        compare_kv(e, desc, "packed sparse-slot KV", &packed_kv, &reference_kv)?;
+        let exact = flag("--exact").is_some_and(|v| v != "0");
+        if !reference_kv.is_empty() {
+            let same = packed_kv == reference_kv;
+            println!("  packed KV bytes: {}", if same { "bit-identical" } else { "differ" });
+            if exact && !same {
+                return Err("packed KV differs from serial (--exact)".into());
+            }
+            compare_kv(e, desc, e4m3, "packed sparse-slot KV", &packed_kv, &reference_kv)?;
+        }
+        for (((name, slot, elem), got), (_, want)) in packed_state.iter().zip(&reference_state) {
+            let diff = got.iter().zip(want).filter(|(a, b)| a != b).count();
+            println!("  recurrent {name} slot {slot}: {diff} of {} bytes differ", got.len());
+            if diff != 0 {
+                if exact {
+                    return Err(format!("recurrent {name} slot {slot} differs (--exact)").into());
+                }
+                let f = |b: &[u8]| -> Vec<f32> {
+                    b.chunks_exact(2)
+                        .map(|x| {
+                            let h = u16::from_le_bytes([x[0], x[1]]);
+                            if *elem == "f16" { f16_to_f32(h) } else { f32::from_bits(u32::from(h) << 16) }
+                        })
+                        .collect()
+                };
+                compare_f32(&format!("recurrent {name} slot {slot}"), &f(got), &f(want), 6.0e-3, 7.5e-2)?;
+            }
+        }
         for (request, expected) in reference.iter().enumerate() {
             let row1 = row0 + rows[request];
+            let got = &packed[row0 * hidden..row1 * hidden];
+            let diff = got.iter().zip(expected).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            println!("  packed request {request} ({} rows): {diff} of {} elements differ", rows[request], got.len());
+            if exact && diff != 0 {
+                return Err(format!("packed request {request} differs (--exact)").into());
+            }
             compare_f32(
                 &format!("packed request {request} activation"),
                 &packed[row0 * hidden..row1 * hidden],
@@ -687,15 +772,29 @@ mod cuda {
                     .collect()
             })
             .unwrap_or_default();
+        // `--in x.npy` ([T, hidden], every slot's prompt) and `--rows r.npy` ([steps * B, hidden],
+        // the decode rows) replace the seeded synthetic inputs, for a reference comparison.
+        let read_rows = |name: &str| -> Result<Option<Vec<f32>>, Box<dyn std::error::Error>> {
+            let Some(p) = flag(name) else { return Ok(None) };
+            let (shape, data) = npy::read_f32(Path::new(&p))?;
+            if shape.len() != 2 || shape[1] != hidden {
+                return Err(format!("{name} must be [rows, {hidden}], got {shape:?}").into());
+            }
+            Ok(Some(data))
+        };
+        let xin = read_rows("--in")?.unwrap_or_else(|| synth(t, hidden));
+        let t = xin.len() / hidden;
         let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
-        let xin = synth(t, hidden);
         let mut last = vec![0u32; bsz];
+        let (x_rows, mut scratch) = (act_x_rows(e, hidden), Vec::new());
         for (b, tok) in last.iter_mut().enumerate() {
             e.begin_slot(b, t + steps + 2)?;
-            e.upload_activation("act.x", &xin)?;
-            *tok = e.prefill_slot(b, &prompt)?;
+            *tok = prefill_rows(e, b, &prompt, &xin, hidden, x_rows, out_name, &mut scratch)?.0;
         }
-        let rows = synth(steps * bsz, hidden);
+        let rows = read_rows("--rows")?.unwrap_or_else(|| synth(steps * bsz, hidden));
+        if rows.len() < steps * bsz * hidden {
+            return Err(format!("--rows needs {} rows", steps * bsz).into());
+        }
         let mut out = Vec::with_capacity(seq.iter().sum::<usize>() * hidden);
         let mut toks = Vec::new();
         for (s, &n) in seq.iter().enumerate() {
@@ -747,6 +846,7 @@ mod cuda {
     fn mixed_check(
         e: &mut plowrt::exec::gpu::GpuEngine,
         desc: &plow_asset::BlockDescriptor,
+        e4m3: bool,
         hidden: usize,
         out_name: &str,
         flag: &dyn Fn(&str) -> Option<String>,
@@ -803,6 +903,7 @@ mod cuda {
             mixed_kv.push(snapshot_kv_range(
                 e,
                 desc,
+                e4m3,
                 decode_rows,
                 span,
                 prefill_rows,
@@ -831,6 +932,7 @@ mod cuda {
             let reference_kv = snapshot_kv_range(
                 e,
                 desc,
+                e4m3,
                 decode_rows,
                 span,
                 prefill_rows,
@@ -849,6 +951,7 @@ mod cuda {
             compare_kv(
                 e,
                 desc,
+                e4m3,
                 &format!("span {span} written KV"),
                 &mixed_kv[span],
                 &reference_kv,
@@ -863,6 +966,7 @@ mod cuda {
     fn snapshot_kv_range(
         e: &plowrt::exec::gpu::GpuEngine,
         desc: &plow_asset::BlockDescriptor,
+        e4m3: bool,
         decode_rows: usize,
         decode_position: usize,
         prefill_rows: usize,
@@ -876,12 +980,13 @@ mod cuda {
                 prefill_rows,
             )))
             .collect();
-        snapshot_kv_requests(e, desc, &ranges)
+        snapshot_kv_requests(e, desc, e4m3, &ranges)
     }
 
     fn snapshot_kv_requests(
         e: &plowrt::exec::gpu::GpuEngine,
         desc: &plow_asset::BlockDescriptor,
+        e4m3: bool,
         ranges: &[(usize, usize, usize)],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let heads = usize::try_from(desc.dims.kv_heads.ok_or("block has no KV-head count")?)?;
@@ -895,7 +1000,7 @@ mod cuda {
                 let scale_name = format!("{name}_scale");
                 let fp8 = e.tensor_bytes(&scale_name).is_some();
                 let kv_row_bytes = head_dim
-                    .checked_mul(if fp8 { 1 } else { 2 })
+                    .checked_mul(if fp8 || e4m3 { 1 } else { 2 })
                     .ok_or("KV row size overflow")?;
                 for (tensor, row_bytes) in [(name.as_str(), kv_row_bytes), (&scale_name, 4)] {
                     if tensor == scale_name.as_str() && !fp8 {
@@ -935,15 +1040,48 @@ mod cuda {
                 }
             }
         }
-        if out.is_empty() {
-            return Err("block descriptor has no KV carried state".into());
+        Ok(out)
+    }
+
+    /// Every recurrent carried-state tensor's bytes at each slot, as `((name, slot, element), bytes)`.
+    #[allow(clippy::type_complexity)]
+    fn snapshot_recurrent(
+        e: &plowrt::exec::gpu::GpuEngine,
+        desc: &plow_asset::BlockDescriptor,
+        slots: &[usize],
+    ) -> Result<Vec<((String, usize, &'static str), Vec<u8>)>, Box<dyn std::error::Error>> {
+        let mut out = Vec::new();
+        for state in desc.carried_state.iter().filter(|s| s.role == "recurrent") {
+            for name in &state.tensors {
+                let bytes = e
+                    .tensor_bytes(name)
+                    .ok_or_else(|| format!("missing carried-state tensor {name:?}"))?;
+                let stride = bytes / e.batch() as u64;
+                let elem = if name.ends_with(".ssm") { "f16" } else { "bf16" };
+                for &slot in slots {
+                    let mut buf = vec![0u8; stride as usize];
+                    e.read_tensor_range(name, slot as u64 * stride, &mut buf)?;
+                    out.push(((name.clone(), slot, elem), buf));
+                }
+            }
         }
         Ok(out)
+    }
+
+    fn f16_to_f32(h: u16) -> f32 {
+        let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as u32, (h & 0x3ff) as u32);
+        let v = match exp {
+            0 => man as f32 * 2f32.powi(-24),
+            31 => if man == 0 { f32::INFINITY } else { f32::NAN },
+            _ => f32::from_bits((exp + 112) << 23 | man << 13),
+        };
+        if sign == 1 { -v } else { v }
     }
 
     fn compare_kv(
         e: &plowrt::exec::gpu::GpuEngine,
         desc: &plow_asset::BlockDescriptor,
+        e4m3: bool,
         what: &str,
         got: &[u8],
         reference: &[u8],
@@ -961,6 +1099,34 @@ mod cuda {
             }
             println!("  {what}: {} FP8 KV and scale bytes exact", got.len());
             Ok(())
+        } else if e4m3 {
+            if got.len() != reference.len() {
+                return Err(format!("{what}: length {} != {}", got.len(), reference.len()).into());
+            }
+            // A row whose bf16 source differs within the activation tolerance (another GEMM arm
+            // for the request's own bucket) may round to the neighbouring E4M3 code: allow one
+            // code step of the same sign, and bound the decoded rel-L2.
+            let diff = got.iter().zip(reference).filter(|(a, b)| a != b).count();
+            let far = got
+                .iter()
+                .zip(reference)
+                .filter(|(&a, &b)| (a ^ b) & 0x80 != 0 || (a & 0x7f).abs_diff(b & 0x7f) > 1)
+                .count();
+            println!("  {what}: {diff} of {} E4M3 KV bytes differ, {far} by more than one code", got.len());
+            if far != 0 {
+                return Err(format!("{what}: {far} E4M3 KV bytes differ by more than one code").into());
+            }
+            if diff == 0 {
+                return Ok(());
+            }
+            let decode = |b: &u8| {
+                let (exp, man) = (i32::from((b >> 3) & 0xf), f32::from(b & 7));
+                let v = if exp == 0 { man * 2f32.powi(-9) } else { (1.0 + man / 8.0) * 2f32.powi(exp - 7) };
+                if b & 0x80 != 0 { -v } else { v }
+            };
+            let (g, r): (Vec<f32>, Vec<f32>) =
+                (got.iter().map(decode).collect(), reference.iter().map(decode).collect());
+            compare_f32(what, &g, &r, 6.0e-3, f64::INFINITY)
         } else {
             compare_bf16(what, got, reference, 6.0e-3, 5.0e-2)
         }
@@ -1021,6 +1187,46 @@ mod cuda {
         )
     }
 
+    /// Prefill slot `b` with `xin` as act.x, chunk by chunk: the engine splits an off-bucket
+    /// prompt into several launches, and in block mode (no Embed) each chunk reads act.x from
+    /// row 0, so each chunk gets its own input rows uploaded and its output rows read back
+    /// into `out`. Returns (first token, chunks).
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_rows(
+        e: &mut plowrt::exec::gpu::GpuEngine,
+        b: usize,
+        prompt: &[u32],
+        xin: &[f32],
+        hidden: usize,
+        x_rows: usize,
+        out_name: &str,
+        out: &mut Vec<f32>,
+    ) -> Result<(u32, usize), Box<dyn std::error::Error>> {
+        let t = prompt.len();
+        out.clear();
+        let (mut c0, mut chunks) = (0usize, 0usize);
+        loop {
+            let rows = (t - c0).min(x_rows);
+            e.upload_activation("act.x", &xin[c0 * hidden..(c0 + rows) * hidden])?;
+            let (c1, tok) = match e.prefill_chunk(b, prompt, usize::MAX)? {
+                plowrt::exec::gpu::PrefillStep::Progress(p) => (p, None),
+                plowrt::exec::gpu::PrefillStep::Done(tok) => (t, Some(tok)),
+            };
+            let o = e.download_activation(out_name)?;
+            out.extend_from_slice(&o[..(c1 - c0) * hidden]);
+            c0 = c1;
+            chunks += 1;
+            if let Some(tok) = tok {
+                return Ok((tok, chunks));
+            }
+        }
+    }
+
+    fn act_x_rows(e: &plowrt::exec::gpu::GpuEngine, hidden: usize) -> usize {
+        e.tensor_bytes("act.x")
+            .map_or(usize::MAX, |b| usize::try_from(b).unwrap_or(0) / 2 / hidden)
+    }
+
     fn check(
         e: &mut plowrt::exec::gpu::GpuEngine,
         hidden: usize,
@@ -1074,18 +1280,20 @@ mod cuda {
         //  - decode-only blocks (GLM/Kimi MLA, Nemotron Mamba/GQA/MoE — the
         //    emit path has prefill_buckets=[]): drive ONE decode step (M=1) on a
         //    single row, mirroring step_bench's no-prefill branch.
+        let mut pf_out: Vec<f32> = Vec::new();
         let t = if e.has_prefill() {
             let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
+            let x_rows = act_x_rows(e, hidden);
             // `--repeat N`: the same real input N times, so a timing read (PLOW_PF_SEG_TIME)
             // can skip the cold first launch.
             let repeat: usize = flag("--repeat").and_then(|s| s.parse().ok()).unwrap_or(1);
             for _ in 0..repeat.max(1) {
                 e.begin_slot(0, t + 1)?;
-                e.upload_activation("act.x", &xin)?;
                 let t0 = Instant::now();
-                e.prefill_slot(0, &prompt)?;
+                let (_, chunks) =
+                    prefill_rows(e, 0, &prompt, &xin, hidden, x_rows, out_name, &mut pf_out)?;
                 println!(
-                    "  launched prefill(T={t}) in {:.3} ms",
+                    "  launched prefill(T={t}) in {chunks} chunk(s), {:.3} ms",
                     t0.elapsed().as_secs_f64() * 1e3
                 );
             }
@@ -1105,7 +1313,11 @@ mod cuda {
             1
         };
 
-        let out = e.download_activation(out_name)?;
+        let out = if pf_out.is_empty() {
+            e.download_activation(out_name)?
+        } else {
+            std::mem::take(&mut pf_out)
+        };
         let out = &out[..t * hidden]; // trim pad rows past T
         let (mut mn, mut mx, mut sum, mut nan, mut inf) =
             (f32::INFINITY, f32::NEG_INFINITY, 0.0f64, 0usize, 0usize);
@@ -1182,6 +1394,34 @@ mod cuda {
         hidden: usize,
         flag: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        // `--decode-in rows.npy` ([n, hidden] f32): every decode step's act.x rows, cycled,
+        // uploaded outside the timer (distinct rows route a MoE block like real traffic; the
+        // default leaves act.x at the prefill's near-identical synthetic rows).
+        let decode_in = match flag("--decode-in") {
+            Some(path) => {
+                let (shape, data) = npy::read_f32(Path::new(&path))?;
+                if shape.len() != 2 || shape[1] != hidden || shape[0] == 0 {
+                    return Err(format!("--decode-in {path}: want [n, {hidden}], got {shape:?}").into());
+                }
+                Some(data)
+            }
+            None => None,
+        };
+        let mut decode_step = 0usize;
+        let mut feed_rows = |e: &mut plowrt::exec::gpu::GpuEngine,
+                             bsz: usize|
+         -> Result<(), Box<dyn std::error::Error>> {
+            let Some(rows) = &decode_in else { return Ok(()) };
+            let n = rows.len() / hidden;
+            let mut x = Vec::with_capacity(bsz * hidden);
+            for b in 0..bsz {
+                let r = (decode_step * bsz + b) % n;
+                x.extend_from_slice(&rows[r * hidden..(r + 1) * hidden]);
+            }
+            decode_step += 1;
+            e.upload_activation("act.x", &x)?;
+            Ok(())
+        };
         let batches = flag("--batch")
             .map(|s| parse_list(&s))
             .unwrap_or_else(|| vec![1, 2, 4, 8]);
@@ -1287,6 +1527,7 @@ mod cuda {
                     e.sync_stream()?;
                 }
                 for _ in 0..warmup {
+                    feed_rows(e, bsz)?;
                     e.step_slots(&feeds(&last), &mut toks)?;
                     last.copy_from_slice(&toks);
                     if fixed_ctx {
@@ -1299,6 +1540,7 @@ mod cuda {
                 e.trace_reset()?;
                 let mut us: Vec<f64> = Vec::with_capacity(iters);
                 for _ in 0..iters {
+                    feed_rows(e, bsz)?;
                     let t0 = Instant::now();
                     e.step_slots(&feeds(&last), &mut toks)?;
                     us.push(t0.elapsed().as_secs_f64() * 1e6);

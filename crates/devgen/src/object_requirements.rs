@@ -15,6 +15,8 @@ struct Facts {
     gdn_pitched: bool,
     /// Runs the full-tile FP8 GEMM, the opcode the route-specific arms serve.
     fp8_gemm: bool,
+    /// Runs it over TMA maps (i6/i7), the sm_90a prefill epilogue the vLLM route attests.
+    fp8_tma_gemm: bool,
     rows: u32,
 }
 
@@ -24,6 +26,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
         gdn: false,
         gdn_pitched: false,
         fp8_gemm: false,
+        fp8_tma_gemm: false,
         rows: 0,
     };
     for &index in programs {
@@ -42,6 +45,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
             // Block-scaled FP8 GEMMs run on cuBLASLt only, never on an interpreter arm.
             f.fp8_gemm |=
                 inst.op == DevOp::GemmFp8 as u16 && inst.i[5] != packet::dev::FP8_BLOCK_GROUP;
+            f.fp8_tma_gemm |= inst.op == DevOp::GemmFp8 as u16 && inst.i[6] != 0 && inst.i[7] != 0;
         }
     }
     f
@@ -83,7 +87,8 @@ fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requireme
     if routes.w8a8 && f.fp8_arms {
         out.push(Requirement::new(req::W8A8_ARMS, 1));
     }
-    if routes.vllm && f.fp8_gemm {
+    // An unmapped prefill GEMM is the generic mma.sync arm (the sm_120 interpreter): W8A8_ARMS.
+    if routes.vllm && f.fp8_tma_gemm {
         for &index in programs {
             let rows = packet::devbuild::program_rows(m.prog_t[index]);
             assert!(
@@ -200,11 +205,23 @@ mod tests {
         decode_ops: &[DevOp],
         rungs: &[u32],
     ) -> Model {
+        model_mapped(bucket, prefill_ops, decode_ops, rungs, true)
+    }
+
+    /// `maps`: prefill `GemmFp8` carries TMA maps (the sm_90a route).
+    fn model_mapped(
+        bucket: u32,
+        prefill_ops: &[DevOp],
+        decode_ops: &[DevOp],
+        rungs: &[u32],
+        maps: bool,
+    ) -> Model {
         let mut progs = Vec::new();
         let mut prog_t = Vec::new();
-        for (ops, t) in [(prefill_ops, bucket)]
+        for (index, (ops, t)) in [(prefill_ops, bucket)]
             .into_iter()
             .chain(rungs.iter().map(|&r| (decode_ops, r)))
+            .enumerate()
         {
             let mut b = Builder::new(2);
             b.force_uniseg();
@@ -215,6 +232,10 @@ mod tests {
                     d.i[0] = 1;
                     d.i[1] = 1;
                     d.i[2] = 1;
+                    if maps && index == 0 && op == DevOp::GemmFp8 {
+                        d.i[6] = 1;
+                        d.i[7] = 2;
+                    }
                 }));
             }
             if prev.is_none() {
@@ -316,6 +337,33 @@ mod tests {
             &[1],
         );
         assert_eq!(manifest(&one, None).decode.len(), 2);
+    }
+
+    /// The sm_120 interpreter route: unmapped mma.sync W8A8 prefill GEMMs, per-channel FP8 GEMV
+    /// decode. Only the generic arms are required, at any bucket.
+    #[test]
+    fn gdn_unmapped_w8a8_prefill_requires_only_the_arms() {
+        let m = model_mapped(
+            512,
+            &[
+                DevOp::QwenRmsNorm,
+                DevOp::QuantFp8,
+                DevOp::GemmFp8,
+                DevOp::QwenGdnPrefill,
+            ],
+            &[DevOp::QwenRmsNorm, DevOp::GemvFp8, DevOp::QwenGdnStep],
+            &[1, 16],
+            false,
+        );
+        let r = manifest(&m, None);
+        assert_eq!(
+            r.prefill,
+            vec![
+                Requirement::new(req::GDN_PREFILL_ABI, 1),
+                Requirement::new(req::W8A8_ARMS, 1),
+            ]
+        );
+        assert!(r.decode.is_empty());
     }
 
     #[test]

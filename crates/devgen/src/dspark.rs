@@ -1075,6 +1075,9 @@ fn draft_sections(
             slot: h16(d.slot),
             hidden: None,
             hidden_rows: 0,
+            step_position: Vec::new(),
+            step_kv_len: Vec::new(),
+            own_kv: Vec::new(),
         },
         block: Some(spec_draft::BlockDraft {
             size: d.size,

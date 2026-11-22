@@ -413,6 +413,67 @@ fn prefill_eligible(model: &Model, op: &packet::dev::DevInst, rows: u32, profile
         Some(DevOp::GemmFp8 | DevOp::GemmMedFp8 | DevOp::GemmSmallFp8)
     ) {
         let rows = packet::devbuild::program_rows(rows);
+        // Unit scales: one scalar-scale matmul; the emitter's RowColScale follows it.
+        if op.i[5] == packet::dev::FP8_UNIT_SCALE {
+            return op.blocks > 0
+                && op.i[0] == rows
+                && plow_asset::segment_roles::cublaslt_prefill_fp8_unit(
+                    profile, rows, op.i[1], op.i[2],
+                )
+                && op.i[3..5] == [0, 0]
+                && op.i[6..] == [0, 0]
+                && op.t[3..]
+                    .iter()
+                    .all(|&tensor| tensor == packet::dev::TENSOR_NONE)
+                && op.t[0] != op.t[1]
+                && op.t[0] != op.t[2]
+                && op.t[1] != op.t[2]
+                && [
+                    (op.t[0], u64::from(rows) * u64::from(op.i[1]) * 2),
+                    (op.t[1], u64::from(rows) * u64::from(op.i[2])),
+                    (op.t[2], u64::from(op.i[1]) * u64::from(op.i[2])),
+                ]
+                .into_iter()
+                .all(|(handle, bytes)| {
+                    model
+                        .tensors
+                        .get(handle as usize)
+                        .is_some_and(|tensor| tensor.bytes >= bytes)
+                });
+        }
+        // Per-tensor scales: one f32 activation and one f32 weight scale (scalar scale pointers).
+        if op.i[5] == packet::dev::FP8_TENSOR_SCALE {
+            return op.blocks > 0
+                && op.i[0] == rows
+                && plow_asset::segment_roles::cublaslt_prefill_fp8_tensor(
+                    profile, rows, op.i[1], op.i[2],
+                )
+                && op.i[3..5] == [0, 0]
+                && op.i[6..] == [0, 0]
+                && op.t[5..]
+                    .iter()
+                    .all(|&tensor| tensor == packet::dev::TENSOR_NONE)
+                && op.t[..5]
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == 5
+                && [
+                    (op.t[0], u64::from(rows) * u64::from(op.i[1]) * 2),
+                    (op.t[1], u64::from(rows) * u64::from(op.i[2])),
+                    (op.t[2], u64::from(op.i[1]) * u64::from(op.i[2])),
+                    (op.t[3], 4),
+                    (op.t[4], 4),
+                ]
+                .into_iter()
+                .all(|(handle, bytes)| {
+                    model
+                        .tensors
+                        .get(handle as usize)
+                        .is_some_and(|tensor| tensor.bytes >= bytes)
+                });
+        }
         // Block-scaled FP8: cuBLASLt runs the rows padded to 4 with 1x128 activation and 128x128
         // weight scales (see `packet::dev::FP8_BLOCK_GROUP`).
         let block = op.i[5] == packet::dev::FP8_BLOCK_GROUP;
@@ -1113,6 +1174,30 @@ mod tests {
         assert!(prefill_eligible(&model, &op, 1024, "sm90a"));
         model.tensors[scale as usize].bytes = 1024 * 4 - 1;
         assert!(!prefill_eligible(&model, &op, 1024, "sm90a"));
+    }
+
+    #[test]
+    fn fp8_unit_scale_prefill_is_sm12x_only_and_carries_no_scales() {
+        let mut model = prefill_model();
+        let mut op = model.progs[2].insts[1].clone();
+        op.op = DevOp::GemmFp8 as u16;
+        op.i[..].copy_from_slice(&[1024, 17408, 5120, 0, 0, packet::dev::FP8_UNIT_SCALE, 0, 0]);
+        for profile in ["sm_121a", "sm_120a"] {
+            assert!(prefill_eligible(&model, &op, 1024, profile));
+        }
+        assert!(!prefill_eligible(&model, &op, 1024, "sm90a"));
+        assert!(!prefill_eligible(&model, &op, 2048, "sm_121a"));
+        let mut scaled = op.clone();
+        scaled.t[3] = 0;
+        assert!(!prefill_eligible(&model, &scaled, 1024, "sm_121a"));
+        let mut mapped = op.clone();
+        mapped.i[7] = 8;
+        assert!(!prefill_eligible(&model, &mapped, 1024, "sm_121a"));
+        let mut vector = op.clone();
+        vector.i[5] = 0;
+        assert!(!prefill_eligible(&model, &vector, 1024, "sm_121a"));
+        model.tensors[op.t[0] as usize].bytes = 1024 * 17408 * 2 - 1;
+        assert!(!prefill_eligible(&model, &op, 1024, "sm_121a"));
     }
 
     #[test]

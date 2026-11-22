@@ -30,12 +30,33 @@ pub struct Cache {
     /// writer (`QwenHeadNormRope` i7).
     #[serde(default, skip_serializing_if = "is_head_major")]
     pub layout: u32,
+    /// E4M3 bytes at one static unit scale per tensor (vLLM's default `k_scale = v_scale = 1.0`),
+    /// no scale tensors; declared by the cache writer (`QwenHeadNormRope` i7 [`KV_E4M3`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub e4m3: bool,
+}
+impl Cache {
+    /// Bytes per cache element.
+    pub fn elem_bytes(&self) -> u32 {
+        if self.scales.is_some() || self.e4m3 {
+            1
+        } else {
+            2
+        }
+    }
 }
 /// `[slot][head][stride][hd]`.
 pub const LAYOUT_HEAD_MAJOR: u32 = 0;
 /// `[slot][stride][head][hd]`: one position's heads are contiguous, so a slot's live rows are
 /// one prefix of its extent (the live-KV allocator charges `heads * hd` bytes per row).
 pub const LAYOUT_ROW_INTERLEAVED: u32 = 1;
+/// `QwenHeadNormRope` i7 bit: the writer stores E4M3 at unit scale ([`Cache::e4m3`]); the low
+/// byte is the layout.
+pub const KV_E4M3: u32 = 1 << 8;
+/// `QwenHeadNormRope` i7 bit with [`KV_E4M3`]: a per-tensor scale `s` (f32, t3) instead of unit,
+/// stored as `sat_e4m3(x / s)` (vLLM's static checkpoint `k_scale` / `v_scale`). Drafter caches
+/// only: the live-KV caches stay unit-scale.
+pub const KV_SCALE: u32 = 1 << 9;
 fn is_head_major(layout: &u32) -> bool {
     *layout == LAYOUT_HEAD_MAJOR
 }
@@ -139,19 +160,23 @@ pub fn emit(packet: &Packet<'_>) -> Result<Manifest> {
                 Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
             )
         })
-        .map(|d| Cache {
-            pair: [d.t[3], d.t[4]],
-            scales: (d.op == DevOp::FlashDecodeFp8 as u16).then_some([d.t[6], d.t[7]]),
-            heads: d.i[2],
-            hd: d.i[6],
-            stride: d.i[3],
-            window: d.i[4],
-            mask: d.i[7],
-            layout: widest
+        .map(|d| {
+            let writer = widest
                 .insts
                 .iter()
                 .find(|w| w.op == DevOp::QwenHeadNormRope as u16 && w.t[0] == d.t[3])
-                .map_or(LAYOUT_HEAD_MAJOR, |w| w.i[7]),
+                .map_or(LAYOUT_HEAD_MAJOR, |w| w.i[7]);
+            Cache {
+                pair: [d.t[3], d.t[4]],
+                scales: (d.op == DevOp::FlashDecodeFp8 as u16).then_some([d.t[6], d.t[7]]),
+                heads: d.i[2],
+                hd: d.i[6],
+                stride: d.i[3],
+                window: d.i[4],
+                mask: d.i[7],
+                layout: writer & !KV_E4M3,
+                e4m3: writer & KV_E4M3 != 0,
+            }
         })
     {
         // KV sharing (Gemma-4 E-series): later layers read an earlier layer's cache with the same
@@ -281,6 +306,8 @@ impl Manifest {
                         LAYOUT_ROW_INTERLEAVED => c.scales.is_none() && c.window == 0,
                         _ => false,
                     }
+                    && (!c.e4m3
+                        || (c.scales.is_none() && c.window == 0 && c.layout == LAYOUT_HEAD_MAJOR))
                     && if c.window == 0 {
                         c.stride == self.max_ctx && c.mask == u32::MAX
                     } else {
@@ -291,7 +318,7 @@ impl Manifest {
             let bytes = (self.batch as u64)
                 .checked_mul(c.heads as u64)
                 .and_then(|v| v.checked_mul(c.stride as u64))
-                .and_then(|v| v.checked_mul(c.hd as u64 * if c.scales.is_some() { 1 } else { 2 }))
+                .and_then(|v| v.checked_mul(u64::from(c.hd * c.elem_bytes())))
                 .ok_or("cache extent overflow")?;
             for &h in &c.pair {
                 require(
@@ -463,6 +490,10 @@ impl Manifest {
                         } && d.t[5] == self.kv_length
                             && match c.scales {
                                 Some(scales) => d.t[6..8] == scales,
+                                // Span mode on a BF16 cache: t6 is the row-slot map.
+                                None if self.row_slot.is_some_and(|r| d.t[6] == r) => {
+                                    d.t[7] == TENSOR_NONE16
+                                }
                                 None => {
                                     (d.t[7] == TENSOR_NONE16 || hnr_fold)
                                         && crate::mixed_step::validate_decode_slot_tensor(
@@ -631,9 +662,14 @@ impl Manifest {
                                     && d.i[3] == p.rows
                                     && d.i[4] == c.stride
                                     && d.i[6] == u32::from(prefill)
-                                    && d.i[7] == c.layout
+                                    && d.i[7] == c.layout | if c.e4m3 { KV_E4M3 } else { 0 }
                                     && d.t[5] == self.position
-                                    && d.t[7] == TENSOR_NONE16
+                                    // Span mode: every decode writer carries the row-slot map.
+                                    && d.t[7]
+                                        == match self.row_slot {
+                                            Some(r) if !prefill => r,
+                                            _ => TENSOR_NONE16,
+                                        }
                                     && (writes.insert(h) || staged(pc)),
                                 "Qwen cache writer contract",
                             )?;
@@ -784,6 +820,24 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 )?;
             }
         }
+        // `out[s] = x[rows[s]]` over bf16 rows of `H`: the gathered source must hold `M` rows.
+        DevOp::RowGather => {
+            let [s, h, m] = [d.i[0], d.i[1], d.i[2]].map(u64::from);
+            let extent = |handle: u16, bytes: u64| {
+                packet
+                    .tensors
+                    .get(handle as usize)
+                    .is_some_and(|t| t.bytes >= bytes)
+            };
+            require(
+                s > 0
+                    && h > 0
+                    && extent(d.t[0], s * h * 2)
+                    && extent(d.t[1], m * h * 2)
+                    && extent(d.t[2], s * 4),
+                "row gather operands",
+            )?;
+        }
         // The kernel probes `table[id & (cap-1)]` and gathers `slab[row]`.
         DevOp::MmRowsBf16 => {
             let [rows, width, cap, slab_rows] = [d.i[0], d.i[1], d.i[2], d.i[3]].map(u64::from);
@@ -816,6 +870,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::Residual
                 | DevOp::Glu
                 | DevOp::GluPitched
+                | DevOp::RowColScale
                 // Gemma-4 E-series per-layer input gate: activations only (gate, table, out).
                 | DevOp::GluStrided
                 | DevOp::Gemm
@@ -861,6 +916,14 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::MoeDownMx
                 | DevOp::MoeGluMxPf
                 | DevOp::MoeDownMxPf
+                | DevOp::MoeRouterLogitsF32
+                | DevOp::MoeRouterSigmoidTopk
+                | DevOp::MoeUpNvfp4
+                | DevOp::MoeDownNvfp4
+                | DevOp::MoeAlignNvfp4
+                | DevOp::MoeUpNvfp4Pf
+                | DevOp::MoeDownNvfp4Pf
+                | DevOp::MoeQuantNvfp4
                 // Gemma-4 26B-A4B MoE, decode (61-72) and grouped prefill (73-77).
                 // Audited against the operand contracts in packet::dev: every one of these
                 // reads and writes only hidden-state activations, routing metadata
@@ -905,6 +968,18 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::QwenGdnQkvPrep
                 | DevOp::QwenGdnGatePrep
                 | DevOp::QwenGdnPrefill
+                // Mamba-2 mixer (240-245): activations, weights, per-slot `state.nemo.*`
+                // conv/SSM state, `act.nemo.*` scan scratch and `in.active`; no cache pair, no
+                // generated tensor map.
+                | DevOp::Mamba2Conv
+                | DevOp::Mamba2Step
+                | DevOp::Mamba2GatedNorm
+                | DevOp::Mamba2ChunkState
+                | DevOp::Mamba2ChunkPass
+                | DevOp::Mamba2ChunkOut
+                // Activation row gather (audited above); a cache operand still fails the
+                // cache-access arms.
+                | DevOp::RowGather
         ),
         "opcode has no audited direct-operand access contract",
     )

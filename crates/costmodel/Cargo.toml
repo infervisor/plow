@@ -8,3 +8,6 @@ description = "Shared hardware cost model (design §6.3): MMA tile shapes, paged
 [dependencies]
 hwspec.workspace = true
 nn-graph = { workspace = true, default-features = false, features = [] }
+
+[dev-dependencies]
+serde_json.workspace = true

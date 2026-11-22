@@ -58,7 +58,8 @@ fn split_sites(insts: &[packet::dev::DevInst64]) -> Result<(Vec<(usize, bool)>, 
 pub(super) struct SpecDraft {
     manifest: Manifest,
     programs: Vec<Loaded>,
-    /// Chain: `[kmax + 1 tokens, hidden_row, position, kv_len, slot][rows]` i32 staging.
+    /// Chain: `[kmax + 1 tokens, hidden_row, position, kv_len, slot, step positions, step kv
+    /// lengths][rows]` i32 staging (the step sections only for a drafter with its own KV).
     /// Block: `[kmax + 1 tokens][rows]` then `[ids, position, kv_len, slot, store][size * rows]`.
     stage: PinnedHost,
     rows: usize,
@@ -161,6 +162,21 @@ impl SpecDraft {
             }
             (None, Some(hidden_row), Some(hidden)) => {
                 inputs.extend([hidden_row, t.position, t.kv_len, t.slot].map(|h| (h, rows)));
+                inputs.extend(
+                    t.step_position
+                        .iter()
+                        .chain(&t.step_kv_len)
+                        .map(|&h| (h, rows)),
+                );
+                if t.own_kv
+                    .iter()
+                    .any(|h| inputs.iter().any(|&(i, _)| i == *h))
+                    || t.own_kv
+                        .iter()
+                        .any(|&h| e.tensor_names[usize::from(h)].starts_with("in."))
+                {
+                    return Err(reject("drafter KV aliases a staged input"));
+                }
                 if inputs.iter().any(|&(h, _)| h == hidden) {
                     return Err(reject("aliased draft input tensors"));
                 }
@@ -239,7 +255,7 @@ impl SpecDraft {
             .collect::<Result<Vec<_>>>()?;
         let words = match &manifest.block {
             Some(b) => manifest.kmax as usize + 1 + 5 * b.size as usize,
-            None => manifest.kmax as usize + 5,
+            None => manifest.kmax as usize + 5 + 2 * manifest.tensors.step_position.len(),
         };
         let stage = e.be.host_alloc_pinned(words * rows * 4)?;
         tracing::info!(
@@ -287,6 +303,14 @@ impl GpuEngine {
     pub fn spec_draft_enable(&mut self, assets: &Path) -> Result<u32> {
         let d = SpecDraft::load(self, assets)?;
         let kmax = d.manifest.kmax;
+        // The drafter's own cache starts finite: rows no step wrote (a prompt, a prefix hit)
+        // read as zeros, never as stale or uninitialized bytes.
+        for &h in &d.manifest.tensors.own_kv {
+            let mem = &self.devp[usize::from(h)];
+            self.be
+                .memset_d8_async(mem.base, 0, mem.len as usize, &self.stream)?;
+        }
+        self.be.stream_synchronize(&self.stream)?;
         self.spec_draft = Some(d);
         Ok(kmax)
     }
@@ -340,14 +364,32 @@ impl GpuEngine {
             words[(kmax + 4) * n + r] = slot as i32;
         }
         let t = d.manifest.tensors.clone();
+        let steps = t.step_position.len();
+        for s in 0..steps {
+            let j = s as i32 + 1;
+            for r in 0..p.rows as usize {
+                let pos = pos[r.min(rows.len() - 1)] as i32;
+                words[(kmax + 5 + s) * n + r] = pos - 1 + j;
+                words[(kmax + 5 + steps + s) * n + r] = pos + j;
+            }
+        }
         let bytes = d.stage.as_slice();
+        let step_sections = (0..steps).flat_map(|s| {
+            [
+                (kmax + 5 + s, t.step_position[s]),
+                (kmax + 5 + steps + s, t.step_kv_len[s]),
+            ]
+        });
         for (i, h) in [
             (0, t.tokens[0]),
             (kmax + 1, t.hidden_row.expect("chain drafter")),
             (kmax + 2, t.position),
             (kmax + 3, t.kv_len),
             (kmax + 4, t.slot),
-        ] {
+        ]
+        .into_iter()
+        .chain(step_sections)
+        {
             // SAFETY: the pinned stage is rewritten only after the next stage's synchronize.
             unsafe {
                 self.be.memcpy_htod_async(
@@ -379,6 +421,12 @@ impl GpuEngine {
             prog.cur = want;
         }
         d.selected = Some((k, p.index as usize, rows.len()));
+        // Step j stores the drafter's own K/V at `pos - 1 + j`: past the committed rows from j = 2.
+        if let Some(v) = &self.vmm {
+            for (&(slot, _, _), &c) in rows.iter().zip(&pos) {
+                v.ensure_rows(slot, c + k)?;
+            }
+        }
         Ok(())
     }
 

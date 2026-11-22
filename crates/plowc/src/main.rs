@@ -955,6 +955,11 @@ fn main() -> ExitCode {
     // load and executes the same single-segment (uniseg) packet shape as sm_120. Resolve the
     // arch from the part unless one was named explicitly.
     if let Some(spec) = hwspec::registry::lookup(&cli.gpu) {
+        if hwspec::IsaLevel::from_spec(spec) == Some(hwspec::IsaLevel::Sm121a)
+            && cli.arch == "sm_120a"
+        {
+            cli.arch = hwspec::IsaLevel::Sm121a.arch_flag().to_string();
+        }
         if spec.vendor == hwspec::Vendor::Apple && cli.arch == "sm_120a" {
             cli.arch = hwspec::IsaLevel::Metal3.arch_flag().to_string();
         }
@@ -2523,6 +2528,7 @@ fn build_cubin_from_manifest(
                 || d.starts_with("PLOW_NV_FP8_PF_SCALE_WFIRST=")
                 || d.starts_with("PLOW_NV_GEMMA3=")
                 || d.starts_with("PLOW_NV_FA_PIPE=")
+                || d.starts_with("PLOW_NV_KV_E4M3=")
         })
         .map(|d| format!("-D{d}"))
         .collect();
@@ -2671,7 +2677,12 @@ fn effective_uniseg(
 ) -> bool {
     if segmented {
         false
-    } else if (arch.starts_with("sm_120") || arch == "metal3" || cpu) && !env_present {
+    } else if (arch.starts_with("sm_120")
+        || hwspec::IsaLevel::arch_is_sm12x(arch)
+        || arch == "metal3"
+        || cpu)
+        && !env_present
+    {
         true
     } else {
         configured
@@ -2715,7 +2726,7 @@ fn manifest_requires_segmented_prefill(manifest: &serde_json::Value) -> bool {
 fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
     match arch {
         "sm_90a" => Ok("-DPLOW_SM90A_CUBIN=ON"),
-        "sm_120a" => Ok("-DPLOW_SM120_CUBIN=ON"),
+        a if hwspec::IsaLevel::arch_is_sm12x(a) => Ok("-DPLOW_SM120_CUBIN=ON"),
         "sm_89" => Ok("-DPLOW_SM89_CUBIN=ON"),
         _ if devgen::target_is_cpu(arch, "") => Err(format!(
             "--emit devblob+cubin: --arch {arch} is a CPU target; the CPU engine needs no \
@@ -2723,7 +2734,7 @@ fn cubin_arch_option(arch: &str) -> Result<&'static str, String> {
         )),
         _ => Err(format!(
             "--emit devblob+cubin: no served interpreter object is defined for --arch {arch}; \
-             supported CUDA architectures are sm_90a, sm_120a and sm_89."
+             supported CUDA architectures are sm_90a, sm_120a, sm_121a and sm_89."
         )),
     }
 }
@@ -3934,6 +3945,10 @@ mod cli_tests {
             cubin_arch_option("sm_120a").unwrap(),
             "-DPLOW_SM120_CUBIN=ON"
         );
+        assert_eq!(
+            cubin_arch_option("sm_121a").unwrap(),
+            "-DPLOW_SM120_CUBIN=ON"
+        );
         assert_eq!(cubin_arch_option("sm_89").unwrap(), "-DPLOW_SM89_CUBIN=ON");
         assert!(cubin_arch_option("sm_100a")
             .unwrap_err()
@@ -3993,6 +4008,7 @@ mod cli_tests {
         assert!(!effective_uniseg("sm_90a", false, true, true, false));
         assert!(effective_uniseg("sm_120a", false, false, false, false));
         assert!(!effective_uniseg("sm_120a", false, false, false, true));
+        assert!(effective_uniseg("sm_121a", false, false, false, false));
         assert!(effective_uniseg("amx", true, false, false, false));
     }
 

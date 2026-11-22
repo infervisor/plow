@@ -625,6 +625,55 @@ impl Ctx<'_> {
                 Ok(replace_last(&q, v.dim(3).clone()))
             }
 
+            Op::Mamba2Scan {
+                num_heads,
+                head_dim,
+                n_groups,
+                state_size,
+                ..
+            } => {
+                self.expect_arity(inputs, 7)?;
+                let x = self.input_shape(inputs, 0)?;
+                let dt = self.input_shape(inputs, 1)?;
+                let b = self.input_shape(inputs, 3)?;
+                let c = self.input_shape(inputs, 4)?;
+                let want = |s: &Shape, dims: &[i64]| {
+                    s.rank() == dims.len() + 2
+                        && (0..2).all(|a| !s.dim(a).provably_ne(x.dim(a)))
+                        && dims
+                            .iter()
+                            .enumerate()
+                            .all(|(i, d)| s.dim(i + 2).as_static() == Some(*d))
+                };
+                let (nh, hd) = (*num_heads as i64, *head_dim as i64);
+                let (ng, n) = (*n_groups as i64, *state_size as i64);
+                if x.rank() != 4 || !want(&x, &[nh, hd]) {
+                    return Err(self.err(format!("mamba2_scan x {x} must be [B, S, {nh}, {hd}]")));
+                }
+                if !want(&dt, &[nh]) {
+                    return Err(self.err(format!("mamba2_scan dt {dt} must be [B, S, {nh}]")));
+                }
+                if ng == 0 || nh % ng != 0 {
+                    return Err(self.err(format!(
+                        "mamba2_scan n_groups {ng} must divide num_heads {nh}"
+                    )));
+                }
+                for (name, s) in [("B", &b), ("C", &c)] {
+                    if !want(s, &[ng, n]) {
+                        return Err(
+                            self.err(format!("mamba2_scan {name} {s} must be [B, S, {ng}, {n}]"))
+                        );
+                    }
+                }
+                for (idx, name) in [(2, "A_log"), (5, "D"), (6, "dt_bias")] {
+                    let s = self.input_shape(inputs, idx)?;
+                    if s.rank() != 1 || s.dim(0).as_static() != Some(nh) {
+                        return Err(self.err(format!("mamba2_scan {name} {s} must be [{nh}]")));
+                    }
+                }
+                Ok(x)
+            }
+
             Op::SituGlu { .. } => {
                 self.expect_arity(inputs, 2)?;
                 let gate = self.input_shape(inputs, 0)?;

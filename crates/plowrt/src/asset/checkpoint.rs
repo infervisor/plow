@@ -244,6 +244,36 @@ pub(crate) fn missing_weights_in(
         .collect())
 }
 
+/// Columns `lo..hi` of the row-major 2-D tensor `src` (`shape` = [rows, cols]), row by row.
+fn column_block(
+    name: &str,
+    src: &[u8],
+    shape: &[usize],
+    [lo, hi]: [u64; 2],
+    bytes: u64,
+) -> Result<Vec<u8>> {
+    let bad = || RuntimeError::Device(format!("{name}: column block {lo}..{hi} of {shape:?}"));
+    let &[rows, cols] = shape else {
+        return Err(bad());
+    };
+    let (rows, cols) = (rows as u64, cols as u64);
+    if hi > cols || lo >= hi || rows == 0 || src.len() as u64 % (rows * cols) != 0 {
+        return Err(bad());
+    }
+    let elem = src.len() as u64 / (rows * cols);
+    if rows * (hi - lo) * elem != bytes {
+        return Err(RuntimeError::Device(format!(
+            "SIZE MISMATCH {name} (want {bytes} got {})",
+            rows * (hi - lo) * elem
+        )));
+    }
+    let mut out = Vec::with_capacity(bytes as usize);
+    for row in src.chunks_exact((cols * elem) as usize) {
+        out.extend_from_slice(&row[(lo * elem) as usize..(hi * elem) as usize]);
+    }
+    Ok(out)
+}
+
 /// The packet's `derived_weights.json` section, when it carries one.
 pub(crate) fn derived_weights(
     blob: &crate::asset::devblob::DevBlob,
@@ -652,12 +682,34 @@ impl Checkpoint {
     }
 
     /// The bytes of a `derived_weights.json` tensor: its sources back to back along axis 0
-    /// (same dtype and trailing dims), widened to f32 when declared, `bytes` long.
+    /// (same dtype and trailing dims), widened to f32 when declared, or the declared column
+    /// block of its one 2-D source; `bytes` long.
     pub(crate) fn concatenated(
         &self,
         spec: &plow_asset::derived_weights::DerivedTensor,
         bytes: u64,
     ) -> Result<Vec<u8>> {
+        if let Some(n) = spec.repeat {
+            let source = spec.sources.first().map(String::as_str).unwrap_or_default();
+            let (src, _) = self
+                .tensor_ex(source)
+                .ok_or_else(|| RuntimeError::Device(format!("MISSING WEIGHT: {source}")))?;
+            if src.len() as u64 * n != bytes {
+                return Err(RuntimeError::Device(format!(
+                    "SIZE MISMATCH {} (want {bytes} got {} x {n})",
+                    spec.name,
+                    src.len()
+                )));
+            }
+            return Ok(src.repeat(n as usize));
+        }
+        if let Some(cols) = spec.cols {
+            let source = spec.sources.first().map(String::as_str).unwrap_or_default();
+            let (src, shape) = self
+                .tensor_ex(source)
+                .ok_or_else(|| RuntimeError::Device(format!("MISSING WEIGHT: {source}")))?;
+            return column_block(&spec.name, src, shape, cols, bytes);
+        }
         let sources: Vec<&str> = spec.sources.iter().map(String::as_str).collect();
         self.assemble(&spec.name, &sources, spec.widen_f32, bytes)
     }
@@ -676,9 +728,14 @@ impl Checkpoint {
             parts.push((e, src));
         }
         let (first, _) = parts[0];
+        // Rank-0 sources concatenate only with rank-0 sources (n scalars -> `[n]`, e.g. the
+        // per-expert NVFP4 `weight_scale_2`); otherwise every source needs an axis 0.
+        let all_scalar = parts.iter().all(|(e, _)| e.shape.is_empty());
         if leaves.len() > 1
             && parts.iter().any(|(e, _)| {
-                e.dtype != first.dtype || e.shape.is_empty() || e.shape[1..] != first.shape[1..]
+                e.dtype != first.dtype
+                    || (!all_scalar
+                        && (e.shape.is_empty() || e.shape[1..] != first.shape[1..]))
             })
         {
             return Err(RuntimeError::Device(format!(
@@ -1035,9 +1092,12 @@ mod missing_weights_tests {
                 ("a", "F8_E4M3", &[4, 3], a.clone()),
                 ("b", "F8_E4M3", &[2, 3], b.clone()),
                 ("a_s", "BF16", &[2, 1], sa),
-                ("b_s", "BF16", &[1, 1], sb),
+                ("b_s", "BF16", &[1, 1], sb.clone()),
                 ("c", "F8_E4M3", &[2, 2], vec![0; 4]),
                 ("d", "BF16", &[2, 3], vec![0; 12]),
+                ("g0", "F32", &[], 1.5f32.to_le_bytes().to_vec()),
+                ("g1", "F32", &[], 2.5f32.to_le_bytes().to_vec()),
+                ("g2", "BF16", &[], vec![0x40, 0x40]),
             ],
         );
         let ck = Checkpoint::open(&dir).unwrap();
@@ -1045,9 +1105,22 @@ mod missing_weights_tests {
             name: "cat/x".into(),
             sources: sources.iter().map(|s| s.to_string()).collect(),
             widen_f32,
+            cols: None,
+            repeat: None,
         };
         let cat = ck.concatenated(&spec(&["a", "b"], false), 18).unwrap();
+        let tiled = plow_asset::derived_weights::DerivedTensor {
+            repeat: Some(3),
+            ..spec(&["b_s"], false)
+        };
+        assert_eq!(ck.concatenated(&tiled, 6).unwrap(), sb.repeat(3));
+        assert!(ck.concatenated(&tiled, 4).is_err());
         assert_eq!(cat, [a, b].concat());
+        // Rank-0 scalars concatenate into `[n]`, only with each other and one dtype.
+        let gs = ck.concatenated(&spec(&["g0", "g1", "g0"], false), 12).unwrap();
+        assert_eq!(gs, [1.5f32, 2.5, 1.5].map(f32::to_le_bytes).concat());
+        assert!(ck.concatenated(&spec(&["g0", "g2"], false), 6).is_err());
+        assert!(ck.concatenated(&spec(&["g0", "a_s"], false), 8).is_err());
         let wide = ck.concatenated(&spec(&["a_s", "b_s"], true), 12).unwrap();
         let f: Vec<f32> = wide
             .chunks_exact(4)
@@ -1113,6 +1186,17 @@ mod missing_weights_tests {
         assert!(!ok(blob(false, None)));
         assert!(!ok(blob(true, Some("cat/a.weight"))));
         assert!(!ok(blob(false, Some("cat/other.weight"))));
+    }
+
+    #[test]
+    fn column_blocks_slice_every_row() {
+        // 2 x 4 bf16: rows [0 1 2 3], [4 5 6 7] (one byte pair per element).
+        let src: Vec<u8> = (0u8..8).flat_map(|e| [e, 0]).collect();
+        let half = super::column_block("w", &src, &[2, 4], [2, 4], 8).unwrap();
+        assert_eq!(half, [2, 0, 3, 0, 6, 0, 7, 0]);
+        assert!(super::column_block("w", &src, &[2, 4], [2, 5], 8).is_err());
+        assert!(super::column_block("w", &src, &[8], [0, 4], 8).is_err());
+        assert!(super::column_block("w", &src, &[2, 4], [0, 2], 6).is_err());
     }
 
     #[test]

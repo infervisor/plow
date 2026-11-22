@@ -206,9 +206,9 @@ pub enum Op {
         logit_scale: f32,
     },
 
-    /// Data-dependent routed-expert SwiGLU dispatch and weighted combine.
-    /// Inputs `[x, routes]`; the exhaustive checkpoint names live in
-    /// `Graph::expert_bindings`, avoiding `3 * num_experts` compute nodes.
+    /// Data-dependent routed-expert dispatch and weighted combine; `act` is the
+    /// expert MLP form. Inputs `[x, routes]`; the exhaustive checkpoint names live
+    /// in `Graph::expert_bindings`, avoiding `3 * num_experts` compute nodes.
     ///
     /// `post_expert_norm` (Muse Spark) is the eps of an
     /// [`Op::RmsNormInputScaled`] applied to every (token, expert) output
@@ -219,6 +219,7 @@ pub enum Op {
         intermediate_size: u32,
         block_fp8: bool,
         post_expert_norm: Option<f32>,
+        act: MoeExpertAct,
     },
 
     /// GLM DSA indexer. Inputs are hidden state, normalized query latent,
@@ -360,6 +361,46 @@ pub enum Op {
     /// The IR has no clamp or sqrt, and `Add` is a plausible stand-in that
     /// computes a different model, so this is one op.
     ResidualGate { temperature: f32, eps: f32 },
+
+    /// Mamba-2 selective state-space scan (SSD) with a carried per-head state.
+    ///
+    /// Inputs `[x, dt, A_log, B, C, D, dt_bias]`: `x` is `[B, S, heads, head_dim]`
+    /// (post conv + SiLU), `dt` is the raw `[B, S, heads]` time-step projection,
+    /// `A_log`, `D` and `dt_bias` are `[heads]`, and `B`/`C` are
+    /// `[B, S, n_groups, state_size]`, shared by `heads / n_groups` heads each.
+    /// Per head `h` in group `g`, in fp32:
+    ///
+    /// ```text
+    /// dt'   = clamp(softplus(dt + dt_bias), dt_limit.0, dt_limit.1)
+    /// state = state * exp(-exp(A_log) * dt') + dt' * x ⊗ B[g]
+    /// y     = state · C[g] + D * x
+    /// ```
+    ///
+    /// Output is shape-equal to `x`. The `[B, heads, head_dim, state_size]`
+    /// recurrent state is a runtime resource carried across steps, the same
+    /// convention as [`Op::LinearAttention`] and the KV cache. Not a
+    /// `LinearAttention` kind: B/C are per group with a state width unrelated to
+    /// the value head dim, there is no q/k normalization or beta, and `D` adds a
+    /// skip path inside the op. `chunk_size` is the reference's prefill chunk
+    /// length; it changes rounding, not the function.
+    Mamba2Scan {
+        num_heads: u32,
+        head_dim: u32,
+        n_groups: u32,
+        state_size: u32,
+        chunk_size: u32,
+        dt_limit: (f32, f32),
+    },
+}
+
+/// The routed-expert MLP of [`Op::MoeExperts`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "models", derive(serde::Serialize))]
+pub enum MoeExpertAct {
+    /// `down(silu(gate(x)) * up(x))`.
+    SwiGlu,
+    /// Gate-less `down(relu(up(x))^2)` (Nemotron-H); the experts have no gate tensor.
+    Relu2,
 }
 
 /// DeepSeek `noaux_tc` group-limited expert routing.
@@ -438,6 +479,7 @@ impl Op {
             Op::SituGlu { .. } => "situ_glu",
             Op::BlockResidual { .. } => "block_residual",
             Op::ResidualGate { .. } => "residual_gate",
+            Op::Mamba2Scan { .. } => "mamba2_scan",
         }
     }
 }

@@ -323,6 +323,9 @@ impl Lt {
         self.plan_impl(m, n, k, weight, template, None, rows, ns)
     }
 
+    /// `weight_scale`/`input_scale` are ignored for [`Fp8Scale::Unit`]; one f32 each for
+    /// [`Fp8Scale::Tensor`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fp8_plan(
         self: &Arc<Self>,
         m: u32,
@@ -331,7 +334,7 @@ impl Lt {
         weight_scale: u64,
         input_scale: u64,
         fast_accum: bool,
-        block: bool,
+        scale: Fp8Scale,
     ) -> Result<Arc<Plan>> {
         self.be.bind()?;
         let mut plan = Plan {
@@ -344,10 +347,15 @@ impl Lt {
             algo: Algo::default(),
         };
         let mut raw = std::ptr::null_mut();
-        // CUDA 12.9: E4M3=28, BF16=14, OUTER_VEC_32F=3, VEC128_32F=4, BLK128x128_32F=5. A is W^T,
-        // B is X. Block route: weight scales [N/128][K/128], activation scales [K/128][m] (m
-        // padded to 4), measured exact against an f64 dequant on cuBLASLt 13.4 (sm_90).
-        let (a_mode, b_mode) = if block { (5, 4) } else { (3, 3) };
+        // CUDA 12.9: E4M3=28, BF16=14, SCALAR_32F=0, OUTER_VEC_32F=3, VEC128_32F=4,
+        // BLK128x128_32F=5. A is W^T, B is X. Block route: weight scales [N/128][K/128], activation
+        // scales [K/128][m] (m padded to 4), measured exact against an f64 dequant on cuBLASLt 13.4
+        // (sm_90). Unit route: scalar mode with no scale pointers (1.0), alpha 1.
+        let (a_mode, b_mode) = match scale {
+            Fp8Scale::Vector => (3, 3),
+            Fp8Scale::Block => (5, 4),
+            Fp8Scale::Unit | Fp8Scale::Tensor => (0, 0),
+        };
         // SAFETY: CUDA C ABI; Plan owns descriptors and the route retains the scale buffers.
         unsafe {
             check(
@@ -378,7 +386,13 @@ impl Lt {
                     "FP8 Lt fast accumulation",
                 )?;
             }
-            for (attr, value) in [(17, weight_scale), (18, input_scale)] {
+            let pointers = [(17, weight_scale), (18, input_scale)];
+            let pointers = if scale == Fp8Scale::Unit {
+                &pointers[..0]
+            } else {
+                &pointers[..]
+            };
+            for &(attr, value) in pointers {
                 check(
                     (self.api.cublasLtMatmulDescSetAttribute)(
                         raw,
@@ -474,9 +488,9 @@ impl Lt {
                     .iter()
                     .find(|r| r.state == 0 && r.workspace <= bytes)
                     .ok_or_else(|| {
-                        RuntimeError::Device(
-                            "no supported FP8 vector-scale cuBLASLt algorithm".into(),
-                        )
+                        RuntimeError::Device(format!(
+                            "no supported FP8 {scale:?}-scale cuBLASLt algorithm"
+                        ))
                     })?
                     .algo;
                 Ok(())
@@ -657,6 +671,18 @@ impl Lt {
                     "Lt workspace",
                 )?;
                 let mut results = [Heuristic::default(); 32];
+                // Deterministic: no workspace, so no split-K / stream-K partial reductions.
+                if crate::config::RuntimeConfig::get().nv.lt_deterministic {
+                    check(
+                        (self.api.cublasLtMatmulPreferenceSetAttribute)(
+                            pref,
+                            1,
+                            &0usize as *const _ as *const c_void,
+                            size_of::<usize>(),
+                        ),
+                        "Lt deterministic workspace",
+                    )?;
+                }
                 let mut count = 0;
                 check(
                     (self.api.cublasLtMatmulAlgoGetHeuristic)(
@@ -683,6 +709,10 @@ impl Lt {
                     })?;
                 plan.algo = winner.algo;
                 // More than the top 8 only when timing spans several rungs.
+                // Deterministic: the heuristic's first pick, not a per-process timed choice.
+                if crate::config::RuntimeConfig::get().nv.lt_deterministic {
+                    return Ok(());
+                }
                 let count = if rows.len() > 1 { count } else { count.min(8) };
                 plan.select(
                     results.get(..count as usize).unwrap_or(&[]),
@@ -1640,9 +1670,98 @@ impl Drop for Plan {
     }
 }
 
+/// The packet-declared FP8 scale mode of a cuBLASLt projection (`GemmFp8` `i5`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fp8Scale {
+    /// Per-row activation and per-channel weight vectors (OUTER_VEC_32F).
+    Vector,
+    /// 1x128 activation and 128x128 weight blocks.
+    Block,
+    /// No scales: the packet's `RowColScale` instruction applies them to the output.
+    Unit,
+    /// One f32 activation and one f32 weight scale (SCALAR_32F with scale pointers).
+    Tensor,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a leased SM120/SM121 GPU and cuBLASLt 12.9 or newer"]
+    fn fp8_unit_scale_is_the_unscaled_product() -> Result<()> {
+        let be = Arc::new(CudaBackend::new(0)?);
+        let lt = Lt::load(&be, None)?;
+        let stream = be.stream_create()?;
+        let (m, n, k) = (128usize, 512usize, 5120usize);
+        let input = be.alloc(0, (m * k) as u64)?;
+        let weight = be.alloc(0, (n * k) as u64)?;
+        let output = be.alloc(0, (m * n * 2) as u64)?;
+        // e4m3 0x38 = 1.0, 0x40 = 2.0, 0xb8 = -1.0.
+        let x: Vec<u8> = (0..m * k)
+            .map(|i| if (i / k) % 2 == 0 { 0x38 } else { 0x40 })
+            .collect();
+        let w: Vec<u8> = (0..n * k)
+            .map(|i| if (i / k) % 2 == 0 { 0x38 } else { 0xb8 })
+            .collect();
+        be.upload(&input, 0, &x)?;
+        be.upload(&weight, 0, &w)?;
+        let plan = lt.fp8_plan(m as u32, n as u32, k as u32, 0, 0, false, Fp8Scale::Unit)?;
+        plan.run(input.base, weight.base, output.base, &stream)?;
+        be.synchronize()?;
+        let mut values = vec![0u16; m * n];
+        be.download(&output, 0, bytemuck::cast_slice_mut(&mut values))?;
+        for row in 0..m {
+            for col in 0..n {
+                let expected = k as f32
+                    * if row % 2 == 0 { 1.0 } else { 2.0 }
+                    * if col % 2 == 0 { 1.0 } else { -1.0 };
+                let actual = f32::from_bits(u32::from(values[row * n + col]) << 16);
+                assert_eq!(actual, expected, "row={row} col={col}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a leased SM120/SM121 GPU and cuBLASLt 12.9 or newer"]
+    fn fp8_tensor_scales_multiply_the_product() -> Result<()> {
+        let be = Arc::new(CudaBackend::new(0)?);
+        let lt = Lt::load(&be, None)?;
+        let stream = be.stream_create()?;
+        let (m, n, k) = (128usize, 256usize, 4096usize);
+        let input = be.alloc(0, (m * k) as u64)?;
+        let weight = be.alloc(0, (n * k) as u64)?;
+        let output = be.alloc(0, (m * n * 2) as u64)?;
+        let xs = be.alloc(0, 4)?;
+        let ws = be.alloc(0, 4)?;
+        let x: Vec<u8> = (0..m * k)
+            .map(|i| if (i / k) % 2 == 0 { 0x38 } else { 0x40 })
+            .collect();
+        let w: Vec<u8> = (0..n * k)
+            .map(|i| if (i / k) % 2 == 0 { 0x38 } else { 0xb8 })
+            .collect();
+        be.upload(&input, 0, &x)?;
+        be.upload(&weight, 0, &w)?;
+        be.upload(&xs, 0, bytemuck::cast_slice(&[0.25f32]))?;
+        be.upload(&ws, 0, bytemuck::cast_slice(&[0.125f32]))?;
+        let plan = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false, Fp8Scale::Tensor)?;
+        plan.run(input.base, weight.base, output.base, &stream)?;
+        be.synchronize()?;
+        let mut values = vec![0u16; m * n];
+        be.download(&output, 0, bytemuck::cast_slice_mut(&mut values))?;
+        for row in 0..m {
+            for col in 0..n {
+                let expected = k as f32
+                    / 32.0
+                    * if row % 2 == 0 { 1.0 } else { 2.0 }
+                    * if col % 2 == 0 { 1.0 } else { -1.0 };
+                let actual = f32::from_bits(u32::from(values[row * n + col]) << 16);
+                assert_eq!(actual, expected, "row={row} col={col}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires a leased SM90 GPU and cuBLASLt 12.9 or newer"]
@@ -1669,10 +1788,9 @@ mod tests {
         be.upload(&weight, 0, &w)?;
         be.upload(&ws, 0, bytemuck::cast_slice(&scales))?;
         be.upload(&ws2, 0, bytemuck::cast_slice(&scales2))?;
-        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false, false)?;
-        let second = lt.fp8_plan(
-            m as u32, n as u32, k as u32, ws2.base, xs.base, false, false,
-        )?;
+        let vector = Fp8Scale::Vector;
+        let first = lt.fp8_plan(m as u32, n as u32, k as u32, ws.base, xs.base, false, vector)?;
+        let second = lt.fp8_plan(m as u32, n as u32, k as u32, ws2.base, xs.base, false, vector)?;
         for iteration in 1..=2 {
             let xscales: Vec<f32> = (0..m)
                 .map(|i| (1 + i % 8) as f32 * iteration as f32 / 16.0)

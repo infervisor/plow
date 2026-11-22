@@ -1,0 +1,311 @@
+{
+ "comment": "Per-op compulsory-byte / FLOP floors (one instruction). Checked by crates/costmodel/src/op_floor.rs and scripts/bench/test_op_roof.py: both models must reproduce every row. Regenerate rows from op_roof.py only together with op_floor.rs.",
+ "certification": {
+  "memory_bound": 0.8,
+  "compute_bound": 0.75
+ },
+ "cases": [
+  {
+   "op": "RowColScale",
+   "rows": 1024,
+   "params": {
+    "M": 1024,
+    "N": 5120
+   },
+   "bytes": 20996096.0,
+   "flops": 0.0
+  },
+  {
+   "op": "Mamba2Conv",
+   "rows": 4,
+   "params": {
+    "C": 10240,
+    "W": 4,
+    "rows": 4,
+    "T": 0,
+    "prefill": 0
+   },
+   "bytes": 757760.0,
+   "flops": 327680.0
+  },
+  {
+   "op": "Mamba2Conv",
+   "rows": 1024,
+   "params": {
+    "C": 10240,
+    "W": 4,
+    "rows": 1024,
+    "T": 1024,
+    "prefill": 1
+   },
+   "bytes": 42106880.0,
+   "flops": 83886080.0
+  },
+  {
+   "op": "Mamba2Step",
+   "rows": 4,
+   "params": {
+    "H": 128,
+    "P": 64,
+    "N": 128,
+    "G": 8,
+    "B": 4,
+    "state_bytes": 2
+   },
+   "bytes": 16924672.0,
+   "flops": 25165824.0
+  },
+  {
+   "op": "Mamba2Step",
+   "rows": 16,
+   "params": {
+    "H": 128,
+    "P": 64,
+    "N": 128,
+    "G": 8,
+    "B": 16,
+    "state_bytes": 0
+   },
+   "bytes": 134807552.0,
+   "flops": 100663296.0
+  },
+  {
+   "op": "Mamba2GatedNorm",
+   "rows": 4,
+   "params": {
+    "groups": 8,
+    "group": 1024,
+    "rows": 4
+   },
+   "bytes": 196608.0,
+   "flops": 0.0
+  },
+  {
+   "op": "Mamba2ChunkState",
+   "rows": 1024,
+   "params": {
+    "H": 128,
+    "P": 64,
+    "R": 1024,
+    "T": 1024,
+    "N": 128,
+    "G": 8
+   },
+   "bytes": 55574528.0,
+   "flops": 2147483648.0
+  },
+  {
+   "op": "Mamba2ChunkPass",
+   "rows": 1024,
+   "params": {
+    "H": 128,
+    "P": 64,
+    "R": 1024,
+    "T": 1024,
+    "N": 128,
+    "state_bytes": 2
+   },
+   "bytes": 71827456.0,
+   "flops": 16777216.0
+  },
+  {
+   "op": "Mamba2ChunkOut",
+   "rows": 1000,
+   "params": {
+    "H": 128,
+    "P": 64,
+    "R": 1000,
+    "T": 1024,
+    "N": 128,
+    "G": 8
+   },
+   "bytes": 71442432.0,
+   "flops": 4456448000.0
+  },
+  {
+   "op": "MoeRouterLogitsF32",
+   "rows": 4,
+   "params": {
+    "T": 4,
+    "E": 512,
+    "H": 4096,
+    "KS": 16
+   },
+   "bytes": 4358144.0,
+   "flops": 16777216.0
+  },
+  {
+   "op": "MoeRouterLogitsF32",
+   "rows": 1024,
+   "params": {
+    "T": 1024,
+    "E": 512,
+    "H": 4096,
+    "KS": 1
+   },
+   "bytes": 14680064.0,
+   "flops": 4294967296.0
+  },
+  {
+   "op": "MoeRouterSigmoidTopk",
+   "rows": 4,
+   "params": {
+    "T": 4,
+    "E": 512,
+    "k": 22,
+    "KS": 16,
+    "flags": 1
+   },
+   "bytes": 133824.0,
+   "flops": 0.0
+  },
+  {
+   "op": "MoeAlignNvfp4",
+   "rows": 1024,
+   "params": {
+    "T": 1024,
+    "E": 512,
+    "k": 22
+   },
+   "bytes": 456704.0,
+   "flops": 0.0
+  },
+  {
+   "op": "MoeCombinePf",
+   "rows": 4,
+   "params": {
+    "H": 1024,
+    "k": 22,
+    "T": 4
+   },
+   "bytes": 368640.0,
+   "flops": 0.0
+  },
+  {
+   "op": "MoeCombinePf",
+   "rows": 1024,
+   "params": {
+    "H": 1024,
+    "k": 22,
+    "T": 1024,
+    "bf16": 1
+   },
+   "bytes": 48414720.0,
+   "flops": 0.0
+  },
+  {
+   "op": "MoeQuantNvfp4",
+   "rows": 1024,
+   "params": {
+    "R": 1024,
+    "K": 1024,
+    "n": 512
+   },
+   "bytes": 2689024.0,
+   "flops": 0.0
+  },
+  {
+   "op": "MoeUpNvfp4",
+   "rows": 4,
+   "params": {
+    "T": 4,
+    "k": 22,
+    "I": 2688,
+    "K": 1024,
+    "E": 512,
+    "experts": 80
+   },
+   "bytes": 124344640.0,
+   "flops": 484442112.0
+  },
+  {
+   "op": "MoeUpNvfp4",
+   "rows": 4,
+   "params": {
+    "T": 4,
+    "k": 1,
+    "I": 5376,
+    "K": 4096,
+    "E": 1
+   },
+   "bytes": 12462084.0,
+   "flops": 176160768.0
+  },
+  {
+   "op": "MoeDownNvfp4",
+   "rows": 4,
+   "params": {
+    "T": 4,
+    "k": 22,
+    "H": 1024,
+    "I": 2688,
+    "E": 512,
+    "mode": 0,
+    "experts": 80
+   },
+   "bytes": 124696896.0,
+   "flops": 484442112.0
+  },
+  {
+   "op": "MoeDownNvfp4",
+   "rows": 4,
+   "params": {
+    "T": 4,
+    "k": 1,
+    "H": 4096,
+    "I": 5376,
+    "E": 1,
+    "mode": 1
+   },
+   "bytes": 12462084.0,
+   "flops": 176160768.0
+  },
+  {
+   "op": "MoeUpNvfp4Pf",
+   "rows": 1024,
+   "params": {
+    "T": 1024,
+    "k": 22,
+    "I": 2688,
+    "K": 1024,
+    "E": 512,
+    "w4a4": 1,
+    "n2": 512,
+    "experts": 512
+   },
+   "bytes": 827377664.0,
+   "flops": 124017180672.0
+  },
+  {
+   "op": "MoeDownNvfp4Pf",
+   "rows": 1024,
+   "params": {
+    "T": 1024,
+    "k": 22,
+    "H": 1024,
+    "I": 2688,
+    "E": 512,
+    "mode": 2,
+    "w4a4": 1,
+    "experts": 512
+   },
+   "bytes": 872925184.0,
+   "flops": 124017180672.0
+  },
+  {
+   "op": "MoeUpNvfp4Pf",
+   "rows": 1024,
+   "params": {
+    "T": 1024,
+    "k": 1,
+    "I": 5376,
+    "K": 4096,
+    "E": 1,
+    "w4a4": 1,
+    "n2": 1
+   },
+   "bytes": 17842180.0,
+   "flops": 45097156608.0
+  }
+ ]
+}

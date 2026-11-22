@@ -381,6 +381,11 @@ pub(super) fn upload_program(
 }
 
 impl GpuEngine {
+    /// Whether the packet declares a mixed decode + prefill program.
+    pub fn has_mixed_step(&self) -> bool {
+        self.mixed_step.is_some()
+    }
+
     /// Select the packet-declared mixed variant that covers the most waiting
     /// prefill rows for this decode width, preferring less padding on ties.
     pub fn mixed_step_rows(&self, decode_rows: usize, prefill_rows: usize) -> Option<u32> {

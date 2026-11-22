@@ -81,6 +81,9 @@ const LIBRARY_OBJECT_SUFFIX: &str = ".aot";
 /// whenever a prefill program runs `QwenGdnPrefill`; the packet names it by that opcode, not in
 /// `segment_roles`.
 const GDN_PREFILL_OBJECT: &str = "plow_gdn_prefill.aot";
+/// Its native twin (`device::cuda::qwen_gdn::OBJECT_NATIVE`, runtime/nvidia/gdn_prefill_sm120.cu)
+/// on every non-Hopper CUDA target.
+const GDN_PREFILL_NATIVE_OBJECT: &str = "gdn_prefill_sm120.cubin";
 
 /// Shares the directory and belongs to something else: the tokenizer, which is
 /// classified by provenance rather than by name.
@@ -999,9 +1002,21 @@ pub fn declared_objects(packet: &Path) -> Result<Vec<(String, Option<String>)>> 
         .flat_map(|p| &p.insts)
         .any(|i| i.op == packet::dev::DevOp::QwenGdnPrefill as u16);
     if gdn {
-        out.push((GDN_PREFILL_OBJECT.to_string(), None));
+        let abi = blob
+            .abi(&buf)
+            .map_err(|e| bad(format!("{}: {e}", packet.display())))?;
+        out.push((gdn_prefill_object(abi.as_ref()).to_string(), None));
     }
     Ok(out)
+}
+
+/// The GDN prefill object `NativeGdn::load` reads: the CuTe library on sm_90a, the native cubin
+/// on every other CUDA target. A packet without a declared target predates the native cubin.
+fn gdn_prefill_object(abi: Option<&plow_asset::abi::Abi>) -> &'static str {
+    match abi.and_then(|a| a.target.as_ref()).map(|t| t.isa.as_str()) {
+        Some(isa) if isa != "sm_90a" => GDN_PREFILL_NATIVE_OBJECT,
+        _ => GDN_PREFILL_OBJECT,
+    }
 }
 
 /// Refuse an objset that does not carry, byte for byte, an object the packet loads by name.

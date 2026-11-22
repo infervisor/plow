@@ -1030,6 +1030,20 @@ fn ensure_model_packet_path_supported(
              block-residual state; use the existing Kimi HF-directory/devblob path"
                 .into(),
         )),
+        Some(mt @ ("nemotron_h" | "nemotron_h_omni")) => {
+            // Build first so a config the graph refuses reports that instead.
+            nn_graph::models::build_text_generation_from_config_json_at(
+                metadata.config_json(),
+                &nn_graph::models::ShapeBucket::default(),
+            )
+            .map_err(nn_graph::hub::HubError::from)?;
+            Err(PlowcError::InvalidDim(format!(
+                "{mt}: the Nemotron-H text graph builds, but device emit is not implemented \
+                 on the metadata-only `--model` scheduled-packet path (no Mamba-2 / NVFP4 \
+                 latent-MoE lowering there); use the HF-directory devblob path (devgen \
+                 `nemotron_h`, sm_120a / sm_121a)"
+            )))
+        }
         _ => Ok(()),
     }
 }
@@ -1326,7 +1340,12 @@ fn build_experts_schema(
                         .routed_experts
                         .iter()
                         .map(|expert| plow_asset::RoutedExpertWeights {
-                            gate: expert.gate.weight.clone(),
+                            // Gate-less (relu²) experts have no gate tensor.
+                            gate: expert
+                                .gate
+                                .as_ref()
+                                .map(|gate| gate.weight.clone())
+                                .unwrap_or_default(),
                             up: expert.up.weight.clone(),
                             down: expert.down.weight.clone(),
                         })
@@ -2795,7 +2814,7 @@ fn projection_weight_ids(graph: &nn_graph::Graph) -> std::collections::HashSet<u
     }
     for layer in &graph.expert_bindings {
         for expert in &layer.routed_experts {
-            for projection in [&expert.gate, &expert.up, &expert.down] {
+            for projection in expert.gate.iter().chain([&expert.up, &expert.down]) {
                 if let Some(id) = name_to_id.get(projection.weight.as_str()) {
                     projection_ids.insert(*id);
                 }

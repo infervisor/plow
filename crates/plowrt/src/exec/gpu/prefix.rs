@@ -269,7 +269,7 @@ impl GpuEngine {
         let rows = rows.min(self.max_ctx.saturating_sub(1));
         let copy = (|| -> Result<()> {
             for cache in &manifest.caches {
-                let head_row = u64::from(cache.hd) * 2;
+                let head_row = u64::from(cache.hd * cache.elem_bytes());
                 let head_bytes = u64::from(cache.stride) * head_row;
                 let slot_bytes = u64::from(cache.heads) * head_bytes;
                 for &handle in &cache.pair {
@@ -441,10 +441,10 @@ impl GpuEngine {
             return declined("encoder overlay rows are not keyed by the prompt ids");
         }
         let requested = config.nv_vmm_prefix();
-        // GB202 (sm_120) auto-selects the cache for every packet with a layout, rank groups
+        // GB202 / GB10 (sm_120a / sm_121a) auto-select the cache for every packet with a layout, rank groups
         // included. Hopper keeps the geometry allowlist it was qualified on; other targets
         // need an explicit PLOW_VMM_PREFIX=1.
-        let gb202 = capability == (12, 0);
+        let gb202 = hwspec::IsaLevel::from_nvidia_cc(capability).is_some_and(hwspec::IsaLevel::is_sm12x);
         if requested == Some(false)
             || (requested.is_none()
                 && ((capability != (9, 0) && !gb202)
@@ -594,7 +594,11 @@ impl GpuEngine {
             }
         };
         let full_fp8 = geo.full_layers.first().map(|&l| scales_of(l).is_some());
-        geo.elem = if full_fp8 == Some(true) { 1 } else { 2 };
+        // Unit-scale E4M3 caches carry no scale tensors: the LIVE manifest's writers declare them.
+        let unit_e4m3 = blob
+            .with_packet_view(plow_asset::live_kv::emit)
+            .is_ok_and(|m| m.caches.iter().any(|c| c.e4m3));
+        geo.elem = if full_fp8 == Some(true) || unit_e4m3 { 1 } else { 2 };
 
         // Full layers: declared bytes must equal the batch-major shape at the
         // resolved elem, and the fp8 discriminator must be uniform — a layer
@@ -618,6 +622,7 @@ impl GpuEngine {
             }
             match (geo.elem, scales_of(l)) {
                 (2, None) => {}
+                (1, None) if unit_e4m3 => {}
                 (1, Some((ik, iv))) => {
                     let want = batch as u64 * geo.kvh_full as u64 * geo.max_ctx as u64 * 4;
                     if blob.tensors[ik].bytes != want || blob.tensors[iv].bytes != want {

@@ -542,6 +542,7 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             intermediate_size,
             block_fp8,
             post_expert_norm: None,
+            act: nn_graph::MoeExpertAct::SwiGlu,
         } => model(
             ModelOpKind::MoeExperts,
             2,

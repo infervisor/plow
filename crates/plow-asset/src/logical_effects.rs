@@ -3,7 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use packet::dev::{DevInst64, DevOp, FP8_BLOCK_GROUP, TENSOR_NONE16, TENSOR_NONE_I};
+use packet::dev::{
+    DevInst64, DevOp, FP8_BLOCK_GROUP, FP8_TENSOR_SCALE, FP8_UNIT_SCALE, TENSOR_NONE16,
+    TENSOR_NONE_I,
+};
 use packet::devbuild::ProgramRole;
 use serde_json::{json, Value};
 
@@ -194,7 +197,8 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         }
         SoftCap | Argmax | ArgmaxFin if all(&[0, 1]) => Some(&[0]),
         GemvArgmax if all(&[0, 1, 2, 3]) => Some(&[0, 3]),
-        FlashDecode if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
+        // t6: the physical-slot or span row-slot map (read only).
+        FlashDecode if all(&[0, 1, 2, 3, 4, 5]) && none(&[7]) => Some(&[0, 1]),
         FlashDecodeFp8 if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0, 1]),
         FlashMerge if d.i[4] == 0 && all(&[0, 1, 2]) && none(&[3]) => Some(&[0]),
         FlashPrefill
@@ -218,6 +222,20 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         {
             Some(&[0])
         }
+        GemmFp8
+            if all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) && d.i[3] == 0 && d.i[5] == FP8_UNIT_SCALE =>
+        {
+            Some(&[0])
+        }
+        GemmFp8
+            if all(&[0, 1, 2, 3, 4])
+                && none(&[5, 6, 7])
+                && d.i[3] == 0
+                && d.i[5] == FP8_TENSOR_SCALE =>
+        {
+            Some(&[0])
+        }
+        RowColScale if all(&[0, 1, 2, 3]) && none(&[4, 5, 6, 7]) => Some(&[0]),
         Gemv if d.i[3] == 0 && all(&[0, 1, 2]) => Some(&[0]),
         Gemv if d.i[3] == 4
             && d.i[4] == 0
@@ -254,6 +272,14 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         {
             Some(if has(5) { &[0, 3, 5] } else { &[0, 3] })
         }
+        QuantFp8
+            if d.i[3] == 0
+                && d.i[5] == FP8_TENSOR_SCALE
+                && all(&[0, 1, 2])
+                && none(&[3, 4, 5, 6, 7]) =>
+        {
+            Some(&[0])
+        }
         QuantFp8 if d.i[3] == 0 && all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => Some(&[0, 2]),
         QuantFp8 if d.i[3] == 0 && all(&[0, 1, 2, 3, 4]) && none(&[5, 6, 7]) => Some(&[0, 1, 2]),
         QuantFp8 if d.i[3] == FP8_BLOCK_GROUP && all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => {
@@ -283,6 +309,8 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         MoeExpertGluNormGemma if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0, 5]),
         QwenGatedNorm if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0]),
         QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0, 3]),
+        // Span verify: t5 = in.rowslot (read), t6 = the history snapshots (written).
+        QwenGdnConv if all(&[0, 1, 2, 3, 5, 6]) && none(&[7]) => Some(&[0, 3, 6]),
         QwenGdnGatePrep if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
         QwenGdnQkvPrep if all(&[0, 1, 2, 3]) && none(&[4, 5, 6, 7]) => Some(&[0, 1, 2]),
         QwenGdnStep if all(&[0, 1, 2, 3, 4, 5, 6]) => Some(&[0, 6]),
@@ -292,6 +320,30 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
             Some(if has(4) { &[0, 1] } else { &[0] })
         }
         QwenSigmoidGate if all(&[0, 1, 2]) && none(&[4, 5, 6, 7]) => Some(&[0]),
+        // op_moe_nvfp4.cuh (Nemotron latent MoE): router logits, top-k table, NVFP4 experts
+        // (t2 table/meta optional = dense shared expert), align writes meta + row arrays.
+        MoeRouterLogitsF32 if all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => Some(&[0]),
+        MoeRouterSigmoidTopk if all(&[0, 1]) && none(&[4, 5, 6, 7]) => Some(&[0]),
+        MoeUpNvfp4 | MoeDownNvfp4 if all(&[0, 1, 3, 4, 5]) && none(&[6, 7]) => Some(&[0]),
+        MoeAlignNvfp4 if all(&[0, 1, 2, 3, 4]) && none(&[5, 6, 7]) => Some(&[0, 2, 3, 4]),
+        MoeUpNvfp4Pf if all(&[0, 1, 3, 4, 5]) && none(&[7]) => Some(&[0]),
+        MoeUpNvfp4Pf if d.i[5] == 1 && all(&[0, 1, 3, 4, 5, 7]) => Some(&[0]),
+        MoeQuantNvfp4 if all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => Some(&[0]),
+        MoeDownNvfp4Pf if all(&[0, 1, 3, 4, 5]) => Some(&[0]),
+        // op 87: out from the f32 parts (+ residual / shared when present).
+        MoeCombinePf if all(&[0, 3]) && none(&[4, 5, 6, 7]) => Some(&[0]),
+        MoeCombinePf if d.i[5] == 1 && all(&[0, 3, 4]) && none(&[1, 2, 5, 6, 7]) => Some(&[0]),
+        // op_mamba.cuh: conv out + history in place; step y + state in place; chunk phases.
+        Mamba2Conv if all(&[0, 1, 2, 4]) && none(&[6, 7]) => Some(&[0, 4]),
+        // Span verify: t6 = in.rowslot (read), t7 = the history snapshots (written).
+        Mamba2Conv if all(&[0, 1, 2, 4, 6, 7]) => Some(&[0, 4, 7]),
+        Mamba2Step if all(&[0, 1, 2, 3, 4, 5, 6]) => Some(&[0, 6]),
+        Mamba2GatedNorm if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0]),
+        // prefill i3 = 1: t0 is out_proj's e4m3 input (t5 = its input_scale), fused quant.
+        Mamba2GatedNorm if d.i[3] == 1 && all(&[0, 1, 2, 3, 5]) && none(&[6, 7]) => Some(&[0]),
+        Mamba2ChunkState if all(&[0, 1, 2, 3, 4, 5, 6]) && none(&[7]) => Some(&[0, 5, 6]),
+        Mamba2ChunkPass if all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => Some(&[0, 2]),
+        Mamba2ChunkOut if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0]),
         Embed
         | EmbedFrameBf16
         | SoftCap
@@ -315,6 +367,7 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         | QuantFp8
         | RmsNorm
         | GluPitched
+        | RowColScale
         | MoeRouterGemmaTopk
         | MoeCombineNormGemma
         | MoeCombineNormGemmaPf
@@ -338,7 +391,22 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         | QwenGdnPrefill
         | QwenQGateSplit
         | QwenRmsNorm
-        | QwenSigmoidGate => None,
+        | QwenSigmoidGate
+        | MoeRouterLogitsF32
+        | MoeRouterSigmoidTopk
+        | MoeUpNvfp4
+        | MoeDownNvfp4
+        | MoeAlignNvfp4
+        | MoeUpNvfp4Pf
+        | MoeDownNvfp4Pf
+        | MoeQuantNvfp4
+        | MoeCombinePf
+        | Mamba2Conv
+        | Mamba2Step
+        | Mamba2GatedNorm
+        | Mamba2ChunkState
+        | Mamba2ChunkPass
+        | Mamba2ChunkOut => None,
         _ => return None,
     };
     Some(writes.ok_or_else(|| format!("unaudited logical effects variant of {op:?}")))
@@ -385,6 +453,16 @@ fn handle_accesses(d: &DevInst64) -> Result<Vec<(u32, bool)>, String> {
     let accesses: Vec<(u32, bool)> = match DevOp::from_u16(d.op) {
         Some(DevOp::FlashDecode) if fold != 0 => vec![(fold & 0xFFFF, true), (fold >> 16, true)],
         Some(DevOp::FlashDecodeFp8) if fold != 0 => vec![(fold, false)],
+        // Span verify: j1 = in.rowslot (read), i6 = the state snapshots (written).
+        Some(DevOp::QwenGdnStep) if fold != 0 => vec![(fold, false), (d.i[6], true)],
+        // Span verify: i6 >> 16 = in.rowslot (read), i7 >> 16 = the step records (written),
+        // i5 >> 16 = the replay table (read).
+        Some(DevOp::Mamba2Step) if d.i[6] >> 16 != 0 => {
+            let mut a = vec![(d.i[6] >> 16, false), (d.i[7] >> 16, true)];
+            a.extend(reads(&[d.i[5] >> 16]));
+            a
+        }
+        Some(DevOp::Mamba2Conv) if d.i[5] >> 16 != 0 => vec![(d.i[5] >> 16, false)],
         Some(DevOp::Gemv) if d.i[3] == 4 => reads(&[d.i[5], d.i[6], d.i[7]]),
         Some(DevOp::GemvGlu) if d.i[3] == 4 && fold == 0 => reads(&[d.i[4], d.i[6], d.i[7]]),
         // sm_90a TMA descriptors over A and B (dev_isa.h GEMM: 0 = absent).
@@ -1075,6 +1153,12 @@ mod tests {
         (DevOp::GemmFp8, &[0, 1, 2, 3, 4], &[], 0, Some(&[0]), "interp_sm120.cu:1588 d_gemm_w8a8 C"),
         (DevOp::GemmFp8, &[0, 1, 2, 3, 4], &[(5, 128)], 0, Some(&[0]), "block-128 scales, same C"),
         (DevOp::GemmFp8, &[0, 1, 2, 3, 4, 5], &[], 0, None, "split-K / multi-output"),
+        (DevOp::GemmFp8, &[0, 1, 2], &[(5, 1)], 0, Some(&[0]), "unit scales: library route C, op_gemm.cuh d_gemm_w8a8 null scales"),
+        (DevOp::GemmFp8, &[0, 1, 2, 3, 4], &[(5, 1)], 0, None, "unit scales carry no scale operands"),
+        (DevOp::GemmFp8, &[0, 1, 2], &[], 0, None, "vector scales required"),
+        (DevOp::GemmFp8, &[0, 1, 2, 3, 4], &[(5, 2)], 0, Some(&[0]), "per-tensor scales: cuBLASLt route C (interpreter traps)"),
+        (DevOp::RowColScale, &[0, 1, 2, 3], &[], 0, Some(&[0]), "op_elementwise.cuh d_row_col_scale out"),
+        (DevOp::RowColScale, &[0, 1, 2], &[], 0, None, "column scales required"),
         (DevOp::Gemv, &[0, 1, 2], &[], 0, Some(&[0]), "interp_sm120.cu:2425 C"),
         (DevOp::Gemv, &[0, 1, 2, 3], &[(3, 4), (5, 9), (7, 10)], 0, Some(&[0, 1, 3]), "op_qwen_gdn.cuh:743 fold norm writes x, residual"),
         (DevOp::Gemv, &[0, 1, 2, 3, 4, 5], &[(3, 8)], 0, None, "AddNorm fold producer"),
@@ -1092,6 +1176,7 @@ mod tests {
         (DevOp::QuantFp8, &[0, 1, 2], &[], 0, Some(&[0, 2]), "interp_sm120.cu:1627 e4m3, scale"),
         (DevOp::QuantFp8, &[0, 1, 2, 3, 4], &[], 0, Some(&[0, 1, 2]), "op_gemm.cuh:2851/2861 fused GLU stores x"),
         (DevOp::QuantFp8, &[0, 1, 2], &[(3, 128)], 0, Some(&[0, 2]), "op_gemm.cuh:2771 group-128"),
+        (DevOp::QuantFp8, &[0, 1, 2], &[(5, 2)], 0, Some(&[0]), "op_gemm.cuh d_quant_fp8_tensor e4m3 (scale read)"),
         (DevOp::QuantFp8, &[0, 1, 2], &[(3, 64)], 0, None, "unaudited group"),
         (DevOp::RmsNorm, &[0, 1, 2], &[], 0, Some(&[0]), "interp_sm120.cu:1435"),
         (DevOp::RmsNorm, &[0, 1, 2, 3, 4], &[], 0, Some(&[0, 3, 4]), "op_norm.cuh:211/220 fused quant"),
@@ -1127,6 +1212,35 @@ mod tests {
         (DevOp::QwenRmsNorm, &[0, 1, 2, 3], &[], 0, Some(&[0]), "op_qwen_gdn.cuh:575"),
         (DevOp::QwenRmsNorm, &[0, 1, 2, 3, 4], &[], 0, Some(&[0, 1]), "op_qwen_gdn.cuh:532 residual in place"),
         (DevOp::QwenSigmoidGate, &[0, 1, 2, 3], &[], 0, Some(&[0]), "op_qwen_gdn.cuh:486"),
+        (DevOp::Mamba2Conv, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0, 4]), "op_mamba.cuh d_mamba2_conv out, history"),
+        (DevOp::Mamba2Conv, &[0, 1, 2, 4], &[(4, 1)], 0, Some(&[0, 4]), "prefill mode, no bias"),
+        (DevOp::Mamba2Conv, &[0, 1, 2, 3], &[], 0, None, "history required"),
+        (DevOp::Mamba2Conv, &[0, 1, 2, 3, 4, 5, 6, 7], &[(5, 3)], 0, Some(&[0, 4, 7]), "op_mamba_span.cuh span verify"),
+        (DevOp::Mamba2Conv, &[0, 1, 2, 3, 4, 5, 6], &[(5, 3)], 0, None, "span needs its snapshot"),
+        (DevOp::Mamba2Step, &[0, 1, 2, 3, 4, 5, 6, 7], &[], 0, Some(&[0, 6]), "op_mamba.cuh d_mamba2_step y, state"),
+        (DevOp::Mamba2Step, &[0, 1, 2, 3, 4, 5, 7], &[], 0, None, "state required"),
+        (DevOp::Mamba2GatedNorm, &[0, 1, 2, 3, 4], &[], 0, Some(&[0]), "op_mamba.cuh d_mamba2_gated_norm"),
+        (DevOp::Mamba2GatedNorm, &[0, 1, 2, 3, 5], &[(3, 1)], 0, Some(&[0]), "op_mamba.cuh mamba_gn_store q (fp8 out)"),
+        (DevOp::Mamba2GatedNorm, &[0, 1, 2, 3, 5], &[], 0, None, "t5 only with i3 = 1"),
+        (DevOp::Mamba2ChunkState, &[0, 1, 2, 3, 4, 5, 6], &[], 0, Some(&[0, 5, 6]), "op_mamba.cuh cstate, dtv, cum"),
+        (DevOp::Mamba2ChunkPass, &[0, 1, 2], &[], 0, Some(&[0, 2]), "op_mamba.cuh entering states, slot state"),
+        (DevOp::Mamba2ChunkOut, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0]), "op_mamba.cuh y"),
+        (DevOp::Mamba2ChunkOut, &[0, 1, 2, 3, 4], &[], 0, None, "D required"),
+        (DevOp::MoeRouterLogitsF32, &[0, 1, 2], &[], 0, Some(&[0]), "op_moe_nvfp4.cuh logits"),
+        (DevOp::MoeRouterSigmoidTopk, &[0, 1, 2], &[], 0, Some(&[0]), "op_moe_nvfp4.cuh table"),
+        (DevOp::MoeRouterSigmoidTopk, &[0, 1], &[], 0, Some(&[0]), "no correction bias"),
+        (DevOp::MoeRouterSigmoidTopk, &[0, 1, 2, 3], &[], 0, Some(&[0]), "decode active mask"),
+        (DevOp::MoeUpNvfp4, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0]), "op_moe_nvfp4.cuh fu"),
+        (DevOp::MoeUpNvfp4, &[0, 1, 3, 4, 5], &[], 0, Some(&[0]), "dense shared expert"),
+        (DevOp::MoeDownNvfp4, &[0, 1, 2, 3, 4], &[], 0, None, "gs required"),
+        (DevOp::MoeAlignNvfp4, &[0, 1, 2, 3, 4], &[], 0, Some(&[0, 2, 3, 4]), "meta, rows"),
+        (DevOp::MoeUpNvfp4Pf, &[0, 1, 2, 3, 4, 5, 6], &[], 0, Some(&[0]), "op_moe_nvfp4.cuh fug"),
+        (DevOp::MoeDownNvfp4Pf, &[0, 1, 2, 3, 4, 5, 6, 7], &[], 0, Some(&[0]), "parts"),
+        (DevOp::MoeUpNvfp4Pf, &[0, 1, 2, 3, 4, 5, 6, 7], &[(5, 1)], 0, Some(&[0]), "op_moe_nvfp4_pf.cuh W4A4 q out"),
+        (DevOp::MoeQuantNvfp4, &[0, 1, 2], &[], 0, Some(&[0]), "op_moe_nvfp4_pf.cuh q tensor"),
+        (DevOp::MoeCombinePf, &[0, 3], &[], 0, Some(&[0]), "op_moe.cuh latent combine"),
+        (DevOp::MoeCombinePf, &[0, 3, 4], &[(5, 1)], 0, Some(&[0]), "op_moe_nvfp4_pf.cuh bf16 combine"),
+        (DevOp::MoeCombinePf, &[0, 1, 2], &[], 0, None, "parts required"),
     ];
 
     #[test]

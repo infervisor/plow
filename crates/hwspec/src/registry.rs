@@ -23,6 +23,7 @@ pub const ALL: &[&GpuSpec] = &[
     &blackwell::RTX_5090,
     &blackwell::RTX_6000_PRO,
     &blackwell::B200,
+    &blackwell::GB10,
     &mi300::MI300X,
     &mi300::MI325X,
     &mi350::MI350X,
@@ -58,6 +59,9 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("6000pro", "RTX 6000 Pro Blackwell"),
     ("rtx6000", "RTX 6000 Pro Blackwell"),
     ("b200", "B200"),
+    ("gb10", "GB10"),
+    ("dgxspark", "GB10"),
+    ("spark", "GB10"),
     // AMD CDNA 3
     ("mi300", "MI300X"),
     ("mi300x", "MI300X"),

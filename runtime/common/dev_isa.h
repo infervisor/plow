@@ -1566,6 +1566,70 @@ enum {
      * g = gu[r*i3 + p], u = gu[r*i3 + i4 + p]. t0=out t1=gu i0=n (rows*width) i1=act
      * i2=width i3=in_stride i4=up_col (elements) f0=alpha f1=limit. */
     PLOW_DOP_GLU_PITCHED = 230,
+    /* Outer scaling of an unscaled GEMM_FP8 (i5 = PLOW_FP8_UNIT_SCALE) output:
+     * out[m*N + n] = bf16(f32(x[m*N + n]) * row[m] * col[n]). t0=out t1=x (may alias out)
+     * t2=row(f32[M]) t3=col(f32[N]) i0=M i1=N (N % 8 == 0). */
+    PLOW_DOP_ROW_COL_SCALE = 231,
+    /* NVFP4 latent MoE (Nemotron-3.5), op_moe_nvfp4.cuh. W4A16: e2m1*e4m3 dequantised exactly to
+     * bf16, f32 accumulate. NVFP4 tensors: W u8 [E][N][K/2] (low nibble = even k), S e4m3
+     * [E][N][K/16], gs f32 [E]. table = {u32 eid, f32 w} [T*k]. 256 threads.
+     *   ROUTER_LOGITS_F32 t0=logits(f32 [KS][T][E]) t1=x(bf16 [T][H]) t2=W(bf16 [E][H])
+     *         i0=T i1=E i2=H i3=KS (0=1; T > 16 needs KS = 1)
+     *   ROUTER_SIGMOID_TOPK t0=table t1=logits t2=bias?(f32 [E]) t3=active?(i32 [T], KS>1)
+     *         i0=T i1=E i2=k(<=32) i3=KS i4=flags(bit0 renormalize) f0=scale(0=1); top-k of
+     *         sigmoid+bias, w = sigmoid; an inactive row writes k unused (0xFFFFFFFF) slots.
+     *   UP_NVFP4 (T<=16) t0=fu(bf16 [T*k][I]) t1=x(bf16 [T][K]) t2=table? t3=W t4=S t5=gs
+     *         i0=T i1=k i2=I i3=K i4=E; fu = relu(gs*W.x)^2; table NONE = dense (E=1).
+     *   DOWN_NVFP4 (T<=16) t0=out t1=fu t2=table? t3=W t4=S t5=gs i0=T i1=k i2=H i3=I i4=E
+     *         i5=mode (0: f32 part[T*k][H] = w*gs*W.fu; 1: dense bf16 [T][H]).
+     *   ALIGN_NVFP4 (blocks=1) t0=meta(i32 [3E+1]: rowoff|cnt|64-row tile prefix) t1=table
+     *         t2=row_token t3=row_partidx(u32 [T*k]) t4=row_gate(f32 [T*k]) i0=T i1=E i2=k
+     *   UP_NVFP4_PF t0=fug(bf16 [T*k][I], sorted rows) t1=x t2=meta? t3=W t4=S t5=gs
+     *         t6=row_token? i0=T i1=k i2=I i3=K i4=E (meta NONE = dense)
+     *   DOWN_NVFP4_PF t0=out t1=fug t2=meta? t3=W t4=S t5=gs t6=row_partidx? t7=row_gate?
+     *         i0=T i1=k i2=H i3=I i4=E i5=mode (as DOWN_NVFP4).
+     * The latent combine is MOE_COMBINE_PF (87) with t1 = t2 = NONE. */
+    PLOW_DOP_MOE_ROUTER_LOGITS_F32 = 232,
+    PLOW_DOP_MOE_ROUTER_SIGMOID_TOPK = 233,
+    PLOW_DOP_MOE_UP_NVFP4 = 234,
+    PLOW_DOP_MOE_DOWN_NVFP4 = 235,
+    PLOW_DOP_MOE_ALIGN_NVFP4 = 236,
+    PLOW_DOP_MOE_UP_NVFP4_PF = 237,
+    PLOW_DOP_MOE_DOWN_NVFP4_PF = 238,
+    /* W4A4 prefill arm, op_moe_nvfp4_pf.cuh (vLLM's NVFP4 activations). q tensor of R x K:
+     * [R][K/2] e2m1 | [R][K/16] e4m3 | f32 alpha (the input_scale max of the quant).
+     *   QUANT_NVFP4 t0=q t1=x(bf16 [R][K]) t2=input_scale(f32 [n]) i0=R i1=K i2=n.
+     *   UP_NVFP4_PF i5=1: t1 = q of x, t0 = q of relu^2 (sorted rows), t7 = down input_scale
+     *         (i6 entries). DOWN_NVFP4_PF i6=1: t1 = that q tensor. */
+    PLOW_DOP_MOE_QUANT_NVFP4 = 239,
+
+    /* Mamba-2 (Nemotron-H) mixer, op_mamba.cuh (232..239 are the NVFP4 MoE above; a new opcode
+     * goes after 245 so PLOW_DOP__COUNT stays one past the highest value).
+     * Prefill-mode instructions carry the REAL rows in i2 and the bucket rows T in i3 (the
+     * runtime patches i2 per chunk); pad rows are the identity on every state and write 0.
+     * Sources j1 = row pitch | column << 16 (elements) inside the in_proj output.
+     *   CONV  t0=out[rows,C] t1=in(xBC, j1) t2=w[C,W] t3=bias[C]? t4=history[slots,C,W-1]
+     *         t5=active? (all bf16 but active)  i0=C i1=W i2=rows (decode B / prefill real R)
+     *         i3=T i4=prefill. History oldest first; out = SiLU(bias + conv).
+     *   STEP  t0=y[B,H*P] t1=xbc(conv out) t2=proj(dt at j1) t3=A_log[H] t4=D[H] t5=dt_bias[H]
+     *         t6=state(fp16[slots,H,P,N]) t7=active (mask, then the step seed word)  i0=H
+     *         i1=P i2=N(128) i3=G i4=B i5=state bytes(2) i6=seed word index i7=layer
+     *         f0/f1 = dt clamp; dt = softplus(dt + dt_bias); y = C.s + D x; the new state is
+     *         stored with stochastic rounding (Philox-4x32-5 keyed by seed and layer).
+     *   GATED_NORM t0=out t1=y t2=z(j1) t3=gamma t4=active?  i0=groups i1=group size
+     *         i2=rows f0=eps; out = bf16(bf16(v rsqrt(mean v^2 + eps)) gamma), v = y silu(z).
+     *   CHUNK_STATE t0=cstate(f32[T/128,H,P,N]) t1=xbc t2=proj(dt at j1) t3=A_log t4=dt_bias
+     *         t5=dtv(f32[H,T]) t6=cum(f32[H,T])  i0=H i1=P(64) i2=R i3=T i4=N(128) i5=G f0/f1.
+     *   CHUNK_PASS t0=cstate (local -> entering, in place) t1=cum t2=state(fp16[H,P,N], in/out,
+     *         stored round-to-nearest) i0=H i1=P i2=R i3=T i4=N i5=state bytes(2).
+     *   CHUNK_OUT t0=y[T,H*P] t1=xbc t2=cstate(entering) t3=cum t4=dtv t5=D
+     *         i0=H i1=P i2=R i3=T i4=N i5=G. */
+    PLOW_DOP_MAMBA2_CONV = 240,
+    PLOW_DOP_MAMBA2_STEP = 241,
+    PLOW_DOP_MAMBA2_GATED_NORM = 242,
+    PLOW_DOP_MAMBA2_CHUNK_STATE = 243,
+    PLOW_DOP_MAMBA2_CHUNK_PASS = 244,
+    PLOW_DOP_MAMBA2_CHUNK_OUT = 245,
 
     PLOW_DOP__COUNT
 };
@@ -1573,6 +1637,12 @@ enum {
 /* Sentinel expert id a router writes for an unused top-k slot; the expert body skips compute
  * (still signals) when expert_id >= num_experts. Mirrors packet::dev::EXPERT_UNUSED. */
 #define PLOW_EXPERT_UNUSED 0xFFFFFFFFu
+/* GEMM_FP8 i5: unscaled (t3/t4 absent); a following ROW_COL_SCALE applies the per-row activation
+ * and per-channel weight scales. Mirrors packet::dev::FP8_UNIT_SCALE. */
+#define PLOW_FP8_UNIT_SCALE 1u
+/* QUANT_FP8 / GEMM_FP8 i5: per-tensor static scale (QUANT_FP8 reads t2 = f32 [1] and writes only
+ * xq; GEMM_FP8 runs on the cuBLASLt route only). Mirrors packet::dev::FP8_TENSOR_SCALE. */
+#define PLOW_FP8_TENSOR_SCALE 2u
 
 /* A gate: wait until counters[id] >= threshold. `threshold` is the number of
  * producing workgroups, so it is determined by how the producer was sliced. */
@@ -2083,5 +2153,13 @@ PLOW_SASSERT(sizeof(PlowTraceRec) == 40, "PlowTraceRec size");
 PLOW_SASSERT(sizeof(PlowProgram) == 176, "PlowProgram token-batch ABI size");
 PLOW_SASSERT(sizeof(PlowTokenBatch) == 72, "PlowTokenBatch size");
 PLOW_SASSERT(__builtin_offsetof(PlowTokenBatch, spans) == 32, "PlowTokenBatch has no padding gap");
+
+/* GB202 (sm_120a) and GB10 (sm_121a): one instruction set, one interpreter source, separate
+ * cubins. Device code that differs by family keys on this, never on one __CUDA_ARCH__. */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+#define PLOW_SM12X 1
+#else
+#define PLOW_SM12X 0
+#endif
 
 #endif /* PLOW_DEV_ISA_H */

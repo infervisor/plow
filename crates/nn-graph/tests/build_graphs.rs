@@ -1737,7 +1737,12 @@ fn muse_spark_text_tower_ops_and_manifest() {
     assert_eq!(g.count_ops(|o| matches!(o, Op::Act(ActKind::Tanh))), 1);
     assert_eq!(g.expert_bindings.len(), 1);
     assert_eq!(g.expert_bindings[0].routed_experts.len(), 4);
-    assert!(g.expert_bindings[0].routed_experts[3].gate.scale.is_none());
+    assert!(g.expert_bindings[0].routed_experts[3]
+        .gate
+        .as_ref()
+        .unwrap()
+        .scale
+        .is_none());
 
     let manifest = g.checkpoint_manifest();
     let find = |name: &str| {
@@ -1861,4 +1866,233 @@ fn muse_spark_quark_mxfp4_experts_bind_scales() {
         err.to_string().contains("self_attn.q_proj is MXFP4"),
         "{err}"
     );
+}
+
+/// Scaled `nemotron_h_omni` (Nemotron-3.5-Super-VL layout): one of each mixer,
+/// ModelOpt FP8 Mamba/attention/lm_head and NVFP4 experts on layer 1.
+fn nemotron_h_json() -> String {
+    let p = "language_model.backbone.layers";
+    let mut quantized = serde_json::Map::new();
+    let fp8 = serde_json::json!({"quant_algo": "FP8"});
+    let nvfp4 = serde_json::json!({"quant_algo": "NVFP4", "group_size": 16});
+    for m in [
+        "0.mixer.in_proj",
+        "0.mixer.out_proj",
+        "2.mixer.q_proj",
+        "2.mixer.o_proj",
+    ] {
+        quantized.insert(format!("{p}.{m}"), fp8.clone());
+    }
+    for m in ["shared_experts.up_proj", "shared_experts.down_proj"] {
+        quantized.insert(format!("{p}.1.mixer.{m}"), nvfp4.clone());
+    }
+    for e in 0..8 {
+        for m in ["up_proj", "down_proj"] {
+            quantized.insert(format!("{p}.1.mixer.experts.{e}.{m}"), nvfp4.clone());
+        }
+    }
+    quantized.insert("language_model.lm_head".into(), fp8);
+    serde_json::json!({
+        "architectures": ["NemotronH_Omni_Reasoning_V3"],
+        "model_type": "nemotron_h_omni",
+        "dtype": "bfloat16",
+        "vision_config": {"model_type": "radio"},
+        "quantization_config": {
+            "quant_method": "modelopt_mixed",
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_scheme": {"dynamic": false, "num_bits": 8, "type": "float"},
+            "quantized_layers": quantized
+        },
+        "llm_config": {
+            "model_type": "nemotron_h",
+            "vocab_size": 100, "hidden_size": 64, "layer_norm_epsilon": 1e-5,
+            "layers_block_type": ["mamba", "moe", "attention", "moe"],
+            "tie_word_embeddings": false, "num_nextn_predict_layers": 1,
+            "mamba_num_heads": 8, "mamba_head_dim": 8, "ssm_state_size": 16,
+            "n_groups": 2, "conv_kernel": 4, "chunk_size": 16,
+            "mamba_hidden_act": "silu", "use_conv_bias": true, "use_bias": false,
+            "time_step_limit": [0.0, {"__float__": "Infinity"}],
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+            "attention_bias": false, "sliding_window": null,
+            "n_routed_experts": 8, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 48, "moe_latent_size": 32,
+            "moe_shared_expert_intermediate_size": 96, "n_shared_experts": 1,
+            "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+            "routed_scaling_factor": 5.0, "mlp_hidden_act": "relu2", "mlp_bias": false,
+            "dtype": "bfloat16"
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn nemotron_h_hybrid_decoder() {
+    use nn_graph::{ActKind, DType, EwKind, MoeExpertAct, Op};
+    let g = build_text_generation_from_config_json_at(&nemotron_h_json(), &ShapeBucket::default())
+        .expect("build Nemotron-H text decoder");
+    assert_fully_inferred(&g);
+    assert_eq!(output_shape_str(&g), "[B, S, 100]");
+    assert_eq!(g.blocks.len(), 4);
+    let count = |f: &dyn Fn(&Op) -> bool| g.count_ops(f);
+    assert_eq!(count(&|o| matches!(o, Op::Mamba2Scan { .. })), 1);
+    assert_eq!(
+        count(&|o| matches!(o, Op::Conv1dDepthwise { kernel: 4 })),
+        1
+    );
+    assert_eq!(
+        count(&|o| matches!(
+            o,
+            Op::Attention {
+                num_heads: 4,
+                num_kv_heads: 2,
+                ..
+            }
+        )),
+        1
+    );
+    assert_eq!(count(&|o| matches!(o, Op::Rope { .. })), 0);
+    assert_eq!(
+        count(&|o| matches!(
+            o,
+            Op::MoeExperts {
+                act: MoeExpertAct::Relu2,
+                top_k: 2,
+                ..
+            }
+        )),
+        2
+    );
+    // relu² = mul(relu(x), relu(x)) on each shared expert.
+    assert_eq!(count(&|o| matches!(o, Op::Act(ActKind::Relu))), 2);
+    // 4 block norms, the final norm, and the weightless grouped norm.
+    assert_eq!(count(&|o| matches!(o, Op::RmsNorm { .. })), 6);
+    assert_eq!(count(&|o| matches!(o, Op::Elementwise(EwKind::Add))), 4 + 2);
+
+    let manifest = g.checkpoint_manifest();
+    let find = |name: &str| {
+        let w = manifest
+            .iter()
+            .find(|w| w.name == name)
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let dims = w.shape.unwrap().dims().iter();
+        (
+            w.dtype,
+            dims.map(|d| d.as_static().unwrap()).collect::<Vec<_>>(),
+        )
+    };
+    let p = "language_model.backbone.layers";
+    assert_eq!(
+        find(&format!("{p}.0.mixer.in_proj.weight")),
+        (DType::F8E4M3, vec![8 * 8 * 2 + 2 * 2 * 16 + 8, 64])
+    );
+    assert_eq!(
+        find(&format!("{p}.0.mixer.in_proj.weight_scale")),
+        (DType::F32, vec![])
+    );
+    assert_eq!(
+        find(&format!("{p}.0.mixer.in_proj.input_scale")),
+        (DType::F32, vec![1])
+    );
+    assert_eq!(
+        find(&format!("{p}.0.mixer.conv1d.weight")),
+        (DType::BF16, vec![128, 1, 4])
+    );
+    assert_eq!(
+        find(&format!("{p}.0.mixer.conv1d.bias")),
+        (DType::BF16, vec![128])
+    );
+    assert_eq!(
+        find(&format!("{p}.0.mixer.norm.weight")),
+        (DType::BF16, vec![64])
+    );
+    assert_eq!(find(&format!("{p}.0.mixer.A_log")), (DType::BF16, vec![8]));
+    assert_eq!(
+        find(&format!("{p}.1.mixer.experts.7.up_proj.weight")),
+        (DType::U8, vec![48, 16])
+    );
+    assert_eq!(
+        find(&format!("{p}.1.mixer.experts.7.up_proj.weight_scale")),
+        (DType::F8E4M3, vec![48, 2])
+    );
+    assert_eq!(
+        find(&format!("{p}.1.mixer.experts.7.down_proj.weight")),
+        (DType::U8, vec![32, 24])
+    );
+    assert_eq!(
+        find(&format!("{p}.1.mixer.experts.7.down_proj.weight_scale_2")),
+        (DType::F32, vec![])
+    );
+    assert_eq!(
+        find(&format!("{p}.1.mixer.shared_experts.up_proj.weight")),
+        (DType::U8, vec![96, 32])
+    );
+    assert_eq!(
+        find(&format!("{p}.1.mixer.gate.e_score_correction_bias")),
+        (DType::F32, vec![8])
+    );
+    assert_eq!(
+        find(&format!("{p}.3.mixer.experts.0.up_proj.weight")),
+        (DType::BF16, vec![48, 32])
+    );
+    assert_eq!(
+        find(&format!("{p}.2.mixer.k_proj.weight")),
+        (DType::BF16, vec![32, 64])
+    );
+    assert_eq!(
+        find("language_model.lm_head.weight"),
+        (DType::F8E4M3, vec![100, 64])
+    );
+    assert!(!manifest
+        .iter()
+        .any(|w| w.name.contains("mtp.") || w.name.contains("vision")));
+    assert_eq!(g.expert_bindings.len(), 2);
+    assert_eq!(g.expert_bindings[1].block, 3);
+    assert!(g.expert_bindings[1].routed_experts[0].up.scale.is_none());
+}
+
+#[test]
+fn nemotron_h_near_variants_are_rejected() {
+    let json = nemotron_h_json();
+    for (from, to, reason) in [
+        (r#""hidden_size":64,"#, "", "missing field `hidden_size`"),
+        (
+            r#""moe_intermediate_size":48,"#,
+            "",
+            "moe_intermediate_size",
+        ),
+        (r#""mamba","moe""#, r#""mamba","mlp""#, "dense `mlp` blocks"),
+        (
+            r#""mlp_hidden_act":"relu2""#,
+            r#""mlp_hidden_act":"silu""#,
+            "only relu2",
+        ),
+        (
+            r#""n_shared_experts":1"#,
+            r#""n_shared_experts":2"#,
+            "exactly one shared expert",
+        ),
+        (
+            r#""sliding_window":null"#,
+            r#""sliding_window":64"#,
+            "sliding_window",
+        ),
+        (
+            r#""modelopt_mixed""#,
+            r#""modelopt""#,
+            "only ModelOpt modelopt_mixed",
+        ),
+        (r#""group_size":16"#, r#""group_size":32"#, "is not modeled"),
+        (
+            "1.mixer.shared_experts.up_proj",
+            "1.mixer.gate",
+            "not a linear of the modeled graph",
+        ),
+    ] {
+        let variant = json.replacen(from, to, 1);
+        assert_ne!(variant, json, "fixture lacks {from:?}");
+        let err = build_from_config_json(&variant)
+            .expect_err(reason)
+            .to_string();
+        assert!(err.contains(reason), "{from:?}: {err}");
+    }
 }

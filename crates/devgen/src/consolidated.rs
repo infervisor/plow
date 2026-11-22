@@ -6,7 +6,7 @@
 use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::Builder;
 use packet::rope::{GenTensor, RopeScale};
-use packet::typed_abi::{GemmFp8MxArgs, RmsNormArgs, RopeArgs};
+use packet::typed_abi::{GemmFp8MxArgs, RmsNormArgs, RopeArgs, TypedOp};
 
 /// Consolidated RoPE parameter configuration and tensor generator.
 #[derive(Clone, Debug, PartialEq)]
@@ -118,20 +118,20 @@ impl ConsolidatedRmsNorm {
         assert!(out != TENSOR_NONE && x != TENSOR_NONE && weight != TENSOR_NONE);
 
         let args = RmsNormArgs {
-            op: DevOp::RmsNorm,
             out,
             x,
-            weight,
-            residual_in: None,
-            residual_out: None,
+            gamma: weight,
             rows,
-            hidden,
+            feat: hidden,
             eps: self.eps,
-            residual_f32: self.residual_f32,
+            ..Default::default()
         };
 
         b.emit(DevOp::RmsNorm, cus, deps, |d| {
             args.apply(d);
+            if self.residual_f32 {
+                d.i[6] |= packet::dev::RESIDUAL_F32_FLAG;
+            }
             if self.q128_quant {
                 d.i[7] = 1; // Mark block-128 quantization enabled
             }
@@ -215,17 +215,17 @@ impl ConsolidatedWeightLayout {
         let args = GemmFp8MxArgs {
             out,
             x,
-            wt,
+            w: wt,
             scale,
-            m,
-            n,
-            k,
-            row0,
-            c_row0,
+            T: m,
+            N: n,
+            K: k,
         };
 
         b.emit(DevOp::GemmFp8Mx, cus.to_vec(), deps, |d| {
             args.apply(d);
+            d.i[4] = row0;
+            d.i[5] = c_row0;
         })
     }
 }
@@ -427,7 +427,7 @@ impl ConsolidatedHybridAttention {
         window_size: u32,
         pattern: HybridPattern,
     ) {
-        args.sliding_window = Self::window_for_layer(layer_idx, window_size, pattern);
+        args.window = Self::window_for_layer(layer_idx, window_size, pattern).unwrap_or(0);
     }
 }
 

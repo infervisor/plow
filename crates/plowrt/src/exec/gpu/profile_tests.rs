@@ -119,6 +119,7 @@ fn preserves_sm120_profile_and_rejects_unknown_arches() {
     let p = interpreter_profile((12, 0)).unwrap();
     assert_eq!(p.prefill_file, "interp_sm120_pf.cubin");
     assert_eq!(p.prefill_symbol, "_Z15interp_sm120_pf11PlowProgram");
+    assert_eq!(interpreter_profile((12, 1)), Some(p));
     assert!(interpreter_profile((8, 6)).is_none());
     assert!(interpreter_profile((10, 0)).is_none());
 }

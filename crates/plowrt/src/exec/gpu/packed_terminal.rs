@@ -208,7 +208,12 @@ impl PackedTerminal {
                 if post_norm { source_id } else { norm.t[2] },
                 hidden as u64 * 2,
             ),
-            (head.t[2], head.i[1] as u64 * hidden as u64 * 2),
+            (
+                head.t[2],
+                head.i[1] as u64
+                    * hidden as u64
+                    * if head.op == DevOp::GemvFp8 as u16 { 1 } else { 2 },
+            ),
             (head.t[0], capacity as u64 * head.i[1] as u64 * 2),
             (max.t[0], capacity as u64 * max.blocks as u64 * 8),
             (e.t_ids as u16, capacity as u64 * 4),
@@ -298,7 +303,7 @@ impl PackedTerminal {
         let Some(lt) = &e.terminal_lt else {
             return Ok(None);
         };
-        if !crate::config::RuntimeConfig::get().nv.terminal_lt {
+        if !crate::config::RuntimeConfig::get().nv.terminal_lt || head.op == DevOp::GemvFp8 as u16 {
             return Ok(None);
         }
         let (n, k) = (head.i[1], head.i[2]);
@@ -645,7 +650,7 @@ mod tests {
         assert_eq!(parsed[1], ops[1]);
         assert_eq!(parsed[2].op, DevOp::Nop as u16);
         assert_eq!(parsed[3..], ops[2..]);
-        for head in [DevOp::GemmSmall, DevOp::GemmMed] {
+        for head in [DevOp::GemmSmall, DevOp::GemmMed, DevOp::GemvFp8] {
             ops[1].op = head as u16;
             assert!(layout(&ops, 128, 4, 0).is_some());
         }

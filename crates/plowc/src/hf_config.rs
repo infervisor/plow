@@ -230,6 +230,30 @@ pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> 
             v["model_type"].as_str().unwrap_or_default()
         ));
     }
+    if let Some(mt @ ("nemotron_h" | "nemotron_h_omni")) = v["model_type"].as_str() {
+        nn_graph::models::ModelConfig::from_json(json).map_err(|e| format!("{mt}: {e}"))?;
+        return Err(format!(
+            "{mt}: config parses and the Nemotron-H text graph builds, but device emit is not \
+             implemented (devgen has no Nemotron-H emitter: Mamba-2 SSD scan, grouped gated \
+             RMSNorm, NVFP4 linears/experts, gate-less relu² latent MoE)"
+        ));
+    }
+    // `parse_weight_dtype` has no ModelOpt arm; without this a ModelOpt FP8/NVFP4
+    // checkpoint would synthesize as BF16.
+    for q in [
+        &v["quantization_config"],
+        &v["text_config"]["quantization_config"],
+    ] {
+        if let Some(method) = q["quant_method"]
+            .as_str()
+            .filter(|m| m.starts_with("modelopt"))
+        {
+            return Err(format!(
+                "quantization_config.quant_method {method:?} (ModelOpt) is not implemented by \
+                 --hf-dir synthesis"
+            ));
+        }
+    }
     if v.get("text_config").is_some() {
         return synth_gemma(&v["text_config"], name, "model.language_model.");
     }
@@ -1821,6 +1845,44 @@ mod tests {
         let json = gemma_json("").replace("gemma4_unified", "muse_spark");
         let err = synthesize_full(&json, "muse".into()).unwrap_err();
         assert!(err.contains("Muse Spark"), "{err}");
+    }
+
+    const NEMOTRON_H_OMNI: &str = r#"{
+        "model_type": "nemotron_h_omni", "dtype": "bfloat16",
+        "llm_config": {
+            "model_type": "nemotron_h", "vocab_size": 64, "hidden_size": 32,
+            "layer_norm_epsilon": 1e-5, "layers_block_type": ["mamba", "moe", "attention"],
+            "tie_word_embeddings": false, "mamba_num_heads": 4, "mamba_head_dim": 8,
+            "ssm_state_size": 8, "n_groups": 2, "conv_kernel": 4, "chunk_size": 8,
+            "mamba_hidden_act": "silu", "use_conv_bias": true, "use_bias": false,
+            "time_step_limit": [0.0, {"__float__": "Infinity"}],
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+            "attention_bias": false, "n_routed_experts": 4, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16, "moe_latent_size": 16,
+            "moe_shared_expert_intermediate_size": 32, "n_shared_experts": 1,
+            "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+            "routed_scaling_factor": 5.0, "mlp_hidden_act": "relu2", "mlp_bias": false
+        }
+    }"#;
+
+    #[test]
+    fn nemotron_h_refuses_at_device_emit_after_the_graph_parses() {
+        let err = synthesize_full(NEMOTRON_H_OMNI, "nemotron".into()).unwrap_err();
+        assert!(err.contains("device emit is not implemented"), "{err}");
+        let broken = NEMOTRON_H_OMNI.replace(
+            r#""mlp_hidden_act": "relu2""#,
+            r#""mlp_hidden_act": "silu""#,
+        );
+        let err = synthesize_full(&broken, "nemotron".into()).unwrap_err();
+        assert!(err.contains("only relu2"), "{err}");
+    }
+
+    #[test]
+    fn modelopt_quantization_is_refused_not_synthesized_as_bf16() {
+        let json = r#"{"model_type":"llama","hidden_size":64,
+            "quantization_config":{"quant_method":"modelopt","quant_algo":"NVFP4"}}"#;
+        let err = synthesize_full(json, "x".into()).unwrap_err();
+        assert!(err.contains("ModelOpt"), "{err}");
     }
 
     #[test]

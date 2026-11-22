@@ -67,7 +67,7 @@ __device__ __forceinline__ constexpr bool sp_arm_on(unsigned arm) {
 /* Covers the GEMM ring, AttentionF32's Q/K/V stages (SpfShape), and
  * GroupedAttention's K stage for group_rows*(head_width+1) <= SP_ARENA_FLOATS - 2048 (larger
  * groups read K from global instead). */
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200)
+#if (PLOW_SM12X || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890))
 /* sm_89 and sm_120 cap one block at 99 KiB of shared memory, static included. The hd128
  * AttentionF32 stage (25856 floats) does not fit; that arm traps there. */
 #define SP_ARENA_FLOATS 24576
@@ -138,7 +138,7 @@ static __device__ const float2 sp_exp_tab[64] = {
     {0x1.ea4afap+0f, 0x1.52486cp-27f}, {0x1.efa1bep+0f, 0x1.cc2b44p-25f}, {0x1.f50766p+0f, -0x1.246ebp-26f},
     {0x1.fa7c18p+0f, 0x1.9e90d8p-28f},
 };
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_SM12X
 __device__ __forceinline__ float sp_expf(float x) {
     if (!(x <= 0.0f && x >= -86.0f)) return (float)exp((double)x);
     const float k = rintf(x * 0x1.715476p+6f);
@@ -170,7 +170,7 @@ __device__ __forceinline__ float sp_tanhf(float x) { return (float)tanh((double)
  * conv2 4.228 -> 3.739, fc1 0.146 -> 0.084. Same bf16 GELU as the double form for all 65536 bf16
  * inputs; the attention softmax keeps sp_expf (expf moved its probabilities). */
 __device__ __forceinline__ float sp_gelu_expf(float x) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
+#if (PLOW_SM12X || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900))
     return expf(x);
 #else
     return sp_expf(x);
@@ -193,7 +193,7 @@ __device__ __forceinline__ float sp_gelu_tanh(float x) {
  * equals the __fdiv_rn form on all 65536 bf16 inputs. Both float forms also run on sm_90a (op test
  * --gelu-only walks the 65536 inputs against the double exp / __fdiv_rn spelling). */
 __device__ __forceinline__ float sp_gelu_rcp(float d) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
+#if (PLOW_SM12X || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900))
     d = fminf(d, 0x1p126f);
     float r;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
@@ -1935,7 +1935,7 @@ static __device__ __noinline__ void d_dense_gemm_f32(float* __restrict__ out, co
     if (flags & 4u) {
         const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
         if ((flags & 8u) && (k & 7u) == 0 && (stride & 7u) == 0 && sp_aligned(x, 16) && sp_aligned(wb, 16)) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
+#if (PLOW_SM12X || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900))
             if (rs && !ln) {
                 const SpRowBf16 lb{wb, k, stride, true};
                 switch (sp_tcn_shape(m, n, k, nblk)) {
@@ -2784,7 +2784,7 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
     const SpConvGeom g{frames, width, ic, kernel, stride, pad_before, of, ow, in_layout, wstride};
     if (flags & 1024u) {
         /* Blocked bf16 weights exist only for the staged 3x3 / stride 2 path. */
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
+#if (PLOW_SM12X || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900))
         if (depthwise || !(flags & 256u) || (flags & 64u) || kernel != 3u || stride != 2u || wstride != 2u ||
             pad_before != 1u || pad_after != 1u || in_layout != 2u || (ic & 15u) || !sp_aligned(w, 16) ||
             (uint64_t)batches * ic * frames * width >= (1ull << 31))
@@ -2810,7 +2810,7 @@ static __device__ __noinline__ void d_conv2d_f32(float* __restrict__ out, const 
             static_assert(TAB0 >= 4u * SpTc<false>::STAGE_BYTES / 4u, "conv table placement");
             SpConvTab* tab = (SpConvTab*)(arena + TAB0);
             const bool tabled = TAB0 + 2u * k <= SP_ARENA_FLOATS && (uint64_t)ic * frames * width < (1ull << 31);
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 900)
+#if (PLOW_SM12X || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900))
             if (ic == 1u && kernel == 3u && stride == 2u && wstride == 2u && pad_before == 1u && pad_after == 1u &&
                 out_layout == 2u &&
                 (flags & 128u) && oc * 13u <= SP_ARENA_FLOATS && positions64 * oc < (1ull << 31)) {

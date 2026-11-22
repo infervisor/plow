@@ -4414,7 +4414,13 @@ fn run_one_tick(
                         caps.iter().filter(|&&c| c > 0).count() as u64,
                         Ordering::Relaxed,
                     );
-                    let skip = if did_prefill {
+                    // A prefill pass whose launch did not carry the decode rows (serial, or packed
+                    // without riders) is followed by this tick's decode launch: its rows still
+                    // speculate. The token batch and the mixed step carry them themselves.
+                    // Span riders that rode left no feeds; any left over (refused) speculate.
+                    let rows_rode = (e.token_batch_enabled() && !e.span_riders_enabled())
+                        || e.has_mixed_step();
+                    let skip = if did_prefill && rows_rode {
                         Some(crate::obs::serving::SpecSkip::PrefillTick)
                     } else if obs.host.spec_backlog {
                         Some(crate::obs::serving::SpecSkip::Backlog)
@@ -4943,11 +4949,13 @@ fn run_one_tick(
                     }
                 } else {
                     // Prefill pass — chunk-interleaved continuous batching. With live
-                    // decoders, at most ONE capped prefill chunk runs per tick, so a
-                    // mid-decode arrival stalls the running streams by one chunk (not one
-                    // whole prompt); the decode launch below runs between chunks. With no
-                    // decoders live, stop once a request becomes ready for decode,
-                    // unless the caller explicitly defers decode.
+                    // decoders (or once a request becomes ready for decode), further chunks
+                    // run only while the tick stays within one widest serial launch's measured
+                    // time, so a mid-decode arrival stalls the running streams by about one
+                    // full chunk (not one whole prompt) and a burst of short prompts shares
+                    // ticks instead of each paying a decode launch in between; the decode
+                    // launch below runs between ticks. `PLOW_PF_INTERLEAVE` (or no measured
+                    // launch yet) keeps one chunk per tick.
                     let prefilling_slots = slots
                         .iter()
                         .take(cap)
@@ -4967,6 +4975,12 @@ fn run_one_tick(
                     // Short serial-only prompts (speech) share one tick up to the interleave budget:
                     // nothing packs them, and one per tick leaves the decode batch starved.
                     let mut serial_rows = 0usize;
+                    let tick_budget_ms = (crate::config::RuntimeConfig::get().pf_interleave.is_none()
+                        && !co_scheduled)
+                        .then(|| e.pf_launch_ms(e.pf_max_rows()))
+                        .flatten();
+                    let pf_tick = Instant::now();
+                    let mut owe_decode = false;
                     loop {
                         let Some(i) = (0..slots.len().min(cap))
                             .filter(|&i| slots[i].as_ref().is_some_and(|s| s.needs_prefill()))
@@ -4974,6 +4988,18 @@ fn run_one_tick(
                         else {
                             break;
                         };
+                        if owe_decode {
+                            let rem = slots[i]
+                                .as_ref()
+                                .map_or(0, |s| s.prompt_ids.len().saturating_sub(s.pf_pos));
+                            let spent = pf_tick.elapsed().as_secs_f64() * 1e3;
+                            if !tick_budget_ms
+                                .zip(e.pf_launch_ms(rem.min(cap_rows)))
+                                .is_some_and(|(budget, next)| spent + next <= budget)
+                            {
+                                break;
+                            }
+                        }
                         // Client gone mid-prefill (chunks span ticks now) — don't spend
                         // launches building KV for a dead stream.
                         if slots[i]
@@ -5074,8 +5100,16 @@ fn run_one_tick(
                                 slot_opt.as_ref(),
                             ) && !(serial && serial_rows < pf_interleave_rows()))
                         {
-                            // New decoders join next tick; their first token was already emitted.
-                            break;
+                            // A chunk that made no progress (live KV pressure) retries next tick.
+                            let stalled = slot_opt
+                                .as_ref()
+                                .is_some_and(|s| s.needs_prefill() && s.pf_pos == pf_before);
+                            if co_scheduled || serial || stalled || tick_budget_ms.is_none() {
+                                // New decoders join next tick; their first token was already
+                                // emitted.
+                                break;
+                            }
+                            owe_decode = true;
                         }
                     }
                 }
@@ -5097,8 +5131,8 @@ fn run_one_tick(
                     // frees it (mid-quantum EOS — extra device tokens past the stop
                     // are discarded). Remaining output budgets cap K. Any sampling adjustment
                     // falls through to the per-token path below.
-                    // Speculation runs only in pure decode ticks with nobody queued (their
-                    // prefill comes first), on a drained pipeline.
+                    // Speculation runs with nobody queued (their prefill comes first), on a
+                    // drained pipeline, in decode ticks and after a serial prefill chunk.
                     let spec_plan = match &spec_metrics {
                         Some((limits, m)) if spec_open => {
                             let plan = gpu_spec_plan(&*e, &feeds, &slots, &mut obs.host, limits);
@@ -8119,6 +8153,9 @@ fn gpu_prefill_batched_pass(
     // the owner's row + 1: the unified batch carries neither, so pairs take the ordinary path.
     let mut unified =
         e.token_batch_enabled() && !slots.iter().take(cap).flatten().any(|s| s.cfg.is_some());
+    // Span riders change nothing for a prefill-only pass: it keeps the packed path (one-request
+    // packs on the serial pair).
+    unified &= !(e.span_riders_enabled() && feeds.is_empty());
     let row_body_max = unified.then(|| e.row_decode_rungs().next_back()).flatten();
     if row_body_max.is_some() {
         ride.enable_frame_costs();
@@ -8128,7 +8165,13 @@ fn gpu_prefill_batched_pass(
     let mut ride_open = unified && !feeds.is_empty() && row_body_max.is_none();
     let withheld = usize::from(!compact);
     spans.clear();
-    let mut decode_rows = if unified { feeds.len() } else { 0 };
+    // A span rider rides at full depth (`gpu_spec_riders`): its launch rows are its span's.
+    let rider_rows = e
+        .span_riders_enabled()
+        .then(|| e.spec_serving())
+        .flatten()
+        .map_or(1, |l| l.kmax as usize + 1);
+    let mut decode_rows = if unified { feeds.len() * rider_rows } else { 0 };
     let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = row_body_max.unwrap_or_else(|| e.pf_max_rows());
     if budget_max == 0 {
@@ -8162,6 +8205,18 @@ fn gpu_prefill_batched_pass(
     let overlap = unified && compact && pf_admit_overlap();
     let probe = if overlap { e.vmm_prefix_probe() } else { None };
     let mut window: Vec<WindowAdmit> = Vec::new();
+    // A Mamba pack with decoders live runs further packs while the tick stays within one widest
+    // launch's measured time, as the serial chunk loop does (`run_one_tick`): one pack per tick
+    // put a decode step between a prompt's [128, 1024] launches (c8 TTFT +0.2 s per prompt).
+    let tick_budget_ms = (crate::config::RuntimeConfig::get().pf_interleave.is_none()
+        && e.mamba_packs()
+        && !bounded_tick
+        && !unified
+        && row_body_max.is_none())
+    .then(|| e.pf_launch_ms(e.pf_max_rows()))
+    .flatten();
+    let pass_t = Instant::now();
+    let mut owe_decode = false;
     loop {
         let host_t = packlog::on().then(Instant::now);
         let mut room = overlap.then(|| {
@@ -8350,6 +8405,14 @@ fn gpu_prefill_batched_pass(
         }
         // Gather candidate spans directly; counting admitted rows and filtering slots in one pass.
         let now = Instant::now();
+        let waiting = |i: usize| {
+            pack_row(slots, i).is_some_and(|(s, pf_pos)| {
+                e.packed_slot_ready(i)
+                    && s.needs_prefill()
+                    && pf_pos + withheld < s.prompt_ids.len()
+            })
+        };
+        let packing = (0..cap.min(slots.len())).filter(|&i| waiting(i)).nth(1).is_some();
         let candidates: Vec<crate::sched::step::Candidate> = (0..cap.min(slots.len()))
             .filter_map(|i| {
                 let (s, pf_pos) = pack_row(slots, i)?;
@@ -8362,7 +8425,7 @@ fn gpu_prefill_batched_pass(
                     e.pf_publish_cap(i, pf_pos)
                         .min(e.state_capture_cut(i, &s.prompt_ids, pf_pos));
                 let mut remaining = e
-                    .pf_plan_slice(n - withheld - pf_pos, chunk_cap)
+                    .pf_plan_slice(n - withheld - pf_pos, chunk_cap, packing)
                     .min(publish);
                 if s.mm.as_deref().is_some_and(|j| j.spans()) {
                     remaining = plow_asset::multimodal::span_chunk_rows(
@@ -8571,7 +8634,13 @@ fn gpu_prefill_batched_pass(
                 cut_pack_tail(&mut pack, rows - fit);
             }
         }
-        if pack.is_empty() {
+        let over_budget = owe_decode
+            && !tick_budget_ms
+                .zip(e.pf_launch_ms(pack.iter().map(|p| p.2).sum::<usize>()))
+                .is_some_and(|(budget, next)| {
+                    pass_t.elapsed().as_secs_f64() * 1e3 + next <= budget
+                });
+        if pack.is_empty() || over_budget {
             if !window.is_empty() {
                 admit_window(e, &mut window, false);
                 apply_window(e, slots, &mut window, arena, &mut tick_fault);
@@ -8592,12 +8661,16 @@ fn gpu_prefill_batched_pass(
         // Riders' drafts fill the rows the launch's bucket pads anyway, within the terminal's
         // sample rows (one per rider and per packed prompt). Drafted before the launch's clock:
         // the ride costs price launches, not drafts.
+        // Span riders (a Mamba chain) verify at full depth: their rows cost a fraction of the
+        // decode tick they replace.
         if row_body_max.is_none() && unified && compact && !feeds.is_empty() {
             let rows = pack.iter().map(|p| p.2).sum::<usize>() + feeds.len();
-            let slack = e
-                .pf_cover_rows(rows)
-                .saturating_sub(rows)
-                .min(e.batch().saturating_sub(feeds.len() + pack.len()));
+            let pad = if e.span_riders_enabled() {
+                usize::MAX
+            } else {
+                e.pf_cover_rows(rows).saturating_sub(rows)
+            };
+            let slack = pad.min(e.batch().saturating_sub(feeds.len() + pack.len()));
             gpu_spec_riders(e, feeds, slots, slack, spans);
         }
         let riders = if unified { feeds.len() } else { 0 };
@@ -8619,6 +8692,8 @@ fn gpu_prefill_batched_pass(
             // A feed or pack entry whose slot vanished mid-tick is skipped, not a panic:
             // the tick thread must outlive one inconsistent row, and the slot re-feeds
             // next tick from live state.
+            // A span-rider engine's decode rows ride as (one-row) verify spans.
+            let all_verify = e.span_riders_enabled();
             let decode = feeds.iter().enumerate().filter_map(|(f, &(i, ref token))| {
                 let slot = slots[i].as_ref()?;
                 let span = spans.get(f).filter(|t| t.len() > 1);
@@ -8627,7 +8702,7 @@ fn gpu_prefill_batched_pass(
                     slot: i as u32,
                     state_slot: i as u32,
                     generation: e.slot_generation(i)?,
-                    phase: if span.is_some() {
+                    phase: if span.is_some() || all_verify {
                         Phase::Verify
                     } else {
                         Phase::Decode
@@ -8875,9 +8950,14 @@ fn gpu_prefill_batched_pass(
                 return tick_fault;
             }
         }
-        if row_body_max.is_some() || !completed.is_empty() || !cold || bounded_tick {
+        if row_body_max.is_some()
+            || !completed.is_empty()
+            || (!cold && tick_budget_ms.is_none())
+            || bounded_tick
+        {
             return tick_fault; // bounded stall: decode now, next pack next tick
         }
+        owe_decode |= !cold;
         // Cold path: stop as soon as any request is ready so its first token
         // fires this tick; the rest continue next tick (with decoders live).
         let any_ready = pack.iter().any(|&(i, _, _)| {
@@ -10831,7 +10911,7 @@ fn gpu_spec_policy<'h>(
     })
 }
 
-/// One speculative decode tick over `feeds` (no prefill this tick, decode pipeline drained):
+/// One speculative decode tick over `feeds` (no packed prefill this tick, decode pipeline drained):
 /// draft, verify, commit, then stream each row's tokens through the same funnel plain decode
 /// uses. Drafting rows emit their accepted drafts plus the verify row's token (argmax, or the
 /// plain-decode sample with `PLOW_SPEC_SAMPLED`); other rows take their one token from the
@@ -11009,7 +11089,11 @@ fn gpu_spec_riders(
     out: &mut Vec<smallvec::SmallVec<[u32; 8]>>,
 ) {
     out.clear();
-    let ride_k = crate::config::RuntimeConfig::get().nv.spec_ride;
+    let ride_k = if e.span_riders_enabled() {
+        u32::MAX
+    } else {
+        crate::config::RuntimeConfig::get().nv.spec_ride
+    };
     if ride_k == 0 {
         return;
     }
@@ -11145,9 +11229,12 @@ fn gpu_emit_ride_verdicts(
         if e.slot_generation(i) != Some(v.req_gen) {
             continue;
         }
-        metrics.serving.spec.record(k, u32::from(v.n_acc));
-        if let Some(p) = host.spec.as_mut() {
-            p.observe_verdict(k, u32::from(v.n_acc));
+        // A one-row span (a span rider that did not draft) is a plain decode row.
+        if k > 0 {
+            metrics.serving.spec.record(k, u32::from(v.n_acc));
+            if let Some(p) = host.spec.as_mut() {
+                p.observe_verdict(k, u32::from(v.n_acc));
+            }
         }
         for &token in &v.tokens[..usize::from(v.n_emit)] {
             if slots[i].is_none() {

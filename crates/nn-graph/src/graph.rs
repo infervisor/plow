@@ -75,6 +75,9 @@ pub struct Graph {
     /// every expert weight and scale loadable without cloning 3*E GEMMs into
     /// the graph.
     pub expert_bindings: Vec<ExpertLayerBinding>,
+    /// Per-tensor quantization metadata of non-expert linears (ModelOpt FP8 /
+    /// NVFP4).
+    pub quant_linear_bindings: Vec<QuantLinearBinding>,
 }
 
 impl Graph {
@@ -210,13 +213,39 @@ pub struct Fp8ScaleBinding {
 pub struct ExpertProjectionBinding {
     pub weight: String,
     pub scale: Option<String>,
+    /// NVFP4 per-tensor fp32 weight scale (ModelOpt `weight_scale_2`).
+    pub scale_2: Option<String>,
+    /// Static fp32 activation scale (ModelOpt `input_scale`).
+    pub input_scale: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutedExpertBinding {
-    pub gate: ExpertProjectionBinding,
+    /// `None` for gate-less experts ([`crate::op::MoeExpertAct::Relu2`]).
+    pub gate: Option<ExpertProjectionBinding>,
     pub up: ExpertProjectionBinding,
     pub down: ExpertProjectionBinding,
+}
+
+/// Storage format of a per-tensor-scaled quantized linear weight (ModelOpt).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearQuantFormat {
+    /// `F8E4M3 [out, in]` weight, fp32 scalar `weight_scale`.
+    Fp8PerTensor,
+    /// NVFP4: `U8 [out, in / 2]` packed e2m1 pairs, `F8E4M3 [out, in / group]`
+    /// block `weight_scale`, fp32 scalar `weight_scale_2`.
+    Nvfp4 { group: u32 },
+}
+
+/// Quantization metadata loaded with a non-expert linear's weight. The scales
+/// are checkpoint tensors, not logical operands of `Op::Linear`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantLinearBinding {
+    pub weight: String,
+    pub format: LinearQuantFormat,
+    pub weight_scale: String,
+    pub weight_scale_2: Option<String>,
+    pub input_scale: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -247,6 +276,7 @@ pub struct GraphBuilder {
     outputs: Vec<TensorId>,
     fp8_scale_bindings: Vec<Fp8ScaleBinding>,
     expert_bindings: Vec<ExpertLayerBinding>,
+    quant_linear_bindings: Vec<QuantLinearBinding>,
 }
 
 impl GraphBuilder {
@@ -261,6 +291,7 @@ impl GraphBuilder {
             outputs: Vec::new(),
             fp8_scale_bindings: Vec::new(),
             expert_bindings: Vec::new(),
+            quant_linear_bindings: Vec::new(),
         }
     }
 
@@ -330,6 +361,10 @@ impl GraphBuilder {
         self.expert_bindings.push(binding);
     }
 
+    pub fn quant_linear_binding(&mut self, binding: QuantLinearBinding) {
+        self.quant_linear_bindings.push(binding);
+    }
+
     /// Add an operation node. The result tensor's shape is left `None` for the
     /// inference pass to fill. `out_dtype` is the declared output element type.
     pub fn op(&mut self, op: Op, inputs: Vec<TensorId>, out_dtype: DType) -> TensorId {
@@ -372,6 +407,7 @@ impl GraphBuilder {
             outputs: self.outputs,
             fp8_scale_bindings: self.fp8_scale_bindings,
             expert_bindings: self.expert_bindings,
+            quant_linear_bindings: self.quant_linear_bindings,
         }
     }
 }

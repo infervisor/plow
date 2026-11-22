@@ -3,8 +3,9 @@
 //! packed terminal (CUDA) and the offline capability inventory, so it stays device-free.
 use packet::dev::{DevInst64, DevOp};
 
+/// A post-norm head may also be the FP8 GEMV (Nemotron-H: `GemvFp8`, same M/N/K/a_row0 slots).
 pub(crate) fn is_head(op: u16) -> bool {
-    [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed]
+    [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed, DevOp::GemvFp8]
         .iter()
         .any(|&o| o as u16 == op)
 }

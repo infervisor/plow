@@ -510,8 +510,9 @@ pub struct EmitConfig {
 
     /// Drafter family for PLOW_EMIT_SPEC: `gemma4_assistant` (unset, the MTP draft programs) or
     /// `gemma4_dspark` (the DSpark block drafter's context tail in every target program and its
-    /// own KV layers; `model-dspark.safetensors`).
-    #[arg(long, env = "PLOW_SPEC_KIND", value_parser = clap::builder::PossibleValuesParser::new(["gemma4_assistant", "gemma4_dspark"]))]
+    /// own KV layers; `model-dspark.safetensors`) or `qwen3_5_mtp` (the qwen3_5 checkpoint's own
+    /// `mtp.*` layer as a chain drafter with its own KV, plus recurrent verify rollback).
+    #[arg(long, env = "PLOW_SPEC_KIND", value_parser = clap::builder::PossibleValuesParser::new(["gemma4_assistant", "gemma4_dspark", "qwen3_5_mtp", "nemotron_h_mtp"]))]
     pub spec_kind: Option<String>,
 
     /// sm_120a decode: the Qwen / Llama AddNorm packets fold into the GEMVs around them (o_proj /
@@ -1829,6 +1830,11 @@ pub struct EmitConfig {
     #[arg(long = "fp8-decode-tc64", env = "PLOW_FP8_DECODE_TC64", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub fp8_decode_tc64: bool,
 
+    /// mma.sync decode objects (sm_12x): the narrowest rung whose FP8 GEMVs take the tensor-core
+    /// walk (op_gemv_fp8_tc.cuh); narrower rungs keep the FFMA walk. Unset = FFMA everywhere.
+    #[arg(long = "fp8-decode-tc", env = "PLOW_FP8_DECODE_TC")]
+    pub fp8_decode_tc: Option<u32>,
+
     /// Isolate each layer's grouped MoE prefill GLU + DOWN pair as a packet-declared library
     /// segment, which the CUDA runtime serves with cuBLASLt grouped matmuls under
     /// `PLOW_MOE_PF_LT`. A runtime that leaves that knob unset runs the packet unchanged.
@@ -2363,6 +2369,7 @@ impl EmitConfig {
             decode_fp8_block: env_bool("PLOW_EMIT_DECODE_FP8_BLOCK"),
             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
             fp8_decode_tc64: env_bool("PLOW_FP8_DECODE_TC64"),
+            fp8_decode_tc: env_u32("PLOW_FP8_DECODE_TC"),
             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
             moe_pf_lt_route: env_bool("PLOW_EMIT_MOE_PF_LT_ROUTE"),
             moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),

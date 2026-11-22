@@ -147,14 +147,14 @@ k_projection_loop(PlowProgram prog, PlowDevInst in, void* out, int iters,
         const auto* weight = weights + (size_t)(it % copies) * n * k;
         if constexpr (Prefill) {
             if constexpr (F32) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_SM12X
                 d_gemm(partial, input, weight, m, n, k, 0, blockIdx.x, gridDim.x, arena);
 #else
                 __trap();
 #endif
             } else d_gemm(partial, input, weight, m, n, k, 0, blockIdx.x, gridDim.x, arena);
         } else if constexpr (F32) {
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X
             d_gemv_tp_f32(partial, input, weight, m, n, k, blockIdx.x, gridDim.x);
 #else
             __trap();

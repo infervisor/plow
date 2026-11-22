@@ -303,7 +303,7 @@ __device__ __forceinline__ bool xr_staged_barrier(const PlowProgram& prog, size_
     return !bailed;
 }
 
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X
 __device__ __forceinline__ void xr_publish_f32(const PlowProgram& prog, uint32_t slot,
                                                uint32_t n, unsigned tid, unsigned stride) {
     const auto* src = (const uint32_t*)((const char*)prog.peer_scratch[prog.n_gpu] + slot);
@@ -409,7 +409,7 @@ __device__ __forceinline__ void xr_staged_reduce_range(const PlowProgram& prog, 
 /* XREDUCE (one-shot): t0=out i0=n i1=n_gpu i2=slot_bytes i3=gate. */
 __device__ __forceinline__ void d_xreduce_nv(const PlowProgram& prog, const PlowDevInst* in,
                                              void* const* T, unsigned slice, unsigned nblk) {
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X
     if (in->fj[0].u == PLOW_XREDUCE_PARTIAL_F32_MARK) {
         const uint32_t n = in->i[0], slot = in->i[2];
         if (prog.n_gpu != 2 || in->i[1] != prog.n_gpu || (slot & 3u)

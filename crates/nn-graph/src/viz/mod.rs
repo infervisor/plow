@@ -28,6 +28,7 @@ pub fn op_to_category(op: &Op) -> OpCategory {
         Op::Linear { .. } | Op::MatMul | Op::Embedding => OpCategory::Linear,
         Op::Attention { .. }
         | Op::LinearAttention { .. }
+        | Op::Mamba2Scan { .. }
         | Op::DsaAttention { .. }
         | Op::Rope { .. }
         | Op::Softmax { .. } => OpCategory::Attention,

@@ -57,13 +57,13 @@ pub(super) struct CudaTokenBatch {
 impl CudaTokenBatch {
     pub(super) fn eligible(e: &GpuEngine) -> bool {
         !RuntimeConfig::get().fusion
-            && e.be.compute_capability() == (9, 0)
             && e.packed_prefill.is_some()
             && e.has_packed_terminal()
             // A recurrent chain packs only through its per-request state gather / varlen scan /
             // scatter, so a one-row decode request is a continuing chunk of length 1; the split
             // attention riders never arm on it (`riders.rs`), the rows attend through the
-            // prefill attention's request table.
+            // prefill attention's request table. A Mamba chain's rows ride as verify spans
+            // (`span_riders.rs`), checked at load.
             && (e.recurrent.is_none() || e.recurrent_packs)
             && e.mixed_step.is_none()
             // An overlay packet steps only through `token_batch_step_staged`, whose `prepare`
@@ -75,11 +75,26 @@ impl CudaTokenBatch {
     }
 
     pub(super) fn load(e: &GpuEngine) -> Option<Self> {
+        // Off Hopper the token batch is qualified only with span riders (Mamba packed packets
+        // on sm_12x); a GDN chain's one-row continuing chunks and one-row hd256 prefill
+        // attention there are not.
+        if Self::eligible(e) && e.be.compute_capability() != (9, 0) && e.span_riders.is_none() {
+            tracing::info!(
+                route = "token-batch",
+                ready = false,
+                reason = "off Hopper the token batch runs only with span riders",
+                "unified token batch declined"
+            );
+            return None;
+        }
         (Self::eligible(e)
+            && (!e.mamba_packs() || e.span_riders.is_some())
             && e.prefill.iter().enumerate().all(|(i, b)| {
                 attention_supported(
                     b.flash_sites.iter().map(|&pc| b.h_inst[pc].i[6]),
-                    e.row_decode.is_some() || e.riders.as_ref().is_some_and(|r| r.serves(i)),
+                    e.row_decode.is_some()
+                        || e.riders.as_ref().is_some_and(|r| r.serves(i))
+                        || e.span_riders.as_ref().is_some_and(|r| r.serves(i)),
                 )
             }))
         .then(|| Self {
@@ -167,6 +182,11 @@ impl GpuEngine {
         self.token_batch.is_some()
     }
 
+    /// Decode rows ride the token batch as verify spans (`span_riders.rs`).
+    pub fn span_riders_enabled(&self) -> bool {
+        self.token_batch.is_some() && self.span_riders.is_some()
+    }
+
     pub fn slot_generation(&self, slot: usize) -> Option<u32> {
         self.slot_generations.get(slot).copied()
     }
@@ -241,6 +261,10 @@ impl GpuEngine {
         })?;
         let mut body_enqueued = false;
         let verdicts_before = self.tb_verdicts.len();
+        // Span riders: each verify span's slot and first row past the prefill rows, and the
+        // replay staging (record parity, the deferred commits it took).
+        let mut span_rows: smallvec::SmallVec<[(usize, u32); 16]> = smallvec::SmallVec::new();
+        let mut span_replay: Option<(u32, Vec<Option<(u32, u32, u32)>>)> = None;
         // Multimodal soft-token rows (bit 31): the prefill buckets this batch runs replace them
         // from the slab (MmRowsBf16).
         let mm_rows = self
@@ -255,11 +279,21 @@ impl GpuEngine {
                     "speech token batch requires staged inputs and no verification spans".into(),
                 ));
             }
-            // A verify span's rejected drafts roll back by frontier only: a recurrent state the
-            // scan advanced past them cannot be taken back (`spec_enable` refuses such packets).
-            if self.recurrent.is_some() && requests.iter().any(|r| r.phase == Phase::Verify) {
+            // A verify span's rejected drafts roll back by frontier only here: the packed scan
+            // keeps no per-row snapshots (decode-rung verify does, `recurrent_state.verify`).
+            // Span riders verify through the decode rung's span sites instead; a one-row decode
+            // request would join the Mamba prefill scan (prefill arithmetic), so it rides as a
+            // one-row verify span.
+            let spans_ride = self.span_riders.is_some();
+            if self.recurrent.is_some()
+                && requests.iter().any(|r| match r.phase {
+                    Phase::Verify => !spans_ride,
+                    Phase::Decode => spans_ride,
+                    Phase::Prefill => false,
+                })
+            {
                 return Err(RuntimeError::Rejected(
-                    "CUDA token batch cannot verify on a recurrent chain".into(),
+                    "CUDA token batch cannot verify on this recurrent chain".into(),
                 ));
             }
             // Only a prefill chunk reads an attached state from its block; a decode or verify row
@@ -454,11 +488,44 @@ impl GpuEngine {
                 .zip(&chunks)
                 .take_while(|(phase, chunk)| **phase == Phase::Decode && chunk.tokens.len() == 1)
                 .count();
+            if spans_ride && !verifies.is_empty() {
+                let mut row0 = None;
+                let mut spans = Vec::with_capacity(verifies.len());
+                for (s, _) in plan
+                    .spans
+                    .iter()
+                    .zip(&plan.phases)
+                    .filter(|(_, p)| **p == Phase::Verify)
+                {
+                    let r0 = *row0.get_or_insert(s.row0);
+                    span_rows.push((s.slot as usize, s.row0 - r0));
+                    spans.push(span_riders::Span {
+                        slot: s.slot as usize,
+                        rows: s.n_rows,
+                        kv_end: s.kv_len,
+                    });
+                }
+                let row0 = row0.expect("verify spans");
+                if row0 as usize + spans.iter().map(|s| s.rows as usize).sum::<usize>() != real_rows {
+                    return Err(RuntimeError::Rejected(
+                        "span riders must be the batch's last rows".into(),
+                    ));
+                }
+                let slots: smallvec::SmallVec<[usize; 16]> = spans.iter().map(|s| s.slot).collect();
+                self.pf_span = Some((row0, spans));
+                span_replay = self.span_rider_replay(&slots)?;
+                if span_replay.is_none() {
+                    return Err(RuntimeError::Rejected(
+                        "span riders need replay rollback (spec not enabled)".into(),
+                    ));
+                }
+            }
             let body = if row_decode.is_some() {
                 self.enqueue_row_decode(plan, &chunks)
             } else {
                 self.packed_token_body_enqueue(&chunks)
             };
+            self.pf_span = None;
             self.pf_riders = 0;
             self.pf_seg_prefix = false;
             body?;
@@ -588,6 +655,18 @@ impl GpuEngine {
                 .staging
                 .commit_after_device_success(&mut self.pos, &self.slot_generations)
                 .map_err(|error| RuntimeError::Rejected(error.to_string()))?;
+            if let Some((parity, _)) = span_replay.take() {
+                let commits: smallvec::SmallVec<[(usize, u32, u32, u32); 16]> = self.tb_verdicts
+                    [self.tb_verdicts.len() - verifies.len()..]
+                    .iter()
+                    .zip(&verifies)
+                    .map(|(&(slot, _, v), &(_, _, n, _))| {
+                        let row0 = span_rows.iter().find(|r| r.0 == slot).map_or(0, |r| r.1);
+                        (slot, n, u32::from(v.n_emit), row0)
+                    })
+                    .collect();
+                self.span_rider_commit(parity, &commits)?;
+            }
             self.spec_hidden_commit(true);
             if self.vmm_prefix_enabled() {
                 for chunk in &chunks {
@@ -641,6 +720,10 @@ impl GpuEngine {
         })();
         if result.is_err() {
             self.pf_riders = 0;
+            self.pf_span = None;
+            if let Some((_, taken)) = span_replay.take().filter(|_| !self.tb_launched) {
+                self.span_rider_restore(taken);
+            }
             self.pf_seg_prefix = false;
             self.tb_verdicts.truncate(verdicts_before);
             self.spec_hidden_commit(false);
