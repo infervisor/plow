@@ -329,7 +329,7 @@ impl RungController {
         // C_admit(t) = max(C_nominal, covering(occupied_extent)).
         if self.target > nominal_idx && load.queued == 0 {
             let drain_seat = self.rungs.covering(load.occupied_extent).max(nominal_idx);
-            if drain_seat < self.target {
+            if drain_seat < self.target && self.dwell_ticks >= THROUGHPUT_DWELL_TICKS {
                 self.target = drain_seat;
                 self.dwell_ticks = 0;
                 self.low_load_ticks = 0;
@@ -350,7 +350,12 @@ impl RungController {
             self.dwell_ticks = 0;
             self.low_load_ticks = 0;
             reason = RungReason::Throughput;
-        } else if load.queued > 0 && seat > self.target {
+        } else if load.queued > 0
+            && seat > self.target
+            && (seat <= nominal_idx
+                || load.queued >= 4
+                || load.oldest_wait_ms >= self.elastic_wait_ms)
+        {
             let wait = self.projected_wait_ms(self.target, load);
             let slo = load.slo_ms.max(8.0 * self.service_ms(self.target));
             self.target = seat;
