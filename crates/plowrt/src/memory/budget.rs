@@ -64,15 +64,7 @@ impl GpuMemoryBudget {
         let park_nominal = params
             .config
             .decode_nominal_rung
-            .unwrap_or_else(|| {
-                if params.config.decode_max_rung.is_some()
-                    || params.config.decode_elastic_rung.is_some()
-                {
-                    32.min(concurrency_cap)
-                } else {
-                    concurrency_cap
-                }
-            })
+            .unwrap_or(concurrency_cap)
             .min(concurrency_cap);
         let (ring_park_slots, ring_park_cap_bytes) = if params.ring_slot_charge > 0 {
             let max_slots_in_half_room = (usable_room_bytes / 2) / params.ring_slot_charge.max(1);
