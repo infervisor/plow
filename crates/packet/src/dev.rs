@@ -1160,7 +1160,7 @@ pub enum DevOp {
     ///
     /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb_cap,H] bf16)
     /// t3=score_w([H] f32) t4=push_src? t5=gamma? t6=res_a? t7=res_b?` ·
-    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre? i6=mwg_scratch` · `f0=eps`.
+    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre? i6=mwg_scratch i7=cuda_mode` · `f0=eps`.
     ///
     /// `gamma` is the FUSED POST-NORM, `[H] bf16`, and it is what makes the slice map above
     /// affordable. Every AttnRes in a K3 program is read by exactly one consumer and that consumer

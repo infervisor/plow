@@ -69,6 +69,10 @@ def parse(text):
             for slot in ("gamma", "beta", "add", "key_lengths"):
                 operand = re.search(rf"\b{slot}<-(\S+)", head)
                 p[f"has_{slot}"] = bool(operand and operand.group(1) != "—")
+        if m.group(2) == "AttnRes":
+            for slot in ("gamma", "res_b"):
+                operand = re.search(rf"\b{slot}<-(\S+)", head)
+                p[f"has_{slot}"] = bool(operand and operand.group(1) != "—")
         if m.group(2) == "GatherRowsF32":
             operand = re.search(r"\bindex<-(\S+)", head)
             p["has_index"] = bool(operand and operand.group(1) != "—")
@@ -159,6 +163,19 @@ def cost(op, p, rows, ctx, wb, kvb):
     if op == "FlashMerge":
         n, hh, ns, hd = g("n_batch", rows), g("n_head"), g("nsplit", 1), g("hd")
         return 4 * n * hh * hd * ns + 2 * n * hh * hd, 0
+    if op == "AttnRes":
+        mode = g("cuda_mode", 0)
+        n, h = g("T", rows), g("H")
+        if mode == 1:
+            queries, blocks = g("push_row"), g("nb")
+            gamma = g("has_gamma", False)
+            source = 2 * n * h * (blocks + 1 + g("has_res_b", False))
+            output = (2 if gamma else 4) * n * h * queries
+            return source + output + (6 if gamma else 4) * h * queries, 0
+        if mode == 2:
+            return 12 * n * h, 0
+        if mode == 3:
+            return 18 * n * h + 2 * h, 0
     if op in ("RmsNorm", "NormResidual", "NormResidualNorm", "AddNorm"):
         # AddNorm: reads a and b, writes the residual sum and its norm.
         tensors = {"RmsNorm": 2, "NormResidual": 3, "NormResidualNorm": 4, "AddNorm": 4}[op]

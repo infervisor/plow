@@ -14,6 +14,14 @@ class SweepTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prefill T=128 has unpriced ops: HeadNormRopeFp8"):
             op_roof.require_priced(program, priced)
 
+    def test_cuda_residual_mix_prices_sources_query_and_output(self):
+        text = ("===== program T=8 =====\n"
+                "#0 AttnRes b=8 gamma<-weight res_b<-addend | "
+                "T=8 H=16 nb=1 push_row=2 nb_cap=8 cuda_mode=1\n")
+        _, _, [(idx, op, _, params)] = op_roof.parse(text)[0]
+        self.assertEqual(idx, 0)
+        self.assertEqual(op_roof.cost(op, params, 8, 8, 2, 2), (1472, 0))
+
     def test_empty_sweep_is_not_treated_as_a_measurement(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "sweep.jsonl"
