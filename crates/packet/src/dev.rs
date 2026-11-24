@@ -156,6 +156,8 @@ pub enum DevOp {
     /// path byte-identical, so prefill and B=1 decode are unchanged.
     /// `cos = TENSOR_NONE` skips RoPE. `out_row0` lets K/V land directly at a row
     /// offset of the KV cache, so the cache write is not a separate copy.
+    /// CUDA pair mode 4 applies a BF16 scale per head and channel, then clips
+    /// the FP32 L2 norm to the FP32 bits in `i4` (+ `f0` epsilon in the divisor). Output is dense.
     HeadNormRope = 3,
     /// `t0=out t1=a t2=b t3=pre?` · `i0=n` · `f0=scale`, computing
     /// `(a + b) * scale`, or `(pre + bf16(a + b)) * scale` when `pre` is present.
@@ -2703,6 +2705,8 @@ pub const ROPE_PAIR_HALF: u32 = 2;
 /// [`DevOp::HeadNormRope`] `i5 = pair_mode`: the DSA indexer key prep (PLOW_DSA_PREP) — LayerNorm
 /// with bias (`t2 = gamma`, `t6 = beta`, `f0 = eps`) then HD=128 interleaved rope, skip_norm.
 pub const ROPE_PAIR_DSA_KPREP: u32 = 3;
+/// Dense CUDA scaled L2 clipping without RoPE or KV addressing.
+pub const ROPE_PAIR_L2_CLIP: u32 = 4;
 
 impl DevOp {
     /// Every opcode, in numeric order.

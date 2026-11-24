@@ -81,6 +81,7 @@ enum {
      * (GLM/Kimi); 2 = FORCE half-split (NeoX `rotate_half`) at EVERY hd. GPT-OSS is hd=64
      * half-split, the one combination the legacy rule gets wrong, and a wrong pairing is fluent
      * text from the wrong model. Zero-init packets keep the legacy rule byte-for-byte. */
+    /* CUDA pair mode 4 uses t2=head/channel BF16 scale and i4=FP32 L2 clip threshold bits. */
     PLOW_DOP_HEADNORM_ROPE = 3,
 
     /* t0=out t1=a t2=b                 i0=n                     f0=scale

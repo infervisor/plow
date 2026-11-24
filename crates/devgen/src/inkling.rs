@@ -37,6 +37,7 @@ pub(crate) struct InklingCfg {
     pub route_scale: f32,
     pub eps: f32,
     pub attn_scale: f32,
+    pub qk_clip: f32,
     pub prefix: String,
     pub is_full: Vec<bool>,
     pub core_start: usize,
@@ -121,6 +122,7 @@ fn cfg_inkling(v: &Value) -> InklingCfg {
         route_scale,
         eps,
         attn_scale,
+        qk_clip: t["qk_l2_clip_threshold"].as_f64().expect("missing qk_l2_clip_threshold") as f32,
         prefix,
         is_full,
         core_start,
@@ -146,6 +148,7 @@ struct Emitter<'a> {
     kg: u32,
     vg: u32,
     q: u32,
+    q_clipped: u32,
     opart: u32,
     mlpart: u32,
     attn_gate: u32,
@@ -296,8 +299,21 @@ impl Emitter<'_> {
             (f, f, f)
         };
 
-        // Q has NoPE (skip_norm, no cos/sin), so projection writes directly to q.
-        let c_qn = cq;
+        let q_scale = self.w(&format!("{p}attn.q_l2_clip.scale"), qd as u64 * BF16);
+        let q_in = q;
+        let q = self.q_clipped;
+        let c_qn = self.b.emit(DevOp::HeadNormRope, self.b.all(), &[cq], |d| {
+            d.t[0] = q;
+            d.t[1] = q_in;
+            d.t[2] = q_scale;
+            d.t[5] = self.pos;
+            d.i[0] = t;
+            d.i[1] = heads;
+            d.i[2] = hd;
+            d.i[5] = packet::dev::ROPE_PAIR_L2_CLIP;
+            d.f[0] = 1e-6;
+            d.i[4] = c.qk_clip.to_bits();
+        });
         let fuse_kv = !self.prefill && t == 1 && !self.ladder;
         let (c_kn, c_vn) = if fuse_kv {
             // Fuse K and V cache writes into a single HeadNormRope pair instruction (i[7] = 1).
@@ -570,6 +586,7 @@ fn phase_range(
     let kg = act(&mut b, "kg", tr * kd as u64 * BF16);
     let vg = act(&mut b, "vg", tr * kd as u64 * BF16);
     let q = act(&mut b, "q", tr * qd as u64 * BF16);
+    let q_clipped = act(&mut b, "q_clipped", tr * qd as u64 * BF16);
     let opart = act(
         &mut b,
         "opart",
@@ -607,6 +624,7 @@ fn phase_range(
         kg,
         vg,
         q,
+        q_clipped,
         opart,
         mlpart,
         attn_gate,
@@ -894,7 +912,6 @@ pub(super) fn run(
             "_sconv.",
             "wr_du",
             "rel_",
-            "q_l2_clip",
             "attn_res.",
             "controllers.",
             "middle_cycle_cross_pass_",

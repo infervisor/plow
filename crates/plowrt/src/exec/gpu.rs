@@ -1428,6 +1428,39 @@ fn validate_gemv_decode_role_inst(
     Ok(())
 }
 
+fn validate_head_l2_clip(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::HeadNormRope as u16 || d.i[5] != packet::dev::ROPE_PAIR_L2_CLIP {
+            continue;
+        }
+        let extent = |slot: usize, bytes: u64| {
+            blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= bytes)
+        };
+        let heads = u64::from(d.i[1]);
+        let rows = u64::from(d.i[0]) * heads;
+        let positive = |bits| {
+            let value = f32::from_bits(bits);
+            value.is_finite() && value > 0.0
+        };
+        if d.i[2] != 128
+            || rows == 0
+            || rows > u64::MAX / 256
+            || !positive(d.fj[0])
+            || !positive(d.i[4])
+            || d.fj[1] != 0
+            || d.fj[2] != 0
+            || d.t[0] == d.t[1]
+            || d.t[0] == d.t[2]
+            || !extent(0, rows * 256)
+            || !extent(1, rows * 256)
+            || !extent(2, heads * 256)
+        {
+            return Err(RuntimeError::Rejected("invalid scaled head L2 clip operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_gated_flash_merge(blob: &DevBlob) -> Result<()> {
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
         if d.op != DevOp::FlashMerge as u16
@@ -4575,6 +4608,7 @@ impl GpuEngine {
                 let blob = image.blob.clone();
                 validate_moe_outer_scales(&blob)?;
                 validate_gated_flash_merge(&blob)?;
+                validate_head_l2_clip(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {

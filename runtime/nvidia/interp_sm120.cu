@@ -2072,6 +2072,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * T16 (PLOW_NV_FA_ROPE): also in the FA object — rope packets classed 2 merge the
      * [rope, flash, flash, merge] chain into ONE FA-class launch. */
     case PLOW_DOP_HEADNORM_ROPE:
+        if (in->i[5] == 4) {
+            if (in->i[2] != 128 || !TEN(2)) __trap();
+            else d_head_l2_clip<128>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                                   (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1],
+                                   in->fj[0].f, __uint_as_float(in->i[4]), slice, nblk);
+            break;
+        }
 #if PLOW_MIXED_STEP
 #define PLOW_HNR_SLOT , (const int*)TEN(6), mixed
 #elif PLOW_NV_PREFILL

@@ -1026,6 +1026,32 @@ static __device__ __forceinline__ unsigned plow_hnr_next_live(const int* __restr
     return total;
 }
 
+template <unsigned HD>
+static __device__ void d_head_l2_clip(__nv_bfloat16* __restrict__ out,
+                                    const __nv_bfloat16* __restrict__ x,
+                                    const __nv_bfloat16* __restrict__ scale,
+                                    unsigned rows, unsigned heads, float eps, float threshold,
+                                    unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned warps = blockDim.x / 32;
+    for (size_t w = slice * warps + threadIdx.x / 32; w < (size_t)rows * heads; w += nblk * warps) {
+        const size_t offset = w * HD + lane;
+        const size_t scale_offset = (w % heads) * HD + lane;
+        float values[HD / 32];
+        float sum_sq = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < HD / 32; ++i) {
+            values[i] = __bfloat162float(x[offset + i * 32])
+                      * __bfloat162float(scale[scale_offset + i * 32]);
+            sum_sq += values[i] * values[i];
+        }
+        const float factor = fminf(threshold / (sqrtf(warp_sum32(sum_sq)) + eps), 1.0f);
+#pragma unroll
+        for (unsigned i = 0; i < HD / 32; ++i)
+            out[offset + i * 32] = __float2bfloat16(values[i] * factor);
+    }
+}
+
 template <int HD, bool INTERLEAVE = false>
 static __device__ void d_headnorm_rope(__nv_bfloat16* __restrict__ hnr_out,
                                 const __nv_bfloat16* __restrict__ hnr_x,
