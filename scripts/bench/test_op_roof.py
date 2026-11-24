@@ -8,6 +8,13 @@ import op_roof
 
 
 class SweepTests(unittest.TestCase):
+    def test_fp32_router_prices_projection_output_and_topk_read(self):
+        self.assertEqual(op_roof.cost("GemmF32", {"M": 8, "N": 16, "K": 32}, 8, 0, 1, 2),
+                         (2048, 8192))
+        shape = {"n_exp": 16, "k": 2, "flags": 15}
+        self.assertEqual(op_roof.moe_cost("MoeRouterTopkPf", shape, 8, 2), (704, 0))
+        self.assertEqual(op_roof.moe_cost("MoeRouterTopkPf", {**shape, "flags": 7}, 8, 2), (448, 0))
+
     def test_roofline_rejects_unpriced_instructions(self):
         program = ("prefill", 128, [(1, "HeadNormRopeFp8", "", {})])
         priced = op_roof.price(program, 128, 2, 2, 3173, 989)

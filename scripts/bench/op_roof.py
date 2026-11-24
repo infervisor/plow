@@ -122,6 +122,9 @@ def cost(op, p, rows, ctx, wb, kvb):
     if op in ("Gemm", "Gemv", "GemmMed", "GemmSmall", "GemmWide"):
         n, k = g("N"), g("K")
         return wb * n * k + 2 * m * k + 2 * m * n, 2 * m * n * k
+    if op == "GemmF32":
+        n, k = g("N"), g("K")
+        return 2 * n * k + 2 * m * k + 4 * m * n, 2 * m * n * k
     if op in ("GemvFp8", "GemvGluFp8"):
         n, k = g("N"), g("K")
         matrices = 2 if op == "GemvGluFp8" else 1
@@ -343,8 +346,13 @@ def moe_cost(op, p, rows, wb):
         t, h, n = (g("T", rows) if op == "MoeRouterGemmaPf" else rows), g("H"), g("n_exp")
         out = t * g("k") * 8 if op == "MoeRouterGemmaPf" else t * n * 4
         return 2 * n * h + 4 * h + 2 * t * h + out, 2 * t * n * h
-    if op in ("MoeRouterGemmaTopk", "MoeRouterTopkPf"):
+    if op == "MoeRouterGemmaTopk":
         return rows * (4 * g("n_exp") + 8 * g("k")) + 2 * g("n_exp"), 0
+    if op == "MoeRouterTopkPf":
+        flags, experts = int(g("flags", 0)), g("n_exp")
+        score_bytes = 4 if flags & 8 else 2
+        bias_bytes = 4 * experts if flags & 4 else 0
+        return rows * (score_bytes * experts + 8 * g("k")) + bias_bytes, 0
     if op in ("MoeAlignGemmaPf", "MoeAlignPf"):
         return 20 * g("T", rows) * g("k") + 12 * g("n_exp"), 0
     if op in ("MoeCombineNormGemma", "MoeCombineNormGemmaPf", "MoeCombinePf"):
