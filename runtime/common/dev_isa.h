@@ -1567,6 +1567,17 @@ enum {
      * i2=width i3=in_stride i4=up_col (elements) f0=alpha f1=limit. */
     PLOW_DOP_GLU_PITCHED = 230,
 
+    /* DeepSeek-V4.1 activation fake quant (kernel.py act_quant(x, 32, "ue8m0")) ahead of
+     * GEMM_FP8_MX: t0=out(bf16, may alias t1) t1=x(bf16) i0=rows i1=K. runtime/common/op_act_quant_mx.h */
+    PLOW_DOP_ACT_QUANT_MX = 231,
+    /* DeepSeek-V4.1 batched decode (runtime/nvidia/op_sparse_attn_decode.cuh, op_compress.cuh,
+     * op_index_decode.cuh); operand tables in crates/packet/src/dev.rs. */
+    PLOW_DOP_SPARSE_ATTN_DECODE = 232,
+    PLOW_DOP_SPARSE_ATTN_MERGE = 233,
+    PLOW_DOP_COMPRESS_DECODE_STEP = 234,
+    PLOW_DOP_INDEX_SCORE_DECODE = 235,
+    PLOW_DOP_INDEX_SELECT_DECODE = 236,
+
     PLOW_DOP__COUNT
 };
 

@@ -3931,6 +3931,27 @@ pub fn config_header(manifest: &Value) -> String {
     if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {
         out.push_str(&format!("#define PLOW_PACKET_GQA {gqa}\n"));
     }
+    let nvcc_req: Vec<&str> = manifest
+        .pointer("/backends/nvcc/requires")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !nvcc_req.is_empty() {
+        let nv_gemma = nvcc_req.iter().any(|v| *v == "PLOW_NV_GEMMA=1");
+        out.push_str(&format!(
+            "#ifndef PLOW_NV_GEMMA\n#define PLOW_NV_GEMMA {}\n#endif\n",
+            if nv_gemma { 1 } else { 0 }
+        ));
+        for r in &nvcc_req {
+            if let Some(val) = r.strip_prefix("PLOW_NV_FA_GF=") {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_GF\n#define PLOW_NV_FA_GF {val}\n#endif\n"
+                ));
+            }
+        }
+    }
 
     // What `scripts/build_gfx942.sh` reads under PLOW_HSACO_CONFIG: the AMD `requires` list,
     // the decode batch and ladder, and whether token-batch BODY programs (the `_tb` object

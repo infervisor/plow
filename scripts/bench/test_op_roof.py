@@ -478,6 +478,33 @@ class MoeCostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no preceding router"):
             op_roof.price(prog, 128, 2, 2, 3000, 989)
 
+    def test_mxfp4_decode_and_prefill_moe_are_priced(self):
+        decode_txt = ("===== program T=1 =====\n"
+                      "#10 MoeRouterTopkPf b=1 table<-act.tab logit<-act.logit atom_acc?<-— bias<-— | atom_h=0 n_exp=128 k=8 flags=0 T=1 shared_tail=0 route_scale=8.0 logit_scale?=—\n"
+                      "#11 MoeGluMx b=132 fu<-act.fu x<-act.xn2 table<-act.tab W_gu<-w13 S_gu<-s13 bias_gu?<-— | k=8 I=1152 K=2304 n_exp=128 layout=0 act=3 n_batch=1 alpha=1.0 limit=4.0\n"
+                      "#12 MoeDownMx b=132 part<-act.part fu<-act.fu table<-act.tab W_d<-w2 S_d<-s2 bias_d?<-— | k=8 H=2304 I=1152 n_exp=128 n_batch=1 alpha=1.0 limit=4.0\n"
+                      "#13 MoeCombinePf b=1 out<-act.moe residual?<-— shared?<-— part<-act.part | H=2304 k=8 T=1 t_row0=0 det=0\n")
+        prog = op_roof.parse(decode_txt)[0]
+        priced = op_roof.price(prog, 128, 2, 2, 3089.1, 774.2)
+        op_roof.require_priced(prog, priced)
+        self.assertEqual(priced[10][0], "MoeRouterTopkPf")
+        self.assertEqual(priced[11][0], "MoeGluMx")
+        self.assertEqual(priced[12][0], "MoeDownMx")
+        self.assertEqual(priced[13][0], "MoeCombinePf")
+
+        prefill_txt = ("===== program T=128 =====\n"
+                       "#10 MoeRouterTopkPf b=1 table<-act.tab logit<-act.logit atom_acc?<-— bias<-— | atom_h=0 n_exp=128 k=8 flags=0 T=128 shared_tail=0 route_scale=8.0 logit_scale?=—\n"
+                       "#11 MoeAlignPf b=1 meta<-act.meta table<-act.tab row_token<-act.rt row_partidx<-act.rp row_gate<-act.rg | T=128 n_exp=128 k=8\n"
+                       "#12 MoeGluMxPf b=132 fu_g<-act.fu xn2<-act.xn2 W_gu<-w13 S_gu<-s13 meta<-act.meta row_token<-act.rt bias_gu?<-— | I=1152 K=2304 n_exp=128 layout=0 act=3 alpha=1.0 limit=4.0\n"
+                       "#13 MoeDownMxPf b=132 part<-act.part fu_g<-act.fu W_d<-w2 S_d<-s2 meta<-act.meta bias_d?<-— row_partidx<-act.rp row_gate<-act.rg | H=2304 I=1152 n_exp=128\n"
+                       "#14 MoeCombinePf b=1 out<-act.moe residual?<-— shared?<-— part<-act.part | H=2304 k=8 T=128 t_row0=0 det=0\n")
+        prog_pf = op_roof.parse(prefill_txt)[0]
+        priced_pf = op_roof.price(prog_pf, 128, 2, 2, 3089.1, 774.2)
+        op_roof.require_priced(prog_pf, priced_pf)
+        self.assertEqual(priced_pf[11][0], "MoeAlignPf")
+        self.assertEqual(priced_pf[12][0], "MoeGluMxPf")
+        self.assertEqual(priced_pf[13][0], "MoeDownMxPf")
+
 
 class CeilingTests(unittest.TestCase):
     def test_calibrated_file_wins_over_registry_and_overrides_win_over_both(self):

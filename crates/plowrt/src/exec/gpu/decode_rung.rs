@@ -309,6 +309,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     }
                     d.i[1] = 1;
                 }
+                Some(DevOp::MoeRouter) => {}
                 Some(DevOp::MoeRouterTopkPf) => {
                     if d.i[4] != g.t {
                         return Err(reject("MoE router rows disagree with rung width"));

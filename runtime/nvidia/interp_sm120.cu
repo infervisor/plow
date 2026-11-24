@@ -141,6 +141,9 @@ extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
 #ifndef PLOW_HAS_GEMV_FP8_BLK
 #define PLOW_HAS_GEMV_FP8_BLK 1
 #endif
+#ifndef PLOW_HAS_MOE_ROUTER
+#define PLOW_HAS_MOE_ROUTER 1
+#endif
 #ifndef PLOW_HAS_MOE_ROUTER_GEMMA
 #define PLOW_HAS_MOE_ROUTER_GEMMA 1
 #endif
@@ -189,11 +192,13 @@ extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
 #define PLOW_NV_MXFP4_MOE                                                                  \
     (PLOW_HAS_MOE_GLU_MX || PLOW_HAS_MOE_DOWN_MX || PLOW_HAS_MOE_GLU_MX_PF ||              \
      PLOW_HAS_MOE_DOWN_MX_PF)
+#define PLOW_NV_MXFP4_MOE_SMEM 0
 #define PLOW_NV_MOE_COMMON                                                                 \
-    (PLOW_HAS_MOE_ROUTER_TOPK_PF || PLOW_HAS_MOE_ALIGN_PF || PLOW_HAS_MOE_COMBINE_PF)
+    (PLOW_HAS_MOE_ROUTER || PLOW_HAS_MOE_ROUTER_TOPK_PF || PLOW_HAS_MOE_ALIGN_PF || PLOW_HAS_MOE_COMBINE_PF)
 #else
 #define PLOW_NV_MXFP4_PROJ 0
 #define PLOW_NV_MXFP4_MOE 0
+#define PLOW_NV_MXFP4_MOE_SMEM 0
 #define PLOW_NV_MOE_COMMON 0
 #define PLOW_PACKET_LINEAR_BIAS 0
 #define PLOW_PACKET_ROPE_HALF_HD64 0
@@ -1564,7 +1569,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_ADD_NORM:
         d_add_norm((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
                    (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), in->i[0], in->i[1],
-                   in->fj[0].f, slice, nblk, arena);
+                   in->fj[0].f, slice, nblk, arena, in->i[7]);
         break;
 
 #if PLOW_NV_GEMMA
@@ -2551,12 +2556,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) && in->i[1] >= 1024 &&
-            (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
+            (in->i[2] == 2048 || in->i[2] == 2304 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
              in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
              in->i[2] == 5376 || in->i[2] == 6144 || in->i[2] == 8192)) {
             auto* x = (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2];
             switch (in->i[2]) {
             case 2048: if (PLOW_NV_XREG_K(2048)) d_gemv_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
+            case 2304: if (PLOW_NV_XREG_K(2304)) d_gemv_sm90_xreg<2304>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
             case 2560: if (PLOW_NV_XREG_K(2560)) d_gemv_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
             case 2816: if (PLOW_NV_XREG_K(2816)) d_gemv_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
             case 3072: if (PLOW_NV_XREG_K(3072)) d_gemv_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), x, (const __nv_bfloat16*)TEN(2), in->i[1], slice, nblk); break;
@@ -2637,12 +2643,18 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) &&
-            (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
+            (in->i[2] == 2048 || in->i[2] == 2304 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
              in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
              in->i[2] == 5376 || in->i[2] == 6144)) {
             switch (in->i[2]) {
             case 2048:
                 if (PLOW_NV_XREG_K(2048)) d_gemv_qkv_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
+                    (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
+                    (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
+                break;
+            case 2304:
+                if (PLOW_NV_XREG_K(2304)) d_gemv_qkv_sm90_xreg<2304>((__nv_bfloat16*)TEN(0), (__nv_bfloat16*)TEN(3),
                     (__nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(1),
                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(4),
                     (const __nv_bfloat16*)TEN(6), in->i[1], in->i[3], in->i[4], slice, nblk);
@@ -2791,11 +2803,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_GEMV_XREG
         if (!PLOW_NV_GEMV_MMA_B1 && in->i[0] == 1 && PLOW_NV_XREG_K(in->i[2]) &&
-            (in->i[2] == 2048 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
+            (in->i[2] == 2048 || in->i[2] == 2304 || in->i[2] == 2560 || in->i[2] == 2816 || in->i[2] == 3072 ||
              in->i[2] == 3584 || in->i[2] == 3840 || in->i[2] == 4096 || in->i[2] == 5120 ||
              in->i[2] == 5376 || in->i[2] == 6144)) {
             switch (in->i[2]) {
             case 2048: if (PLOW_NV_XREG_K(2048)) d_gemv_glu_sm90_xreg<2048>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
+            case 2304: if (PLOW_NV_XREG_K(2304)) d_gemv_glu_sm90_xreg<2304>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
             case 2560: if (PLOW_NV_XREG_K(2560)) d_gemv_glu_sm90_xreg<2560>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
             case 2816: if (PLOW_NV_XREG_K(2816)) d_gemv_glu_sm90_xreg<2816>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
             case 3072: if (PLOW_NV_XREG_K(3072)) d_gemv_glu_sm90_xreg<3072>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(5), in->i[1], in->i[5], slice, nblk); break;
@@ -3110,6 +3123,15 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif /* !PLOW_NV_PREFILL || PLOW_MIXED_STEP */
 
 #if !PLOW_NV_GEMM_ONLY
+#if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ROUTER
+    case PLOW_DOP_MOE_ROUTER:
+        d_moe_router_nv((unsigned char*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                        (const __nv_bfloat16*)TEN(2),
+                        (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr,
+                        in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, slice,
+                        nblk, (float*)arena);
+        break;
+#endif
 #if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ROUTER_TOPK_PF
     case PLOW_DOP_MOE_ROUTER_TOPK_PF:
         if (TEN(2) || in->i[0] || in->i[6] > 1u || in->i[7]) { __trap(); break; }
@@ -3133,7 +3155,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                      (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
                      (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
                      in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6],
-                     in->fj[0].f, in->fj[1].f, slice, nblk);
+                     in->fj[0].f, in->fj[1].f, slice, nblk, in->i[7]);
         break;
 #endif
 #if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX
@@ -3141,7 +3163,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         d_moe_down_mx((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
                       (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
                       (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
-                      in->i[1], in->i[2], in->i[3], in->i[6], slice, nblk);
+                      in->i[1], in->i[2], in->i[3], in->i[6], slice, nblk, in->i[7]);
         break;
 #endif
 #if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_GLU_MX_PF
@@ -3150,7 +3172,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                         (const uint8_t*)TEN(2), (const uint8_t*)TEN(3), (const int*)TEN(4),
                         (const unsigned*)TEN(5), (const __nv_bfloat16*)TEN(6), in->i[0],
                         in->i[1], in->i[2], in->i[3], in->i[5], in->fj[0].f, in->fj[1].f,
-                        slice, nblk);
+                        slice, nblk, in->i[7]);
         break;
 #endif
 #if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX_PF
@@ -3159,7 +3181,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                          (const uint8_t*)TEN(2), (const uint8_t*)TEN(3),
                          (const int*)TEN(4), (const __nv_bfloat16*)TEN(5),
                          (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0], in->i[1],
-                         in->i[2], slice, nblk);
+                         in->i[2], slice, nblk, in->i[7]);
         break;
 #endif
 #if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_COMBINE_PF
@@ -4422,7 +4444,7 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS) PLOW_SYM(plow_sm12
     case PLOW_DOP_ADD_NORM:
         d_add_norm((__nv_bfloat16*)LIGHT_TEN(0), (__nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
                    (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4), in->i[0], in->i[1],
-                   in->fj[0].f, slice, nblk, part);
+                   in->fj[0].f, slice, nblk, part, in->i[7]);
         break;
     case PLOW_DOP_GLU:
         d_glu((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),

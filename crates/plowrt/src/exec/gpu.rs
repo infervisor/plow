@@ -1441,6 +1441,7 @@ fn validate_mxfp4_moe_role_inst(
         || d.i[0] == 0
         || d.i[0] > 16
         || d.i[3] == 0
+        || d.i[7] > 2
     {
         return Err(reject());
     }
@@ -1478,16 +1479,21 @@ fn validate_mxfp4_moe_role_inst(
         {
             let inter = u64::from(d.i[1]);
             let hidden = u64::from(d.i[2]);
+            let (w_row, s_row) = match d.i[7] {
+                1 => (hidden, hidden.div_ceil(32)),
+                2 => (hidden.div_ceil(2), hidden.div_ceil(16)),
+                _ => (hidden.div_ceil(2), hidden.div_ceil(32)),
+            };
             extent(0, checked(&[ksel, inter, 2])?, false)?;
             extent(1, checked(&[hidden, 2])?, false)?;
             extent(
                 3,
-                checked(&[experts, 2 * inter, hidden.div_ceil(2)])?,
+                checked(&[experts, 2 * inter, w_row])?,
                 false,
             )?;
             extent(
                 4,
-                checked(&[experts, 2 * inter, hidden.div_ceil(32)])?,
+                checked(&[experts, 2 * inter, s_row])?,
                 false,
             )?;
             extent(5, checked(&[experts, 2 * inter, 2])?, true)?;
@@ -1495,10 +1501,15 @@ fn validate_mxfp4_moe_role_inst(
         Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 => {
             let hidden = u64::from(d.i[1]);
             let inter = u64::from(d.i[2]);
+            let (w_row, s_row) = match d.i[7] {
+                1 => (inter, inter.div_ceil(32)),
+                2 => (inter.div_ceil(2), inter.div_ceil(16)),
+                _ => (inter.div_ceil(2), inter.div_ceil(32)),
+            };
             extent(0, checked(&[ksel, hidden, 4])?, false)?;
             extent(1, checked(&[ksel, inter, 2])?, false)?;
-            extent(3, checked(&[experts, hidden, inter.div_ceil(2)])?, false)?;
-            extent(4, checked(&[experts, hidden, inter.div_ceil(32)])?, false)?;
+            extent(3, checked(&[experts, hidden, w_row])?, false)?;
+            extent(4, checked(&[experts, hidden, s_row])?, false)?;
             extent(5, checked(&[experts, hidden, 2])?, true)?;
         }
         _ => return Err(reject()),

@@ -406,10 +406,12 @@ static __device__ void d_layernorm_bias(__nv_bfloat16* __restrict__ out,
 static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16* resid,
                            const __nv_bfloat16* a, const __nv_bfloat16* __restrict__ b,
                            const __nv_bfloat16* __restrict__ gamma, unsigned rows, unsigned feat,
-                           float eps, unsigned slice, unsigned nblk, float* part) {
+                           float eps, unsigned slice, unsigned nblk, float* part, unsigned ksel = 0) {
     const bool fits = (feat <= RN_REG * PLOW_NV_THREADS) && ((feat & 7u) == 0);
+    const float* part_in = (ksel > 1) ? (const float*)b : nullptr;
     for (unsigned row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
+        const size_t part_base = (size_t)row * ksel * feat;
         if (fits) {
             bf16v8 av[RN_VEC], bv[RN_VEC], w[RN_VEC];
 #pragma unroll
@@ -420,20 +422,44 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
                 w[c] = bf16v8_zero();
                 if (i < feat) {
                     av[c] = ld_glob8(a + base + i);
-                    bv[c] = ld_glob8(b + base + i);
+                    if (ksel <= 1 && b) bv[c] = ld_glob8(b + base + i);
                     if (gamma) w[c] = ld_glob8(gamma + i);
                 }
             }
             float r[RN_VEC * 8];
             float ss = 0.0f;
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++)
+            for (int c = 0; c < RN_VEC; c++) {
+                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
+                float part_sum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                if (ksel > 1 && i < feat) {
+                    for (unsigned p = 0; p < ksel; p++) {
+                        const float* pp = part_in + part_base + (size_t)p * feat + i;
+                        float4 f0 = *(const float4*)(pp);
+                        float4 f1 = *(const float4*)(pp + 4);
+                        part_sum[0] += f0.x;
+                        part_sum[1] += f0.y;
+                        part_sum[2] += f0.z;
+                        part_sum[3] += f0.w;
+                        part_sum[4] += f1.x;
+                        part_sum[5] += f1.y;
+                        part_sum[6] += f1.z;
+                        part_sum[7] += f1.w;
+                    }
+                }
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    const float f = __bfloat162float(av[c].x[j]) + __bfloat162float(bv[c].x[j]);
+                    float b_val;
+                    if (ksel <= 1) {
+                        b_val = b ? __bfloat162float(bv[c].x[j]) : 0.0f;
+                    } else {
+                        b_val = __bfloat162float(__float2bfloat16(part_sum[j]));
+                    }
+                    const float f = __bfloat162float(av[c].x[j]) + b_val;
                     r[c * 8 + j] = f;
                     ss += f * f;
                 }
+            }
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
 #pragma unroll
             for (int c = 0; c < RN_VEC; c++) {
@@ -454,12 +480,28 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
         } else {
             float ss = 0.0f;
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
-                const float f = __bfloat162float(a[base + i]) + __bfloat162float(b[base + i]);
+                float b_val;
+                if (ksel <= 1) {
+                    b_val = b ? __bfloat162float(b[base + i]) : 0.0f;
+                } else {
+                    float sum_k = 0.0f;
+                    for (unsigned p = 0; p < ksel; p++) sum_k += part_in[part_base + (size_t)p * feat + i];
+                    b_val = __bfloat162float(__float2bfloat16(sum_k));
+                }
+                const float f = __bfloat162float(a[base + i]) + b_val;
                 ss += f * f;
             }
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
-                const float f = __bfloat162float(a[base + i]) + __bfloat162float(b[base + i]);
+                float b_val;
+                if (ksel <= 1) {
+                    b_val = b ? __bfloat162float(b[base + i]) : 0.0f;
+                } else {
+                    float sum_k = 0.0f;
+                    for (unsigned p = 0; p < ksel; p++) sum_k += part_in[part_base + (size_t)p * feat + i];
+                    b_val = __bfloat162float(__float2bfloat16(sum_k));
+                }
+                const float f = __bfloat162float(a[base + i]) + b_val;
                 const float g = gamma ? norm_weight(__bfloat162float(gamma[i])) : 1.0f;
                 resid[base + i] = __float2bfloat16(f);
                 out[base + i] = __float2bfloat16(f * inv * g);

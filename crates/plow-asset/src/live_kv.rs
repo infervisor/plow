@@ -854,6 +854,7 @@ fn direct_operands(op: DevOp, d: &DevInst64, packet: &Packet<'_>) -> Result<()> 
                 | DevOp::ZeroF32
                 | DevOp::GemmSplitK
                 | DevOp::CastF32Bf16
+                | DevOp::MoeRouter
                 | DevOp::MoeRouterTopkPf
                 | DevOp::MoeAlignPf
                 | DevOp::MoeCombinePf

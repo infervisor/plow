@@ -2732,7 +2732,7 @@ template <unsigned K>
 __device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
     const __nv_bfloat16* x, const __nv_bfloat16* W, unsigned N,
     unsigned slice, unsigned nblk) {
-    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+    static_assert(K == 2048 || K == 2304 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
                   K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144 || K == 8192);
     constexpr unsigned chunks = K / GV_STEP;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -2745,16 +2745,26 @@ __device__ __forceinline__ void d_gemv_sm90_xreg(__nv_bfloat16* C,
     for (unsigned n = first + warp; n < end; n += blockDim.x / 32u) {
         const __nv_bfloat16* row = W + (size_t)n * K;
         float acc = 0.f;
+        if constexpr (chunks <= 12) {
+            bf16v8 weights[chunks];
 #pragma unroll
-        for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
-            bf16v8 weights[GV_UNROLL];
+            for (unsigned c = 0; c < chunks; c++)
+                weights[c] = ld_glob8_cs(row + c * GV_STEP + lane * 8u);
 #pragma unroll
-            for (unsigned u = 0; u < GV_UNROLL; u++)
-                if (c + u < chunks)
-                    weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
+            for (unsigned c = 0; c < chunks; c++)
+                acc = dot8(weights[c], xv[c], acc);
+        } else {
 #pragma unroll
-            for (unsigned u = 0; u < GV_UNROLL; u++)
-                if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+            for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
+                bf16v8 weights[GV_UNROLL];
+#pragma unroll
+                for (unsigned u = 0; u < GV_UNROLL; u++)
+                    if (c + u < chunks)
+                        weights[u] = ld_glob8_cs(row + (c + u) * GV_STEP + lane * 8u);
+#pragma unroll
+                for (unsigned u = 0; u < GV_UNROLL; u++)
+                    if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+            }
         }
         const float total = warp_sum32(acc);
         if (lane == 0) C[n] = __float2bfloat16(total);

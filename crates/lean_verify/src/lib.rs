@@ -372,10 +372,13 @@ pub fn verifier_sha256() -> Result<String, VerifyError> {
 /// # Example
 ///
 /// ```ignore
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let result = lean_verify::query("counter_granularity", serde_json::json!({
 ///     "edges": [{"id": 7, "consumer_slices": [0,1,2,3], "work": [100,100,100,100]}]
 /// }))?;
 /// // result.answer contains per-edge fine/coarse decisions
+/// # Ok(())
+/// # }
 /// ```
 pub fn query(query_type: &str, payload: serde_json::Value) -> Result<QueryResult, VerifyError> {
     let request = serde_json::json!({

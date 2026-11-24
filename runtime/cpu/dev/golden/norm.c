@@ -185,19 +185,38 @@ G_K(g_add_norm) {
     const plow_bf16* a = PLOW_CPU_TEN(in, T, 2);
     const plow_bf16* b = PLOW_CPU_TEN(in, T, 3);
     const plow_bf16* gamma = PLOW_CPU_TEN(in, T, 4);
-    const uint32_t rows = in->i[0], feat = in->i[1];
+    const uint32_t rows = in->i[0], feat = in->i[1], k = in->i[7];
     const float eps = in->fj[0].f;
+    const float* part_in = k ? (const float*)PLOW_CPU_TEN(in, T, 3) : NULL;
     for (uint32_t row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
         float ss = 0.0f;
         for (uint32_t i = 0; i < feat; i++) {
-            const float f = plow_bf2f(a[base + i]) + plow_bf2f(b[base + i]);
+            float b_val;
+            if (k) {
+                float sum_k = 0.0f;
+                const float* p_row = part_in + (size_t)row * k * feat;
+                for (uint32_t s = 0; s < k; s++) sum_k += p_row[(size_t)s * feat + i];
+                b_val = plow_bf2f(plow_f2bf(sum_k));
+            } else {
+                b_val = plow_bf2f(b[base + i]);
+            }
+            const float f = plow_bf2f(a[base + i]) + b_val;
             ss += f * f;
         }
         const float inv = g_rsqrt(ss / (float)feat + eps);
         for (uint32_t i = 0; i < feat; i++) {
+            float b_val;
+            if (k) {
+                float sum_k = 0.0f;
+                const float* p_row = part_in + (size_t)row * k * feat;
+                for (uint32_t s = 0; s < k; s++) sum_k += p_row[(size_t)s * feat + i];
+                b_val = plow_bf2f(plow_f2bf(sum_k));
+            } else {
+                b_val = plow_bf2f(b[base + i]);
+            }
             const float g = gamma ? plow_bf2f(gamma[i]) : 1.0f;
-            const float f = plow_bf2f(a[base + i]) + plow_bf2f(b[base + i]);
+            const float f = plow_bf2f(a[base + i]) + b_val;
             resid[base + i] = plow_f2bf(f);
             out[base + i] = plow_f2bf(f * inv * g);
         }

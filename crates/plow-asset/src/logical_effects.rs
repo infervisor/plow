@@ -202,10 +202,16 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         {
             Some(&[1, 5])
         }
+        FlashPrefill
+            if d.i[7] >= 1 && d.i[4] >> 31 == 0 && all(&[0, 1, 2, 3, 4]) && none(&[5, 6]) =>
+        {
+            Some(&[0, 1])
+        }
         FlashPrefillFp8 if d.i[7] == 1 && d.i[4] >> 31 == 0 && all(&[0, 1, 2, 3, 4, 5, 6, 7]) => {
             Some(&[5])
         }
         HeadNormRope if d.i[7] == 0 && all(&[0, 1, 5]) && has(3) == has(4) => Some(&[0]),
+        HeadNormRope if d.i[7] == 1 && all(&[0, 1, 5, 6, 7]) && has(3) == has(4) => Some(&[0, 6]),
         HeadNormRopeFp8 if d.i[7] == 0 && d.i[5] == 0 && all(&[0, 1, 5, 6]) && has(3) == has(4) => {
             Some(&[0, 6])
         }
@@ -281,6 +287,14 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         MoeGroupDownGemmaPfW8a8 if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0]),
         MoeExpertDownGemma if all(&[0, 1, 2, 3]) && (d.i[6] == 0 || all(&[5, 6, 7])) => Some(&[0]),
         MoeExpertGluNormGemma if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0, 5]),
+        MoeRouter if all(&[0, 1, 2]) => Some(&[0]),
+        MoeRouterTopkPf if all(&[0, 1]) => Some(&[0]),
+        MoeAlignPf if all(&[0, 1, 2, 3, 4]) => Some(&[0, 2, 3, 4]),
+        MoeGluMx if all(&[0, 1, 2, 3, 4]) => Some(&[0]),
+        MoeDownMx if all(&[0, 1, 2, 3, 4]) => Some(&[0]),
+        MoeGluMxPf if all(&[0, 1, 2, 3, 4, 5]) => Some(&[0]),
+        MoeDownMxPf if all(&[0, 1, 2, 3, 4, 6, 7]) => Some(&[0]),
+        MoeCombinePf if all(&[0, 3]) => Some(&[0]),
         QwenGatedNorm if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0]),
         QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0, 3]),
         QwenGdnGatePrep if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
@@ -329,6 +343,14 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         | MoeGroupDownGemmaPfW8a8
         | MoeExpertDownGemma
         | MoeExpertGluNormGemma
+        | MoeRouter
+        | MoeRouterTopkPf
+        | MoeAlignPf
+        | MoeGluMx
+        | MoeDownMx
+        | MoeGluMxPf
+        | MoeDownMxPf
+        | MoeCombinePf
         | QwenGatedNorm
         | QwenGdnConv
         | QwenGdnConvPrefill
@@ -1060,13 +1082,15 @@ mod tests {
         (DevOp::FlashMerge, &[0, 1, 2], &[], 0, Some(&[0]), "op_attention.cuh:3250 O"),
         (DevOp::FlashMerge, &[0, 1, 2], &[(4, 1024)], 0, None, "padded MLA layout producer"),
         (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5, 7], &[(7, 1)], 0, Some(&[1, 5]), "op_attention.cuh:3816 O; sm90 v3 :5460 fa_ws"),
-        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5, 7], &[(7, 2)], 0, None, "split-KV partials"),
+        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5, 7], &[(7, 2)], 0, None, "split-KV partials with O_final rejected"),
+        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4], &[(7, 2)], 0, Some(&[0, 1]), "op_attention.cuh:3816 Opart/mlpart split-KV"),
+        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 7], &[(7, 2)], 0, Some(&[0, 1]), "op_attention.cuh:3816 Opart/mlpart with tmap"),
         (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5, 7], &[(7, 1), (4, 1 << 31)], 0, None, "packed request table"),
         (DevOp::FlashPrefillFp8, &[0, 1, 2, 3, 4, 5, 6, 7], &[(7, 1)], 0, Some(&[5]), "gen_attn_pf_hd256_sliding_fp8kv.cu:763 O"),
         (DevOp::HeadNormRope, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0]), "op_norm.cuh:1295 out (q / KV row)"),
         (DevOp::HeadNormRope, &[0, 1, 5], &[], 0, Some(&[0]), "op_norm.cuh:1295 v row"),
         (DevOp::HeadNormRope, &[0, 1, 2, 3, 5], &[], 0, None, "op_norm.cuh:1274 sin read with cos"),
-        (DevOp::HeadNormRope, &[0, 1, 2, 3, 4, 5, 6], &[(7, 1)], 0, None, "fused KV pair writes t6"),
+        (DevOp::HeadNormRope, &[0, 1, 2, 3, 4, 5, 6, 7], &[(7, 1)], 0, Some(&[0, 6]), "fused KV pair writes t0 and t6"),
         (DevOp::HeadNormRopeFp8, &[0, 1, 2, 3, 4, 5, 6, 7], &[], 0, Some(&[0, 6]), "op_norm.cuh:1356 e4m3 row, :1474 scale"),
         (DevOp::HeadNormRopeFp8, &[0, 1, 5, 6], &[(5, 1)], 0, None, "unaudited i5"),
         (DevOp::QwenHeadNormRope, &[0, 1, 2, 3, 4, 5, 6], &[(2, 64)], 0, Some(&[0]), "op_qwen_gdn.cuh:840 out"),

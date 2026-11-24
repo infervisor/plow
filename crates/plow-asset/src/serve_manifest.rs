@@ -530,10 +530,58 @@ impl KvGeometry {
             }
             None => {
                 let n = t.get("num_hidden_layers")?.as_u64()? as u32;
-                full_layers = (0..n).collect();
+                if let Some(local_ids) = t.get("local_layer_ids").and_then(|x| x.as_array()) {
+                    let local_set: std::collections::BTreeSet<u32> = local_ids
+                        .iter()
+                        .filter_map(|x| x.as_u64().map(|y| y as u32))
+                        .collect();
+                    for l in 0..n {
+                        if local_set.contains(&l) {
+                            slide_layers.push(l);
+                        } else {
+                            full_layers.push(l);
+                        }
+                    }
+                } else {
+                    full_layers = (0..n).collect();
+                }
             }
         }
         let u = |k: &str| t.get(k).and_then(|x| x.as_u64()).map(|x| x as u32);
+        if let Some(loop_cfg) = t.get("loop_config").and_then(|x| x.as_object()) {
+            let n = u("num_hidden_layers").unwrap_or((full_layers.len() + slide_layers.len()) as u32);
+            let core_start = loop_cfg
+                .get("core_start")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as usize;
+            let core_end = loop_cfg
+                .get("core_end")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(n as u64) as usize;
+            let num_passes = loop_cfg
+                .get("num_passes")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1) as usize;
+            if num_passes > 1 {
+                let layer_seq: Vec<usize> = (0..core_start)
+                    .chain((0..num_passes).flat_map(|_| core_start..core_end))
+                    .chain(core_end..n as usize)
+                    .collect();
+                let full_set: std::collections::BTreeSet<u32> = full_layers.into_iter().collect();
+                full_layers = layer_seq
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &l)| full_set.contains(&(l as u32)))
+                    .map(|(li, _)| li as u32)
+                    .collect();
+                slide_layers = layer_seq
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &l)| !full_set.contains(&(l as u32)))
+                    .map(|(li, _)| li as u32)
+                    .collect();
+            }
+        }
         if let (Some(n), Some(shared)) = (u("num_hidden_layers"), u("num_kv_shared_layers")) {
             let own = n.saturating_sub(shared);
             full_layers.retain(|&l| l < own);
@@ -542,8 +590,11 @@ impl KvGeometry {
         let kv_heads_slide = u("num_key_value_heads")?;
         let head_dim_slide = u("head_dim")?;
         let window = match slide_layers.is_empty() {
-            true => u("sliding_window").unwrap_or(0),
-            false => u("sliding_window")?,
+            true => u("sliding_window")
+                .or_else(|| u("sliding_window_size"))
+                .unwrap_or(0),
+            false => u("sliding_window")
+                .or_else(|| u("sliding_window_size"))?,
         };
         Some(KvGeometry {
             full_layers,
@@ -1026,6 +1077,41 @@ mod tests {
             ),
             (1, 512, 8, 256)
         );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn looped_model_unrolls_local_and_full_layers() {
+        let d = tmp("looped");
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"text_config":{
+                "num_hidden_layers":6,
+                "local_layer_ids":[0,1,3,4],
+                "sliding_window_size":1024,
+                "num_key_value_heads":8,
+                "head_dim":128,
+                "loop_config":{"core_start":2,"core_end":4,"num_passes":2}
+            }}"#,
+        )
+        .unwrap();
+        let kv = KvGeometry::from_config(&d).unwrap();
+        // Layer sequence: [0, 1] + [2, 3] + [2, 3] + [4, 5] = 8 passes.
+        // Full layers: 2 and 5.
+        // Passes:
+        // 0 -> l0 (local)
+        // 1 -> l1 (local)
+        // 2 -> l2 (full)
+        // 3 -> l3 (local)
+        // 4 -> l2 (full)
+        // 5 -> l3 (local)
+        // 6 -> l4 (local)
+        // 7 -> l5 (full)
+        assert_eq!(kv.full_layers, vec![2, 4, 7]);
+        assert_eq!(kv.slide_layers, vec![0, 1, 3, 5, 6]);
+        assert_eq!(kv.window, 1024);
+        assert_eq!(kv.kv_heads_full, 8);
+        assert_eq!(kv.head_dim_full, 128);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

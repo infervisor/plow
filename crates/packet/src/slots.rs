@@ -197,7 +197,7 @@ const DOC: &[S] = &[
     S { op: DevOp::XDcpGather, t: &["idx?", "kv_len", "gckv", "gkrot", "gscale", "glen?"], i: &["n_batch", "K", "", "page_shift", "degree_shift", "slot_bytes", "gate", "n_gpu"], f: &[], j: &[] },
     S { op: DevOp::XReduceAddNorm, t: &["out2", "xmid_out", "x", "gamma"], i: &["feat", "n_gpu", "slot", "gate"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRopeFp8, t: &["out", "", "", "", "", "", "scale"], i: &[], f: &[], j: &[] },
-    S { op: DevOp::MoeRouter, t: &[], i: &["H", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
+    S { op: DevOp::MoeRouter, t: &["table", "x", "wr", "bias?"], i: &["H", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MoeExpertGlu, t: &["fu", "x", "routing_table", "expert_weight_table"], i: &["slot", "I_moe", "H", "n_exp", "", "act"], f: &[], j: &[] },
     S { op: DevOp::MoeExpertDown, t: &["part", "fu", "routing_table", "expert_weight_table"], i: &["slot", "H", "I_moe", "n_exp", "", "", "", "ybf"], f: &[], j: &[] },
     S { op: DevOp::MoeCombine, t: &["out", "residual?", "shared?", "part_base"], i: &["H", "k"], f: &[], j: &[] },

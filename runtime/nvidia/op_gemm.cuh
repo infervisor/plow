@@ -3074,7 +3074,7 @@ __device__ __forceinline__ void d_gemv_qkv_sm90_xreg(
     const __nv_bfloat16* x,
     const __nv_bfloat16* Wq, const __nv_bfloat16* Wk, const __nv_bfloat16* Wv,
     unsigned Nq, unsigned Nk, unsigned Nv, unsigned slice, unsigned nblk) {
-    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+    static_assert(K == 2048 || K == 2304 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
                   K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144);
     constexpr unsigned chunks = K / GV_STEP;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -3098,16 +3098,26 @@ __device__ __forceinline__ void d_gemv_qkv_sm90_xreg(
         }
         const __nv_bfloat16* row = W + (size_t)n * K;
         float acc = 0.f;
+        if constexpr (chunks <= 12) {
+            bf16v8 weights[chunks];
 #pragma unroll
-        for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
-            bf16v8 weights[GV_UNROLL];
+            for (unsigned c = 0; c < chunks; c++)
+                weights[c] = ld_glob8_cs(row + c * GV_STEP + lane * 8u);
 #pragma unroll
-            for (unsigned u = 0; u < GV_UNROLL; u++)
-                if (c + u < chunks)
-                    weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
+            for (unsigned c = 0; c < chunks; c++)
+                acc = dot8(weights[c], xv[c], acc);
+        } else {
 #pragma unroll
-            for (unsigned u = 0; u < GV_UNROLL; u++)
-                if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+            for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
+                bf16v8 weights[GV_UNROLL];
+#pragma unroll
+                for (unsigned u = 0; u < GV_UNROLL; u++)
+                    if (c + u < chunks)
+                        weights[u] = ld_glob8_cs(row + (c + u) * GV_STEP + lane * 8u);
+#pragma unroll
+                for (unsigned u = 0; u < GV_UNROLL; u++)
+                    if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+            }
         }
         const float total = warp_sum32(acc);
         if (lane == 0) C[n] = __float2bfloat16(total);
@@ -3118,7 +3128,7 @@ template <unsigned K>
 __device__ __forceinline__ void d_gemv_glu_sm90_xreg(__nv_bfloat16* C,
     const __nv_bfloat16* x, const __nv_bfloat16* Wg, const __nv_bfloat16* Wu,
     unsigned N, unsigned act, unsigned slice, unsigned nblk) {
-    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+    static_assert(K == 2048 || K == 2304 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
                   K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144);
     constexpr unsigned chunks = K / GV_STEP;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -3138,8 +3148,8 @@ __device__ __forceinline__ void d_gemv_glu_sm90_xreg(__nv_bfloat16* C,
 #pragma unroll
             for (unsigned u = 0; u < GV_UNROLL_GLU; u++) {
                 if (c + u < chunks) {
-                    gv[u] = ld_glob8(grow + (c + u) * GV_STEP + lane * 8u);
-                    uv[u] = ld_glob8(urow + (c + u) * GV_STEP + lane * 8u);
+                    gv[u] = ld_glob8_cs(grow + (c + u) * GV_STEP + lane * 8u);
+                    uv[u] = ld_glob8_cs(urow + (c + u) * GV_STEP + lane * 8u);
                 }
             }
 #pragma unroll
@@ -3732,18 +3742,9 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
  * multiply its exact power-of-two E8M0 scale and accumulate across blocks. */
 __device__ __forceinline__ float plow_mxfp4_e2m1(unsigned v) {
     const unsigned mag = v & 7u;
-    float x;
-    switch (mag) {
-    case 0: x = 0.0f; break;
-    case 1: x = 0.5f; break;
-    case 2: x = 1.0f; break;
-    case 3: x = 1.5f; break;
-    case 4: x = 2.0f; break;
-    case 5: x = 3.0f; break;
-    case 6: x = 4.0f; break;
-    default: x = 6.0f; break;
-    }
-    return (v & 8u) ? -x : x;
+    const unsigned sign = (v & 8u) << 28;
+    const unsigned base = (mag ? 252u : 0u) + (mag > 1u ? mag : 0u);
+    return __uint_as_float(sign | (base << 22));
 }
 
 __device__ __forceinline__ float plow_mxfp4_scale(unsigned v) {

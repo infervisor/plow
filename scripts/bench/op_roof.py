@@ -313,23 +313,43 @@ GEMMA_MOE_EXPERT = {"MoeExpertGluGemma", "MoeExpertGluNormGemma", "MoeExpertGluG
                     "MoeGroupGluGemmaPf", "MoeGroupGluGemmaPfW8a8",
                     "MoeGroupDownGemmaPf", "MoeGroupDownGemmaPfW8a8"}
 
+MXFP4_MOE_EXPERT = {"MoeGluMx", "MoeDownMx", "MoeGluMxPf", "MoeDownMxPf"}
+
 
 def moe_cost(op, p, rows, wb):
-    """Gemma-4 MoE (NVIDIA). Expert weights are charged for `experts` touched experts (`price`
-    injects it from the router-table or uniform-routing model); FP8/W8A8 experts carry one-byte
-    weights plus an FP32 scale per output row. The partial sums are FP32 (`act.moe.part`)."""
+    """Gemma-4 and MXFP4 MoE (NVIDIA). Expert weights are charged for `experts` touched experts
+    (`price` injects it from the router-table or uniform-routing model); FP8/W8A8 experts carry
+    one-byte weights plus an FP32 scale per output row; MXFP4 carries half-byte weights plus an
+    FP8 scale per 16 elements. The partial sums are FP32 (`act.moe.part`)."""
     g = p.get
     if op in ("MoeRouterGemmaScoreFast", "MoeRouterGemmaPf"):
         t, h, n = (g("T", rows) if op == "MoeRouterGemmaPf" else rows), g("H"), g("n_exp")
         out = t * g("k") * 8 if op == "MoeRouterGemmaPf" else t * n * 4
         return 2 * n * h + 4 * h + 2 * t * h + out, 2 * t * n * h
-    if op == "MoeRouterGemmaTopk":
+    if op in ("MoeRouterGemmaTopk", "MoeRouterTopkPf"):
         return rows * (4 * g("n_exp") + 8 * g("k")) + 2 * g("n_exp"), 0
-    if op == "MoeAlignGemmaPf":
+    if op in ("MoeAlignGemmaPf", "MoeAlignPf"):
         return 20 * g("T", rows) * g("k") + 12 * g("n_exp"), 0
-    if op in ("MoeCombineNormGemma", "MoeCombineNormGemmaPf"):
-        t = g("T", rows) if op == "MoeCombineNormGemmaPf" else rows
+    if op in ("MoeCombineNormGemma", "MoeCombineNormGemmaPf", "MoeCombinePf"):
+        t = g("T", rows) if op in ("MoeCombineNormGemmaPf", "MoeCombinePf") else rows
         return t * g("H") * (4 * g("k") + 4) + 2 * g("H"), 0
+    if op in MXFP4_MOE_EXPERT:
+        t, k = g("T", rows), g("k")
+        if None in (t, k, g("experts")):
+            raise ValueError(f"{op}: expert shape needs T, k and the touched-expert count")
+        if op in ("MoeGluMx", "MoeGluMxPf"):
+            k_in, i = g("K"), g("I")
+            n_out = 2 * i
+            weight = g("experts") * (n_out * k_in * 0.5 + n_out * (k_in / 16.0))
+            act_in = 2 * t * k_in
+            act_out = 2 * t * k * n_out
+            return weight + act_in + act_out, 2 * t * k * n_out * k_in
+        if op in ("MoeDownMx", "MoeDownMxPf"):
+            h, i = g("H"), g("I")
+            weight = g("experts") * (h * i * 0.5 + h * (i / 16.0))
+            act_in = 2 * t * k * i
+            act_out = 4 * t * k * h
+            return weight + act_in + act_out, 2 * t * k * h * i
     if op not in GEMMA_MOE_EXPERT:
         return None
     t, k, h = g("T", rows), g("k"), g("H")
@@ -387,9 +407,9 @@ def price(prog, ctx, wb, kvb, bw, tflops, fp8_tflops=None, prefill_past=None, ro
     for idx, op, name, p in prog[2]:
         if prog[0] == "prefill" and op in ("FlashPrefill", "FlashPrefillFp8") and prefill_past is not None:
             p = dict(p, q_pos0=prefill_past, n_kv=prefill_past + p["n_q"])
-        if op in ("MoeRouterGemmaPf", "MoeAlignGemmaPf", "MoeRouterGemmaTopk"):
+        if op in ("MoeRouterGemmaPf", "MoeAlignGemmaPf", "MoeRouterGemmaTopk", "MoeRouterTopkPf", "MoeAlignPf"):
             routed = (p.get("T", prog[1]), p["k"], p["n_exp"])
-        if op in GEMMA_MOE_EXPERT:
+        if op in GEMMA_MOE_EXPERT or op in MXFP4_MOE_EXPERT:
             if routed is None or routed[2] != p["n_exp"]:
                 raise ValueError(f"{op} at #{idx} has no preceding router of its expert count")
             t, k, n = routed
