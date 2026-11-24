@@ -957,6 +957,8 @@ pub(super) fn run(
     let lean = apply_verify_gate(&m, verify);
     let outp = Path::new(out);
     let mut sections = vec![crate::qwen35::recurrent_state_section(&m, dbatch)];
+    crate::object_requirements::append(&m, &mut sections)
+        .unwrap_or_else(|error| panic!("object requirements: {error}"));
     if block.is_some() {
         use plow_asset::*;
         let l = layers.start;
