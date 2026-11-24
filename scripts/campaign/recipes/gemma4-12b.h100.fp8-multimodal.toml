@@ -11,7 +11,7 @@
 #
 # Qualified (2026-10-05, plowrt ee57f7b7, packet 5fbe627c02af): campaign.py report MATCHED + EQUIVALENT
 # vs vLLM 0.28 fp8_per_token_head KV on every 4K/15K/agentic16k/open-loop cell; FP32-reference gate
-# PASS, KL mean 0.105 vs vLLM 0.128. docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# PASS, KL mean 0.105 vs vLLM 0.128. perf-data/campaign/gemma12b-fp8-20260930/comparison.md.
 # plow_git rebuild (packet ab1c1d583f8d) changes only the hd512 FP8-KV attention object; gate PASS.
 # vLLM with BF16 KV (FLASH_ATTN) is still faster than this packet: same doc, Caveats.
 #

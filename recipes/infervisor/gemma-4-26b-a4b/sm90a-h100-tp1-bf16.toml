@@ -12,14 +12,14 @@
 # served name and the 0685a38a single-block MoE align below 1024 rows, digest-identical), campaign.py
 # report MATCHED + EQUIVALENT vs vLLM 0.28 BF16: wins agentic c32/c64/c128 1.57x / 1.32x / 1.03x;
 # loses 4K c32/c128 0.88x / 0.77x, 15K 0.87x / 0.86x, latency c1/c4 0.94x / 0.93x.
-# docs/bringup/results/gemma26b-h100-20261007/comparison.md.
+# perf-data/campaign/gemma26b-h100-20261007/comparison.md.
 # 2026-10-25 (branch kv-block-store, plow_git below): the branch compiler reproduces packet
 # 475cb17f9986 byte for byte; FP32 gate c16 PASS on it with the KV block store and host tier auto
 # (kl_mean 0.0899 vs vLLM 0.1005, kl_trim 0.0462 vs 0.0496, kl_p99 1.77 vs 2.25, top1_decisive
 # 0.9838 vs 0.9778, cont_frac 0.662, needle 1; kvstore-scratch/gemma-final-gates/g26bf16-2).
 # The served comparison was not re-run on the branch.
 # 2026-10-27 vs vLLM 0.29 (plowrt bb9f389fd, packet f72d0330f9d8, campaign.py report MATCHED +
-# EQUIVALENT; docs/bringup/results/gemma26b-h100-bf16-20261027): NOT production ready. Prod mix 1.8
+# EQUIVALENT; 2026-10-27 campaign): NOT production ready. Prod mix 1.8
 # sessions/s: tok/s 0.96x, TTFT/TPOT P99 13.3x/2.5x, goodput 88 vs 100 %; 2.7 refused (plowrt failed
 # requests, vLLM 97-100 % goodput); 1000/128 c1/c8/c32 tok/s 0.90x/0.79x/0.62x. Step-bound (decode
 # 14-21 ms vs vLLM 8-13 ms, 128-row prefill launch ~29 ms). Best serve tune: the FP8 recipe's serving
@@ -67,7 +67,7 @@
 # 15.84 -> 9.35 / 11.03 / 15.41 ms, token digests identical, ctx 4094/4095/8191 sweep clean; FP8
 # unchanged. FP32 gate PASS (kl_trim 0.0472 vs vLLM 0.0496, top1_decisive 0.9798, stage-fuse/gates/
 # bf16c-r4). Strict production mix vs vLLM 0.29, MATCHED + EQUIVALENT
-# (docs/bringup/results/gemma26b-h100-bf16-20261029): 1.8 sessions/s tok/s 0.98x, SLO met 97.4% vs
+# (2026-10-29 campaign): 1.8 sessions/s tok/s 0.98x, SLO met 97.4% vs
 # 100%; 2.7 sessions/s tok/s 1.00x, SLO met 95.2% vs 98.4%, TPOT P99 1.04x, TTFT P99 4.12x.
 # 2026-11-04 (branch g26bf16-gap, plow_git below = the emit commit, packet 982ba2a6d97f, plowrt
 # 70d80ca36: spill-ahead keeps a quarter headroom while KV store restores are in flight, so
@@ -152,7 +152,7 @@ PLOW_EMIT_GEN_KERNELS = "attn_pf_hd256_sliding@128"
 PLOW_PREFIX_CACHE = "1"
 # Pinned wide (8192 launches). The auto width objective measured TTFT p50 -20..40% but tok/s -2..3%
 # at 4K c16/c32, TTFT p99 +9..16% and FP8 agentic c128 -11% tok/s (p99 3.6x): narrow 4096 launches
-# cost ~8% more per row (2026-10-08 auto-vs-pin A/B, docs/bringup/results/gemma26b-h100-20261009).
+# cost ~8% more per row (2026-10-08 auto-vs-pin A/B, perf-data/campaign/gemma26b-h100-20261009).
 PLOW_PF_INTERLEAVE = "0"
 # Sliding rings mapped per admitted slot: the block store's device cap 12.8 -> 27.6 GiB.
 PLOW_VMM_LIVE_RINGS = "1"

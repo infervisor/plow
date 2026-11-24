@@ -16,7 +16,7 @@
 # 1.57x / 1.55x, 15K 2.26x / 2.28x, agentic c32/c64/c128 2.35x / 2.05x / 1.98x,
 # 32K c1/c4/c16 2.20x / 2.45x / 2.49x; loses latency c1/c4
 # (0.84x / 0.92x: B=1 decode 19.7 ms vs vLLM TPOT 16.1 ms, 50% of the HBM roofline).
-# docs/bringup/results/gemma31b-h100-20261010/comparison.md.
+# perf-data/campaign/gemma31b-h100-20261010/comparison.md.
 #
 # max_ctx 16384: the long FP32 gate (20 cases to 32768 tokens) FAILS twice on cont_frac only (0.511 /
 # 0.548, limit 0.558) while kl_mean / kl_p99 / top1_decisive beat vLLM's; needles 36/36 at 8192..130000.
@@ -30,7 +30,7 @@
 # x 512, 40 KiB/token) gets the remaining ~16 GiB admission budget (~420K rows). 64 slots would leave
 # no full-attention KV.
 #
-# Routes (per-rung evidence: docs/bringup/results/gemma31b-h100-20261010/comparison.md "rung gates"):
+# Routes (per-rung evidence: perf-data/campaign/gemma31b-h100-20261010/comparison.md "rung gates"):
 #   prefill projections   cuBLASLt FP8 OUTER_VEC (segment_roles CUBLASLT_PREFILL_GEMMA4_31B_SHAPES),
 #                         native ws384 FP8 down_proj at 512 and >= 2048 rows (route matrix: 7-15% faster)
 #   prefill attention     generated FP8-KV hd256 sliding + hd512 global (FlashPrefillFp8, rungs >= 128)

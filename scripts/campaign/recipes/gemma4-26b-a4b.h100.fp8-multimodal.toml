@@ -20,7 +20,7 @@
 # 0.202, kl_p99 3.14 / 3.83 vs 3.73, needle 1.0). Total tok/s vs vLLM: 4K c32/c128 1.27x / 1.30x,
 # 15K 1.88x / 1.92x, agentic c32/c64/c128 1.20x / 1.13x / 3.30x, 32K c1/c4/c16 2.25x / 2.18x / 2.28x,
 # 128K 3.18x / 3.19x / 3.26x, latency c1 1.02x; loses latency c4 (0.95x).
-# docs/bringup/results/gemma26b-h100-20261009/comparison.md.
+# perf-data/campaign/gemma26b-h100-20261009/comparison.md.
 #
 # max_ctx 131072 is gated by: the long FP32 gate (20 cases to 32768 tokens; PASS once, kl_mean 0.133
 # vs vLLM 0.165, kl_p99 2.86 vs 3.56; an FP32 reference past 32768 does not fit one 80 GiB GPU) and
@@ -124,7 +124,7 @@ PLOW_PF_SEG_PURE = "fp8"
 PLOW_PF_SEG_FA512 = "1"
 # Pinned wide (8192 launches). The auto width objective measured TTFT p50 -20..40% but tok/s -2..3%
 # at 4K c16/c32, TTFT p99 +9..16% and FP8 agentic c128 -11% tok/s (p99 3.6x): narrow 4096 launches
-# cost ~8% more per row (2026-10-08 auto-vs-pin A/B, docs/bringup/results/gemma26b-h100-20261009).
+# cost ~8% more per row (2026-10-08 auto-vs-pin A/B, perf-data/campaign/gemma26b-h100-20261009).
 PLOW_PF_INTERLEAVE = "0"
 PLOW_VMM_LIVE_RINGS = "0"
 PLOW_MULTISTEP = "0"

@@ -10,7 +10,7 @@
 #
 # Qualified (2026-10-05, plowrt ee57f7b7, packet 5fbe627c02af): campaign.py report MATCHED + EQUIVALENT
 # vs vLLM 0.28 fp8_per_token_head KV on every 4K/15K/agentic16k/open-loop cell; FP32-reference gate
-# PASS, KL mean 0.105 vs vLLM 0.128. docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# PASS, KL mean 0.105 vs vLLM 0.128. perf-data/campaign/gemma12b-fp8-20260930/comparison.md.
 # plow_git rebuild (packet ab1c1d583f8d) changes only the hd512 FP8-KV attention object; gate PASS.
 # plow_git 597c56d6 (packet 06da7686, 2026-10-10) again changes only that object: fp16 MMA operands
 # (docs/runtime/kernel-generators.md "FP8-KV entries"); step_bench packed prefill of one 15360-row
@@ -45,7 +45,7 @@
 # (token digests identical), so PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS stays 128. Closing the gap is
 # decode-interpreter kernel work (small-M tensor-core projections, fusion / barrier removal,
 # long-context attention); the serve env below is kept and the loss stands until a kernel change
-# qualifies per rung. Diagnosis: docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# qualifies per rung. Diagnosis: perf-data/campaign/gemma12b-fp8-20260930/comparison.md.
 # 2026-10-27 (plow_git 98347bfa, packet 01c02ceb2e53, decode object interp_sm90a_fp8kv 8110b0b6):
 # the decode attention was the step's largest item (B=32 ctx 8K: hd512 9.7 ms + hd256 4.2 of 23.9
 # traced, the generic per-thread-row FP8 body). Now: hd256 on the FP8 row-group body with its
@@ -194,7 +194,7 @@ PLOW_BUILD_GEN_KERNELS = "attn_pf_hd256_sliding_fp8kv,attn_pf_hd512_fp8kv"
 # (kl_trim <= 1.10x peer, top1 >= peer - 0.005, cont >= peer - 2). Per-site dumps of a 15872-token
 # natural case: route O vs FP32 attention rel-L2 1.69-1.73e-3 on all 56 sites (native 1.7e-3); the
 # natural-text KL shift vs native is a rounding re-roll (per case 9 better / 11 worse of 20). The
-# bf16 pool fails c1 (cont 40). Evidence: docs/bringup/results/gemma12b-fp8-20260930/comparison.md.
+# bf16 pool fails c1 (cont 40). Evidence: perf-data/campaign/gemma12b-fp8-20260930/comparison.md.
 PLOW_BUILD_FA4_HD512 = "f16"
 
 [emit_roles.env]
@@ -259,7 +259,7 @@ serve_env = { PLOW_DECODE_MAX_RUNG = "128" }
 [rung_choices.PLOW_EMIT_ATTN_LIBRARY]
 # Library vs declared native role, every prefill rung (see the PLOW_BUILD_FA4_* comment above).
 label = "qualified"
-evidence = ["lib-attn 2026-10-29 bin6 aef05632, packet a0464475f8ab: chunk 2048/1024/512/128 0.608/0.633/0.758/2.375 -> 0.549/0.572/0.677/1.813 s; FP32 gate c1/c8/c32 PASS", "docs/bringup/results/gemma12b-fp8-20260930/comparison.md", "docs/arch/28-library-attention.md"]
+evidence = ["lib-attn 2026-10-29 bin6 aef05632, packet a0464475f8ab: chunk 2048/1024/512/128 0.608/0.633/0.758/2.375 -> 0.549/0.572/0.677/1.813 s; FP32 gate c1/c8/c32 PASS", "perf-data/campaign/gemma12b-fp8-20260930/comparison.md", "docs/arch/28-library-attention.md"]
 
 [measured]
 tok_s = 622.7

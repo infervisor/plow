@@ -18,7 +18,7 @@
 # 0.202, kl_p99 3.14 / 3.83 vs 3.73, needle 1.0). Total tok/s vs vLLM: 4K c32/c128 1.27x / 1.30x,
 # 15K 1.88x / 1.92x, agentic c32/c64/c128 1.20x / 1.13x / 3.30x, 32K c1/c4/c16 2.25x / 2.18x / 2.28x,
 # 128K 3.18x / 3.19x / 3.26x, latency c1 1.02x; loses latency c4 (0.95x).
-# docs/bringup/results/gemma26b-h100-20261009/comparison.md.
+# perf-data/campaign/gemma26b-h100-20261009/comparison.md.
 #
 # max_ctx 131072 is gated by: the long FP32 gate (20 cases to 32768 tokens; PASS once, kl_mean 0.133
 # vs vLLM 0.165, kl_p99 2.86 vs 3.56; an FP32 reference past 32768 does not fit one 80 GiB GPU) and
@@ -33,7 +33,7 @@
 # 32.60 -> 26.66 ms (0.82x, spread flagged); 2.7 sessions/s 1.00x / 485.2 -> 735.7 ms (1.52x;
 # Infervisor repeats 952.9 / 518.5 ms) / 57.89 -> 62.89 ms (1.09x). FP32 gate PASS (kl_trim 0.118
 # vs vLLM 0.1242, top1_decisive 0.9622, cont 0.5375, needle 1). With the tier off the same mix wins
-# every latency row (docs/bringup/results/gemma26b-h100-20261023/comparison.md); the tier costs
+# every latency row (perf-data/campaign/gemma26b-h100-20261023/comparison.md); the tier costs
 # at 10 s think and wins at production's 45 s think (hit 71.7% vs 58.3%, lower TTFT and TPOT), so
 # it stays auto. Evidence: <lab scratch>/kvstore-scratch/strict-g26-tier23.
 # The re-emit from the plow_git below (packet faaebced1d4a) keeps Kit 2's `union`, `tuning` and
@@ -221,7 +221,7 @@ PLOW_PF_SEG_PURE = "fp8"
 PLOW_PF_SEG_FA512 = "1"
 # Pinned wide (8192 launches). The auto width objective measured TTFT p50 -20..40% but tok/s -2..3%
 # at 4K c16/c32, TTFT p99 +9..16% and FP8 agentic c128 -11% tok/s (p99 3.6x): narrow 4096 launches
-# cost ~8% more per row (2026-10-08 auto-vs-pin A/B, docs/bringup/results/gemma26b-h100-20261009).
+# cost ~8% more per row (2026-10-08 auto-vs-pin A/B, perf-data/campaign/gemma26b-h100-20261009).
 PLOW_PF_INTERLEAVE = "0"
 # Sliding rings mapped per admitted slot instead of 128 x 200 MiB preallocated: free device memory
 # after load 26 -> 52 GiB for the KV admission budget and the prefix cache. Production chat (no

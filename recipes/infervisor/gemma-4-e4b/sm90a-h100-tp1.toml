@@ -8,7 +8,7 @@
 # Gates: scripts/llm/gemma_logit_parity.py (served logprobs vs HF transformers bf16);
 # bench: scripts/llm/gemma_voice_bench.sh (plowbench conventions, vLLM reference same client).
 #
-# 2026-10-27 vs vLLM 0.29 (plowrt bb9f389fd, packet 046539c8a8a7; docs/bringup/results/
+# 2026-10-27 vs vLLM 0.29 (plowrt bb9f389fd, packet 046539c8a8a7; perf-data/campaign/
 # gemma4-e4b-h100-20261027): campaign.py report MATCHED + EQUIVALENT, 1000/128 c1/c8/c32 tok/s
 # 1.01x/1.03x/1.11x, TTFT P99 1.51x*/0.70x/0.74x, TPOT P99 1.01x/1.02x/0.93x, peak memory 0.64-0.70x.
 # Voice sweep: TTFT P50 2-7x lower c1..c128, session later-turn TTFT P50 16.5 vs 45.6 ms (64 calls);
@@ -65,7 +65,7 @@ PLOW_EMIT_PREFILL_CUBLASLT = "1"
 # Every decode rung runs each layer projection as a cuBLASLt matmul inside the rung's captured
 # graph (light launches between them). step_bench ctx 1024 B=48/64/96/128 11.0/11.9/15.6/16.4 ->
 # 9.9/10.2/12.3/12.8 ms (48); from 2 rows (fd0fe175): B=2/4/8/16/32 5.75/5.86/6.17/6.77/8.62 ->
-# 5.62/5.68/5.93/6.24/6.78 ms, 48+ unchanged (docs/bringup/results/gemma4-h100/native-kernels-20261009.md);
+# 5.62/5.68/5.93/6.24/6.78 ms, 48+ unchanged (native kernel measurement 2026-10-09);
 # from 1 row: B=1 5.715 -> 5.63 ms, token digest unchanged (nativek/res/rungs3).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "1"

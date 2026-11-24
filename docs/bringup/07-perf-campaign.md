@@ -73,7 +73,7 @@ Generate the mandatory 12-row performance report exclusively via `campaign.py re
 python3 scripts/campaign/campaign.py report \
   --plow <scratch>/plow_results \
   --peer <scratch>/ref_results \
-  --out docs/bringup/results/<campaign>/comparison.md
+  --out perf-data/campaign/<campaign>/comparison.md
 ```
 
 ### Report Schema (12 Required Rows)
@@ -100,4 +100,4 @@ Before advancing to Stage 8 or closing campaign:
 - [ ] Symmetric serving executed under identical GPU lease and traffic distribution.
 - [ ] `llm_fp32_ref` accuracy gate passes all four statistical thresholds.
 - [ ] Waterfall audit confirms clean scheduling gaps and zero rogue prefix-cache hits.
-- [ ] Strict 12-row comparison table generated and committed to `docs/bringup/results/<campaign>/comparison.md`.
+- [ ] Strict 12-row comparison table generated and committed to `perf-data/campaign/<campaign>/comparison.md`.

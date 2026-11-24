@@ -12,7 +12,7 @@
 # 0.0024-0.0028; top1_decisive 1.0 / 1.0 / 0.999; continuation 0.852 / 0.817 / 0.845 vs 0.845 /
 # 0.826 / 0.854; needles 1.0). c1 numerics equal the single-slot packet 949474c1acaffbd9 to the digit
 # (the first token comes from the prefill launch in both). The served comparison (campaign.py report
-# vs vLLM 0.28 BF16) is in docs/bringup/results/qwen38-27b-h100/comparison.md. Re-qualified with the
+# vs vLLM 0.28 BF16) is in perf-data/campaign/qwen38-27b-h100/comparison.md. Re-qualified with the
 # row-group decode attention (plowrt 7ae76221, build48, gate48: c1/c8/c32 PASS, see the route), and
 # 2026-10-12 with the generated decode object, light launches and riders (build77, gate77 c1/c8/c32
 # PASS at the 1084 positions through each case's first stop token: c1 trimmed mean 0.00047 vs vLLM
@@ -102,7 +102,7 @@
 # Ladder tops at 48: the 64-slot recurrent state (151 MB per slot) left the planner 0.5 GiB short on
 # the 80 GB part.
 # 2026-10-27 vs vLLM 0.29 (plowrt bb9f389fd, packet 3157ca560892, campaign.py report MATCHED +
-# EQUIVALENT; docs/bringup/results/qwen38-27b-h100/comparison.md): NOT production ready. 1000/128
+# EQUIVALENT; perf-data/campaign/qwen38-27b-h100/comparison.md): NOT production ready. 1000/128
 # c1/c8/c32 tok/s 0.91x/0.88x/0.80x, TPOT P99 1.12x/1.41x/1.60x (c32 was 0.96x/1.25x vs vLLM 0.28 on
 # 2026-10-13 with the prefix cache off); prod mix (1.8 sessions/s overloads vLLM too) at 0.45: tok/s
 # 0.95x, TTFT/TPOT P99 3.9x/1.8x, SLO met 63 vs 99 %; 0.7 overloads plowrt. Decode ~25 ms at 4 rows,
@@ -192,7 +192,7 @@ TVM_FFI_DISABLE_TORCH_C_DLPACK = "1"
 # kl_trim 0.000456 vs native 0.000448, p95 0.0026, top1_decisive 0.9988, cont_decisive 1).
 # Production mix 0.45/s, 2 reps, vs vLLM 0.29: TTFT P99 1728 -> 1504 ms, TPOT P99 81.3 -> 75.7 ms,
 # SLO met 99.3 -> 99.9% (spread > 10%; better in both reps). Evidence:
-# docs/bringup/results/qwen38-27b-h100/comparison.md.
+# perf-data/campaign/qwen38-27b-h100/comparison.md.
 [[prep]]
 name = "fa4-hd256-lib"
 script = "scripts/fa4_aot/build.py"
@@ -308,14 +308,14 @@ tokenizer = "{env:QWEN38_CHECKPOINT}"
 model_id = "qwen3.8-27b"
 gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
-# Served c1 (grid43full, docs/bringup/results/qwen38-27b-h100/comparison.md): vLLM 0.28 at the same
+# Served c1 (grid43full, perf-data/campaign/qwen38-27b-h100/comparison.md): vLLM 0.28 at the same
 # cell 415 total tok/s, TPOT p99 19.97 ms, TTFT p99 242 ms. Wins TTFT P99 (0.48x) and memory; loses
 # throughput (0.87x) and TPOT (1.19x) here and in every wider cell (c32 0.67x, c64 0.58x: the 40 ms
 # B32 step, ladder tops at 48 slots).
 [rung_choices.PLOW_EMIT_ATTN_LIBRARY]
 # Library vs declared native role, every prefill rung (see the PLOW_BUILD_FA4_* comment above).
 label = "qualified"
-evidence = ["lib-attn2 2026-10-29 plowrt a50a58555, packet 48cf345c9314: chunk 4096/1024/512/128 1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/3.996 s; FP32 gate c1/c8/c32 PASS", "docs/bringup/results/qwen38-27b-h100/comparison.md", "docs/arch/28-library-attention.md"]
+evidence = ["lib-attn2 2026-10-29 plowrt a50a58555, packet 48cf345c9314: chunk 4096/1024/512/128 1.403/1.517/1.784/4.325 -> 1.386/1.491/1.757/3.996 s; FP32 gate c1/c8/c32 PASS", "perf-data/campaign/qwen38-27b-h100/comparison.md", "docs/arch/28-library-attention.md"]
 
 [measured]
 tok_s = 40.9

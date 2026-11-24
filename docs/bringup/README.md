@@ -36,6 +36,6 @@ Cross-cutting rules, execution environments, and CLI tools live in [`agent-tools
 
 ## Results Directory Structure
 
-* **Campaign Summary:** `docs/bringup/results/<campaign>/comparison.{md,csv}` (indexed in [results/README.md](results/README.md)).
+* **Campaign Summary:** `perf-data/campaign/<campaign>/comparison.{md,csv}`.
 * **Reference CSVs:** `perf-data/campaign/` (used by `campaign.py compare`).
 * **Scratch & Artifacts:** All raw logs, traces, captures, and intermediate JSON files must remain in external scratch directories outside the Git repository.

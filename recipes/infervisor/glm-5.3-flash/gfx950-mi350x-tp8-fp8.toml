@@ -255,7 +255,7 @@ cmd = "scripts/glm53_needle_probe.py"
 expect = "36/36"
 
 # One serving cell for orientation; the full grid (isl 1024/4096/16384 at c1..c128, 32768/61440 at
-# c1/c8) and the strict comparison against vLLM are docs/bringup/results/glm53flash-mi350x-2026-10-12.
+# c1/c8) and the strict comparison against vLLM are perf-data/campaign/glm53flash-mi350x-2026-10-12.
 # Qualified wins: isl4096-c1 TTFT 144.5 ms (3.5x faster vs vLLM 511.6 ms), isl4096-c8 TTFT 1095.7 ms (2.09x faster)
 # & TPOT 18.04 ms (1.41x faster), isl1024-c8 TTFT 639.5 ms (2.76x faster), 0.80x peak GPU memory across all cells.
 [measured]

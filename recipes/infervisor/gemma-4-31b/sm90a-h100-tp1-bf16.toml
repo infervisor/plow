@@ -14,7 +14,7 @@
 # to FP32 here. The excess sits in repetition-loop positions of the natural-text cases. campaign.py
 # report vs vLLM 0.28 BF16 (0.97 memory, --max-model-len 16384) is therefore NOT EQUIVALENT; total tok/s:
 # latency c1/c4 0.97x / 0.99x, 4K c32/c128 0.81x / 0.81x (8 slots vs vLLM's ~13 windowed requests),
-# 15K c32/c128 1.06x / 1.05x. docs/bringup/results/gemma31b-h100-20261010/comparison.md.
+# 15K c32/c128 1.06x / 1.05x. perf-data/campaign/gemma31b-h100-20261010/comparison.md.
 # Not run: agentic, the open-loop production mix. Token batch off is numerically broken on this
 # packet (keep 1).
 #

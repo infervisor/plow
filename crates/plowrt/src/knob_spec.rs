@@ -73,7 +73,7 @@ const SESSION_TTL_CANDIDATE: Status = Status::Candidate {
 /// Default 50 ms above `rt.asr_encode_hold_inflight`; no checkpoint P certificate yet.
 const ASR_ENCODE_HOLD_CANDIDATE: Status = Status::Candidate {
     evidence: &[
-        "docs/bringup/results/serving-concurrency-h100/summary.md (ASR, Qwen3-ASR 1.7B H100), hold 50 vs 0: c64 RTFx 1041 vs 850, c256 1152 vs 1169, c1 p50 54.1 vs 53.8 ms",
+        "Qwen3-ASR 1.7B H100 serving concurrency screen, hold 50 vs 0: c64 RTFx 1041 vs 850, c256 1152 vs 1169, c1 p50 54.1 vs 53.8 ms",
         "`=0` is the rollback",
     ],
 };

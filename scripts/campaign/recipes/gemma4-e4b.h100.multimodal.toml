@@ -78,7 +78,7 @@ PLOW_EMIT_PREFILL_CUBLASLT = "1"
 # Every decode rung runs each layer projection as a cuBLASLt matmul inside the rung's captured
 # graph (light launches between them). step_bench ctx 1024 B=48/64/96/128 11.0/11.9/15.6/16.4 ->
 # 9.9/10.2/12.3/12.8 ms (48); from 2 rows (fd0fe175): B=2/4/8/16/32 5.75/5.86/6.17/6.77/8.62 ->
-# 5.62/5.68/5.93/6.24/6.78 ms, 48+ unchanged (docs/bringup/results/gemma4-h100/native-kernels-20261009.md);
+# 5.62/5.68/5.93/6.24/6.78 ms, 48+ unchanged (native kernel measurement 2026-10-09);
 # from 1 row: B=1 5.715 -> 5.63 ms, token digest unchanged (nativek/res/rungs3).
 PLOW_EMIT_DECODE_CUBLASLT = "1"
 PLOW_EMIT_DECODE_CUBLASLT_MIN_ROWS = "1"

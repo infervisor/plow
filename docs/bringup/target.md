@@ -21,7 +21,7 @@ The parameter block below must be populated once at the beginning of Stage 4 and
 | `$FEATURES` | `plowrt` Cargo feature flag | `cuda` (NVIDIA), `hsa` (AMD), `metal` (Apple), `cpu` (CPU) | Required cargo feature when building `plowrt` |
 | `$BW_BOUND` | Empirical HBM read/write streaming bandwidth (GB/s) | Measured via calibration probe (see §3 below) | Real floor from `perf-data/probes/<hw_fingerprint>.json`; never datasheet |
 | `$COMPUTE_CEIL` | Empirical sustained Tensor Core compute peak (TFLOPS) | Measured via calibration probe (see §3 below) | Real floor from `perf-data/probes/<hw_fingerprint>.json`; never datasheet |
-| `$RESULTS` | Scratch directory for raw benchmark output | Outside Git repo (e.g. `/tmp/plow-campaign/<campaign>`) | Repo keeps only `docs/bringup/results/<campaign>/comparison.{md,csv}` |
+| `$RESULTS` | Scratch directory for raw benchmark output | Outside Git repo (e.g. `/tmp/plow-campaign/<campaign>`) | Repo keeps only `perf-data/campaign/<campaign>/comparison.{md,csv}` |
 
 ---
 
