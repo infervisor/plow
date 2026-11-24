@@ -130,11 +130,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some((hidden, values)) = &input {
             engine.upload_activation("act.x", &values[step * hidden..(step + 1) * hidden])?;
         }
-        if step == start && prefill_prefix.is_some() {
+        let prefill_terminal_row = if step == start && prefill_prefix.is_some() {
             tokens.push(engine.prefill_slot(0, &ids[..step + 1])?);
+            Some(engine.prefill_terminal_row())
         } else {
             engine.step_slots(&[(0, id)], &mut tokens)?;
-        }
+            None
+        };
         let mut dumps = Vec::new();
         for (index, (name, bytes)) in tensors.iter().enumerate() {
             let mut raw = vec![0u8; usize::try_from(*bytes)?];
@@ -156,7 +158,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
         steps.push(serde_json::json!({"step": step, "input_token": id,
-            "argmax": tokens.first(), "tensors": dumps, "logits_f32": logits_file}));
+            "argmax": tokens.first(), "tensors": dumps, "logits_f32": logits_file,
+            "prefill_terminal_row": prefill_terminal_row}));
         std::fs::write(
             out.join("manifest.json"),
             serde_json::to_vec_pretty(
