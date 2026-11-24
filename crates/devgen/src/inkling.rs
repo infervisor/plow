@@ -637,13 +637,22 @@ fn phase_range(
             &format!("{}embed.weight", c.prefix),
             c.vocab as u64 * h as u64 * BF16,
         );
-        em.b.emit(DevOp::Embed, rows.clone(), &[], |d| {
-            d.t[0] = x;
+        let embed_norm = em.w(&format!("{}embed_norm.weight", c.prefix), h as u64 * BF16);
+        let embed = em.b.emit(DevOp::Embed, rows.clone(), &[], |d| {
+            d.t[0] = og;
             d.t[1] = emb;
             d.t[2] = ids;
             d.i[0] = t;
             d.i[1] = h;
             d.f[0] = 1.0;
+        });
+        em.b.emit(DevOp::RmsNorm, rows.clone(), &[embed], |d| {
+            d.t[0] = x;
+            d.t[1] = og;
+            d.t[2] = embed_norm;
+            d.i[0] = t;
+            d.i[1] = h;
+            d.f[0] = c.eps;
         })
     };
     let g_in_for = |em: &mut Emitter, l: usize| -> u32 {
@@ -899,7 +908,6 @@ pub(super) fn run(
             "q_l2_clip",
             "attn_res.",
             "controllers.",
-            "embed_norm.",
             "middle_cycle_cross_pass_",
             "k_input_norm.",
             "v_input_norm.",

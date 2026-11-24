@@ -1308,7 +1308,11 @@ enum {
      *   i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch(0 = 1)   f0=alpha f1=limit
      * slot s in [0, B*k) reads x row s/k and writes fu row s:
      *   fu[s][n] = A(g)*B(u),  g = dot(W_e[gate_n], x) + b_e[gate_n],  u = likewise for up_n
-     * with (A, B) the act's pair form (act=3 is documented on GLU, op 5). */
+     * with (A, B) the act's pair form (act=3 is documented on GLU, op 5).
+     * CUDA i7=2 selects NVFP4 block-16 E4M3 scales, with optional paired
+     * t6=amax(f32[E]) and t7=denominator(f32) for the expert outer scale.
+     * CUDA act=4 takes gate/up soft caps in f0/f1 and stores
+     * bf16(softcap(gate) * sigmoid(gate) * softcap(up) * table[s].gate). */
     PLOW_DOP_MOE_GLU_MX = 150,
 
     /* DECODE grouped down + gate scale.
@@ -1316,6 +1320,8 @@ enum {
      *   t3=W_d(fp4 [E][H][I/2]) t4=S_d(e8m0 [E][H][I/32]) t5=bias_d?(bf16 [E][H])
      *   i0=k i1=H i2=I i3=n_exp i6=n_batch(0 = 1)
      *   part[s][h] = table[s].gate * (dot(W_e[h], fu[s]) + b_e[h])      (f32, no bf16 round)
+     * CUDA i7=2 accepts the paired NVFP4 outer-scale operands above. CUDA i5=1
+     * skips the gate multiply when the GLU already applied it.
      * The row sum is MOE_COMBINE (43) / MOE_COMBINE_PF (87, i2=T=B) in fixed slot order. */
     PLOW_DOP_MOE_DOWN_MX = 151,
 
