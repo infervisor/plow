@@ -94,6 +94,7 @@ pub const GDN_PREFILL_ABI: &str = "plow_gdn_prefill_abi";
 /// (`j1` = pitch | column << 16; an N-concatenated qkv|z projection).
 pub const GDN_PITCHED_ABI: &str = "plow_gdn_pitched_abi";
 pub const RELATIVE_ATTENTION_ABI: &str = "plow_relative_attention_abi";
+pub const NORMALIZED_RESIDUAL_MIX_ABI: &str = "plow_normalized_residual_mix_abi";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

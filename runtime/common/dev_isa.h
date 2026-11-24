@@ -859,6 +859,8 @@ enum {
      * stay ONE packet, which rules out splitting the reduction across blocks.
      * t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb,H] bf16)
      * t3=score_w([H] f32)   i0=T i1=H i2=nb   f0=eps */
+    /* CUDA i7=1: normalized values, block-major stack, query-major output.
+     * See DevOp::AttnRes for the operand extents and optional FP32 addend. */
     PLOW_DOP_ATTN_RES = 104,
     /* `situ` GLU — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared experts,
      * routed experts). out = beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta).

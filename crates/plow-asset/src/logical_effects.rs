@@ -300,7 +300,9 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         MoeDownMxPf if all(&[0, 1, 2, 3, 4, 6, 7]) => Some(&[0]),
         MoeCombinePf if all(&[0, 3]) => Some(&[0]),
         QwenGatedNorm if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0]),
-        QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3]) && none(&[5, 7]) && (d.i[4] != 0 || none(&[6])) => Some(&[0, 3]),
+        QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3]) && none(&[5])
+            && (d.i[4] != 0 || none(&[6, 7])) => Some(&[0, 3]),
+        AttnRes if d.i[7] == 1 && all(&[0, 1, 3]) && (d.i[2] == 0 || has(2)) => Some(&[0]),
         QwenGdnGatePrep if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
         QwenGdnQkvPrep if all(&[0, 1, 2, 3]) && none(&[4, 5, 6, 7]) => Some(&[0, 1, 2]),
         QwenGdnStep if all(&[0, 1, 2, 3, 4, 5, 6]) => Some(&[0, 6]),

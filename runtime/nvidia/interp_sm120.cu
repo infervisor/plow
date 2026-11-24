@@ -1504,7 +1504,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[4]) {
             d_recurrent_residual_conv4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), (const int*)TEN(4),
-                (const __nv_bfloat16*)TEN(6), in->i[0], in->i[4], in->i[2],
+                (const __nv_bfloat16*)TEN(6), (const __nv_bfloat16*)TEN(7), in->i[0], in->i[4], in->i[2],
                 0, false, in->fj[0].f, slice, nblk);
             break;
         }
@@ -1549,7 +1549,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[4]) {
             d_recurrent_residual_conv4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), nullptr,
-                (const __nv_bfloat16*)TEN(6), in->i[0], in->i[4], in->i[2],
+                (const __nv_bfloat16*)TEN(6), (const __nv_bfloat16*)TEN(7), in->i[0], in->i[4], in->i[2],
                 in->i[3], true, in->fj[0].f, slice, nblk);
             break;
         }
@@ -2361,6 +2361,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                      (const unsigned*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk);
         break;
 
+#if PLOW_HAS_ATTN_RES
+    case PLOW_DOP_ATTN_RES:
+        if (in->i[7] != 1) __trap();
+        else d_normalized_residual_mix(TEN(0), (const __nv_bfloat16*)TEN(1),
+            (const __nv_bfloat16*)TEN(2), (const float*)TEN(3),
+            (const __nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(7),
+            in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+            in->fj[0].f, in->fj[1].f, slice, nblk);
+        break;
+
+#endif
     case PLOW_DOP_RESIDUAL:
         d_residual((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                    (const __nv_bfloat16*)TEN(2), in->i[0], in->fj[0].f, slice, nblk);
@@ -3775,6 +3786,9 @@ extern "C" __device__ unsigned plow_gemv_sm90_cta512_abi = 1;
 #endif
 #if !PLOW_NV_LEAN_DECODE && !PLOW_NV_SEG_GEMM && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE && !PLOW_NV_SKELETON && !PLOW_MIXED_STEP
 extern "C" __device__ unsigned plow_relative_attention_abi = 1;
+#if PLOW_HAS_ATTN_RES
+extern "C" __device__ unsigned plow_normalized_residual_mix_abi = 1;
+#endif
 #endif
 #if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_gdn_prefill_abi = 1;
@@ -4715,7 +4729,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
         if (in->i[4]) {
             d_recurrent_residual_conv4((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
                 (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), nullptr,
-                (const __nv_bfloat16*)LIGHT_TEN(6), in->i[0], in->i[4], in->i[2],
+                (const __nv_bfloat16*)LIGHT_TEN(6), (const __nv_bfloat16*)LIGHT_TEN(7), in->i[0], in->i[4], in->i[2],
                 in->i[3], true, in->fj[0].f, slice, nblk);
             break;
         }
@@ -4739,7 +4753,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
         if (in->i[4]) {
             d_recurrent_residual_conv4((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
                 (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), (const int*)LIGHT_TEN(4),
-                (const __nv_bfloat16*)LIGHT_TEN(6), in->i[0], in->i[4], in->i[2],
+                (const __nv_bfloat16*)LIGHT_TEN(6), (const __nv_bfloat16*)LIGHT_TEN(7), in->i[0], in->i[4], in->i[2],
                 0, false, in->fj[0].f, slice, nblk);
             break;
         }

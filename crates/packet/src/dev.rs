@@ -1190,6 +1190,12 @@ pub enum DevOp {
     /// `mwg_scratch` (non-zero only on a decode packet emitted with `PLOW_ATTNRES_DECODE_MWG=n`)
     /// is the tagged-word rendezvous scratch of the banded multi-workgroup arm; `blocks = n`
     /// column bands then share one packet. `f1` carries the output-norm epsilon (f32-mix).
+    /// CUDA mode `i7=1` mixes RMS-normalized BF16 sources in FP32, with optional
+    /// BF16 post-normalization. Slot 2 is a block-major stack, slot 1 is the last
+    /// block, slot 7 optionally adds to that last block in FP32, and slot 3
+    /// holds unscaled FP32 queries. Slot 5 optionally holds BF16 gamma by query.
+    /// Here i2 counts stack blocks, i3 counts queries and i4 is the stack stride
+    /// in rows. Output is query-major FP32 without gamma and BF16 with gamma.
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).
@@ -1834,6 +1840,7 @@ pub enum DevOp {
     /// CUDA `i4 != 0` selects the four-tap residual mode: `i4` is channels
     /// per group, `f0` scales the sum of input and convolution. Optional BF16
     /// `t6` adds row/group/tap deltas to transposed static weights [W,C].
+    /// Optional BF16 slot 7 adds to the rounded convolution output.
     QwenGdnConv = 136,
     /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
     ///

@@ -415,12 +415,16 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     | DevOp::EmbedFrameBf16
                     | DevOp::FlashDecode
                     | DevOp::FlashDecodeFp8
-                    | DevOp::FlashMerge,
+                    | DevOp::FlashMerge
+                    | DevOp::AttnRes,
                 ) => {
                     if d.i[0] != g.t {
                         return Err(reject("instruction rows disagree with rung width"));
                     }
                     d.i[0] = 1;
+                    if d.op == DevOp::AttnRes as u16 && d.i[7] == 1 && d.i[4] == g.t {
+                        d.i[4] = 1;
+                    }
                     if matches!(
                         DevOp::from_u16(d.op),
                         Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8)

@@ -2882,6 +2882,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     }
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
+            && inst.i[7] != 1
             && (inst.t[6] != packet::TENSOR_NONE
                 || inst.t[7] != packet::TENSOR_NONE
                 || inst.i[5] != packet::dev::TENSOR_NONE_I)

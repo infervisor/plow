@@ -1467,6 +1467,37 @@ fn validate_head_preparation(blob: &DevBlob) -> Result<()> {
     Ok(())
 }
 
+fn validate_normalized_residual_mix(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::AttnRes as u16 || d.i[7] != 1 { continue; }
+        let [rows, width, blocks, queries, stride, ..] = d.i.map(u64::from);
+        let gamma = d.t[5] != TENSOR_NONE16;
+        let bytes = |slot: usize, factors: &[u64]| {
+            factors.iter().try_fold(1u64, |n, &v| n.checked_mul(v)).is_some_and(|n| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n)
+            })
+        };
+        let valid_eps = |slot| {
+            let eps = f32::from_bits(d.fj[slot]);
+            eps.is_finite() && eps > 0.0
+        };
+        if rows == 0 || width == 0 || blocks > 16 || queries == 0
+            || (blocks != 0 && stride < rows) || !valid_eps(0) || (gamma && !valid_eps(1))
+            || d.t[4] != TENSOR_NONE16 || d.t[6] != TENSOR_NONE16
+            || d.t[1..].contains(&d.t[0])
+            || !bytes(0, &[rows, width, queries, if gamma { 2 } else { 4 }])
+            || !bytes(1, &[rows, width, 2])
+            || (blocks != 0 && !bytes(2, &[blocks, stride, width, 2]))
+            || !bytes(3, &[queries, width, 4])
+            || (gamma && !bytes(5, &[queries, width, 2]))
+            || (d.t[7] != TENSOR_NONE16 && !bytes(7, &[rows, width, 2]))
+        {
+            return Err(RuntimeError::Rejected("invalid normalized residual mix operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_relative_attention(blob: &DevBlob) -> Result<()> {
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
         let prefill = d.op == DevOp::FlashPrefill as u16
@@ -2814,14 +2845,15 @@ fn validate_residual_conv(blob: &DevBlob, recurrent: Option<&RecurrentState>) ->
         });
         if channels == 0 || channels % group != 0 || d.i[1] != 4 || rows == 0 || padded < rows
             || !scale.is_finite() || scale <= 0.0
-            || d.t[5] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16 || d.fj[2] != 0
-            || (0..=6).any(|slot| slot != 0 && d.t[slot] == d.t[0])
-            || [1, 2, 4, 6].iter().any(|&slot| d.t[slot] == d.t[3])
+            || d.t[5] != TENSOR_NONE16 || d.fj[2] != 0
+            || (1..=7).any(|slot| d.t[slot] == d.t[0])
+            || [1, 2, 4, 6, 7].iter().any(|&slot| d.t[slot] == d.t[3])
             || !extent(0, channels, padded) || !extent(1, channels, rows) || !extent(2, channels, 4)
             || declared.is_none_or(|&(_, stride)| stride != channels * 6)
             || (!prefill && !extent(3, channels * 3, rows))
             || (!prefill && d.t[4] != TENSOR_NONE16 && !extent(4, 2, rows))
             || (d.t[6] != TENSOR_NONE16 && !extent(6, channels / group * 4, rows))
+            || (d.t[7] != TENSOR_NONE16 && !extent(7, channels, rows))
         {
             return Err(RuntimeError::Rejected("invalid recurrent residual conv operands".into()));
         }
@@ -4696,6 +4728,7 @@ impl GpuEngine {
                 validate_gated_flash_merge(&blob)?;
                 validate_head_preparation(&blob)?;
                 validate_relative_attention(&blob)?;
+                validate_normalized_residual_mix(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {

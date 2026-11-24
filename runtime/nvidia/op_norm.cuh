@@ -1026,6 +1026,79 @@ static __device__ __forceinline__ unsigned plow_hnr_next_live(const int* __restr
     return total;
 }
 
+static __device__ __forceinline__ float plow_residual_source(
+    const __nv_bfloat16* stack, const __nv_bfloat16* last, const __nv_bfloat16* addend,
+    unsigned block, unsigned blocks, size_t stride, size_t col) {
+    if (block < blocks) return __bfloat162float(stack[block * stride + col]);
+    return __bfloat162float(last[col]) + (addend ? __bfloat162float(addend[col]) : 0.0f);
+}
+
+static __device__ __forceinline__ float plow_residual_mix_value(
+    const __nv_bfloat16* stack, const __nv_bfloat16* last, const __nv_bfloat16* addend,
+    const float* weights, unsigned blocks, size_t stride, size_t col) {
+    float sum = 0.0f;
+    for (unsigned b = 0; b <= blocks; ++b)
+        sum = fmaf(plow_residual_source(stack, last, addend, b, blocks, stride, col), weights[b], sum);
+    return sum;
+}
+
+static __device__ void d_normalized_residual_mix(
+    void* out, const __nv_bfloat16* last, const __nv_bfloat16* stack, const float* queries,
+    const __nv_bfloat16* gamma, const __nv_bfloat16* addend,
+    unsigned rows, unsigned width, unsigned blocks, unsigned count, unsigned stride_rows,
+    float eps, float norm_eps, unsigned slice, unsigned nblk) {
+    constexpr unsigned MAX_BLOCKS = 16;
+    __shared__ float part[PLOW_NV_WARPS], logits[MAX_BLOCKS + 1], rstd[MAX_BLOCKS + 1];
+    if (blocks > MAX_BLOCKS || width == 0 || (blocks && (!stack || stride_rows < rows))) {
+        __trap();
+        return;
+    }
+    const float inv_width = 1.0f / width, query_scale = rsqrtf((float)width);
+    const size_t stride = (size_t)stride_rows * width;
+    for (size_t work = slice; work < (size_t)rows * count; work += nblk) {
+        const size_t q = work / rows;
+        const size_t row_offset = (work % rows) * width;
+        for (unsigned b = 0; b <= blocks; ++b) {
+            float sq = 0.0f, dot = 0.0f;
+            for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+                const float x = plow_residual_source(stack, last, addend, b, blocks, stride, row_offset + c);
+                sq = fmaf(x, x, sq);
+                dot = fmaf(queries[q * width + c] * query_scale, x, dot);
+            }
+            const float inv = rsqrtf(fmaf(block_sum(sq, part), inv_width, eps));
+            const float score = block_sum(dot, part) * inv;
+            if (threadIdx.x == 0) { logits[b] = score; rstd[b] = inv; }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float highest = logits[0], sum = 0.0f;
+            for (unsigned b = 1; b <= blocks; ++b) highest = fmaxf(highest, logits[b]);
+            for (unsigned b = 0; b <= blocks; ++b) {
+                logits[b] = expf(logits[b] - highest);
+                sum += logits[b];
+            }
+            for (unsigned b = 0; b <= blocks; ++b) logits[b] = (logits[b] * rstd[b]) / sum;
+        }
+        __syncthreads();
+        float inv = 1.0f;
+        if (gamma) {
+            float sq = 0.0f;
+            for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+                const float x = plow_residual_mix_value(stack, last, addend, logits, blocks, stride, row_offset + c);
+                sq = fmaf(x, x, sq);
+            }
+            inv = rsqrtf(block_sum(sq, part) * inv_width + norm_eps);
+        }
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            const float x = plow_residual_mix_value(stack, last, addend, logits, blocks, stride, row_offset + c);
+            if (gamma) ((__nv_bfloat16*)out)[work * width + c] =
+                __float2bfloat16(x * inv * __bfloat162float(gamma[q * width + c]));
+            else ((float*)out)[work * width + c] = x;
+        }
+        __syncthreads();
+    }
+}
+
 static __device__ __forceinline__ float plow_log_position_scale(const uint32_t* params, int pos) {
     return params ? 1.0f + __uint_as_float(params[1])
         * logf(fmaxf(((float)pos + 1.0f) / params[0], 1.0f)) : 1.0f;
