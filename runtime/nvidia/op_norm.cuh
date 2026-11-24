@@ -1026,10 +1026,39 @@ static __device__ __forceinline__ unsigned plow_hnr_next_live(const int* __restr
     return total;
 }
 
+static __device__ __forceinline__ float plow_log_position_scale(const uint32_t* params, int pos) {
+    return params ? 1.0f + __uint_as_float(params[1])
+        * logf(fmaxf(((float)pos + 1.0f) / params[0], 1.0f)) : 1.0f;
+}
+
+static __device__ void d_relative_logits16(
+    __nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* scale,
+    const __nv_bfloat16* proj, const uint32_t* tau, const int* pos,
+    unsigned rows, unsigned heads, unsigned extent, float eps, float threshold,
+    unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & 31u, warps = blockDim.x / 32;
+    const unsigned tiles = extent / 32;
+    for (size_t work = slice * warps + threadIdx.x / 32;
+         work < (size_t)rows * heads * tiles; work += nblk * warps) {
+        const size_t h = work / tiles;
+        const unsigned distance = (work % tiles) * 32 + lane;
+        float r = lane < 16 ? __bfloat162float(x[h * 16 + lane])
+            * __bfloat162float(scale[(h % heads) * 16 + lane]) : 0.0f;
+        r *= fminf(threshold / (sqrtf(warp_sum32(r * r)) + eps), 1.0f);
+        r = __bfloat162float(__float2bfloat16(r));
+        if (tau) r = __bfloat162float(__float2bfloat16(r * plow_log_position_scale(tau, pos[h / heads])));
+        float sum = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < 16; ++i)
+            sum = fmaf(__shfl_sync(0xffffffffu, r, i), __bfloat162float(proj[(size_t)i * extent + distance]), sum);
+        out[h * extent + distance] = __float2bfloat16(sum);
+    }
+}
+
 template <unsigned HD>
 static __device__ void d_head_l2_clip(__nv_bfloat16* __restrict__ out,
                                     const __nv_bfloat16* __restrict__ x,
-                                    const __nv_bfloat16* __restrict__ scale,
+                                    const __nv_bfloat16* __restrict__ scale, const uint32_t* tau, const int* pos,
                                     unsigned rows, unsigned heads, float eps, float threshold,
                                     unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x % 32;
@@ -1047,8 +1076,11 @@ static __device__ void d_head_l2_clip(__nv_bfloat16* __restrict__ out,
         }
         const float factor = fminf(threshold / (sqrtf(warp_sum32(sum_sq)) + eps), 1.0f);
 #pragma unroll
-        for (unsigned i = 0; i < HD / 32; ++i)
-            out[offset + i * 32] = __float2bfloat16(values[i] * factor);
+        for (unsigned i = 0; i < HD / 32; ++i) {
+            __nv_bfloat16 v = __float2bfloat16(values[i] * factor);
+            if (tau) v = __float2bfloat16(__bfloat162float(v) * plow_log_position_scale(tau, pos[w / heads]));
+            out[offset + i * 32] = v;
+        }
     }
 }
 

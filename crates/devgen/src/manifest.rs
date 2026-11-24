@@ -541,7 +541,8 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
                     let (hd, nh, kvh, nb) = (inst.i[6], inst.i[1], inst.i[2], inst.i[0]);
                     s.hd.insert(hd);
-                    if op == DevOp::FlashDecode && inst.j[1] != 0 {
+                    if op == DevOp::FlashDecode && inst.j[1] != 0
+                        && inst.j[1] != packet::dev::FLASH_DECODE_RELATIVE {
                         s.flash_fold_hd = s.flash_fold_hd.max(hd);
                     }
                     s.kv_heads.insert(kvh);

@@ -38,6 +38,10 @@ pub(crate) struct InklingCfg {
     pub eps: f32,
     pub attn_scale: f32,
     pub qk_clip: f32,
+    pub rel_clip: f32,
+    pub rel_extent: u32,
+    pub log_floor: u32,
+    pub log_alpha: f32,
     pub prefix: String,
     pub is_full: Vec<bool>,
     pub core_start: usize,
@@ -122,6 +126,10 @@ fn cfg_inkling(v: &Value) -> InklingCfg {
         route_scale,
         eps,
         attn_scale,
+        rel_clip: t["rel_l2_clip_threshold"].as_f64().expect("missing rel_l2_clip_threshold") as f32,
+        rel_extent: g("rel_extent"),
+        log_floor: g("log_scaling_n_floor"),
+        log_alpha: t["log_scaling_alpha"].as_f64().expect("missing log_scaling_alpha") as f32,
         qk_clip: t["qk_l2_clip_threshold"].as_f64().expect("missing qk_l2_clip_threshold") as f32,
         prefix,
         is_full,
@@ -155,6 +163,9 @@ struct Emitter<'a> {
     q: u32,
     q_clipped: u32,
     k_clipped: u32,
+    rel: u32,
+    rel_logits: u32,
+    log_scale: u32,
     opart: u32,
     mlpart: u32,
     attn_gate: u32,
@@ -260,9 +271,10 @@ impl Emitter<'_> {
         })
     }
 
-    fn clip_heads(&mut self, out: u32, src: u32, scale: u32, heads: u32, dep: u32) -> u32 {
+    fn clip_heads(&mut self, out: u32, src: u32, scale: u32, heads: u32, tau: u32, dep: u32) -> u32 {
         self.b.emit(DevOp::HeadNormRope, self.b.all(), &[dep], |d| {
             d.t[..3].copy_from_slice(&[out, src, scale]);
+            d.t[3] = tau;
             d.t[5] = self.pos;
             d.i[0] = self.t;
             d.i[1] = heads;
@@ -353,10 +365,22 @@ impl Emitter<'_> {
         let q_scale = self.w(&format!("{p}attn.q_l2_clip.scale"), qd as u64 * BF16);
         let q_in = q;
         let q = self.q_clipped;
-        let c_qn = self.clip_heads(q, q_in, q_scale, heads, cq);
+        let tau = if full { self.log_scale } else { TENSOR_NONE };
+        let c_qn = self.clip_heads(q, q_in, q_scale, heads, tau, cq);
+        let rel_weight = self.w(&format!("{p}attn.wr_du.weight"), (heads * 16) as u64 * h as u64 * BF16);
+        let rel_scale = self.w(&format!("{p}attn.rel_l2_clip.scale"), (heads * 16) as u64 * BF16);
+        let rel_proj = self.w(&format!("{p}attn.rel_logits_proj.proj"), (16 * c.rel_extent) as u64 * BF16);
+        let c_r = self.proj(self.rel, hn, rel_weight, TENSOR_NONE, heads * 16, h, dep);
+        let rel_logits = self.rel_logits;
+        let c_rel = self.b.emit(DevOp::HeadNormRope, self.b.all(), &[c_r], |d| {
+            d.t[..6].copy_from_slice(&[rel_logits, self.rel, rel_scale, rel_proj, tau, self.pos]);
+            d.i[..6].copy_from_slice(&[t, heads, 16, c.rel_extent, c.rel_clip.to_bits(),
+                                      packet::dev::ROPE_PAIR_RELATIVE_LOGITS]);
+            d.f[0] = 1e-6;
+        });
         let ck = self.short_conv(&p, "k", pass_idx, full, self.k_conv, kg, ck, dep);
         let cv = self.short_conv(&p, "v", pass_idx, full, self.v_conv, vg, cv, dep);
-        let ck = self.clip_heads(self.k_clipped, self.k_conv, TENSOR_NONE, kvh, ck);
+        let ck = self.clip_heads(self.k_clipped, self.k_conv, TENSOR_NONE, kvh, TENSOR_NONE, ck);
         let c_kn = self.rope(kc, self.k_clipped, kvh, Some((kvr, kvm)), false, ck);
         let c_vn = self.rope(vc, self.v_conv, kvh, Some((kvr, kvm)), true, cv);
         if !self.prefill {
@@ -375,13 +399,15 @@ impl Emitter<'_> {
             self.b.emit(
                 DevOp::FlashPrefill,
                 self.b.all(),
-                &[c_qn, c_kn, c_vn],
+                &[c_qn, c_kn, c_vn, c_rel],
                 |d| {
                     d.t[0] = opart;
                     d.t[1] = mlpart;
                     d.t[2] = q;
                     d.t[3] = kc;
                     d.t[4] = vc;
+                    d.t[6] = rel_logits;
+                    d.t[7] = rel_logits;
                     d.i[0] = t;
                     d.i[1] = t;
                     d.i[2] = heads;
@@ -396,7 +422,7 @@ impl Emitter<'_> {
                 },
             )
         } else {
-            let fa_deps = [c_qn, c_kn, c_vn];
+            let fa_deps = [c_qn, c_kn, c_vn, c_rel];
             self.b
                 .emit(DevOp::FlashDecode, self.b.all(), &fa_deps, |d| {
                     d.t[0] = opart;
@@ -405,6 +431,8 @@ impl Emitter<'_> {
                     d.t[3] = kc;
                     d.t[4] = vc;
                     d.t[5] = kvlen;
+                    d.t[7] = rel_logits;
+                    d.j[1] = packet::dev::FLASH_DECODE_RELATIVE;
                     d.i[0] = t;
                     d.i[1] = heads;
                     d.i[2] = kvh;
@@ -604,6 +632,9 @@ fn phase_range(
     let q = act(&mut b, "q", tr * qd as u64 * BF16);
     let q_clipped = act(&mut b, "q_clipped", tr * qd as u64 * BF16);
     let k_clipped = act(&mut b, "k_clipped", tr * kd as u64 * BF16);
+    let rel = act(&mut b, "rel", tr * heads as u64 * 16 * BF16);
+    let rel_logits = act(&mut b, "rel_logits", tr * heads as u64 * c.rel_extent as u64 * BF16);
+    let log_scale = b.tensor_init("const.log_scale", [c.log_floor.to_le_bytes(), c.log_alpha.to_le_bytes()].concat());
     let opart = act(
         &mut b,
         "opart",
@@ -648,6 +679,9 @@ fn phase_range(
         q,
         q_clipped,
         k_clipped,
+        rel,
+        rel_logits,
+        log_scale,
         opart,
         mlpart,
         attn_gate,
@@ -818,6 +852,9 @@ pub(super) fn run(
             .expect("inkling config JSON");
     let c = cfg_inkling(&v);
     let text = v.get("text_config").unwrap_or(&v);
+    assert_eq!(text["d_rel"].as_u64(), Some(16), "inkling requires 16 relative channels");
+    assert_eq!(c.rel_extent, packet::dev::FLASH_RELATIVE_EXTENT);
+    assert!(c.log_floor > 0 && c.log_alpha.is_finite() && c.log_alpha >= 0.0);
     assert_eq!(text["sconv_kernel_size"].as_u64(), Some(4), "inkling requires four convolution taps");
     assert_eq!(text["use_value_norm_no_gamma"].as_bool(), Some(true), "inkling requires unweighted V RMSNorm");
     let layers = block
@@ -937,8 +974,6 @@ pub(super) fn run(
         &[
             ".attn_sconv.",
             ".mlp_sconv.",
-            "wr_du",
-            "rel_",
             "attn_res.",
             "controllers.",
             "middle_cycle_cross_pass_",

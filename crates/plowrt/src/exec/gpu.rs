@@ -1428,9 +1428,10 @@ fn validate_gemv_decode_role_inst(
     Ok(())
 }
 
-fn validate_head_l2_clip(blob: &DevBlob) -> Result<()> {
+fn validate_head_preparation(blob: &DevBlob) -> Result<()> {
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
-        if d.op != DevOp::HeadNormRope as u16 || d.i[5] != packet::dev::ROPE_PAIR_L2_CLIP {
+        let relative = d.i[5] == packet::dev::ROPE_PAIR_RELATIVE_LOGITS;
+        if d.op != DevOp::HeadNormRope as u16 || (!relative && d.i[5] != packet::dev::ROPE_PAIR_L2_CLIP) {
             continue;
         }
         let extent = |slot: usize, bytes: u64| {
@@ -1442,20 +1443,67 @@ fn validate_head_l2_clip(blob: &DevBlob) -> Result<()> {
             let value = f32::from_bits(bits);
             value.is_finite() && value > 0.0
         };
-        if d.i[2] != 128
+        let hd = if relative { 16 } else { 128 };
+        let extent_out = if relative { packet::dev::FLASH_RELATIVE_EXTENT } else { hd };
+        let tau = if relative { 4 } else { 3 };
+        if d.i[2] != hd
+            || (relative && d.i[3] != extent_out)
             || rows == 0
-            || rows > u64::MAX / 256
+            || rows > u64::MAX / (u64::from(extent_out) * 2)
             || !positive(d.fj[0])
             || !positive(d.i[4])
             || d.fj[1] != 0
             || d.fj[2] != 0
-            || d.t[0] == d.t[1]
-            || d.t[0] == d.t[2]
-            || !extent(0, rows * 256)
-            || !extent(1, rows * 256)
-            || (d.t[2] != TENSOR_NONE16 && !extent(2, heads * 256))
+            || (1..=5).any(|slot| d.t[slot] == d.t[0])
+            || !extent(0, rows * u64::from(extent_out) * 2)
+            || !extent(1, rows * u64::from(hd) * 2)
+            || ((relative || d.t[2] != TENSOR_NONE16) && !extent(2, heads * u64::from(hd) * 2))
+            || (relative && !extent(3, u64::from(hd) * u64::from(extent_out) * 2))
+            || (d.t[tau] != TENSOR_NONE16 && (!extent(tau, 8) || !extent(5, u64::from(d.i[0]) * 4)))
         {
-            return Err(RuntimeError::Rejected("invalid scaled head L2 clip operands".into()));
+            return Err(RuntimeError::Rejected("invalid head preparation operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_attention(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let prefill = d.op == DevOp::FlashPrefill as u16
+            && d.t[6] == d.t[7] && d.t[7] != TENSOR_NONE16;
+        let decode = d.op == DevOp::FlashDecode as u16
+            && d.fj[2] == packet::dev::FLASH_DECODE_RELATIVE;
+        if !prefill && !decode { continue; }
+        let (heads, kv_heads, stride, mask, window, splits) = if prefill {
+            (d.i[2], d.i[3], d.fj[1], d.fj[2], d.i[5], d.i[7])
+        } else {
+            (d.i[1], d.i[2], d.i[3], d.i[7], d.i[4], d.i[5])
+        };
+        let rows = u64::from(d.i[0]);
+        let head_rows = rows * u64::from(heads);
+        let exists = |slot: usize, count: u64, width: u64| {
+            count.checked_mul(width).is_some_and(|n| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n)
+            })
+        };
+        let parts = head_rows.checked_mul(u64::from(splits));
+        let kv_bytes = u64::from(kv_heads).checked_mul(u64::from(stride))
+            .and_then(|n| n.checked_mul(if prefill { 1 } else { rows }));
+        if d.i[6] != 128 || rows == 0 || heads == 0 || kv_heads == 0 || heads % kv_heads != 0
+            || splits == 0 || stride == 0
+            || (mask != u32::MAX && mask >= stride)
+            || window > packet::dev::FLASH_RELATIVE_EXTENT
+            || !f32::from_bits(d.fj[0]).is_finite()
+            || [1, 2, 3, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[0])
+            || [2, 3, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[1])
+            || !parts.is_some_and(|n| exists(0, n, 512) && exists(1, n, 8))
+            || !exists(2, head_rows, 256)
+            || !kv_bytes.is_some_and(|n| exists(3, n, 256) && exists(4, n, 256))
+            || !exists(7, head_rows, 2 * u64::from(packet::dev::FLASH_RELATIVE_EXTENT))
+            || (decode && (!exists(5, rows, 4) || (d.t[6] != TENSOR_NONE16 && !exists(6, rows, 4))))
+            || (prefill && d.t[5] != TENSOR_NONE16)
+        {
+            return Err(RuntimeError::Rejected("invalid relative attention operands".into()));
         }
     }
     Ok(())
@@ -4646,7 +4694,8 @@ impl GpuEngine {
                 let blob = image.blob.clone();
                 validate_moe_outer_scales(&blob)?;
                 validate_gated_flash_merge(&blob)?;
-                validate_head_l2_clip(&blob)?;
+                validate_head_preparation(&blob)?;
+                validate_relative_attention(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {

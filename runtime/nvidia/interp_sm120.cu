@@ -1904,6 +1904,14 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #else
     case PLOW_DOP_FLASH_PREFILL:
+        if (in->t[6] == in->t[7] && TEN(7)) {
+            d_flash_relative128<true>((float*)TEN(0), (float*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(7), nullptr,
+                nullptr, in->i[0], in->i[2], in->i[3], in->fj[1].u, in->fj[2].u,
+                in->i[5], in->i[7], in->i[1], in->i[4], in->fj[0].f, slice, nblk);
+            break;
+        }
 #if PLOW_HAS_FLASH_HD64
         if (in->i[6] == 64 && PLOW_HAS_FLASH_HD64)
             d_flash_prefill_mux<64, 64, 64>(
@@ -2089,8 +2097,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[5] == 4) {
             if (in->i[2] != 128) __trap();
             else d_head_l2_clip<128>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
-                                   (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1],
+                                   (const __nv_bfloat16*)TEN(2), (const uint32_t*)TEN(3), (const int*)TEN(5),
+                                   in->i[0], in->i[1],
                                    in->fj[0].f, __uint_as_float(in->i[4]), slice, nblk);
+            break;
+        }
+        if (in->i[5] == 5) {
+            d_relative_logits16((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                (const uint32_t*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1], in->i[3],
+                in->fj[0].f, __uint_as_float(in->i[4]), slice, nblk);
             break;
         }
 #if PLOW_MIXED_STEP
@@ -2920,6 +2936,14 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #else
     case PLOW_DOP_FLASH_DECODE: {
+        if (in->fj[2].u == 0xffffffffu) {
+            d_flash_relative128<false>((float*)TEN(0), (float*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(7), (const int*)TEN(5),
+                (const int*)TEN(6), in->i[0], in->i[1], in->i[2], in->i[3], in->i[7],
+                in->i[4], in->i[5], 0, 0, in->fj[0].f, slice, nblk);
+            break;
+        }
         const unsigned gqa = in->i[1] / in->i[2];
         /* Merge fold (no FLASH_MERGE packet): j1 = out handle | counter handle << 16. */
         const unsigned fold = in->fj[2].u;
@@ -3748,6 +3772,9 @@ extern "C" __device__ unsigned plow_dsa_decode_batch_arm = 1;
 #error "GEMV512 role requires the segmented global queue scheduler"
 #endif
 extern "C" __device__ unsigned plow_gemv_sm90_cta512_abi = 1;
+#endif
+#if !PLOW_NV_LEAN_DECODE && !PLOW_NV_SEG_GEMM && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE && !PLOW_NV_SKELETON && !PLOW_MIXED_STEP
+extern "C" __device__ unsigned plow_relative_attention_abi = 1;
 #endif
 #if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
 extern "C" __device__ unsigned plow_gdn_prefill_abi = 1;

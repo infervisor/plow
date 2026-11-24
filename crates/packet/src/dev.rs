@@ -158,6 +158,10 @@ pub enum DevOp {
     /// offset of the KV cache, so the cache write is not a separate copy.
     /// CUDA pair mode 4 applies the optional BF16 scale per head and channel, then clips
     /// the FP32 L2 norm to the FP32 bits in `i4` (+ `f0` epsilon in the divisor). Output is dense.
+    /// In mode 4 slot 3 optionally supplies log-position parameters [floor:u32, alpha:f32].
+    /// CUDA mode 5 instead clips 16 relative channels and multiplies by the BF16
+    /// projection in slot 3, giving i3 output distances per head. Slot 4 optionally
+    /// carries the log-position parameters. Both modes read the position in slot 5.
     HeadNormRope = 3,
     /// `t0=out t1=a t2=b t3=pre?` · `i0=n` · `f0=scale`, computing
     /// `(a + b) * scale`, or `(pre + bf16(a + b)) * scale` when `pre` is present.
@@ -223,12 +227,16 @@ pub enum DevOp {
     /// whose own spec was updated at the time and already agreed. Caught by
     /// `crate::slots`' drift test; see that module for why the table is checked
     /// against these comments rather than generated from them.
+    /// CUDA HD128 relative attention uses equal nonempty slots 6 and 7 for
+    /// BF16 bias [query, head, 1024] indexed by key distance, with slot 5 absent.
     FlashPrefill = 11,
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32) t6=decode_slot(i32)?` ·
     /// `i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd` ·
     /// `f0=scale`. For ordinary BF16, `decode_slot[b]` selects the physical KV slot for
     /// compact row `b`; when absent, physical slot and compact row are identical. Packed
     /// extension forms retain their extension-specific operands.
+    /// CUDA relative attention uses j1 = all ones and slot 7 for the same
+    /// distance-indexed bias. Slot 6 remains the optional physical KV slot map.
     FlashDecode = 12,
     /// `t0=O t1=Opart t2=mlpart t3=sinks? t4=gate? t5=row_sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
     ///
@@ -2712,6 +2720,9 @@ pub const ROPE_PAIR_HALF: u32 = 2;
 pub const ROPE_PAIR_DSA_KPREP: u32 = 3;
 /// Dense CUDA scaled L2 clipping without RoPE or KV addressing.
 pub const ROPE_PAIR_L2_CLIP: u32 = 4;
+pub const ROPE_PAIR_RELATIVE_LOGITS: u32 = 5;
+pub const FLASH_RELATIVE_EXTENT: u32 = 1024;
+pub const FLASH_DECODE_RELATIVE: u32 = u32::MAX;
 
 impl DevOp {
     /// Every opcode, in numeric order.

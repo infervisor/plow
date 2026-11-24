@@ -248,7 +248,8 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         let hnr_folded = g
             .insts
             .iter()
-            .any(|d| d.op == DevOp::FlashDecode as u16 && d.t[7] != TENSOR_NONE16);
+            .any(|d| d.op == DevOp::FlashDecode as u16 && d.t[7] != TENSOR_NONE16
+                && d.fj[2] != packet::dev::FLASH_DECODE_RELATIVE);
         let class = if routed.get(index).copied().unwrap_or(false) {
             1
         } else if folded {

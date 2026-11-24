@@ -197,6 +197,8 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         FlashDecode if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
         FlashDecodeFp8 if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0, 1]),
         FlashMerge if d.i[4] == 0 && all(&[0, 1, 2]) && none(&[3]) => Some(&[0]),
+        FlashPrefill if all(&[0, 1, 2, 3, 4, 7]) && none(&[5]) && d.t[6] == d.t[7]
+            => Some(&[0, 1]),
         FlashPrefill
             if d.i[7] == 1 && d.i[4] >> 31 == 0 && all(&[0, 1, 2, 3, 4, 5]) && none(&[6]) =>
         {
@@ -210,6 +212,8 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         FlashPrefillFp8 if d.i[7] == 1 && d.i[4] >> 31 == 0 && all(&[0, 1, 2, 3, 4, 5, 6, 7]) => {
             Some(&[5])
         }
+        HeadNormRope if matches!(d.i[5], packet::dev::ROPE_PAIR_L2_CLIP | packet::dev::ROPE_PAIR_RELATIVE_LOGITS)
+            && all(&[0, 1, 5]) => Some(&[0]),
         HeadNormRope if d.i[7] == 0 && all(&[0, 1, 5]) && has(3) == has(4) => Some(&[0]),
         HeadNormRope if d.i[7] == 1 && all(&[0, 1, 5, 6, 7]) && has(3) == has(4) => Some(&[0, 6]),
         HeadNormRopeFp8 if d.i[7] == 0 && d.i[5] == 0 && all(&[0, 1, 5, 6]) && has(3) == has(4) => {
@@ -441,7 +445,7 @@ fn tmaps_bound(packet: &Packet<'_>, d: &DevInst64) -> Result<(), String> {
                     matches!(g.kind, GEN_TMAP_BF16 | GEN_TMAP_E4M3) && g.aux == u32::from(target)
                 })
             }),
-        Some(DevOp::FlashPrefill) if d.t[7] != TENSOR_NONE16 => {
+        Some(DevOp::FlashPrefill) if d.t[7] != TENSOR_NONE16 && d.t[6] != d.t[7] => {
             gen(u32::from(d.t[7])).is_some_and(|g| {
                 g.kind == GEN_TMAP_KV_PAIR
                     && g.aux == u32::from(d.t[3])

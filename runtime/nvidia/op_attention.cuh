@@ -3277,6 +3277,61 @@ __device__ __noinline__ void d_flash_decode_slots(
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).
  * Deliberately NOT split over the feature axis — see the AMD comment: widening the merge
  * widens its consumer's gate and made the TOKEN slower there. Kept identical here. */
+/* HD128 BF16 relative attention with FP32 split partials. */
+template <bool PREFILL>
+static __device__ void d_flash_relative128(
+    float* out, float* ml, const __nv_bfloat16* q, const __nv_bfloat16* k,
+    const __nv_bfloat16* v, const __nv_bfloat16* bias, const int* lengths,
+    const int* slots, unsigned rows, unsigned heads, unsigned kv_heads,
+    unsigned stride, unsigned mask, unsigned window, unsigned splits,
+    unsigned key_rows, unsigned q0, float scale, unsigned slice, unsigned nblk) {
+    constexpr unsigned D = 128, E = 1024;
+    const unsigned lane = threadIdx.x & 31u, warps = blockDim.x / 32;
+    for (size_t work = slice * warps + threadIdx.x / 32; work < (size_t)rows * heads * splits;
+         work += nblk * warps) {
+        const unsigned split = work % splits, head = work / splits % heads;
+        const unsigned row = work / splits / heads;
+        const int slot = PREFILL ? 0 : (slots ? slots[row] : (int)row);
+        const int len = PREFILL ? (int)key_rows : lengths[row];
+        const int pos = PREFILL ? (int)(q0 + row) : len - 1;
+        float m = FA_NEG_INF, l = 0.0f;
+        float sums[4] = {};
+        if (slot >= 0 && pos >= 0 && pos < len && (mask != 0xffffffffu || (unsigned)len <= stride)) {
+            const unsigned live = (unsigned)pos + 1;
+            const unsigned lower = window && live > window ? live - window : 0;
+            const unsigned count = live - lower;
+            const unsigned lo = lower + (uint64_t)count * split / splits;
+            const unsigned hi = lower + (uint64_t)count * (split + 1) / splits;
+            const size_t q_head = (size_t)row * heads + head;
+            const size_t kv_head = (size_t)slot * kv_heads + head / (heads / kv_heads);
+            const __nv_bfloat16* const qrow = q + q_head * D;
+            float query[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) query[i] = __bfloat162float(qrow[lane + i * 32]);
+            for (unsigned key = lo; key < hi; ++key) {
+                const size_t kv_off = (kv_head * stride + (key & mask)) * D + lane;
+                float dot = 0.0f;
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i)
+                    dot = fmaf(query[i], __bfloat162float(k[kv_off + i * 32]), dot);
+                const unsigned distance = pos - key;
+                const float rel = distance < E ? __bfloat162float(bias[q_head * E + distance]) : 0.0f;
+                const float score = FA_SCALE(warp_sum32(dot) * scale + rel);
+                const float next = fmaxf(m, score);
+                const float carry = FA_EXP(m - next), p = FA_EXP(score - next);
+                l = l * carry + p;
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i)
+                    sums[i] = fmaf(__bfloat162float(v[kv_off + i * 32]), p, sums[i] * carry);
+                m = next;
+            }
+        }
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) out[work * D + lane + i * 32] = sums[i];
+        if (lane == 0) { ml[2 * work] = m; ml[2 * work + 1] = l; }
+    }
+}
+
 template <int D, bool SINKS = false, bool GATED = false>
 __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __restrict__ Opart,
                               const float* __restrict__ mlpart, unsigned n_batch, unsigned n_head,
