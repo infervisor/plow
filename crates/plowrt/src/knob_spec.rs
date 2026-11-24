@@ -1276,6 +1276,8 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_DSV41_NO_WG", Some("PLOW_DSV41_NO_WG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_DSV41_PROFILE", Some("PLOW_DSV41_PROFILE"), Layer::RawEnv, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("env.PLOW_PUBLISH_URL", Some("PLOW_PUBLISH_URL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PUBLISH_KEY", Some("PLOW_PUBLISH_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_READELF", Some("PLOW_READELF"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
