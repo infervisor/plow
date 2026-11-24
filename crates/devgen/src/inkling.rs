@@ -337,25 +337,18 @@ impl Emitter<'_> {
         })
     }
 
-    fn uses_residual_stack(&self, layer: usize, visit: usize) -> bool {
-        if self.block_mode {
-            return layer == 0;
-        }
-        let block = self.c.residual_block_layers;
-        let first_core_block = self.c.core_start == block && visit == layer
-            && layer < self.c.core_end && layer < block.saturating_mul(2);
-        layer < self.c.core_start.min(block) || first_core_block || layer == 0
+    fn copy_residual(&mut self, out: u32, dst_block: u32, src: u32, src_block: u32, dep: u32) -> u32 {
+        let elements = self.t * self.c.hidden;
+        self.b.emit(DevOp::Residual, self.b.all(), &[dep], |d| {
+            d.t[0] = out;
+            d.t[1] = src;
+            d.i[..3].copy_from_slice(&[elements, dst_block, src_block]);
+            d.i[7] = 1;
+        })
     }
 
     fn complete_residual_block(&mut self, dep: u32) -> u32 {
-        let elements = self.t * self.c.hidden;
-        let copy = self.b.emit(DevOp::Residual, self.b.all(), &[dep], |d| {
-            d.t[0] = self.residual_stack;
-            d.t[1] = self.x;
-            d.i[0] = elements;
-            d.i[1] = self.completed_blocks;
-            d.i[7] = 1;
-        });
+        let copy = self.copy_residual(self.residual_stack, self.completed_blocks, self.x, 0, dep);
         self.completed_blocks += 1;
         copy
     }
@@ -377,7 +370,7 @@ impl Emitter<'_> {
         })
     }
 
-    fn layer(&mut self, l: usize, pass_idx: usize, dep: u32, gamma_next: u32) -> u32 {
+    fn layer(&mut self, l: usize, pass_idx: usize, dep: u32, gamma_next: u32, next_layer: Option<usize>) -> u32 {
         let c = self.c;
         let (t, h, hd, heads, kvh) = (self.t, c.hidden, c.hd, c.heads, c.kvh);
         let (qd, kd) = (heads * hd, kvh * hd);
@@ -399,10 +392,9 @@ impl Emitter<'_> {
         // q/k/v projections. Decode fuses into GemvQkv when t == 1 and not under a ladder; batched decode and prefill use Gemm/GemmSmall.
         let (hn, kg, vg) = (self.hn, self.kg, self.vg);
         let q = self.q;
-        let use_residual_stack = self.uses_residual_stack(l, pass_idx);
+        let use_residual_stack = !self.block_mode || l == 0;
         let first_in_block = l % c.residual_block_layers == 0;
-        let global_residual_input = full && !self.block_mode && l > 0 && pass_idx > 0
-            && self.uses_residual_stack(l - 1, pass_idx - 1);
+        let global_residual_input = full && !self.block_mode && l > 0;
         let (k_input, v_input) = if global_residual_input {
             let query = format!("attn_queries.{}", l - 1);
             let mut kv_input = |kind, row| {
@@ -676,11 +668,15 @@ impl Emitter<'_> {
                 if self.block_mode {
                     conv
                 } else {
-                    let query_rows = if c.is_full.get(l + 1) == Some(&true) { 3 } else { 1 };
-                    let mix = self.residual_mix(hn, next, TENSOR_NONE, &format!("attn_queries.{l}"),
-                        (0, query_rows), gamma_next, conv);
                     self.x = next;
-                    mix
+                    if next_layer == Some(c.core_start) && l + 1 != c.core_start {
+                        return conv;
+                    }
+                    let (query, query_rows) = match next_layer {
+                        Some(layer) => (format!("attn_queries.{}", layer - 1), if c.is_full[layer] { 3 } else { 1 }),
+                        None => ("output_query".into(), 1),
+                    };
+                    self.residual_mix(hn, next, TENSOR_NONE, &query, (0, query_rows), gamma_next, conv)
                 }
             } else {
                 self.add_norm(moe, gamma_next, c_c)
@@ -733,7 +729,7 @@ fn phase_range(
     };
     let tr = t as u64;
     let act = |b: &mut Builder, n: &str, bytes: u64| b.tensor(&format!("act.{n}"), bytes);
-    let stack_blocks = if block_mode { 1 } else { 2 };
+    let stack_blocks = if block_mode { 1 } else { (c.layers as usize).div_ceil(c.residual_block_layers) as u64 };
     let x = act(&mut b, "x", stack_blocks * tr * h as u64 * BF16);
     let hn = act(&mut b, "hn", tr * h as u64 * BF16);
     let kg = act(&mut b, "kg", tr * kd as u64 * BF16);
@@ -879,21 +875,37 @@ fn phase_range(
         d.i[1] = h;
         d.f[0] = eps;
     });
+    let mut prelude = None;
     for (li, &l) in layer_seq.iter().enumerate() {
-        let gamma_next = if li + 1 < layer_seq.len() {
-            let next_l = layer_seq[li + 1];
-            if block_mode {
-                g_in[0]
-            } else {
-                g_in[next_l]
-            }
-        } else if block_mode {
+        let next_layer = layer_seq.get(li + 1).copied();
+        let gamma_next = if block_mode {
             g_in[0]
         } else {
-            g_final
+            next_layer.map_or(g_final, |layer| g_in[layer])
         };
+        if !block_mode && c.num_passes > 1 && l == c.core_start {
+            if let Some((snapshot, blocks)) = prelude {
+                em.x = snapshot;
+                em.completed_blocks = blocks;
+                dep = if l == 0 {
+                    em.b.emit(DevOp::RmsNorm, rows.clone(), &[dep], |d| {
+                        d.t[..3].copy_from_slice(&[hn, snapshot, g_in[l]]);
+                        d.i[..2].copy_from_slice(&[t, h]);
+                        d.f[0] = eps;
+                    })
+                } else {
+                    let query_rows = if c.is_full[l] { 3 } else { 1 };
+                    em.residual_mix(hn, snapshot, TENSOR_NONE, &format!("attn_queries.{}", l - 1),
+                        (0, query_rows), g_in[l], dep)
+                };
+            } else {
+                let snapshot = em.b.tensor("act.prelude_partial", tr * h as u64 * BF16);
+                dep = em.copy_residual(snapshot, 0, em.x, 0, dep);
+                prelude = Some((snapshot, em.completed_blocks));
+            }
+        }
         let pass_idx = if block_mode { l } else { li };
-        dep = em.layer(l, pass_idx, dep, gamma_next);
+        dep = em.layer(l, pass_idx, dep, gamma_next, next_layer);
     }
     if block_mode {
         let tensors = em.b.tensors();
