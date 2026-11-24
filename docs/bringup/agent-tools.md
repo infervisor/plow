@@ -19,7 +19,7 @@ Every campaign report, PR, and `comparison.md` **starts with the block-vs-roofli
 
 * `% of Floor` = `floor / measured time`.
 * `Delta vs Current` = candidate minus production block at identical point in the same lease.
-* Roofline certification: `scripts/campaign/certify_kernel.py` enforces $\ge 80\%$ decode and $\ge 75\%$ prefill efficiency against theoretical roofline floor.
+* Roofline certification: `scripts/campaign/certify_kernel.py` enforces $\ge 80\%$ decode and $\ge 75\%$ prefill efficiency against calibrated roofline floor.
 
 #### Block Harness Tooling
 
@@ -27,9 +27,9 @@ Every campaign report, PR, and `comparison.md` **starts with the block-vs-roofli
 |---|---|---|
 | Emit one block | `campaign.py build <recipe> --block L[..R] --out <dir>` | `plowc --emit devblob --block` |
 | Benchmark | `block_run <asset> bench --batch B --ctx N`<br>`block_run <asset> prefill-bench --query-rows Q --prior P` | `campaign.py block-bench`<br>`PLOW_LAYERS=N` sweeps |
-| Calibrate ceilings | `scripts/bench/calibrate_ceilings.py --out ceilings.json` | Recipe `[roofline]` ceilings |
+| Calibrate ceilings | `scripts/bench/calibrate_ceilings.py --out ceilings.json` | Measured probe in `perf-data/probes/` |
 | Floor & report table | `scripts/campaign/block_roofline.py <assets> --ceilings ceilings.json --plow sweep.json --current <prod.json>` | `campaign.py block-roofline` |
-| Certification gate | `scripts/campaign/certify_kernel.py --input sweep.json` | `scripts/campaign/certify_kernel.py --input sweep.json` |
+| Certification gate | `scripts/campaign/certify_kernel.py --input sweep.json --ceilings ceilings.json` | `scripts/campaign/certify_kernel.py --input sweep.json --ceilings ceilings.json` |
 | A/B comparison | `campaign.py nv-block-ab --control <base> --treatment <cand> --verb bench\|prefill-bench --args "..." --ceilings ceilings.json` | `campaign.py block-ab` |
 | MoE routing table | `PLOW_NV_DUMP_KV=<dir> PLOW_NV_DUMP_ACT=<len>:<pc>` → `scripts/bench/router_table.py` | `rank0.act.tab.bin` capture |
 | Reference layer | `scripts/block_layer_bench.py` (vLLM decoder layer) + `scripts/block_compare.py` | `runtime/tests/*_block_*_test.c` oracles |
@@ -77,6 +77,7 @@ Comparisons against reference engines (vLLM, vLLM-Omni) are valid only when arit
 * **Packet contract:** Model-specific logic lives in packet metadata, `serve.json`, and symbol tables (`docs/runtime/*-packet-contract.md`). `plowrt` remains generic.
 * **Static runtime:** `plowrt` dlopens only vendor libraries (`libcuda`, `cuBLASLt`, `libhsa-runtime64`). Third-party kernels (FA4/FA3/FlashInfer) ship as packet cubins launched via generic host stubs (`cuLaunchKernelEx`).
 * **Knob registration:** Every `PLOW_*` knob, env var, or `#if PLOW_*` define must be registered in `crates/devgen/src/knob_spec.rs` or `crates/plowrt/src/knob_spec.rs`. Verified via `cargo test -p devgen --lib knob` and `cargo test -p plowrt --features cuda,hsa --lib knob`.
+* **Runtime stability invariants:** Implementations must preserve Invariant 1 (monotonic burst draining), Invariant 2 (nominal steady-state floor), Invariant 3 (dwell time & hysteresis), and Tiered Memory Governance Tiers 0–3 ([`06-runtime-opt.md`](06-runtime-opt.md)).
 
 ### Benchmarking & Leases
 * **GPU Queue:** All GPU executions run through `scripts/bench/gpuq.py submit <label> <ngpu> <cmd...>` (FIFO, queue root `/tmp/plow-gpuq`). Never lease bare cards or run raw unqueued workloads.
@@ -160,16 +161,6 @@ env scripts/bench/llm_grid.sh vllm <res>/vllm [--agentic] [--prod]
 # --prod: open-loop Poisson arrival traffic (rates set via PROD_RATES='0.5 1.0')
 ```
 
-### GLM-5.3 Driver (`glm53_mi300x.sh`)
-```bash
-./scripts/glm53_mi300x.sh emit  8                 # Compile packet (CPU only)
-./scripts/glm53_mi300x.sh serve 8 8100            # Start plowrt server (leases GPUs)
-./scripts/glm53_mi300x.sh bench 8 8100 [label]    # Benchmark client
-./scripts/glm53_mi300x.sh vllm  8 8200            # Reference vLLM server
-./scripts/glm53_mi300x.sh smoke 8100              # Readiness test (arg is PORT, not TP)
-./scripts/glm53_mi300x.sh stop  [pattern]         # Stop server and release lease
-```
-
 ### Diagnostic & Audit Tools
 * `scripts/bench/waterfall.py <plow-res> <vllm-res>`: Audit spread, prefix-cache hit rates ($>5\%$ on reference fails), wall time split (prefill, decode, host gap, idle), and decode ms/step.
 * `scripts/bench/host_res.py report <plow-res> <vllm-res> --cell <tag>`: Compare server RSS, pinned memory, host tier footprint, CPU utilization, and startup times.
@@ -214,17 +205,6 @@ A candidate may exceed default `llm_fp32_ref` tolerances only if:
 1. Perf gain is $\ge 5\%$ on affected step time or $\ge 3\%$ on production-mix goodput/latency.
 2. Accuracy remains at vLLM level in $\ge 2$ of 3 runs: `kl_trim_mean`/`kl_p95` $\le 1.10\times$ peer, `top1_decisive` $\ge \text{peer} - 0.005$, `cont_decisive` $\ge \text{peer} - 2\text{ cases}$, `needle_acc` $\ge \text{peer}$.
 3. Gains and per-run evidence are recorded in the recipe header.
-
-### Multimodal Gate (`mm_parity`)
-Gated via `scripts/mm/hf_ref.py`, `scripts/mm/gate.py`, and `mm_check --encode`:
-* Validates prompt-token equality, greedy continuation vs HF reference, prefix-cache stability, refusal formats, and encoder output parity.
-
-### Serve Goldens
-Frozen tokenization and prompt formatting golden tests:
-```bash
-PLOW_SERVE_GOLDEN="<model>=<assets>,..." cargo test -p plowrt --features cuda,hsa --lib golden_tests
-```
-Ensures re-emitted packets reproduce prompt bytes, token IDs, tool syntax, and stop sequences bit-for-bit.
 
 ---
 
