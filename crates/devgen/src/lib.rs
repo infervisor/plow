@@ -59,6 +59,7 @@ mod gen_kernels;
 mod library_attention;
 mod serve_section;
 mod w8a16_prefill_role;
+mod dsv41_prefill_roles;
 use block::{parse_block, write_block_descriptor};
 mod config;
 pub mod emit_config;
@@ -4013,7 +4014,7 @@ fn emit_xreduce_combine_fold(
 /// producer slice — the same collapse the M0 census measured. Splitting the PACKET is what
 /// makes the edge genuinely band-structured.
 #[allow(clippy::too_many_arguments)]
-fn emit_xreduce_twoshot_band(
+pub(crate) fn emit_xreduce_twoshot_band(
     b: &mut Builder,
     xgate: &mut u32,
     xr_cus: &[u32],
@@ -9813,7 +9814,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             let c = mla::cfg_dsv41(&dir).unwrap_or_else(|e| {
                 panic!(
                     "deepseek_v41 --block {l}: the config does not parse, \
-                     so there is nothing to plan a rung against: {e}"
+                     so there is nothing to plan a rung against: {e}\n{}",
+                    dsv41_refusal(&dir)
                 )
             });
             // Every layer, not just the first: a range whose tail is unemittable must say so
@@ -9831,23 +9833,24 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                         .copied()
                         .unwrap_or_else(|| ctx.min(1024));
                     mla::dsv41_emit_block(
-                        &dir,
-                        &layers,
-                        ctx,
-                        t,
-                        &out,
-                        n_cu,
-                        tp,
-                        rope_gen,
-                        &arch,
-                        verify.as_ref(),
+                        &dir, &layers, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(),
+                        emit_config::active().dsv41_head,
                     );
                     return;
                 }
                 Err(report) => panic!("{report}"),
             }
         }
-        panic!("{}", dsv41_refusal(&dir));
+        // The whole model: every layer, embed in front, norm + head + argmax behind.
+        let c = mla::cfg_dsv41(&dir)
+            .unwrap_or_else(|e| panic!("deepseek_v41: the config does not parse: {e}\n{}", dsv41_refusal(&dir)));
+        let layers: Vec<u32> = (0..c.layers).collect();
+        if let Err(report) = layers.iter().try_fold((), |_, &li| mla::dsv41_emit_block_plan(&c, li).map(|_| ())) {
+            panic!("{report}\n{}", dsv41_refusal(&dir));
+        }
+        let t = mla::glm_prefill_buckets_env(ctx).0.last().copied().unwrap_or_else(|| ctx.min(1024));
+        mla::dsv41_emit_block(&dir, &layers, ctx, t, &out, n_cu, tp, rope_gen, &arch, verify.as_ref(), true);
+        return;
     }
     if model_type == "glm5_next" {
         assert!(

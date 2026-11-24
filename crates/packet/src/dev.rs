@@ -2409,7 +2409,7 @@ pub enum DevOp {
     CompressPool = 212,
     /// DeepSeek-V4 CSA2's conjugate rotation on the attention output's last `rd`
     /// dims (`op_compress.h` `d_rope_inverse_o`, `[DSV4-IROPE]`). In place.
-    /// `t0=o(in/out) t1=cosb t2=sinb t3=pos` · `i0=n_tok i1=n_head i2=D i3=rd i4=pos0`.
+    /// `t0=o(in/out) t1=cosb t2=sinb t3=pos` · `i0=n_tok i1=n_head i2=D i3=rd i4=pos0 i5=per_row?`. `per_row`: token `t` at `pos[t]` (batched decode).
     ///
     /// STRUCTURAL, not cosmetic: `o` mixes cached rows each rotated by its OWN
     /// position, so de-rotating by the QUERY's position is what leaves a
@@ -2462,7 +2462,15 @@ pub enum DevOp {
     /// (`op_gemm_common.h` `d_gemm_fp8_mx` -> `d_gemm_t<WFP8MX>`).
     ///
     /// `t0=out(bf16[T][N]) t1=x(bf16[T][K]) t2=w(fp8 e4m3 OCP[N][K])
-    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)])` · `i0=T i1=N i2=K`.
+    /// t3=scale(ue8m0[ceil(N/32)][ceil(K/32)]) t4=xs?` · `i0=T i1=N i2=K i3=groups i4=a_row0 i5=c_row0 i6=fp8?`.
+    ///
+    /// `i3 = groups` > 1 makes it block-diagonal (the output LoRA `wo_a` below TP8): `out` is
+    /// `[T][groups*N]`, `x` `[T][groups*K]`, `w` `[groups*N][K]`, and group `g` multiplies `x`
+    /// columns `g*K..` by weight rows `g*N..` into `out` columns `g*N..` (`N % 32 == 0`). The sm_90a
+    /// role object implements it; the AMD arm traps on it. `i4`/`i5` offset A and C by a row band.
+    ///
+    /// `i6 = 1` (sm_90a role only): `x` is e4m3 `[T][K]` and `t4` its ue8m0 scales `[T][K/32]`,
+    /// ActQuantMx's `t2` form (`K % 128 == 0`).
     ///
     /// The scale grid is row-major with K innermost. `K % 32 == 0` is REQUIRED -- the kernel is
     /// the KEXACT instantiation at BK=32 -- and every V4.1 projection satisfies it by
@@ -2481,8 +2489,8 @@ pub enum DevOp {
     /// DeepSeek-V4.1's compressed-row tail: interleaved RoPE on the last `rd` channels, then
     /// the blockwise fake quant, one workgroup per row (`op_compress.h`
     /// `d_compress_rope_quant`, `[DSV41-CQUANT]`).
-    /// `t0=out t1=src t2=cosb t3=sinb t4=pos` ·
-    /// `i0=n_rows i1=d i2=rd i3=qblk i4=ratio i5=row_base i6=qmode i7=n_head`.
+    /// `t0=out t1=src t2=cosb t3=sinb t4=pos t5=kvlen?` ·
+    /// `i0=n_rows i1=d i2=rd i3=qblk i4=ratio i5=row_base i6=qmode i7=n_head` · `j0=slot_stride? j1=batched_ring?`.
     ///
     /// V4.1 SPLIT WHAT V4 FUSED. [`DevOp::CompressPool`] with `i7 = 2` stops after the norm,
     /// because `Compressor.forward` returns the latent before RoPE for the indexer to consume;
@@ -2632,6 +2640,43 @@ pub enum DevOp {
     /// `t0=out t1=gu` · `i0=n i1=act i2=width i3=in_stride i4=up_col` · `f0=alpha f1=limit`.
     /// `n = rows*width`; strides and `up_col` count elements; requires `up_col + width <= in_stride`.
     GluPitched = 230,
+    /// DeepSeek-V4.1 activation fake quant ahead of GEMM_FP8_MX: per-32 ue8m0 exponent reduction
+    /// over `K` into `out = x * (2^-exp) * 2^exp` (`t2` unset, the interpret/AMD emulation path).
+    /// `t0=out(bf16[rows][K]) t1=x(bf16[rows][K]) t2=scale?` · `i0=rows i1=K`.
+    ///
+    /// `t2` set (NVIDIA): the real quant -- `t0` is e4m3 `[rows][K]` and `t2` the ue8m0 exponents
+    /// `[rows][K/32]`.
+    ///
+    /// The reference quantizes the activation of EVERY block-fp8 projection; op 210 alone
+    /// multiplies the unquantized bf16 row (w8a16), which is not the model. Emitted once per
+    /// activation, ahead of the GEMMs that share it, as `QuantFp8` is on the w8a8 path.
+    ActQuantMx = 231,
+    /// DeepSeek-V4.1 sparse attention, one decode token per slot (`runtime/nvidia/op_sparse_attn_decode.cuh`):
+    /// row `b` attends over its window ring rows `[0, min(pos[b]+1, W))` plus the compressed rows
+    /// `idx[b][..]` names (`-1` skipped), 16 heads per MMA tile. `nsplit > 1` writes unnormalized
+    /// partials to `scratch` that [`DevOp::SparseAttnMerge`] folds with the sink.
+    /// `t0=o(bf16[B][H][512]) t1=q t2=ring([B][W][512]) t3=cmp? t4=idx? t5=pos(i32[B]) t6=sink(f32[H])
+    /// t7=scratch` · `i0=B i1=H i2=W i3=cmp_stride i4=topk i5=nsplit` · `f0=scale`. `cmp` is
+    /// `[B][cmp_stride][512]` and `idx` `i32[B][topk]`; both absent on window-only layers.
+    SparseAttnDecode = 232,
+    /// Folds [`DevOp::SparseAttnDecode`]'s partials with the f32 sink. `t0=o t1=scratch t2=sink` ·
+    /// `i0=B i1=H i2=nsplit`.
+    SparseAttnMerge = 233,
+    /// V4.1 `Compressor` decode step (`op_compress.cuh`): `state[b][pos%ratio] = (kv, score)`; on a
+    /// completed group `latent[b] = RMSNorm(bf16(softmax-pool(state))) * gamma`, else untouched.
+    /// `t0=latent(bf16[B][d]) t1=st_kv(f32[B][ratio][d]) t2=st_sc t3=kv(f32[B][d]) t4=score t5=gamma
+    /// t6=pos(i32[B])` · `i0=B i1=ratio i2=d i3=seed?` · `f0=eps`. `seed` (prefill, one slot,
+    /// `pos = kvlen`): copy the chunk's incomplete tail group into the state, no pooling.
+    CompressDecodeStep = 234,
+    /// V4.1 indexer score at decode (`op_index_decode.cuh`); the indexer is replicated at TP:
+    /// `score[b][t] = sum_h w[b][h] relu(q[b][h] . k[b][t])` for `t < (pos[b]+1)/ratio`, only for
+    /// slots with more than 512 keys. `t0=score(f32[B][cap]) t1=q(bf16[B][HI][128]) t2=w(bf16[B][HI])
+    /// t3=k(bf16[B][cap][128]) t4=pos` · `i0=B i1=HI i2=cap i3=ratio` · `f0=wscale`
+    /// (`softmax_scale * n_heads^-0.5`, applied to `w`).
+    IndexScoreDecode = 235,
+    /// Top-512 of [`DevOp::IndexScoreDecode`]'s (reduced) score, ascending positions, -1 padded.
+    /// `t0=idx(i32[B][512]) t1=score t2=pos` · `i0=B i1=cap i2=ratio`.
+    IndexSelectDecode = 236,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2930,6 +2975,12 @@ impl DevOp {
         DevOp::MuseMoeCombineNorm,
         DevOp::MuseNormGateNorm,
         DevOp::GluPitched,
+        DevOp::ActQuantMx,
+        DevOp::SparseAttnDecode,
+        DevOp::SparseAttnMerge,
+        DevOp::CompressDecodeStep,
+        DevOp::IndexScoreDecode,
+        DevOp::IndexSelectDecode,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -3181,6 +3232,12 @@ impl DevOp {
             DevOp::MuseMoeCombineNorm => "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
             DevOp::MuseNormGateNorm => "PLOW_DOP_MUSE_NORM_GATE_NORM",
             DevOp::GluPitched => "PLOW_DOP_GLU_PITCHED",
+            DevOp::ActQuantMx => "PLOW_DOP_ACT_QUANT_MX",
+            DevOp::SparseAttnDecode => "PLOW_DOP_SPARSE_ATTN_DECODE",
+            DevOp::SparseAttnMerge => "PLOW_DOP_SPARSE_ATTN_MERGE",
+            DevOp::CompressDecodeStep => "PLOW_DOP_COMPRESS_DECODE_STEP",
+            DevOp::IndexScoreDecode => "PLOW_DOP_INDEX_SCORE_DECODE",
+            DevOp::IndexSelectDecode => "PLOW_DOP_INDEX_SELECT_DECODE",
         }
     }
 
@@ -3250,7 +3307,10 @@ impl DevOp {
     /// 225 -> 226 for `TrimSilenceF32 = 225` (reference-audio silence trim).
     /// 226 -> 230 for `MuseRmsNorm = 226` .. `MuseNormGateNorm = 229` (Muse Spark).
     /// 230 -> 231 for `GluPitched = 230` (N-concatenated gate|up projections).
-    pub const COUNT: u16 = 231;
+    /// 231 -> 232 for `ActQuantMx = 231` (V4.1's per-32 ue8m0 activation fake quant ahead of GEMM_FP8_MX).
+    /// 232 -> 237 for V4.1 batched decode: `SparseAttnDecode`/`SparseAttnMerge`,
+    /// `CompressDecodeStep`, `IndexScoreDecode`/`IndexSelectDecode`.
+    pub const COUNT: u16 = 237;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

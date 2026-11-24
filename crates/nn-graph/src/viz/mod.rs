@@ -53,7 +53,10 @@ pub fn op_to_category(op: &Op) -> OpCategory {
         | Op::Concat { .. }
         | Op::Slice { .. }
         | Op::Reduce { .. }
-        | Op::BlockResidual { .. } => OpCategory::Layout,
+        | Op::BlockResidual { .. }
+        | Op::HcMixes { .. }
+        | Op::HcPre { .. }
+        | Op::HcPost { .. } => OpCategory::Layout,
     }
 }
 

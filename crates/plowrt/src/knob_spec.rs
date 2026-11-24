@@ -1158,6 +1158,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.seg_geom", Some("PLOW_SEG_GEOM"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.seg_alt_dir", Some("PLOW_SEG_ALT_DIR"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.moe_prefill_ep_max_extra_bytes", Some("PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES"), Layer::Runtime, USIZE, UNSET, DIAG),
+    KnobSpec::new("rt.moe_ep_cuts", Some("PLOW_MOE_EP_CUTS"), Layer::Runtime, Domain::Str, UNSET, DIAG),
     KnobSpec::new("rt.phase_objects", Some("PLOW_PHASE_OBJECTS"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.live_ctx", Some("PLOW_LIVE_CTX"), Layer::Runtime, U32, UNSET, OPT_IN),
     KnobSpec::new("rt.live_ctx_models", Some("PLOW_LIVE_CTX_MODELS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),

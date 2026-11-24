@@ -726,6 +726,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_DSV41_SEQ_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub dsv41_seq_par: bool,
 
+    /// Ceiling instrument: run the V4.1 mHC and norm packets over `t/tp` rows. WRONG ANSWER by
+    /// construction -- it prices sequence parallelism, it does not implement it.
+    #[arg(long, env = "PLOW_DSV41_SP_ABL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub dsv41_sp_abl: bool,
+
     /// Layers to emit (K3 and GLM): "all", a number N (first N layers), or "single:L".
     /// A truncation instrument for block sweeps and TP-equivalence checks; never a served packet.
     #[arg(long, env = "PLOW_LAYERS", hide = true)]
@@ -1640,6 +1645,15 @@ pub struct EmitConfig {
     /// `PLOW_DSV41_OPS`: truncate the V4.1 block to its first n ops. Profiling only.
     #[arg(long, env = "PLOW_DSV41_OPS")]
     pub dsv41_ops: Option<u32>,
+    /// `PLOW_DSV41_DECODE`: emit the V4.1 block's batched decode program over
+    /// `decode_rungs().last()` slots. `attn` stops after the attention sublayer (bring-up),
+    /// `full` is the whole layer. Unset keeps the empty decode placeholder.
+    #[arg(long, env = "PLOW_DSV41_DECODE")]
+    pub dsv41_decode: Option<String>,
+    /// `PLOW_DSV41_HEAD`: a `--block 0..k` chain also gets the embed and the norm/head/argmax
+    /// tail -- a truncated model, for bring-up parity against a composed reference.
+    #[arg(long, env = "PLOW_DSV41_HEAD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub dsv41_head: bool,
 
     /// GLM TP8 prefill on the AITER MoE route: the shared expert's down projection writes the
     /// MoE seam's reduce-scatter source and the fused call accumulates the routed partials onto
@@ -2125,6 +2139,7 @@ impl EmitConfig {
             dsv41_xr_band: env_u32("PLOW_DSV41_XR_BAND").unwrap_or(1),
             dsv41_xr_band_cus: env_u32("PLOW_DSV41_XR_BAND_CUS"),
             dsv41_seq_par: env_bool("PLOW_DSV41_SEQ_PAR"),
+            dsv41_sp_abl: env_bool("PLOW_DSV41_SP_ABL"),
             k3_prefill: env_str("K3_PREFILL"),
             glm_dsa: env_str("PLOW_GLM_DSA"),
             glm_gf: env_u32("PLOW_GLM_GF"),
@@ -2316,6 +2331,8 @@ impl EmitConfig {
             dsv41_ops: std::env::var("PLOW_DSV41_OPS")
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok()),
+            dsv41_decode: std::env::var("PLOW_DSV41_DECODE").ok().filter(|v| !v.trim().is_empty()),
+            dsv41_head: env_bool("PLOW_DSV41_HEAD"),
             glm_moe_shared_seed: env_bool("PLOW_GLM_MOE_SHARED_SEED"),
             seq_par_seams: env_opt_out("PLOW_SEQ_PAR_SEAMS"),
             moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),
