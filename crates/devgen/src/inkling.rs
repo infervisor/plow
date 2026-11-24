@@ -9,13 +9,13 @@
 //! all sharing one tensor table.
 
 use super::*;
+use crate::mla::router_flag;
 use packet::dev::ACT_SWIGLU_SOFTCAP;
 use packet::devbuild::TensorDecl;
 use std::path::Path;
 
 const DEFAULT_CHUNK: u32 = 8192;
-/// ROUTER_FLAGS: bit 0 = sigmoid, bit 1 = renormalize top-k, bit 2 = selection bias from TEN(3).
-const ROUTER_FLAGS: u32 = 1 | 2 | 4;
+const ROUTER_FLAGS: u32 = router_flag::SIGMOID | router_flag::NORM_TOPK | router_flag::BIAS;
 const BF16: u64 = 2;
 const F32: u64 = 4;
 
@@ -147,6 +147,7 @@ struct Emitter<'a> {
     b: Builder,
     c: &'a InklingCfg,
     prefill: bool,
+    fp32_router: bool,
     grouped_nvfp4_down: bool,
     t: u32,
     dbatch: u32,
@@ -663,6 +664,7 @@ impl Emitter<'_> {
         };
 
         let (rlogit, tab, fu, part, moe) = (self.rlogit, self.tab, self.fu, self.part, self.moe);
+        let router_flags = ROUTER_FLAGS | if self.fp32_router { router_flag::F32_LOGIT } else { 0 };
         let c_tk = if !self.prefill && self.t == 1 && !self.ladder && crate::emit_config::active().nv_moe_router_fold {
             self.b.emit(DevOp::MoeRouter, vec![0], &[c_n1], |d| {
                 d.t[0] = tab;
@@ -672,18 +674,26 @@ impl Emitter<'_> {
                 d.i[0] = h;
                 d.i[1] = e;
                 d.i[2] = k;
-                d.i[3] = ROUTER_FLAGS;
+                d.i[3] = router_flags;
                 d.f[0] = c.route_scale;
             })
         } else {
-            let c_r = self.proj(rlogit, hn, wr, TENSOR_NONE, e, h, c_n1);
+            let c_r = if self.fp32_router {
+                let op = if self.prefill { DevOp::GemmF32 } else { DevOp::GemvF32Out };
+                self.b.emit(op, self.b.all(), &[c_n1], |d| {
+                    d.t[..3].copy_from_slice(&[rlogit, hn, wr]);
+                    d.i[..3].copy_from_slice(&[t, e, h]);
+                })
+            } else {
+                self.proj(rlogit, hn, wr, TENSOR_NONE, e, h, c_n1)
+            };
             self.b.emit(DevOp::MoeRouterTopkPf, self.rows(), &[c_r], |d| {
                 d.t[0] = tab;
                 d.t[1] = rlogit;
                 d.t[3] = br;
                 d.i[1] = e;
                 d.i[2] = k;
-                d.i[3] = ROUTER_FLAGS;
+                d.i[3] = router_flags;
                 d.i[4] = t;
                 d.f[0] = c.route_scale;
             })
@@ -799,6 +809,7 @@ fn phase_range(
     dbatch: u32,
     chunk: u32,
     prefill: bool,
+    fp32_router: bool,
     grouped_nvfp4_down: bool,
     tensors: Option<Vec<TensorDecl>>,
     layers: std::ops::Range<usize>,
@@ -856,7 +867,7 @@ fn phase_range(
     let attn_sink = act(&mut b, "attn_sink", tr * heads as u64 * BF16);
     let at = act(&mut b, "at", tr * qd as u64 * BF16);
     let og = act(&mut b, "og", tr * h as u64 * BF16);
-    let rlogit = act(&mut b, "rlogit", tr * e as u64 * BF16);
+    let rlogit = act(&mut b, "rlogit", tr * e as u64 * if fp32_router { F32 } else { BF16 });
     let tab = act(&mut b, "tab", tr * k as u64 * 8);
 
     let fu = act(&mut b, "fu", tr * k as u64 * inter as u64 * BF16);
@@ -870,6 +881,7 @@ fn phase_range(
         b,
         c,
         prefill,
+        fp32_router,
         grouped_nvfp4_down,
         t,
         dbatch,
@@ -1102,6 +1114,7 @@ pub(super) fn run(
         "inkling: --block currently extracts one layer"
     );
     let ecfg = emit_config::active();
+    let fp32_router = arch == "sm_90a";
     let grouped_nvfp4_down = arch == "sm_90a"
         && ecfg.moe_prefill.as_deref() == Some("inkling-nvfp4");
     let mut rungs = ecfg.decode_rungs();
@@ -1123,6 +1136,7 @@ pub(super) fn run(
                     dbatch,
                     chunk,
                     false,
+                    fp32_router,
                     false,
                     None,
                     layers.clone(),
@@ -1170,6 +1184,7 @@ pub(super) fn run(
             dbatch,
             chunk,
             true,
+            fp32_router,
             grouped_nvfp4_down,
             tensors.take(),
             layers.clone(),
@@ -1188,6 +1203,7 @@ pub(super) fn run(
             dbatch,
             chunk,
             false,
+            fp32_router,
             false,
             tensors.take(),
             layers.clone(),

@@ -2251,7 +2251,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                         (const float*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
                         in->i[3], slice, nblk);
         break;
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && PLOW_NV_PREFILL
+#if PLOW_NV_PREFILL && ((defined(PLOW_NV_HOPPER) && PLOW_HAS_GEMM_F32) || (PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200))
     case PLOW_DOP_GEMM_F32:
         d_gemm((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
                in->i[0], in->i[1], in->i[2], 0, slice, nblk, (__nv_bfloat16*)arena);
@@ -2274,7 +2274,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_CONV2D_F32:
     case PLOW_DOP_PACK_NCFW_ROWS_F32:
     case PLOW_DOP_GROUPED_ATTENTION_F32:
-#if !(PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && PLOW_NV_PREFILL)
+#if !(PLOW_NV_PREFILL && ((defined(PLOW_NV_HOPPER) && PLOW_HAS_GEMM_F32) || (PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200)))
     case PLOW_DOP_GEMM_F32:
 #endif
     case PLOW_DOP_GATHER_ROWS_F32:
@@ -3208,7 +3208,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ROUTER_TOPK_PF
     case PLOW_DOP_MOE_ROUTER_TOPK_PF:
         if (TEN(2) || in->i[0] || in->i[6] > 1u || in->i[7]) { __trap(); break; }
-        d_moe_router_topk_pf_nv((unsigned char*)TEN(0), (const __nv_bfloat16*)TEN(1),
+        d_moe_router_topk_pf_nv((unsigned char*)TEN(0), TEN(1),
                                 (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr,
                                 in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[4], slice,
                                 nblk, (float*)arena);

@@ -4723,7 +4723,7 @@ static __device__ void d_moe_router_nv(
             acc += __shfl_xor_sync(0xffffffff, acc, mask);
         }
         if (lane == 0) {
-            score[e] = __bfloat162float(__float2bfloat16(acc));
+            score[e] = (flags & 8u) ? acc : __bfloat162float(__float2bfloat16(acc));
         }
     }
     __syncthreads();
@@ -4826,7 +4826,7 @@ static __device__ void d_moe_router_nv(
 /* The common router/align/combine chain. GPT-OSS uses flat softmax top-k with no selection bias;
  * the optional f32 bias and generic sigmoid/norm flags remain supported by the packet contract. */
 static __device__ void d_moe_router_topk_pf_nv(
-    unsigned char* table, const bf16* logit, const float* bias, unsigned E, unsigned ksel,
+    unsigned char* table, const void* logit, const float* bias, unsigned E, unsigned ksel,
     unsigned flags, float route_scale, unsigned T, unsigned slice, unsigned nblk, float* score) {
     if (ksel > 16u || E == 0u) { if (threadIdx.x == 0) __trap(); return; }
     const unsigned tid = threadIdx.x;
@@ -4839,15 +4839,19 @@ static __device__ void d_moe_router_topk_pf_nv(
     __shared__ float s_sum;
 
     for (unsigned tok = slice; tok < (T ? T : 1u); tok += nblk) {
-        const bf16* lr = logit + (size_t)tok * E;
+        const size_t row = (size_t)tok * E;
+        auto load_logit = [&](unsigned e) {
+            return (flags & 8u) ? static_cast<const float*>(logit)[row + e]
+                                : __bfloat162float(static_cast<const bf16*>(logit)[row + e]);
+        };
         if (flags & 1u) {
             for (unsigned e = tid; e < E; e += blockDim.x) {
-                score[e] = 1.0f / (1.0f + __expf(-__bfloat162float(lr[e])));
+                score[e] = 1.0f / (1.0f + __expf(-load_logit(e)));
             }
         } else {
             float mx = -INFINITY;
             for (unsigned e = tid; e < E; e += blockDim.x) {
-                mx = fmaxf(mx, __bfloat162float(lr[e]));
+                mx = fmaxf(mx, load_logit(e));
             }
             for (int mask = 16; mask > 0; mask >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, mask));
             if (lane == 0) s_warp_val[warp] = mx;
@@ -4861,7 +4865,7 @@ static __device__ void d_moe_router_topk_pf_nv(
             mx = s_warp_val[0];
             float sum = 0.0f;
             for (unsigned e = tid; e < E; e += blockDim.x) {
-                float sc = __expf(__bfloat162float(lr[e]) - mx);
+                float sc = __expf(load_logit(e) - mx);
                 score[e] = sc;
                 sum += sc;
             }

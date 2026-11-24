@@ -898,8 +898,8 @@ pub enum DevOp {
     // arrays are sized `T*k + n_exp*(MPF_BM-1)`.
     /// T-token router tail — a block-per-token loop of [`DevOp::MoeRouterTopk`], so it is
     /// bit-identical PER TOKEN to the decode router by construction. The `[T,n_exp]` logit matrix is
-    /// an ordinary [`DevOp::Gemm`], already in the prefill bucket; only this tail was missing.
-    /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t2=atom_acc? t3=bias` ·
+    /// an ordinary [`DevOp::Gemm`] or an FP32-output projection. Flag bit 3 selects FP32 logits.
+    /// `t0=table[T*k] t1=logit([T,n_exp]) t2=atom_acc? t3=bias` ·
     /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T i5=shared_tail` · `f0=route_scale
     /// f1=logit_scale?` (as [`DevOp::MoeRouterTopk`]).
     ///
@@ -2167,7 +2167,7 @@ pub enum DevOp {
     /// t3=overlay(f32[overlay_rows,width]) t4=overlay_index(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
     EmbedOverlayBf16 = 179,
-    /// BF16 projection with an FP32 accumulator/output, used for GLM router logits.
+    /// BF16 projection with an FP32 accumulator/output, used for router logits.
     /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K`.
     GemmF32 = 180,
     /// Decode context parallelism, pack half: this rank copies the latent KV records its DCP

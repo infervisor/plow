@@ -294,8 +294,8 @@ __device__ __forceinline__ void pgm90_stage_weight(__nv_bfloat16* dst,
 }
 
 /* C[m,n] = A[m,k] . B[n,k]^T. Drop-in for d_gemm. */
-template <bool BIAS = false, class Weight = __nv_bfloat16>
-static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
+template <bool BIAS = false, class Weight = __nv_bfloat16, class Output = __nv_bfloat16>
+static __device__ void d_gemm_sm90_impl(Output* __restrict__ C,
                                    const __nv_bfloat16* __restrict__ A,
                                    const Weight* __restrict__ B, unsigned m, unsigned n,
                                    unsigned k, unsigned a_row0, unsigned slice, unsigned nblk,
@@ -384,7 +384,10 @@ static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
                         float v = acc[4 * g + 2 * hi + lo];
                         if constexpr (std::is_same_v<Weight, uint8_t>) v *= scale[cc];
                         if constexpr (BIAS) v += __bfloat162float(bias[cc]);
-                        C[(size_t)rr * n + cc] = __float2bfloat16(v);
+                        if constexpr (std::is_same_v<Output, float>)
+                            C[(size_t)rr * n + cc] = v;
+                        else
+                            C[(size_t)rr * n + cc] = __float2bfloat16(v);
                     }
                 }
             }
@@ -392,7 +395,8 @@ static __device__ void d_gemm_sm90_impl(__nv_bfloat16* __restrict__ C,
     }
 }
 
-static __device__ void d_gemm_sm90(__nv_bfloat16* __restrict__ C,
+template <class Output>
+static __device__ void d_gemm_sm90(Output* __restrict__ C,
                                    const __nv_bfloat16* __restrict__ A,
                                    const __nv_bfloat16* __restrict__ B, unsigned m, unsigned n,
                                    unsigned k, unsigned a_row0, unsigned slice, unsigned nblk,
