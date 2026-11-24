@@ -2,14 +2,14 @@
 //!
 //! Per layer: `attn_norm -> q/k/v -> NoPE (skip_norm, no cos/sin) -> flash (sliding 1024 on local
 //! layers, full on global) + FLASH_MERGE -> o_proj -> AddNorm(mlp_norm) -> router GEMV
-//! (+selection bias in t3) -> top-8 sigmoid renorm -> MXFP4 experts (swiglu_oai, interleaved) -> combine ->
+//! (+selection bias in t3) -> top-8 sigmoid renorm -> NVFP4/MXFP8 experts (softcapped SwiGLU, interleaved) -> combine ->
 //! AddNorm`.
 //!
 //! One `Builder` per program: prefill buckets ascending, then decode batch ladder ascending,
 //! all sharing one tensor table.
 
 use super::*;
-use packet::dev::ACT_SWIGLU_OAI;
+use packet::dev::ACT_SWIGLU_SOFTCAP;
 use packet::devbuild::TensorDecl;
 use std::path::Path;
 
@@ -32,8 +32,8 @@ pub(crate) struct InklingCfg {
     pub vocab: u32,
     pub logit_softcap: f32,
     pub window: u32,
-    pub swiglu_alpha: f32,
-    pub swiglu_limit: f32,
+    pub mlp_up_softcap: f32,
+    pub mlp_gate_softcap: f32,
     pub route_scale: f32,
     pub eps: f32,
     pub attn_scale: f32,
@@ -64,8 +64,11 @@ fn cfg_inkling(v: &Value) -> InklingCfg {
         .get("sliding_window_size")
         .and_then(|x| x.as_u64())
         .unwrap_or(1024) as u32;
-    let swiglu_alpha = 1.0;
-    let swiglu_limit = t
+    let mlp_up_softcap = t
+        .get("mlp_up_softcap")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(25.0) as f32;
+    let mlp_gate_softcap = t
         .get("mlp_gate_softcap")
         .and_then(|x| x.as_f64())
         .unwrap_or(4.0) as f32;
@@ -113,8 +116,8 @@ fn cfg_inkling(v: &Value) -> InklingCfg {
         vocab,
         logit_softcap: t["final_logit_softcapping"].as_f64().unwrap_or(0.0) as f32,
         window,
-        swiglu_alpha,
-        swiglu_limit,
+        mlp_up_softcap,
+        mlp_gate_softcap,
         route_scale,
         eps,
         attn_scale,
@@ -437,6 +440,17 @@ impl Emitter<'_> {
             e as u64 * h as u64 * (if is_fp8 { inter / 32 } else { inter / 16 }) as u64,
         );
 
+        let (gu_amax, gu_denominator, down_amax, down_denominator) = if is_fp8 {
+            (TENSOR_NONE, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE)
+        } else {
+            (
+                self.w(&format!("{p}mlp.experts.w13_weight_amax"), e as u64 * F32),
+                self.w(&format!("{p}mlp.experts.w13_weight_outer_scale_denominator"), F32),
+                self.w(&format!("{p}mlp.experts.w2_weight_amax"), e as u64 * F32),
+                self.w(&format!("{p}mlp.experts.w2_weight_outer_scale_denominator"), F32),
+            )
+        };
+
         let (rlogit, tab, fu, part, moe) = (self.rlogit, self.tab, self.fu, self.part, self.moe);
         let c_tk = if !self.prefill && self.t == 1 && !self.ladder && crate::emit_config::active().nv_moe_router_fold {
             self.b.emit(DevOp::MoeRouter, vec![0], &[c_n1], |d| {
@@ -464,24 +478,25 @@ impl Emitter<'_> {
             })
         };
 
-        let (alpha, limit) = (c.swiglu_alpha, c.swiglu_limit);
+        let (gate_cap, up_cap) = (c.mlp_gate_softcap, c.mlp_up_softcap);
         let c_g = self.b.emit(DevOp::MoeGluMx, self.b.all(), &[c_tk], |d| {
             d.t[0] = fu;
             d.t[1] = hn;
             d.t[2] = tab;
             d.t[3] = w_gu;
             d.t[4] = s_gu;
-            d.t[5] = TENSOR_NONE;
+            d.t[6] = gu_amax;
+            d.t[7] = gu_denominator;
             d.i[0] = k;
             d.i[1] = inter;
             d.i[2] = h;
             d.i[3] = e;
             d.i[4] = 0; // interleaved gate/up rows
-            d.i[5] = ACT_SWIGLU_OAI;
+            d.i[5] = ACT_SWIGLU_SOFTCAP;
             d.i[6] = t;
             d.i[7] = quant_mode;
-            d.f[0] = alpha;
-            d.f[1] = limit;
+            d.f[0] = gate_cap;
+            d.f[1] = up_cap;
         });
         let c_d = self.b.emit(DevOp::MoeDownMx, self.b.all(), &[c_g], |d| {
             d.t[0] = part;
@@ -489,11 +504,13 @@ impl Emitter<'_> {
             d.t[2] = tab;
             d.t[3] = w_d;
             d.t[4] = s_d;
-            d.t[5] = TENSOR_NONE;
+            d.t[6] = down_amax;
+            d.t[7] = down_denominator;
             d.i[0] = k;
             d.i[1] = h;
             d.i[2] = inter;
             d.i[3] = e;
+            d.i[5] = 1; // Router weight was applied before the activation rounded to BF16.
             d.i[6] = t;
             d.i[7] = quant_mode;
         });
@@ -877,8 +894,6 @@ pub(super) fn run(
             "_sconv.",
             "gate_attn.",
             "attn_sink_proj.",
-            "_amax",
-            "_outer_scale_denominator",
             "wr_du",
             "rel_",
             "q_l2_clip",
@@ -901,11 +916,6 @@ pub(super) fn run(
     let lean = apply_verify_gate(&m, verify);
     let outp = Path::new(out);
     let mut sections = Vec::new();
-    if let Some(section) = mxfp4_moe_role::apply_output_object(&mut m, arch, outp)
-        .unwrap_or_else(|error| panic!("MXFP4 MoE object: {error}"))
-    {
-        sections.push(section);
-    }
     if block.is_some() {
         use plow_asset::*;
         let l = layers.start;

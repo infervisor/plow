@@ -3155,7 +3155,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                      (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
                      (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
                      in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6],
-                     in->fj[0].f, in->fj[1].f, slice, nblk, in->i[7]);
+                     in->fj[0].f, in->fj[1].f, slice, nblk, in->i[7],
+                     (const float*)TEN(6), (const float*)TEN(7));
         break;
 #endif
 #if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX
@@ -3163,7 +3164,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         d_moe_down_mx((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
                       (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
                       (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
-                      in->i[1], in->i[2], in->i[3], in->i[6], slice, nblk, in->i[7]);
+                      in->i[1], in->i[2], in->i[3], in->i[6], slice, nblk, in->i[7],
+                     (const float*)TEN(6), (const float*)TEN(7), in->i[5] == 1u);
         break;
 #endif
 #if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_GLU_MX_PF

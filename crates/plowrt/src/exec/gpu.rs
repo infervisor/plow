@@ -1428,6 +1428,23 @@ fn validate_gemv_decode_role_inst(
     Ok(())
 }
 
+fn validate_moe_outer_scales(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if !matches!(DevOp::from_u16(d.op), Some(DevOp::MoeGluMx | DevOp::MoeDownMx))
+            || (d.t[6] == TENSOR_NONE16 && d.t[7] == TENSOR_NONE16)
+        {
+            continue;
+        }
+        let size = |slot: usize| blob.tensors.get(d.t[slot] as usize).map(|t| t.bytes);
+        if d.i[7] != 2 || size(6) != Some(u64::from(d.i[3]) * 4) || size(7) != Some(4) {
+            return Err(RuntimeError::Rejected(
+                "invalid NVFP4 MoE outer-scale operands".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_mxfp4_moe_role_inst(
     d: &DevInst64,
     rows: u32,
@@ -1442,6 +1459,8 @@ fn validate_mxfp4_moe_role_inst(
         || d.i[0] > 16
         || d.i[3] == 0
         || d.i[7] > 2
+        || d.t[6] != TENSOR_NONE16
+        || d.t[7] != TENSOR_NONE16
     {
         return Err(reject());
     }
@@ -1498,7 +1517,7 @@ fn validate_mxfp4_moe_role_inst(
             )?;
             extent(5, checked(&[experts, 2 * inter, 2])?, true)?;
         }
-        Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 => {
+        Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 && d.i[5] == 0 => {
             let hidden = u64::from(d.i[1]);
             let inter = u64::from(d.i[2]);
             let (w_row, s_row) = match d.i[7] {
@@ -4523,6 +4542,7 @@ impl GpuEngine {
                 let image = crate::asset::packet_image::PacketImage::open(&pkt)?;
                 image.blob.check_l2_dispatch(false)?;
                 let blob = image.blob.clone();
+                validate_moe_outer_scales(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {

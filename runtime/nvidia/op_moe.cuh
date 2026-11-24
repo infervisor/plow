@@ -4538,7 +4538,8 @@ static __device__ void d_moe_glu_mx(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
     const bf16* __restrict__ bias, unsigned ksel, unsigned I, unsigned K, unsigned E,
     unsigned layout, unsigned act, unsigned B, float alpha, float limit,
-    unsigned slice, unsigned nblk, unsigned mode = 0) {
+    unsigned slice, unsigned nblk, unsigned mode = 0,
+    const float* amax = nullptr, const float* denominator = nullptr) {
     const float2* s_lut = plow_mxfp4_init_lut(s_moe_mxfp4_lut);
     const bool use_smem_x = false;
 
@@ -4584,13 +4585,29 @@ static __device__ void d_moe_glu_mx(
                     We + (size_t)rg * ldw, We + (size_t)ru * ldw,
                     Se + (size_t)rg * lds, Se + (size_t)ru * lds, xr, K, s_lut));
         float g = gu.x, u = gu.y;
+        if (mode == 2u && amax && denominator) {
+            const float scale = amax[eid] / *denominator;
+            g *= scale;
+            u *= scale;
+        }
         if (bias) {
             g += __bfloat162float(bias[(size_t)eid * N2 + rg]);
             u += __bfloat162float(bias[(size_t)eid * N2 + ru]);
         }
         if ((threadIdx.x & 31u) == 0) {
-            float v = act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
-                                : (act == 1u ? act_silu(g) : act_gelu_tanh(g)) * u;
+            float v;
+            if (act == 4u) {
+                g = __bfloat162float(__float2bfloat16(g));
+                u = __bfloat162float(__float2bfloat16(u));
+                const float sigmoid = 1.0f / (1.0f + __expf(-g));
+                const float gate = alpha > 0.0f ? alpha * tanhf(g / alpha) : g;
+                const float up = limit > 0.0f ? limit * tanhf(u / limit) : u;
+                const float weight = *(const float*)(table + (size_t)slot * 8u + 4u);
+                v = ((gate * sigmoid) * up) * weight;
+            } else {
+                v = act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
+                              : (act == 1u ? act_silu(g) : act_gelu_tanh(g)) * u;
+            }
             fu[(size_t)slot * I + n] = __float2bfloat16(v);
         }
     }
@@ -4602,7 +4619,9 @@ static __device__ void d_moe_down_mx(
     const unsigned char* __restrict__ table, const uint8_t* __restrict__ W,
     const uint8_t* __restrict__ S, const bf16* __restrict__ bias,
     unsigned ksel, unsigned H, unsigned I, unsigned E, unsigned B,
-    unsigned slice, unsigned nblk, unsigned mode = 0) {
+    unsigned slice, unsigned nblk, unsigned mode = 0,
+    const float* amax = nullptr, const float* denominator = nullptr,
+    bool preweighted = false) {
     const float2* s_lut = plow_mxfp4_init_lut(s_moe_mxfp4_lut);
     const bool use_smem_fu = false;
 
@@ -4636,8 +4655,9 @@ static __device__ void d_moe_down_mx(
                         ? plow_nvfp4_row_dot_nv_reg(wr, sr, fu_reg, I, s_lut)
                         : plow_nvfp4_row_dot_nv(wr, sr, fur, I, s_lut))
                     : plow_mxfp4_row_dot_nv(wr, sr, fur, I, s_lut));
+            if (mode == 2u && amax && denominator) v *= amax[eid] / *denominator;
             if (bias) v += __bfloat162float(bias[(size_t)eid * H + h]);
-            v *= *(const float*)(table + (size_t)slot * 8u + 4u);
+            if (!preweighted) v *= *(const float*)(table + (size_t)slot * 8u + 4u);
         }
         if ((threadIdx.x & 31u) == 0) part[(size_t)slot * H + h] = v;
     }

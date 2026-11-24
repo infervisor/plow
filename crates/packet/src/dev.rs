@@ -1887,7 +1887,10 @@ pub enum DevOp {
     /// `t0=fu(bf16[B*k][I]) t1=x(bf16[B][K]) t2=table t3=W_gu(fp4[E][2I][K/2])
     /// t4=S_gu(e8m0[E][2I][K/32]) t5=bias_gu?` ·
     /// `i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch` · `f0=alpha f1=limit`.
-    /// `bias_gu` is bf16 `[E][2I]`.
+    /// `bias_gu` is bf16 `[E][2I]`. CUDA NVFP4 mode (`i7=2`) uses block-16 E4M3 scales
+    /// and accepts paired `t6=amax(f32[E]) t7=denominator(f32)` to scale each expert's
+    /// gate/up projections before the bias and activation. `act=4` takes gate/up caps in `f0/f1`
+    /// and stores BF16 `softcap(gate)*sigmoid(gate)*softcap(up)*router_weight`.
     MoeGluMx = 150,
     /// GPT-OSS MXFP4 MoE, DECODE grouped down + gate scale, flat tensors as [`DevOp::MoeGluMx`]:
     /// `part[s][h] = table[s].gate * (dot(W_e[h], fu[s]) + b_e[h])` in f32 (the bias is inside
@@ -1896,7 +1899,9 @@ pub enum DevOp {
     ///
     /// `t0=part(f32[B*k][H]) t1=fu(bf16[B*k][I]) t2=table t3=W_d(fp4[E][H][I/2])
     /// t4=S_d(e8m0[E][H][I/32]) t5=bias_d?` · `i0=k i1=H i2=I i3=n_exp i6=n_batch`.
-    /// `bias_d` is bf16 `[E][H]`.
+    /// `bias_d` is bf16 `[E][H]`. CUDA NVFP4 accepts the same outer-scale operands
+    /// as [`DevOp::MoeGluMx`], applied before bias and router weighting. Set `i5=1` when the
+    /// activation already includes the router weight.
     MoeDownMx = 151,
     /// PREFILL twin of [`DevOp::MoeGluMx`]: token-sorted gathered rows from
     /// [`DevOp::MoeRouterTopkPf`] + [`DevOp::MoeAlignPf`] exactly as [`DevOp::MoeGroupGluPf`]
@@ -2682,6 +2687,9 @@ pub const ACT_LOG: u32 = 20;
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
 pub const ACT_SWIGLU_OAI: u32 = 3;
+
+/// CUDA flat MoE: softcap gate and up independently, then apply the router weight before rounding.
+pub const ACT_SWIGLU_SOFTCAP: u32 = 4;
 /// GLU-family `act` code for the clamped SwiGLU `silu(min(g, L)) * clamp(u, ±L)` (pair form,
 /// `f1 = L`): DeepSeek-V4 and GLM-5.3-Flash `swiglu_limit`. Only the pair-form epilogues
 /// (`moe_glu`, `act_glu_pair`) serve it; the gate-only GEMM/GEMV GLU epilogues poison it to NaN.
