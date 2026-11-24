@@ -101,6 +101,8 @@ pub const NORMALIZED_RESIDUAL_MIX_ABI: &str = "plow_normalized_residual_mix_abi"
 pub const RESIDUAL_COPY_ABI: &str = "plow_residual_copy_abi";
 /// CUDA normalized residual mixes can select a starting query row.
 pub const RESIDUAL_MIX_QUERY_OFFSET_ABI: &str = "plow_residual_mix_query_offset_abi";
+/// CUDA supports the FP32 message-controller input and output epilogues.
+pub const RESIDUAL_MESSAGE_CONTROLLER_ABI: &str = "plow_residual_message_controller_abi";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

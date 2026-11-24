@@ -1487,6 +1487,34 @@ fn validate_residual_copies(blob: &DevBlob) -> Result<()> {
     Ok(())
 }
 
+fn validate_residual_message_controllers(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::AttnRes as u16 || !matches!(d.i[7], 2 | 3) {
+            continue;
+        }
+        let pair = d.i[7] == 2;
+        let inputs = if pair { 3 } else { 6 };
+        let rows = u64::from(d.i[0]);
+        let width = u64::from(d.i[1]);
+        let epsilon = f32::from_bits(d.fj[0]);
+        let fits = |slot: usize, count: u64, element_size: u64| {
+            count.checked_mul(width)
+                .and_then(|n| n.checked_mul(element_size))
+                .is_some_and(|n| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n))
+        };
+        if rows == 0 || width == 0 || !epsilon.is_finite() || epsilon <= 0.0
+            || d.t[1..inputs].contains(&d.t[0])
+            || d.t[inputs..].iter().any(|&h| h != TENSOR_NONE16)
+            || !fits(0, rows, if pair { 4 } else { 2 })
+            || !(1..if pair { 3 } else { 5 }).all(|slot| fits(slot, rows, 4))
+            || (!pair && !fits(5, 1, 2))
+        {
+            return Err(RuntimeError::Rejected("invalid residual message controller operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_normalized_residual_mix(blob: &DevBlob) -> Result<()> {
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
         if d.op != DevOp::AttnRes as u16 || d.i[7] != 1 { continue; }
@@ -4751,6 +4779,7 @@ impl GpuEngine {
                 validate_relative_attention(&blob)?;
                 validate_normalized_residual_mix(&blob)?;
                 validate_residual_copies(&blob)?;
+                validate_residual_message_controllers(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {

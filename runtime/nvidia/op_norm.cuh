@@ -1099,6 +1099,55 @@ static __device__ void d_normalized_residual_mix(
     }
 }
 
+static __device__ void d_residual_message_pair(
+    __nv_bfloat16* out, const float* dest, const float* message, unsigned rows,
+    unsigned width, float eps, unsigned slice, unsigned nblk) {
+    __shared__ float part[PLOW_NV_WARPS];
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * width;
+        float dest_sq = 0.0f, message_sq = 0.0f;
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            const float a = dest[base + c], b = message[base + c];
+            dest_sq = fmaf(a, a, dest_sq);
+            message_sq = fmaf(b, b, message_sq);
+        }
+        const float da = rsqrtf(block_sum(dest_sq, part) / width + eps);
+        const float db = rsqrtf(block_sum(message_sq, part) / width + eps);
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            out[2 * base + c] = __float2bfloat16(dest[base + c] * da);
+            out[2 * base + width + c] = __float2bfloat16(message[base + c] * db);
+        }
+        __syncthreads();
+    }
+}
+
+static __device__ __forceinline__ float plow_blend_message(float dest, float message, float gain, float forget) {
+    return (1.0f - tanhf(forget)) * dest + tanhf(gain) * message;
+}
+
+static __device__ void d_residual_message_blend(
+    __nv_bfloat16* out, const float* dest, const float* message, const float* gain,
+    const float* forget, const __nv_bfloat16* gamma, unsigned rows, unsigned width,
+    float eps, unsigned slice, unsigned nblk) {
+    __shared__ float part[PLOW_NV_WARPS];
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * width;
+        float sq = 0.0f;
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            const size_t j = base + c;
+            const float value = plow_blend_message(dest[j], message[j], gain[j], forget[j]);
+            sq = fmaf(value, value, sq);
+        }
+        const float inv = rsqrtf(block_sum(sq, part) / width + eps);
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            const size_t j = base + c;
+            const float value = plow_blend_message(dest[j], message[j], gain[j], forget[j]);
+            out[j] = __float2bfloat16(value * inv * __bfloat162float(gamma[c]));
+        }
+        __syncthreads();
+    }
+}
+
 static __device__ __forceinline__ float plow_log_position_scale(const uint32_t* params, int pos) {
     return params ? 1.0f + __uint_as_float(params[1])
         * logf(fmaxf(((float)pos + 1.0f) / params[0], 1.0f)) : 1.0f;

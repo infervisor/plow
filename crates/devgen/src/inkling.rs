@@ -48,6 +48,7 @@ pub(crate) struct InklingCfg {
     pub core_start: usize,
     pub core_end: usize,
     pub num_passes: usize,
+    pub gate_rank: u32,
 }
 
 fn cfg_inkling(v: &Value) -> InklingCfg {
@@ -138,6 +139,7 @@ fn cfg_inkling(v: &Value) -> InklingCfg {
         core_start,
         core_end,
         num_passes,
+        gate_rank: t["loop_config"]["gate_rank"].as_u64().unwrap_or(64) as u32,
     }
 }
 
@@ -162,6 +164,7 @@ struct Emitter<'a> {
     x: u32,
     residual_stack: u32,
     completed_blocks: u32,
+    message_bank: Option<(u32, u32)>,
     hn: u32,
     kg: u32,
     vg: u32,
@@ -358,15 +361,71 @@ impl Emitter<'_> {
         let h = self.c.hidden;
         let (query_row, query_rows) = query;
         let query = self.w(&format!("{}attn_res.{name}", self.c.prefix), query_rows as u64 * h as u64 * F32);
+        self.emit_residual_mix(out, last, addend, query, query_row, gamma,
+            (self.residual_stack, self.completed_blocks), dep)
+    }
+
+    fn emit_residual_mix(&mut self, out: u32, last: u32, addend: u32, query: u32,
+                         query_row: u32, gamma: u32, stack: (u32, u32), dep: u32) -> u32 {
+        let h = self.c.hidden;
         self.b.emit(DevOp::AttnRes, self.rows(), &[dep], |d| {
-            d.t[..4].copy_from_slice(&[out, last, self.residual_stack, query]);
+            d.t[..4].copy_from_slice(&[out, last, stack.0, query]);
             d.t[5] = gamma;
             d.t[7] = addend;
-            d.i[..5].copy_from_slice(&[self.t, h, self.completed_blocks, 1, self.t]);
+            d.i[..5].copy_from_slice(&[self.t, h, stack.1, 1, self.t]);
             d.i[5] = query_row;
             d.i[7] = 1;
             d.f[0] = 1e-6;
             d.f[1] = self.c.eps;
+        })
+    }
+
+    fn blend_message(&mut self, layer: usize, stream: &str, dest: u32, gamma: u32,
+                     out: u32, dep: u32) -> u32 {
+        let (t, h, rank, eps) = (self.t, self.c.hidden, self.c.gate_rank, self.c.eps);
+        let row = 2 * (layer - self.c.core_start) as u32;
+        let (query_name, query_row) = match stream {
+            "attn" => ("middle_cycle_cross_pass_queries", row),
+            "k" => ("middle_cycle_cross_pass_kv_queries", row),
+            "v" => ("middle_cycle_cross_pass_kv_queries", row + 1),
+            "mlp" => ("middle_cycle_cross_pass_queries", row + 1),
+            _ => unreachable!(),
+        };
+        let query = self.w(&format!("{}{query_name}", self.c.prefix),
+            (2 * (self.c.core_end - self.c.core_start)) as u64 * h as u64 * F32);
+        let elements = t as u64 * h as u64;
+        let message = self.b.tensor("act.controller_message", elements * F32);
+        let pair = self.b.tensor("act.controller_pair", elements * 2 * BF16);
+        let hidden = self.b.tensor("act.controller_hidden", t as u64 * rank as u64 * BF16);
+        let gain = self.b.tensor("act.controller_gain", elements * F32);
+        let forget = self.b.tensor("act.controller_forget", elements * F32);
+        let prefix = format!("{}layers.{layer}.controllers.{stream}.", self.c.prefix);
+        let down = self.w(&format!("{prefix}down_weight"), 2 * h as u64 * rank as u64 * BF16);
+        let gain_w = self.w(&format!("{prefix}gain_weight"), h as u64 * rank as u64 * BF16);
+        let forget_w = self.w(&format!("{prefix}forget_weight"), h as u64 * rank as u64 * BF16);
+        let (bank_block, bank_last) = self.message_bank.unwrap();
+        let msg = self.emit_residual_mix(message, bank_last, TENSOR_NONE, query, query_row,
+            TENSOR_NONE, (bank_block, 1), dep);
+        let pair_ready = self.b.emit(DevOp::AttnRes, self.rows(), &[msg], |d| {
+            d.t[..3].copy_from_slice(&[pair, dest, message]);
+            d.i[..2].copy_from_slice(&[t, h]);
+            d.i[7] = 2;
+            d.f[0] = 1e-6;
+        });
+        let down_ready = self.proj(hidden, pair, down, TENSOR_NONE, rank, 2 * h, pair_ready);
+        let mut gate = |out, weight| {
+            self.b.emit(DevOp::GemvF32Out, self.b.all(), &[down_ready], |d| {
+                d.t[..3].copy_from_slice(&[out, hidden, weight]);
+                d.i[..3].copy_from_slice(&[t, h, rank]);
+            })
+        };
+        let gain_ready = gate(gain, gain_w);
+        let forget_ready = gate(forget, forget_w);
+        self.b.emit(DevOp::AttnRes, self.rows(), &[gain_ready, forget_ready], |d| {
+            d.t[..6].copy_from_slice(&[out, dest, message, gain, forget, gamma]);
+            d.i[..2].copy_from_slice(&[t, h]);
+            d.i[7] = 3;
+            d.f[0] = eps;
         })
     }
 
@@ -394,22 +453,35 @@ impl Emitter<'_> {
         let q = self.q;
         let use_residual_stack = !self.block_mode || l == 0;
         let first_in_block = l % c.residual_block_layers == 0;
-        let global_residual_input = full && !self.block_mode && l > 0;
-        let (k_input, v_input) = if global_residual_input {
+        let controlled = self.message_bank.is_some() && (c.core_start..c.core_end).contains(&l);
+        let (q_dep, k_input, v_input) = if controlled || (full && !self.block_mode && l > 0) {
             let query = format!("attn_queries.{}", l - 1);
-            let mut kv_input = |kind, row| {
-                let out = self.b.tensor(&format!("act.{kind}_input"), t as u64 * h as u64 * BF16);
-                let gamma = self.w(&format!("{p}{kind}_input_norm.weight"), h as u64 * BF16);
-                let ready = self.residual_mix(out, self.x, TENSOR_NONE, &query, (row, 3), gamma, dep);
-                (out, ready)
+            let query_rows = if full { 3 } else { 1 };
+            let k = self.b.tensor("act.k_input", t as u64 * h as u64 * BF16);
+            let v = self.b.tensor("act.v_input", t as u64 * h as u64 * BF16);
+            let mut input = |kind, stream, row, out, ready| {
+                let gamma_name = if full { format!("{p}{kind}_input_norm.weight") }
+                    else { format!("{p}attn_norm.weight") };
+                let gamma = self.w(&gamma_name, h as u64 * BF16);
+                if controlled {
+                    let dest = self.b.tensor("act.controller_dest", t as u64 * h as u64 * F32);
+                    let mix = self.residual_mix(dest, self.x, TENSOR_NONE, &query,
+                        (row, query_rows), TENSOR_NONE, ready);
+                    self.blend_message(l, stream, dest, gamma, out, mix)
+                } else {
+                    self.residual_mix(out, self.x, TENSOR_NONE, &query, (row, 3), gamma, ready)
+                }
             };
-            (kv_input("k", 1), kv_input("v", 2))
+            let q_dep = if controlled { input("q", "attn", 0, hn, dep) } else { dep };
+            let k_dep = input("k", "k", u32::from(full), k, q_dep);
+            let v_dep = input("v", "v", if full { 2 } else { 0 }, v, k_dep);
+            (q_dep, (k, k_dep), (v, v_dep))
         } else {
-            ((hn, dep), (hn, dep))
+            (dep, (hn, dep), (hn, dep))
         };
         let (cq, ck, cv) = if self.prefill || t > 1 || self.ladder || k_input.0 != hn {
             (
-                self.proj(q, hn, wq, TENSOR_NONE, qd, h, dep),
+                self.proj(q, hn, wq, TENSOR_NONE, qd, h, q_dep),
                 self.proj(kg, k_input.0, wk, TENSOR_NONE, kd, h, k_input.1),
                 self.proj(vg, v_input.0, wv, TENSOR_NONE, kd, h, v_input.1),
             )
@@ -439,7 +511,7 @@ impl Emitter<'_> {
         let rel_weight = self.w(&format!("{p}attn.wr_du.weight"), (heads * 16) as u64 * h as u64 * BF16);
         let rel_scale = self.w(&format!("{p}attn.rel_l2_clip.scale"), (heads * 16) as u64 * BF16);
         let rel_proj = self.w(&format!("{p}attn.rel_logits_proj.proj"), (16 * c.rel_extent) as u64 * BF16);
-        let c_r = self.proj(self.rel, hn, rel_weight, TENSOR_NONE, heads * 16, h, dep);
+        let c_r = self.proj(self.rel, hn, rel_weight, TENSOR_NONE, heads * 16, h, q_dep);
         let rel_logits = self.rel_logits;
         let c_rel = self.b.emit(DevOp::HeadNormRope, self.b.all(), &[c_r], |d| {
             d.t[..6].copy_from_slice(&[rel_logits, self.rel, rel_scale, rel_proj, tau, self.pos]);
@@ -462,8 +534,8 @@ impl Emitter<'_> {
         let attn_sink = self.attn_sink;
         let wg = self.w(&format!("{p}attn.gate_attn.weight"), qd as u64 * h as u64 * BF16);
         let ws = self.w(&format!("{p}attn.attn_sink_proj.weight"), heads as u64 * h as u64 * BF16);
-        let c_gate = self.proj(attn_gate, hn, wg, TENSOR_NONE, qd, h, dep);
-        let c_sink = self.proj(attn_sink, hn, ws, TENSOR_NONE, heads, h, dep);
+        let c_gate = self.proj(attn_gate, hn, wg, TENSOR_NONE, qd, h, q_dep);
+        let c_sink = self.proj(attn_sink, hn, ws, TENSOR_NONE, heads, h, q_dep);
         let c_fa = if self.prefill {
             self.b.emit(
                 DevOp::FlashPrefill,
@@ -543,7 +615,14 @@ impl Emitter<'_> {
             let conv = self.residual_conv(&p, "attn", pass_idx, attn_conv, og,
                 TENSOR_NONE, TENSOR_NONE, ready);
             let (last, addend) = if first_in_block { (attn_conv, TENSOR_NONE) } else { (residual, attn_conv) };
-            self.residual_mix(hn, last, addend, &format!("mlp_queries.{l}"), (0, 1), g_mlp, conv)
+            let query = format!("mlp_queries.{l}");
+            if controlled {
+                let dest = self.b.tensor("act.controller_dest", t as u64 * h as u64 * F32);
+                let mix = self.residual_mix(dest, last, addend, &query, (0, 1), TENSOR_NONE, conv);
+                self.blend_message(l, "mlp", dest, g_mlp, hn, mix)
+            } else {
+                self.residual_mix(hn, last, addend, &query, (0, 1), g_mlp, conv)
+            }
         } else {
             self.add_norm(og, g_mlp, c_o)
         };
@@ -788,6 +867,7 @@ fn phase_range(
         x,
         residual_stack: x,
         completed_blocks: 1,
+        message_bank: None,
         hn,
         kg,
         vg,
@@ -885,6 +965,11 @@ fn phase_range(
         };
         if !block_mode && c.num_passes > 1 && l == c.core_start {
             if let Some((snapshot, blocks)) = prelude {
+                let bank_block = em.b.tensor("act.message_bank_block", tr * h as u64 * BF16);
+                let bank_last = em.b.tensor("act.message_bank_last", tr * h as u64 * BF16);
+                dep = em.copy_residual(bank_block, 0, em.residual_stack, blocks + 1, dep);
+                dep = em.copy_residual(bank_last, 0, em.x, 0, dep);
+                em.message_bank = Some((bank_block, bank_last));
                 em.x = snapshot;
                 em.completed_blocks = blocks;
                 dep = if l == 0 {

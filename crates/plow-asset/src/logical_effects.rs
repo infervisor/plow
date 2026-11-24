@@ -194,6 +194,7 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
             Some(&[0])
         }
         SoftCap | Argmax | ArgmaxFin if all(&[0, 1]) => Some(&[0]),
+        GemvF32Out if d.i[7] == 0 && all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => Some(&[0]),
         GemvArgmax if all(&[0, 1, 2, 3]) => Some(&[0, 3]),
         FlashDecode if d.fj[2] == packet::dev::FLASH_DECODE_RELATIVE
             && all(&[0, 1, 2, 3, 4, 5, 7]) && none(&[6]) => Some(&[0, 1]),
@@ -307,6 +308,8 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3])
             && (if d.i[4] != 0 { !has(5) || has(7) } else { none(&[5, 6, 7]) })
             => Some(&[0, 3]),
+        AttnRes if d.i[7] == 2 && all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => Some(&[0]),
+        AttnRes if d.i[7] == 3 && all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0]),
         AttnRes if d.i[7] == 1 && all(&[0, 1, 3]) && (d.i[2] == 0 || has(2)) => Some(&[0]),
         QwenGdnGatePrep if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
         QwenGdnQkvPrep if all(&[0, 1, 2, 3]) && none(&[4, 5, 6, 7]) => Some(&[0, 1, 2]),
@@ -322,6 +325,7 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         | SoftCap
         | Argmax
         | ArgmaxFin
+        | GemvF32Out
         | GemvArgmax
         | FlashDecode
         | FlashDecodeFp8

@@ -1199,6 +1199,11 @@ pub enum DevOp {
     /// Here i2 counts stack blocks, i3 counts queries and i4 is the stack stride
     /// in rows. i5 is the starting row in slot 3. Output is query-major FP32
     /// without gamma and BF16 with gamma.
+    /// Mode 2 independently RMS-normalizes FP32 destination and message
+    /// (slots 1 and 2), writing their concatenation as BF16 per row.
+    /// Mode 3 mixes them using FP32 gain and forget logits (slots 3 and 4),
+    /// then applies BF16 gamma (slot 5) after RMSNorm. Both use i0 rows,
+    /// i1 hidden width, and f0 epsilon.
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).
