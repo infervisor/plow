@@ -1921,7 +1921,7 @@ pub enum DevOp {
     ///
     /// `t0=fu(bf16[B*k][I]) t1=x(bf16[B][K]) t2=table t3=W_gu(fp4[E][2I][K/2])
     /// t4=S_gu(e8m0[E][2I][K/32]) t5=bias_gu?` ·
-    /// `i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch` · `f0=alpha f1=limit`.
+    /// `i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch i7=mode` · `f0=alpha f1=limit`.
     /// `bias_gu` is bf16 `[E][2I]`. CUDA NVFP4 mode (`i7=2`) uses block-16 E4M3 scales
     /// and accepts paired `t6=amax(f32[E]) t7=denominator(f32)` to scale each expert's
     /// gate/up projections before the bias and activation. `act=4` takes gate/up caps in `f0/f1`
@@ -1933,7 +1933,7 @@ pub enum DevOp {
     /// is [`DevOp::MoeCombine`] / [`DevOp::MoeCombinePf`] (`i2 = T = n_batch`) in fixed slot order.
     ///
     /// `t0=part(f32[B*k][H]) t1=fu(bf16[B*k][I]) t2=table t3=W_d(fp4[E][H][I/2])
-    /// t4=S_d(e8m0[E][H][I/32]) t5=bias_d?` · `i0=k i1=H i2=I i3=n_exp i6=n_batch`.
+    /// t4=S_d(e8m0[E][H][I/32]) t5=bias_d?` · `i0=k i1=H i2=I i3=n_exp i6=n_batch i7=mode`.
     /// `bias_d` is bf16 `[E][H]`. CUDA NVFP4 accepts the same outer-scale operands
     /// as [`DevOp::MoeGluMx`], applied before bias and router weighting. Set `i5=1` when the
     /// activation already includes the router weight.
@@ -1945,7 +1945,7 @@ pub enum DevOp {
     /// segment: `fu_g[r] = swiglu_oai(W_e xn2[row_token[r]] + b_e)`.
     ///
     /// `t0=fu_g(bf16[rows][I]) t1=xn2(bf16[T][K]) t2=W_gu t3=S_gu t4=meta(i32) t5=row_token(u32)
-    /// t6=bias_gu?` · `i0=I i1=K i2=n_exp i3=layout i5=act` · `f0=alpha f1=limit`.
+    /// t6=bias_gu?` · `i0=I i1=K i2=n_exp i3=layout i5=act i7=mode` · `f0=alpha f1=limit`.
     MoeGluMxPf = 152,
     /// PREFILL twin of [`DevOp::MoeDownMx`], slot map after [`DevOp::MoeGroupDownPf`] (the bias
     /// takes the `fu_scale` slot these flat-fp4 ops do not need):

@@ -496,6 +496,10 @@ class MoeCostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no preceding router"):
             op_roof.price(prog, 128, 2, 2, 3000, 989)
 
+    def test_nvfp4_gate_prices_one_fused_activation_and_block16_scales(self):
+        p = {"T": 2, "k": 2, "experts": 3, "I": 8, "K": 32, "mode": 2}
+        self.assertEqual(op_roof.moe_cost("MoeGluMx", p, 2, 2), (1056, 4096))
+
     def test_mxfp4_decode_and_prefill_moe_are_priced(self):
         decode_txt = ("===== program T=1 =====\n"
                       "#10 MoeRouterTopkPf b=1 table<-act.tab logit<-act.logit atom_acc?<-— bias<-— | atom_h=0 n_exp=128 k=8 flags=0 T=1 shared_tail=0 route_scale=8.0 logit_scale?=—\n"

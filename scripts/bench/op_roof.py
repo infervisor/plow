@@ -337,7 +337,7 @@ def moe_cost(op, p, rows, wb):
     """Gemma-4 and MXFP4 MoE (NVIDIA). Expert weights are charged for `experts` touched experts
     (`price` injects it from the router-table or uniform-routing model); FP8/W8A8 experts carry
     one-byte weights plus an FP32 scale per output row; MXFP4 carries half-byte weights plus an
-    FP8 scale per 16 elements. The partial sums are FP32 (`act.moe.part`)."""
+    scale per 32 elements (16 for NVFP4). The partial sums are FP32 (`act.moe.part`)."""
     g = p.get
     if op in ("MoeRouterGemmaScoreFast", "MoeRouterGemmaPf"):
         t, h, n = (g("T", rows) if op == "MoeRouterGemmaPf" else rows), g("H"), g("n_exp")
@@ -354,16 +354,18 @@ def moe_cost(op, p, rows, wb):
         t, k = g("T", rows), g("k")
         if None in (t, k, g("experts")):
             raise ValueError(f"{op}: expert shape needs T, k and the touched-expert count")
+        mode = g("mode", 0)
+        weight_bytes = 1 if mode == 1 else 0.5
+        block_size = 16 if mode in (2, 3) else 32
         if op in ("MoeGluMx", "MoeGluMxPf"):
             k_in, i = g("K"), g("I")
-            n_out = 2 * i
-            weight = g("experts") * (n_out * k_in * 0.5 + n_out * (k_in / 16.0))
+            weight = g("experts") * 2 * i * (k_in * weight_bytes + k_in / block_size)
             act_in = 2 * t * k_in
-            act_out = 2 * t * k * n_out
-            return weight + act_in + act_out, 2 * t * k * n_out * k_in
+            act_out = 2 * t * k * i
+            return weight + act_in + act_out, 4 * t * k * i * k_in
         if op in ("MoeDownMx", "MoeDownMxPf"):
             h, i = g("H"), g("I")
-            weight = g("experts") * (h * i * 0.5 + h * (i / 16.0))
+            weight = g("experts") * h * (i * weight_bytes + i / block_size)
             act_in = 2 * t * k * i
             act_out = 4 * t * k * h
             return weight + act_in + act_out, 2 * t * k * h * i
