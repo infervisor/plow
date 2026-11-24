@@ -333,6 +333,7 @@ impl Emitter<'_> {
             && crate::emit_config::active().nv_fa_fold
             && !crate::emit_is_amd()
             && !crate::emit_is_apple();
+        let at = self.at;
         let c_fa = if self.prefill {
             self.b.emit(
                 DevOp::FlashPrefill,
@@ -344,6 +345,7 @@ impl Emitter<'_> {
                     d.t[2] = q;
                     d.t[3] = kc;
                     d.t[4] = vc;
+                    d.t[5] = at;
                     d.i[0] = t;
                     d.i[1] = t;
                     d.i[2] = heads;
@@ -545,7 +547,7 @@ fn phase_range(
 
     let ns = if prefill {
         n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
-            .max(1)
+            .max(2)
     } else {
         n_cu.div_ceil(heads).max(1)
     };
