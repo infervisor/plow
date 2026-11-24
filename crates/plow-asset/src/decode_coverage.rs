@@ -151,9 +151,9 @@ impl DenseBf16 {
                     && i[2] > 0
                     && i[3] > 0
                     && i[4] <= 1
-                    && matches!(i[5], 0 | 1 | 3 | 4)
+                    && matches!(i[5], 0 | 1 | 3)
                     && batch(i[6])
-                    && (!matches!(i[5], 3 | 4)
+                    && (i[5] != 3
                         || (f32::from_bits(d.fj[0]).is_finite()
                             && f32::from_bits(d.fj[1]).is_finite()
                             && f32::from_bits(d.fj[0]) > 0.0
