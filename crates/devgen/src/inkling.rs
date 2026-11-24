@@ -44,6 +44,7 @@ pub(crate) struct InklingCfg {
     pub log_alpha: f32,
     pub prefix: String,
     pub is_full: Vec<bool>,
+    pub residual_block_layers: usize,
     pub core_start: usize,
     pub core_end: usize,
     pub num_passes: usize,
@@ -133,6 +134,7 @@ fn cfg_inkling(v: &Value) -> InklingCfg {
         qk_clip: t["qk_l2_clip_threshold"].as_f64().expect("missing qk_l2_clip_threshold") as f32,
         prefix,
         is_full,
+        residual_block_layers: t["n_layers_per_attn_res_block"].as_u64().unwrap_or(6) as usize,
         core_start,
         core_end,
         num_passes,
@@ -158,6 +160,7 @@ struct Emitter<'a> {
     k_taps: u32,
     v_taps: u32,
     x: u32,
+    embed_snapshot: u32,
     hn: u32,
     kg: u32,
     vg: u32,
@@ -317,27 +320,29 @@ impl Emitter<'_> {
         })
     }
 
-    fn first_layer_conv(&mut self, prefix: &str, name: &str, out: u32, src: u32,
-                        addend: u32, dep: u32) -> u32 {
+    fn residual_conv(&mut self, prefix: &str, name: &str, visit: usize, out: u32, src: u32,
+                     residual: u32, addend: u32, dep: u32) -> u32 {
         let h = self.c.hidden;
         let weight = self.w(&format!("{prefix}{name}_sconv.weight"), h as u64 * 4 * BF16);
-        let history = self.b.tensor(&format!("state.inkling.0.{name}"),
+        let history = self.b.tensor(&format!("state.inkling.{visit}.{name}"),
                                     self.dbatch as u64 * h as u64 * 3 * BF16);
         let op = if self.prefill { DevOp::QwenGdnConvPrefill } else { DevOp::QwenGdnConv };
         self.b.emit(op, self.b.all(), &[dep], |d| {
             d.t[..5].copy_from_slice(&[out, src, weight, history, self.active]);
+            d.t[5] = residual;
             d.t[7] = addend;
             d.i[..5].copy_from_slice(&[h, 4, self.t, if self.prefill { self.t } else { 0 }, h]);
             d.f[0] = 1.0 / 5.0f32.sqrt();
         })
     }
 
-    fn first_layer_mix(&mut self, last: u32, name: &str, gamma: u32, dep: u32) -> u32 {
+    fn prelude_mix(&mut self, last: u32, addend: u32, name: &str, query_rows: u64, gamma: u32, dep: u32) -> u32 {
         let h = self.c.hidden;
-        let query = self.w(&format!("{}attn_res.{name}", self.c.prefix), h as u64 * F32);
+        let query = self.w(&format!("{}attn_res.{name}", self.c.prefix), query_rows * h as u64 * F32);
         self.b.emit(DevOp::AttnRes, self.rows(), &[dep], |d| {
-            d.t[..4].copy_from_slice(&[self.hn, last, self.x, query]);
+            d.t[..4].copy_from_slice(&[self.hn, last, self.embed_snapshot, query]);
             d.t[5] = gamma;
+            d.t[7] = addend;
             d.i[..5].copy_from_slice(&[self.t, h, 1, 1, self.t]);
             d.i[7] = 1;
             d.f[0] = 1e-6;
@@ -492,14 +497,19 @@ impl Emitter<'_> {
         });
         let og = self.og;
         let c_o = self.proj(og, at, wo, TENSOR_NONE, h, qd, c_attn_out);
-        let first_attn = if l == 0 {
-            self.b.tensor("act.first_attn", t as u64 * h as u64 * BF16)
+        let use_prelude_mix = l == 0 || (!self.block_mode && l < c.core_start
+            && l < c.residual_block_layers && c.is_full[..=l].iter().all(|&full| !full));
+        let attn_conv = if use_prelude_mix {
+            self.b.tensor("act.attn_conv", t as u64 * h as u64 * BF16)
         } else {
             TENSOR_NONE
         };
-        let c_n1 = if l == 0 {
-            let conv = self.first_layer_conv(&p, "attn", first_attn, og, TENSOR_NONE, c_o);
-            self.first_layer_mix(first_attn, "mlp_queries.0", g_mlp, conv)
+        let residual = if use_prelude_mix && l != 0 { self.x } else { TENSOR_NONE };
+        let c_n1 = if use_prelude_mix {
+            let conv = self.residual_conv(&p, "attn", pass_idx, attn_conv, og,
+                TENSOR_NONE, TENSOR_NONE, c_o);
+            let (last, addend) = if l == 0 { (attn_conv, TENSOR_NONE) } else { (residual, attn_conv) };
+            self.prelude_mix(last, addend, &format!("mlp_queries.{l}"), 1, g_mlp, conv)
         } else {
             self.add_norm(og, g_mlp, c_o)
         };
@@ -602,7 +612,7 @@ impl Emitter<'_> {
             d.i[7] = quant_mode;
         });
 
-        if l != 0 && crate::emit_config::active().nv_moe_combine_fold {
+        if !use_prelude_mix && crate::emit_config::active().nv_moe_combine_fold {
             self.add_norm_moe_fold(part, gamma_next, k, c_d)
         } else {
             let c_c = self.b.emit(DevOp::MoeCombinePf, self.b.all(), &[c_d], |d| {
@@ -613,17 +623,20 @@ impl Emitter<'_> {
                 d.i[2] = t;
             });
 
-            if l == 0 {
+            if use_prelude_mix {
                 let next = if self.block_mode {
                     self.x
                 } else {
-                    self.b.tensor("act.first_partial", t as u64 * h as u64 * BF16)
+                    self.b.tensor(if l % 2 == 0 { "act.partial_even" } else { "act.partial_odd" },
+                        t as u64 * h as u64 * BF16)
                 };
-                let conv = self.first_layer_conv(&p, "mlp", next, moe, first_attn, c_c);
+                let conv = self.residual_conv(&p, "mlp", pass_idx, next, moe, residual, attn_conv, c_c);
                 if self.block_mode {
                     conv
                 } else {
-                    let mix = self.first_layer_mix(next, "attn_queries.0", gamma_next, conv);
+                    let query_rows = if c.is_full.get(l + 1) == Some(&true) { 3 } else { 1 };
+                    let mix = self.prelude_mix(next, TENSOR_NONE, &format!("attn_queries.{l}"),
+                        query_rows, gamma_next, conv);
                     self.x = next;
                     mix
                 }
@@ -734,6 +747,7 @@ fn phase_range(
         k_taps,
         v_taps,
         x,
+        embed_snapshot: x,
         hn,
         kg,
         vg,
