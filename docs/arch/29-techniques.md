@@ -295,12 +295,12 @@ Emitter: `crates/devgen/src/mla/dsv41.rs` (`--block` multi-layer devblobs only).
 emit refuses (`dsv41_refusal`, `devgen/src/lib.rs`).
 
 KV / state class: a compressed cache per `kv_source` layer that grows by one row every `ratio`
-tokens (docs/amd/deepseek-v41-flash-mi300x.md §6.3). No `plow-asset` section or runtime cache
+tokens (`docs/amd/deepseek-v4-mi300x.md`). No `plow-asset` section or runtime cache
 class declares it yet.
 
 Status: AMD kernels plus block emit only; not servable.
 
-Deeper: docs/amd/deepseek-v4-mi300x.md, docs/amd/deepseek-v41-flash-mi300x.md §5–6.
+Deeper: docs/amd/deepseek-v4-mi300x.md.
 
 ### Engram conditional memory (hashed n-gram lookup)
 
@@ -336,7 +336,7 @@ lookback over token ids for the hash. That cache is still listed as emitter work
 
 Status: AMD kernel sources plus block emit; not dispatched, not servable.
 
-Deeper: docs/amd/deepseek-v41-flash-mi300x.md.
+Deeper: docs/amd/deepseek-v4-mi300x.md.
 
 ### Hyper-connections (mHC: multi-stream residual)
 
@@ -369,7 +369,7 @@ KV / state class: none. The `n` streams are activations, `n×` the hidden size p
 
 Status: AMD gfx942 / gfx950 (GLM-5.3-Flash); no NVIDIA or CPU arm.
 
-Deeper: docs/amd/glm53-flash-mi350x.md, docs/amd/deepseek-v41-flash-mi300x.md §6.1.
+Deeper: docs/amd/glm53-mi300x.md, docs/amd/deepseek-v4-mi300x.md.
 
 ### Attention residuals (AttnRes: softmax mix over block residuals)
 
@@ -546,7 +546,7 @@ prefix snapshot.
 
 Status: gfx942/gfx950 only.
 
-Deeper: docs/kimi-k3-kda.md (outside arch).
+Deeper: docs/amd/kimi-k3-mi325x.md (outside arch).
 
 ### Mamba-2 selective scan (SSD)
 

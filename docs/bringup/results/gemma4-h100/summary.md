@@ -164,8 +164,7 @@ history, not qualified. Campaign notes: `plans/gemma4-26b-a4b-h100-tracker.md`.
 - H100 2026-10-10: FP8 and BF16 recipes and the strict comparison vs vLLM 0.28:
   [gemma31b-h100-20261010/comparison.md](../gemma31b-h100-20261010/comparison.md).
 - H100 (earlier): frozen release `/opt/dlami/nvme/plow-releases/gemma4-31b-h100-20260909`, functionally
-  validated profiles only ([gemma4-h100-release.md](../../../runtime/gemma4-h100-release.md),
-  [gemma4-h100-checkpoint.md](../../../runtime/gemma4-h100-checkpoint.md)). No serving
+  validated profiles only ([gemma4-e4b-h100.md](../../../runtime/gemma4-e4b-h100.md)). No serving
   comparison is recorded.
 - MI300X: qualified 2026-09-07 (TP1, BF16, 8K context) on numerics and serving checks; the stock
   `vllm bench serve` baseline favors vLLM in every throughput, TTFT and TPOT cell
