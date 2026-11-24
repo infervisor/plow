@@ -1606,7 +1606,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                              in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, arena);
         break;
 
-    /* Gemma final-logit softcap: out = cap * tanh(x / cap), cap = f0 = 30. */
+#endif
+
+#if PLOW_NV_GEMMA || PLOW_HAS_SOFTCAP
+    /* Final-logit softcap: out = cap * tanh(x / cap), cap = f0. */
     case PLOW_DOP_SOFTCAP:
         d_softcap((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), in->i[0], in->fj[0].f, slice,
                   nblk);
