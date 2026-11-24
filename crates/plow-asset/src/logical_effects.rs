@@ -194,7 +194,10 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         }
         SoftCap | Argmax | ArgmaxFin if all(&[0, 1]) => Some(&[0]),
         GemvArgmax if all(&[0, 1, 2, 3]) => Some(&[0, 3]),
-        FlashDecode if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
+        FlashDecode if d.fj[2] == packet::dev::FLASH_DECODE_RELATIVE
+            && all(&[0, 1, 2, 3, 4, 5, 7]) && none(&[6]) => Some(&[0, 1]),
+        FlashDecode if d.fj[2] != packet::dev::FLASH_DECODE_RELATIVE
+            && all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
         FlashDecodeFp8 if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0, 1]),
         FlashMerge if d.i[4] == 0 && all(&[0, 1, 2]) && none(&[3]) => Some(&[0]),
         FlashPrefill if all(&[0, 1, 2, 3, 4, 7]) && none(&[5]) && d.t[6] == d.t[7]
@@ -412,7 +415,7 @@ fn handle_accesses(d: &DevInst64) -> Result<Vec<(u32, bool)>, String> {
     };
     let fold = d.fj[2];
     let accesses: Vec<(u32, bool)> = match DevOp::from_u16(d.op) {
-        Some(DevOp::FlashDecode) if fold != 0 => vec![(fold & 0xFFFF, true), (fold >> 16, true)],
+        Some(DevOp::FlashDecode) if fold != 0 && fold != packet::dev::FLASH_DECODE_RELATIVE => vec![(fold & 0xFFFF, true), (fold >> 16, true)],
         Some(DevOp::FlashDecodeFp8) if fold != 0 => vec![(fold, false)],
         Some(DevOp::Gemv) if d.i[3] == 4 => reads(&[d.i[5], d.i[6], d.i[7]]),
         Some(DevOp::GemvGlu) if d.i[3] == 4 && fold == 0 => reads(&[d.i[4], d.i[6], d.i[7]]),
@@ -1085,6 +1088,8 @@ mod tests {
         (DevOp::GemvArgmax, &[0, 1, 2, 3], &[], 0, Some(&[0, 3]), "op_gemm.cuh:817 C, :828 part"),
         (DevOp::FlashDecode, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0, 1]), "op_attention.cuh:965-968 Opart/mlpart"),
         (DevOp::FlashDecode, &[0, 1, 2, 3, 4, 5, 7], &[], 0, None, "t7 HeadNormRope-fold descriptor"),
+        (DevOp::FlashDecode, &[0, 1, 2, 3, 4, 5, 7], &[], packet::dev::FLASH_DECODE_RELATIVE, Some(&[0, 1]), "relative logits read from t7"),
+        (DevOp::FlashDecode, &[0, 1, 2, 3, 4, 5], &[], packet::dev::FLASH_DECODE_RELATIVE, None, "relative logits required"),
         (DevOp::FlashDecodeFp8, &[0, 1, 2, 3, 4, 5, 6, 7], &[], 0, Some(&[0, 1]), "interp_sm120.cu:2832 same stores, scales read"),
         (DevOp::FlashMerge, &[0, 1, 2], &[], 0, Some(&[0]), "op_attention.cuh:3250 O"),
         (DevOp::FlashMerge, &[0, 1, 2], &[(4, 1024)], 0, None, "padded MLA layout producer"),
