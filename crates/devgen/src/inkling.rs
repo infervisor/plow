@@ -149,6 +149,7 @@ struct Emitter<'a> {
     prefill: bool,
     fp32_router: bool,
     grouped_nvfp4_down: bool,
+    grouped_nvfp4_glu: bool,
     t: u32,
     dbatch: u32,
     ladder: bool,
@@ -700,7 +701,7 @@ impl Emitter<'_> {
         };
 
         let (gate_cap, up_cap) = (c.mlp_gate_softcap, c.mlp_up_softcap);
-        let c_g = self.b.emit(DevOp::MoeGluMx, self.b.all(), &[c_tk], |d| {
+        let emit_glu = |b: &mut Builder| b.emit(DevOp::MoeGluMx, b.all(), &[c_tk], |d| {
             d.t[0] = fu;
             d.t[1] = hn;
             d.t[2] = tab;
@@ -724,18 +725,32 @@ impl Emitter<'_> {
             let aligned_rows = slots + 63 * e;
             let meta = self.b.tensor("act.moe_meta", (3 * u64::from(e) + 1) * 4);
             let row_token = self.b.tensor("act.moe_row_token", u64::from(aligned_rows) * 4);
-            let row_partidx = self.b.tensor("act.moe_row_partidx", u64::from(aligned_rows) * 4);
-            let row_gate = self.b.tensor("act.moe_row_gate", u64::from(aligned_rows) * 4);
+            let row_bytes = u64::from(aligned_rows) * 4;
+            let glu = self.grouped_nvfp4_glu;
+            let row_partidx = self.b.tensor("act.moe_row_partidx", row_bytes * if glu { 2 } else { 1 });
+            let row_gate = if glu { row_partidx } else { self.b.tensor("act.moe_row_gate", row_bytes) };
             let aligned = self.b.emit(DevOp::MoeAlignPf, vec![0], &[c_tk], |d| {
                 d.t[..5].copy_from_slice(&[meta, tab, row_token, row_partidx, row_gate]);
                 d.i[..3].copy_from_slice(&[t, e, k]);
+                d.i[3] = if glu { aligned_rows } else { 0 };
             });
+            let c_g = if glu {
+                self.b.emit(DevOp::MoeGluMxPf, self.b.all(), &[aligned], |d| {
+                    d.t.copy_from_slice(&[fu, hn, w_gu, s_gu, meta, row_partidx, gu_amax, gu_denominator]);
+                    d.i[..6].copy_from_slice(&[inter, h, e, slots, aligned_rows, k]);
+                    d.i[7] = 3;
+                    d.f[..2].copy_from_slice(&[gate_cap, up_cap]);
+                })
+            } else {
+                emit_glu(&mut self.b)
+            };
             self.b.emit(DevOp::MoeDownMxPf, self.b.all(), &[c_g, aligned], |d| {
                 d.t.copy_from_slice(&[part, fu, w_d, s_d, meta, down_amax, row_partidx, down_denominator]);
                 d.i[..5].copy_from_slice(&[h, inter, e, slots, aligned_rows]);
                 d.i[7] = 3;
             })
         } else {
+            let c_g = emit_glu(&mut self.b);
             self.b.emit(DevOp::MoeDownMx, self.b.all(), &[c_g], |d| {
                 d.t[0] = part;
                 d.t[1] = fu;
@@ -811,6 +826,7 @@ fn phase_range(
     prefill: bool,
     fp32_router: bool,
     grouped_nvfp4_down: bool,
+    grouped_nvfp4_glu: bool,
     tensors: Option<Vec<TensorDecl>>,
     layers: std::ops::Range<usize>,
 ) -> Phase {
@@ -883,6 +899,7 @@ fn phase_range(
         prefill,
         fp32_router,
         grouped_nvfp4_down,
+        grouped_nvfp4_glu,
         t,
         dbatch,
         ladder,
@@ -1115,8 +1132,9 @@ pub(super) fn run(
     );
     let ecfg = emit_config::active();
     let fp32_router = arch == "sm_90a";
-    let grouped_nvfp4_down = arch == "sm_90a"
-        && ecfg.moe_prefill.as_deref() == Some("inkling-nvfp4");
+    let grouped_nvfp4_glu = arch == "sm_90a" && ecfg.moe_prefill.as_deref() == Some("inkling-nvfp4-glu");
+    let grouped_nvfp4_down = grouped_nvfp4_glu
+        || (arch == "sm_90a" && ecfg.moe_prefill.as_deref() == Some("inkling-nvfp4"));
     let mut rungs = ecfg.decode_rungs();
     let mut dbatch = *rungs.last().expect("decode_rungs is non-empty");
     let chunk = ecfg.max_chunk.unwrap_or(DEFAULT_CHUNK.min(ctx));
@@ -1137,6 +1155,7 @@ pub(super) fn run(
                     chunk,
                     false,
                     fp32_router,
+                    false,
                     false,
                     None,
                     layers.clone(),
@@ -1186,6 +1205,7 @@ pub(super) fn run(
             true,
             fp32_router,
             grouped_nvfp4_down,
+            grouped_nvfp4_glu,
             tensors.take(),
             layers.clone(),
         );
@@ -1204,6 +1224,7 @@ pub(super) fn run(
             chunk,
             false,
             fp32_router,
+            false,
             false,
             tensors.take(),
             layers.clone(),

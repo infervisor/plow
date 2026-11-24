@@ -3216,9 +3216,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_ALIGN_PF
     case PLOW_DOP_MOE_ALIGN_PF:
-        if (in->i[3] || in->i[4]) { __trap(); break; }
+        if (in->i[4] || (in->i[3] && TEN(3) != TEN(4))) { __trap(); break; }
         d_moe_align_pf_nv((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
-                          (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                          (unsigned*)TEN(3), (float*)TEN(4) + in->i[3], in->i[0], in->i[1], in->i[2],
                           slice);
         break;
 #endif
@@ -3243,6 +3243,19 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_GLU_MX_PF
     case PLOW_DOP_MOE_GLU_MX_PF:
+        if (in->i[7] == 3u) {
+#if defined(PLOW_NV_HOPPER)
+            if (!in->i[5]) { __trap(); break; }
+            d_nvfp4_grouped_hopper<true>((bf16*)TEN(0), (const bf16*)TEN(1),
+                (const uint8_t*)TEN(2), (const uint8_t*)TEN(3), (const int*)TEN(4),
+                (const float*)TEN(6), (const unsigned*)TEN(5), (const float*)TEN(7),
+                2u * in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk,
+                in->i[5], in->fj[0].f, in->fj[1].f);
+#else
+            __trap();
+#endif
+            break;
+        }
         d_moe_glu_mx_pf((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                         (const uint8_t*)TEN(2), (const uint8_t*)TEN(3), (const int*)TEN(4),
                         (const unsigned*)TEN(5), (const __nv_bfloat16*)TEN(6), in->i[0],
@@ -3254,7 +3267,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_MOE_DOWN_MX_PF:
         if (in->i[7] == 3u) {
 #if defined(PLOW_NV_HOPPER)
-            d_nvfp4_grouped_down_hopper((float*)TEN(0), (const bf16*)TEN(1),
+            d_nvfp4_grouped_hopper<false>((float*)TEN(0), (const bf16*)TEN(1),
                 (const uint8_t*)TEN(2), (const uint8_t*)TEN(3), (const int*)TEN(4),
                 (const float*)TEN(5), (const unsigned*)TEN(6), (const float*)TEN(7),
                 in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk);
@@ -3828,6 +3841,9 @@ extern "C" __device__ unsigned plow_gdn_prefill_abi = 0;
 #endif
 #if defined(PLOW_NV_HOPPER) && PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX_PF
 extern "C" __device__ unsigned plow_nvfp4_grouped_down_abi = 1;
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_GLU_MX_PF && PLOW_HAS_MOE_ALIGN_PF && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned plow_nvfp4_grouped_glu_abi = 1;
 #endif
 #if PLOW_NV_QWEN_GDN
 /* object_requirements GDN_PITCHED_ABI: QwenGdnConv/ConvPrefill/GatedNorm honor j1 = pitch | col << 16. */

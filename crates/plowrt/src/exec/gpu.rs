@@ -1636,16 +1636,46 @@ fn validate_moe_outer_scales(blob: &DevBlob) -> Result<()> {
     Ok(())
 }
 
-fn validate_grouped_nvfp4_down(blob: &DevBlob) -> Result<()> {
+fn validate_grouped_nvfp4(blob: &DevBlob) -> Result<()> {
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
-        if d.op != DevOp::MoeDownMxPf as u16 || d.i[7] != 3 {
+        let op = DevOp::from_u16(d.op);
+        if !matches!(op, Some(DevOp::MoeAlignPf | DevOp::MoeDownMxPf | DevOp::MoeGluMxPf)) {
             continue;
         }
-        let [hidden, inner, experts, slots, aligned_rows, ..] = d.i.map(u64::from);
         let fits = |slot: usize, factors: &[u64]| {
             factors.iter().try_fold(1u64, |n, &factor| n.checked_mul(factor))
                 .is_some_and(|bytes| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= bytes))
         };
+        if op == Some(DevOp::MoeAlignPf) {
+            let [rows, experts, topk, aligned_rows, ..] = d.i.map(u64::from);
+            if aligned_rows != 0 && (d.t[3] != d.t[4] || rows == 0 || experts == 0 || topk == 0
+                || rows.saturating_mul(topk).saturating_add(63 * experts) > aligned_rows
+                || !fits(0, &[3 * experts + 1, 4]) || !fits(1, &[rows, topk, 8])
+                || !fits(2, &[aligned_rows, 4]) || !fits(3, &[aligned_rows, 8]))
+            {
+                return Err(RuntimeError::Rejected("invalid grouped NVFP4 alignment operands".into()));
+            }
+            continue;
+        }
+        if d.i[7] != 3 {
+            continue;
+        }
+        if op == Some(DevOp::MoeGluMxPf) {
+            let [inner, hidden, experts, slots, aligned_rows, topk, ..] = d.i.map(u64::from);
+            if inner == 0 || 2 * inner > u64::from(u32::MAX) || hidden == 0
+                || experts == 0 || slots == 0 || aligned_rows < slots || topk == 0
+                || slots % topk != 0
+                || !fits(0, &[slots, inner, 2]) || !fits(1, &[slots / topk, hidden, 2])
+                || !fits(2, &[experts, 2 * inner, hidden.div_ceil(2)])
+                || !fits(3, &[experts, 2 * inner, hidden.div_ceil(16)])
+                || !fits(4, &[3 * experts + 1, 4]) || !fits(5, &[aligned_rows, 8])
+                || !fits(6, &[experts, 4]) || !fits(7, &[4])
+            {
+                return Err(RuntimeError::Rejected("invalid grouped NVFP4 gate/up operands".into()));
+            }
+            continue;
+        }
+        let [hidden, inner, experts, slots, aligned_rows, ..] = d.i.map(u64::from);
         if hidden == 0 || inner == 0 || experts == 0 || slots == 0 || aligned_rows < slots
             || !fits(0, &[slots, hidden, 4])
             || !fits(1, &[slots, inner, 2])
@@ -4800,7 +4830,7 @@ impl GpuEngine {
                 image.blob.check_l2_dispatch(false)?;
                 let blob = image.blob.clone();
                 validate_moe_outer_scales(&blob)?;
-                validate_grouped_nvfp4_down(&blob)?;
+                validate_grouped_nvfp4(&blob)?;
                 validate_gated_flash_merge(&blob)?;
                 validate_head_preparation(&blob)?;
                 validate_relative_attention(&blob)?;

@@ -4542,6 +4542,16 @@ __device__ __forceinline__ const float2* plow_mxfp4_init_lut(float2* s_lut) {
     return s_lut;
 }
 
+static __device__ __forceinline__ float plow_inkling_swiglu(
+    float g, float u, float gate_cap, float up_cap, float weight) {
+    g = __bfloat162float(__float2bfloat16(g));
+    u = __bfloat162float(__float2bfloat16(u));
+    const float sigmoid = 1.0f / (1.0f + __expf(-g));
+    const float gate = gate_cap > 0.0f ? gate_cap * tanhf(g / gate_cap) : g;
+    const float up = up_cap > 0.0f ? up_cap * tanhf(u / up_cap) : u;
+    return ((gate * sigmoid) * up) * weight;
+}
+
 static __device__ void d_moe_glu_mx(
     bf16* __restrict__ fu, const bf16* __restrict__ x, const unsigned char* __restrict__ table,
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
@@ -4606,13 +4616,7 @@ static __device__ void d_moe_glu_mx(
         if ((threadIdx.x & 31u) == 0) {
             float v;
             if (act == 4u) {
-                g = __bfloat162float(__float2bfloat16(g));
-                u = __bfloat162float(__float2bfloat16(u));
-                const float sigmoid = 1.0f / (1.0f + __expf(-g));
-                const float gate = alpha > 0.0f ? alpha * tanhf(g / alpha) : g;
-                const float up = limit > 0.0f ? limit * tanhf(u / limit) : u;
-                const float weight = plow_moe_slot_gate(table, slot);
-                v = ((gate * sigmoid) * up) * weight;
+                v = plow_inkling_swiglu(g, u, alpha, limit, plow_moe_slot_gate(table, slot));
             } else {
                 v = act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
                               : (act == 1u ? act_silu(g) : act_gelu_tanh(g)) * u;
@@ -5019,15 +5023,17 @@ static __device__ void d_moe_glu_mx_pf(
 }
 
 #if defined(PLOW_NV_HOPPER)
-static __device__ void d_nvfp4_grouped_down_hopper(
-    float* part, const bf16* fu, const uint8_t* weight, const uint8_t* scales,
+template <bool GLU, class Output>
+static __device__ void d_nvfp4_grouped_hopper(
+    Output* out, const bf16* input, const uint8_t* weight, const uint8_t* scales,
     const int* meta, const float* amax, const unsigned* row_partidx, const float* denominator,
-    unsigned H, unsigned I, unsigned E, unsigned slots, unsigned aligned_rows,
-    unsigned slice, unsigned nblk) {
+    unsigned cols, unsigned inner, unsigned E, unsigned slots, unsigned aligned_rows,
+    unsigned slice, unsigned nblk, unsigned topk = 1, float gate_cap = 0.0f, float up_cap = 0.0f) {
     using namespace nvcuda;
     constexpr unsigned M = 16, N = 16, K = 16;
+    constexpr unsigned ROW_TILES = GLU ? 2 : 1;
     struct alignas(32) WarpTiles {
-        bf16 a[M * K];
+        bf16 a[ROW_TILES][M * K];
         bf16 b[N * K];
         float c[M * N];
     };
@@ -5039,7 +5045,7 @@ static __device__ void d_nvfp4_grouped_down_hopper(
     const int* tile_prefix = meta + 2u * E;
     const unsigned routing_tiles = tile_prefix[E];
     if (routing_tiles == 0 || routing_tiles > aligned_rows / ROUTING_TILE) return;
-    const size_t work_items = (size_t)routing_tiles * ((H + N - 1u) / N);
+    const size_t work_items = (size_t)routing_tiles * ((cols + N - 1u) / N);
     for (size_t work = slice * warps + warp; work < work_items; work += nblk * warps) {
         const unsigned tile = work % routing_tiles;
         const unsigned col0 = work / routing_tiles * N;
@@ -5056,46 +5062,75 @@ static __device__ void d_nvfp4_grouped_down_hopper(
         const unsigned first = (tile - expert_tile) * ROUTING_TILE;
         const unsigned end = min(first + ROUTING_TILE, count);
         const float outer = amax[expert] / *denominator;
-        for (unsigned row0 = first; row0 < end; row0 += M) {
-            wmma::fragment<wmma::accumulator, M, N, K, float> acc;
-            wmma::fill_fragment(acc, 0.0f);
-            for (unsigned k0 = 0; k0 < I; k0 += K) {
-                for (unsigned j = lane; j < M * K; j += 32) {
-                    const unsigned row = row0 + j / K, k = k0 + j % K;
-                    const unsigned slot = row < count ? row_partidx[begin + row] : PLOW_EXPERT_UNUSED;
-                    stage.a[j] = slot < slots && k < I
-                        ? fu[(size_t)slot * I + k] : __float2bfloat16(0.0f);
+        for (unsigned row0 = first; row0 < end; row0 += ROW_TILES * M) {
+            wmma::fragment<wmma::accumulator, M, N, K, float> acc[ROW_TILES];
+#pragma unroll
+            for (unsigned panel = 0; panel < ROW_TILES; ++panel)
+                wmma::fill_fragment(acc[panel], 0.0f);
+            for (unsigned k0 = 0; k0 < inner; k0 += K) {
+#pragma unroll
+                for (unsigned panel = 0; panel < ROW_TILES; ++panel) {
+                    if (row0 + panel * M >= end) continue;
+                    for (unsigned j = lane; j < M * K; j += 32) {
+                        const unsigned row = row0 + panel * M + j / K, k = k0 + j % K;
+                        const unsigned slot = row < count ? row_partidx[begin + row] : PLOW_EXPERT_UNUSED;
+                        const unsigned input_row = GLU ? slot / topk : slot;
+                        stage.a[panel][j] = slot < slots && k < inner
+                            ? input[(size_t)input_row * inner + k] : __float2bfloat16(0.0f);
+                    }
                 }
                 for (unsigned j = lane; j < N * K; j += 32) {
                     const unsigned col = col0 + j / K, k = k0 + j % K;
                     float w = 0.0f;
-                    if (col < H && k < I) {
-                        const size_t row = (size_t)expert * H + col;
-                        const unsigned packed = weight[row * ((I + 1u) / 2u) + k / 2u];
+                    if (col < cols && k < inner) {
+                        const size_t row = (size_t)expert * cols + col;
+                        const unsigned packed = weight[row * ((inner + 1u) / 2u) + k / 2u];
                         const unsigned nibble = (packed >> ((k & 1u) * 4u)) & 15u;
                         w = plow_mxfp4_e2m1(nibble)
-                            * plow_nvfp4_scale(scales[row * ((I + 15u) / 16u) + k / 16u]);
+                            * plow_nvfp4_scale(scales[row * ((inner + 15u) / 16u) + k / 16u]);
                     }
                     stage.b[j] = __float2bfloat16(w);
                 }
                 __syncwarp();
-                wmma::fragment<wmma::matrix_a, M, N, K, bf16, wmma::row_major> a;
                 wmma::fragment<wmma::matrix_b, M, N, K, bf16, wmma::col_major> b;
-                wmma::load_matrix_sync(a, stage.a, K);
                 wmma::load_matrix_sync(b, stage.b, K);
-                wmma::mma_sync(acc, a, b, acc);
+#pragma unroll
+                for (unsigned panel = 0; panel < ROW_TILES; ++panel) {
+                    if (row0 + panel * M >= end) continue;
+                    wmma::fragment<wmma::matrix_a, M, N, K, bf16, wmma::row_major> a;
+                    wmma::load_matrix_sync(a, stage.a[panel], K);
+                    wmma::mma_sync(acc[panel], a, b, acc[panel]);
+                }
                 __syncwarp();
             }
-            wmma::store_matrix_sync(stage.c, acc, N, wmma::mem_row_major);
-            __syncwarp();
-            for (unsigned j = lane; j < M * N; j += 32) {
-                const unsigned row = row0 + j / N, col = col0 + j % N;
-                if (row >= count || col >= H) continue;
-                const unsigned slot = row_partidx[begin + row];
-                if (slot < slots)
-                    part[(size_t)slot * H + col] = stage.c[j] * outer;
+#pragma unroll
+            for (unsigned panel = 0; panel < ROW_TILES; ++panel) {
+                const unsigned panel_row = row0 + panel * M;
+                if (panel_row >= end) continue;
+                wmma::store_matrix_sync(stage.c, acc[panel], N, wmma::mem_row_major);
+                __syncwarp();
+                if constexpr (GLU) {
+                    const float* gates = reinterpret_cast<const float*>(row_partidx + aligned_rows);
+                    for (unsigned j = lane; j < M * N / 2; j += 32) {
+                        const unsigned row = panel_row + j / (N / 2), col = col0 + 2 * (j % (N / 2));
+                        if (row >= count || col + 1 >= cols) continue;
+                        const unsigned slot = row_partidx[begin + row];
+                        if (slot >= slots) continue;
+                        const float g = stage.c[2 * j] * outer, u = stage.c[2 * j + 1] * outer;
+                        out[(size_t)slot * (cols / 2) + col / 2] =
+                            __float2bfloat16(plow_inkling_swiglu(g, u, gate_cap, up_cap, gates[begin + row]));
+                    }
+                } else {
+                    for (unsigned j = lane; j < M * N; j += 32) {
+                        const unsigned row = panel_row + j / N, col = col0 + j % N;
+                        if (row >= count || col >= cols) continue;
+                        const unsigned slot = row_partidx[begin + row];
+                        if (slot < slots)
+                            out[(size_t)slot * cols + col] = stage.c[j] * outer;
+                    }
+                }
+                __syncwarp();
             }
-            __syncwarp();
         }
     }
     __syncthreads();

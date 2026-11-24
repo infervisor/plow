@@ -15,6 +15,7 @@ struct Facts {
     normalized_residual_mix: bool,
     residual_copy: bool,
     nvfp4_grouped_down: bool,
+    nvfp4_grouped_glu: bool,
     residual_message_controller: bool,
     residual_mix_query_offset: bool,
     conv_residual_operand: bool,
@@ -33,6 +34,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
         normalized_residual_mix: false,
         residual_copy: false,
         nvfp4_grouped_down: false,
+        nvfp4_grouped_glu: false,
         residual_message_controller: false,
         residual_mix_query_offset: false,
         conv_residual_operand: false,
@@ -52,6 +54,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
             f.residual_mix_query_offset |= inst.op == DevOp::AttnRes as u16 && inst.i[7] == 1 && inst.i[5] != 0;
             f.residual_message_controller |= inst.op == DevOp::AttnRes as u16 && matches!(inst.i[7], 2 | 3);
             f.nvfp4_grouped_down |= inst.op == DevOp::MoeDownMxPf as u16 && inst.i[7] == 3;
+            f.nvfp4_grouped_glu |= inst.op == DevOp::MoeGluMxPf as u16 && inst.i[7] == 3;
             f.residual_copy |= inst.op == DevOp::Residual as u16 && inst.i[7] == 1;
             f.relative |= (inst.op == DevOp::FlashDecode as u16
                 && inst.j[1] == packet::dev::FLASH_DECODE_RELATIVE)
@@ -110,6 +113,9 @@ fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requireme
     }
     if f.nvfp4_grouped_down {
         out.push(Requirement::new(req::NVFP4_GROUPED_DOWN_ABI, 1));
+    }
+    if f.nvfp4_grouped_glu {
+        out.push(Requirement::new(req::NVFP4_GROUPED_GLU_ABI, 1));
     }
     if f.residual_copy {
         out.push(Requirement::new(req::RESIDUAL_COPY_ABI, 1));
@@ -303,16 +309,18 @@ mod tests {
     }
 
     #[test]
-    fn grouped_nvfp4_down_requires_the_hopper_prefill_arm() {
-        let mut m = model(&[DevOp::MoeDownMxPf], &[DevOp::MoeDownMx], &[1, 4]);
-        assert!(manifest(&m, None).prefill.is_empty());
-        m.progs[0].insts[0].i[7] = 3;
-        let requirements = manifest(&m, None);
-        assert_eq!(
-            requirements.prefill,
-            vec![Requirement::new(req::NVFP4_GROUPED_DOWN_ABI, 1)]
-        );
-        assert!(requirements.decode.is_empty());
+    fn grouped_nvfp4_requires_the_matching_hopper_prefill_arm() {
+        for (op, symbol) in [
+            (DevOp::MoeDownMxPf, req::NVFP4_GROUPED_DOWN_ABI),
+            (DevOp::MoeGluMxPf, req::NVFP4_GROUPED_GLU_ABI),
+        ] {
+            let mut m = model(&[op], &[DevOp::MoeDownMx], &[1, 4]);
+            assert!(manifest(&m, None).prefill.is_empty());
+            m.progs[0].insts[0].i[7] = 3;
+            let requirements = manifest(&m, None);
+            assert_eq!(requirements.prefill, vec![Requirement::new(symbol, 1)]);
+            assert!(requirements.decode.is_empty());
+        }
     }
 
     #[test]

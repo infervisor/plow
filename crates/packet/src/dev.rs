@@ -916,7 +916,8 @@ pub enum DevOp {
     /// `MPF_BM`-padded prefix, scatter each live slot into its expert's contiguous gathered-row
     /// range. `meta` is `[3*n_exp+1]` i32 (rowoff | cnt | m-tile prefix).
     /// `t0=meta(i32) t1=table t2=row_token(u32) t3=row_partidx(u32) t4=row_gate(f32)` ·
-    /// `i0=T i1=n_exp i2=k`.
+    /// `i0=T i1=n_exp i2=k`. Hopper NVFP4 gate/up may set `i3=aligned_rows`
+    /// with `t4=t3`, storing the gate array after the routed-slot array.
     MoeAlignPf = 84,
     /// Grouped gate/up GEMM + GLU: A gathered from `xn2` by `row_token`, B is the tile's expert's
     /// gate|up staged into one BN tile. `i3` selects the block-fp8 or bf16 weight arm.
@@ -1946,6 +1947,11 @@ pub enum DevOp {
     ///
     /// `t0=fu_g(bf16[rows][I]) t1=xn2(bf16[T][K]) t2=W_gu t3=S_gu t4=meta(i32) t5=row_token(u32)
     /// t6=bias_gu?` · `i0=I i1=K i2=n_exp i3=layout i5=act i7=mode` · `f0=alpha f1=limit`.
+    ///
+    /// Hopper NVFP4 grouped mode (`i7=3`) uses `t5=paired slot/gate arrays
+    /// t6=expert_amax t7=outer_scale_denominator` and writes BF16 by original routed slot.
+    /// `i0=I i1=K i2=n_exp i3=routed_slots i4=aligned_rows i5=topk`;
+    /// `f0=gate_softcap f1=up_softcap`.
     MoeGluMxPf = 152,
     /// PREFILL twin of [`DevOp::MoeDownMx`], slot map after [`DevOp::MoeGroupDownPf`] (the bias
     /// takes the `fu_scale` slot these flat-fp4 ops do not need):
