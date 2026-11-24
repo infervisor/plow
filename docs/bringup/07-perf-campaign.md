@@ -1,96 +1,103 @@
-# Stage 7 — Performance campaign
+# Stage 7 — Performance Campaign
 
-Measure the gated recipe against its vLLM peer, behind the recipe's accuracy gate, and record the
-result. This stage measures; it does not tune. A run that suggests a lever is open work for
-[Stage 5](05-single-block-sweep.md), [Stage 6](06-runtime-opt.md) or
-[Stage 8](08-rung-campaign.md).
+Full serving evaluation under production traffic distributions against reference baseline engines (e.g. vLLM).
 
-**Precondition:** Stage 6 gated out; the recipe is a `recipes/infervisor/<model>/<label>.toml`
-built by `campaign.py build`; the [`target.md`](target.md) block is filled in and goes into the
-campaign header. Only block-level winners reach this stage ([agent-tools.md](agent-tools.md)
-"HARD RULE"); the report opens with the block-vs-roofline table.
+* **Precondition:** Stage 6 passes. Canonical recipe validated and committed.
+* **Output:** Strict 12-row final campaign comparison report rendered via `campaign.py report`.
+* **Architecture Reference:** [`docs/bringup/agent-tools.md`](agent-tools.md) §5 and §6.
 
-**Gate out (bringup complete):** `llm_fp32_ref` passes on the served packet at every recipe
-concurrency, both serving arms ran on the same client and traffic, and `campaign.py report`
-rendered the strict comparison into `docs/bringup/results/<campaign>/`.
+---
 
-Cross-cutting rules: order of operations [agent-tools.md](agent-tools.md) "Campaign playbook";
-queue and leases "Queue"; judging and the vLLM peer "Working rules"; repeats and noise "A/B rule";
-inherited env "Measurement hazards".
+## 1. Symmetric Serving Protocol
 
-## Plan
+To ensure valid scientific comparisons, Plow and reference engines execute under strictly symmetric parameters:
+* **Identical Workloads:** Exact same prompt dataset, token lengths, arrival timestamps, and concurrency.
+* **Precision Parity:** Matching FP8 / FP16 / BF16 formats; identical weight quantization scales.
+* **Hardware Parity:** Identical GPU lease, power state, and clock settings within the same queue session.
 
-Write down before any GPU time: model and precision, the recipe path, input/output lengths, the
-concurrency ladder, traffic profiles (single-turn, `--agentic`, `--prod` with `PROD_RATES`), SLOs,
-and the vLLM peer configuration (same checkpoint, same precision, prefix caching on). Every SLO is
-a number for `$GPU`; one taken from another part is a hypothesis.
+---
 
-## Steps
+## 2. Serving Grid Execution
 
-All GPU steps run through `python3 scripts/bench/gpuq.py submit <label> <ngpu> <command...>`.
+Run symmetric benchmarks across traffic patterns:
+```bash
+# 1. Start Plowrt server
+scripts/bench/gpuq.py submit plow-serve 8 \
+  plowrt serve --recipe recipes/infervisor/<model>/<label>.toml --port 8100
 
-1. **Preflight (CPU).** `scripts/bench/plowbench-doctor.sh <assets> <objdir>`.
-2. **Accuracy gate.** On the exact packet you will serve:
+# 2. Run benchmark sweep (closed-loop agentic & open-loop Poisson production traffic)
+scripts/bench/llm_grid.sh plow <scratch>/plow_results --agentic --prod
 
-   ```bash
-   python3 scripts/campaign/campaign.py gate <recipe> --assets <assets> --out <gate> --only llm_fp32_ref --dry-run
-   python3 scripts/bench/gpuq.py submit gate <ngpu> bash <gate>/run.sh
-   python3 scripts/campaign/campaign.py gate <recipe> --assets <assets> --out <gate> --only llm_fp32_ref --score-only
-   ```
+# 3. Start reference server & run identical sweep
+scripts/bench/gpuq.py submit ref-serve 8 \
+  vllm serve <model_path> --port 8200
+scripts/bench/llm_grid.sh vllm <scratch>/ref_results --agentic --prod
+```
 
-   A screen runs one c16 gate. Promotion runs the recipe's `[gates.llm_fp32_ref].concurrency`,
-   which includes c1 and every served concurrency, each with a same-concurrency vLLM peer.
-   Thresholds and relaxation: [agent-tools.md](agent-tools.md) "Gates". No serving cell is
-   reported for a packet that has not passed this gate.
-3. **Serving arms.** Same client, traffic seeds, concurrency, GPU count and cache policy on both:
+---
 
-   ```bash
-   python3 scripts/bench/gpuq.py submit grid-plow <ngpu> env ASSETS=<assets> HF=<hf> KV_DTYPE=<dtype> \
-       SERVE_ARGS="<recipe serve flags>" scripts/bench/llm_grid.sh plow <res>/plow [--agentic|--prod]
-   python3 scripts/bench/gpuq.py submit grid-vllm <ngpu> env HF=<hf> VLLM_ARGS="<matched flags>" \
-       scripts/bench/llm_grid.sh vllm <res>/vllm [--agentic|--prod]
-   ```
+## 3. Numerical Parity Gate (`llm_fp32_ref`)
 
-   Reuse a captured vLLM peer whose recorded provenance (GPU, vLLM version and flags, client,
-   traffic seeds) matches the plow arm; never recapture it for a screen.
-4. **Audit.** `python3 scripts/bench/waterfall.py <res>/plow <res>/vllm` — spread per cell, reference
-   prefix-cache hits, wall split, decode ms/step. Resolve a failed audit before reporting.
-5. **Report.**
+Validate generation quality against the FP32 ground truth reference:
+```bash
+python3 scripts/campaign/campaign.py gate-accuracy \
+  --candidate <scratch>/plow_results \
+  --reference <scratch>/ref_results \
+  --packet-sha256 <sha256>
+```
 
-   ```bash
-   python3 scripts/campaign/campaign.py report --baseline <res>/vllm --infervisor <res>/plow \
-       --gate <gate>/gates.json --out <dir> [--cells <tags>]
-   ```
+### Numerical Acceptance Thresholds
+* **KL Divergence:** Trim-mean KL divergence $\le 1.10\times$ reference peer.
+* **Top-1 Agreement:** Greedy continuation top-1 token match $\ge \text{peer} - 0.005$.
+* **Decisive Continuations:** Discrepancy $\le 2\text{ cases}$ across validation corpus.
+* **Needle Retrieval:** Exact match accuracy $\ge \text{peer}$ on multi-needle evaluation.
 
-   This is the only accepted final comparison format ([agent-tools.md](agent-tools.md)
-   "Final performance report (strict)"). Never hand-write the table.
+---
 
-## Results placement
+## 4. Diagnostic Waterfall Telemetry Audit
 
-* Raw logs, JSON, captures, traces and per-tool result trees stay in `$RESULTS`, outside the repo.
-* The campaign record is `docs/bringup/results/<campaign>/comparison.md` (rendered report plus
-  qualified wins with evidence links) and its one `comparison.csv`; index new campaigns in
-  [results/README.md](results/README.md).
-* `perf-data/campaign/` holds only reference CSVs for `campaign.py compare`.
+Audit execution timing breakdown using the waterfall analyzer:
+```bash
+python3 scripts/bench/waterfall.py <scratch>/plow_results <scratch>/ref_results
+```
+* **Prefix-Cache Integrity:** Assert reference prefix-cache hit rate is zero when evaluating cold starts ($>5\%$ on reference fails the test).
+* **Wall Time Split:** Analyze breakdown across prefill, decode, host scheduling gap, and idle time.
+* **Step Latency:** Confirm decode ms/step scales linearly with active batch size.
 
-## Pitfalls
+---
 
-* `$MAXCTX` must hold `input + output` of every cell; otherwise the request is refused and the
-  cell shows collapsed tokens/request. That is a compile-size error: re-emit with a larger
-  `--max-ctx`, do not re-run.
-* Device init failure falls back to the CPU reference with correct text. Confirm
-  `backend ready — GPU accelerated` in every plow server log.
-* Compare total generated tokens across arms; an `ignore_eos` or output-cap mismatch distorts
-  throughput. Shed requests count as successful with few tokens — raise `--slo-ms` for throughput
-  cells.
-* A gate on a stored asset cannot catch an emitter regression; gate the packet emitted from the
-  current checkout.
-* Lossy modes (FP8 KV, FP8 activations) are compared only against a peer of the same precision.
+## 5. Strict 12-Row Final Comparison Report
 
-## Stop and ask
+Generate the mandatory 12-row performance report exclusively via `campaign.py report`:
+```bash
+python3 scripts/campaign/campaign.py report \
+  --plow <scratch>/plow_results \
+  --peer <scratch>/ref_results \
+  --out docs/bringup/results/<campaign>/comparison.md
+```
 
-* A target-block row cannot be filled, or `$MAXCTX` cannot cover the planned ladder.
-* `llm_fp32_ref` fails, or TP ranks disagree — a correctness blocker; report no perf number.
-* No vLLM peer can serve this model on `$GPU` — the campaign makes no comparative claim.
-* The target needs a structural change (decode width, TP/DP, a different part) — a Stage 5/6
-  decision.
+### Report Schema (12 Required Rows)
+1. **TTFT p50 ($\mu$s)**
+2. **TTFT p90 ($\mu$s)**
+3. **TTFT p99 ($\mu$s)**
+4. **TPOT p50 ($\mu$s)**
+5. **TPOT p90 ($\mu$s)**
+6. **TPOT p99 ($\mu$s)**
+7. **End-to-End Latency p50 (ms)**
+8. **End-to-End Latency p99 (ms)**
+9. **Generation Throughput (tok/s)**
+10. **Total Serving Throughput (tok/s)**
+11. **Server Peak RSS (GB)**
+12. **GPU Memory Footprint (GB)**
+
+Any campaign report missing rows or altering this schema is rejected.
+
+---
+
+## 6. Gate Checklist
+
+Before advancing to Stage 8 or closing campaign:
+- [ ] Symmetric serving executed under identical GPU lease and traffic distribution.
+- [ ] `llm_fp32_ref` accuracy gate passes all four statistical thresholds.
+- [ ] Waterfall audit confirms clean scheduling gaps and zero rogue prefix-cache hits.
+- [ ] Strict 12-row comparison table generated and committed to `docs/bringup/results/<campaign>/comparison.md`.
