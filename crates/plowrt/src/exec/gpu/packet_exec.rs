@@ -417,6 +417,7 @@ pub struct CudaPacketRuntime {
     module: Module,
     function: KernelFn,
     grid: u32,
+    block: u32,
     smem: u32,
     conv: Option<ConvObject>,
     names: Vec<String>,
@@ -852,6 +853,32 @@ impl CudaPacketRuntime {
         path: &Path,
         shared: Option<SharedPacketTensors>,
     ) -> Result<Self> {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let (file, symbol) = speech_object(be.compute_capability());
+        Self::load_packet(be, path, shared, &dir.join(file), symbol, BLOCK, None)
+    }
+
+    /// Load a packet against a specific CUDA object for opcode qualification.
+    pub fn load_object(
+        be: Arc<CudaBackend>,
+        path: &Path,
+        object: &Path,
+        symbol: &str,
+        block: u32,
+        arena_symbol: &str,
+    ) -> Result<Self> {
+        Self::load_packet(be, path, None, object, symbol, block, Some(arena_symbol))
+    }
+
+    fn load_packet(
+        be: Arc<CudaBackend>,
+        path: &Path,
+        shared: Option<SharedPacketTensors>,
+        object: &Path,
+        symbol: &str,
+        block: u32,
+        arena_symbol: Option<&str>,
+    ) -> Result<Self> {
         let ordinal = be.device_ordinal;
         let image = crate::asset::packet_image::PacketImage::open(path)?;
         image.blob.check_l2_dispatch(false)?;
@@ -880,81 +907,81 @@ impl CudaPacketRuntime {
             )));
         }
         let dir = path.parent().unwrap_or(Path::new("."));
-        let (file, symbol) = speech_object(be.compute_capability());
-        let object = dir.join(file);
-        let image = std::fs::read(&object).map_err(|source| RuntimeError::Io {
-            path: object.clone(),
+        let image = std::fs::read(object).map_err(|source| RuntimeError::Io {
+            path: object.to_path_buf(),
             source,
         })?;
         let module = be.module_load(&image)?;
         let function = be.get_function(&module, symbol)?;
-        // Before the op / capability checks: rebuilding the object cannot repair a stale packet.
-        let layout = blob.speech_flag_layout(raw)?;
-        check_speech_flag_layout(&be, &module, &object, layout.declared, layout.any())?;
-        if let (Some(lo), Some(hi)) = (
-            be.module_global_u32(&module, "plow_speech_ops_lo_speech")?,
-            be.module_global_u32(&module, "plow_speech_ops_hi_speech")?,
-        ) {
-            let ops = missing_speech_ops(speech_ops(&blob), u64::from(hi) << 32 | u64::from(lo));
-            if !ops.is_empty() {
-                return Err(RuntimeError::Rejected(format!(
-                    "{}: {} lacks speech ops {ops:?}; rebuild it for this packet",
-                    path.display(),
-                    object.display()
-                )));
-            }
-        }
-        for (symbol, required, what) in [
-            (
-                plow_asset::speech_flag_layout::CONV_ARMS_SYMBOL,
-                speech_conv_arms(&blob),
-                "conv arms",
-            ),
-            (
-                plow_asset::speech_flag_layout::CONV_BF16_VARIANTS_SYMBOL,
-                speech_conv_bf16_variants(&blob),
-                "bf16 conv variants",
-            ),
-        ] {
-            if let Some(compiled) = be.module_global_u32(&module, symbol)? {
-                let missing = required & !u64::from(compiled);
-                if missing != 0 {
+        if arena_symbol.is_none() {
+            // Before the op / capability checks: rebuilding the object cannot repair a stale packet.
+            let layout = blob.speech_flag_layout(raw)?;
+            check_speech_flag_layout(&be, &module, object, layout.declared, layout.any())?;
+            if let (Some(lo), Some(hi)) = (
+                be.module_global_u32(&module, "plow_speech_ops_lo_speech")?,
+                be.module_global_u32(&module, "plow_speech_ops_hi_speech")?,
+            ) {
+                let ops = missing_speech_ops(speech_ops(&blob), u64::from(hi) << 32 | u64::from(lo));
+                if !ops.is_empty() {
                     return Err(RuntimeError::Rejected(format!(
-                        "{}: {} lacks {what} {missing:#x}; rebuild it for this packet",
+                        "{}: {} lacks speech ops {ops:?}; rebuild it for this packet",
                         path.display(),
                         object.display()
                     )));
                 }
             }
-        }
-        let caps = missing_speech_caps(
-            speech_caps_required(blob.progs.iter().flat_map(|p| &p.insts)),
-            be.module_global_u32(&module, "plow_speech_caps_speech")?,
-        );
-        if caps != 0 {
-            return Err(RuntimeError::Rejected(format!(
-                "{}: {} lacks speech capabilities {caps:#x}; rebuild it for this packet",
-                path.display(),
-                object.display()
-            )));
-        }
-        let features = speech_features(
-            blob.progs
-                .iter()
-                .flat_map(|p| &p.insts)
-                .map(|d| (d.op, d.fj[2])),
-        );
-        check_speech_features(&be, &module, &object, features, |have| {
-            stale_speech_layout(
+            for (symbol, required, what) in [
+                (
+                    plow_asset::speech_flag_layout::CONV_ARMS_SYMBOL,
+                    speech_conv_arms(&blob),
+                    "conv arms",
+                ),
+                (
+                    plow_asset::speech_flag_layout::CONV_BF16_VARIANTS_SYMBOL,
+                    speech_conv_bf16_variants(&blob),
+                    "bf16 conv variants",
+                ),
+            ] {
+                if let Some(compiled) = be.module_global_u32(&module, symbol)? {
+                    let missing = required & !u64::from(compiled);
+                    if missing != 0 {
+                        return Err(RuntimeError::Rejected(format!(
+                            "{}: {} lacks {what} {missing:#x}; rebuild it for this packet",
+                            path.display(),
+                            object.display()
+                        )));
+                    }
+                }
+            }
+            let caps = missing_speech_caps(
+                speech_caps_required(blob.progs.iter().flat_map(|p| &p.insts)),
+                be.module_global_u32(&module, "plow_speech_caps_speech")?,
+            );
+            if caps != 0 {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: {} lacks speech capabilities {caps:#x}; rebuild it for this packet",
+                    path.display(),
+                    object.display()
+                )));
+            }
+            let features = speech_features(
                 blob.progs
                     .iter()
                     .flat_map(|p| &p.insts)
-                    .map(|d| (d.op, d.fj[2], d.i[2])),
-                have,
-            )
-        })?;
+                    .map(|d| (d.op, d.fj[2])),
+            );
+            check_speech_features(&be, &module, object, features, |have| {
+                stale_speech_layout(
+                    blob.progs
+                        .iter()
+                        .flat_map(|p| &p.insts)
+                        .map(|d| (d.op, d.fj[2], d.i[2])),
+                    have,
+                )
+            })?;
+        }
         let smem = be
-            .module_global_u32(&module, "plow_arena_bytes_speech")?
+            .module_global_u32(&module, arena_symbol.unwrap_or("plow_arena_bytes_speech"))?
             .unwrap_or(49152);
         if let Some(limit) = crate::config::RuntimeConfig::debug_max_inst() {
             if be.module_global_set_u32(&module, "plow_debug_max_inst_speech", limit)? {
@@ -965,7 +992,7 @@ impl CudaPacketRuntime {
             }
         }
         be.set_max_dynamic_smem(function, smem)?;
-        let capacity = be.occupancy_blocks_per_sm(function, BLOCK, smem as usize)? * be.sm_count();
+        let capacity = be.occupancy_blocks_per_sm(function, block, smem as usize)? * be.sm_count();
         if blob.n_cu == 0 || blob.n_cu > capacity {
             return Err(RuntimeError::Rejected(format!(
                 "{}: n_cu {} exceeds cooperative capacity {capacity}",
@@ -973,7 +1000,11 @@ impl CudaPacketRuntime {
                 blob.n_cu
             )));
         }
-        let conv = load_conv_object(&be, &module, &object, blob)?;
+        let conv = if arena_symbol.is_none() {
+            load_conv_object(&be, &module, object, blob)?
+        } else {
+            None
+        };
 
         let mut tensors = Vec::with_capacity(blob.tensors.len());
         for t in &blob.tensors {
@@ -1126,6 +1157,7 @@ impl CudaPacketRuntime {
             module,
             function,
             grid: blob.n_cu,
+            block,
             smem,
             conv,
             names: blob.tensors.iter().map(|t| t.name.clone()).collect(),
@@ -1329,7 +1361,7 @@ impl CudaPacketRuntime {
                 self.be.launch_cooperative(
                     self.function,
                     self.grid,
-                    BLOCK,
+                    self.block,
                     self.smem,
                     &mut params,
                     Some(stream),

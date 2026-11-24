@@ -155,11 +155,11 @@ fi
 
 echo
 echo "[6] scratch space"
-for d in /workspace /; do
+for d in "${TMPDIR:-/}" "${ASSETS:-/workspace}"; do
     use=$(df -P "$d" 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')
     [ -n "$use" ] || continue
     if [ "$use" -ge 95 ]; then pb_bad "$d is ${use}% full"
-    elif [ "$use" -ge 85 ]; then pb_warn "$d is ${use}% full — put build output and exports on /workspace"
+    elif [ "$use" -ge 85 ]; then pb_warn "$d is ${use}% full — put build output and exports on a volume with more free space"
     else pb_ok "$d ${use}% used"; fi
 done
 
