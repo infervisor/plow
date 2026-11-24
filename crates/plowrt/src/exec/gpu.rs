@@ -1470,7 +1470,7 @@ fn validate_head_preparation(blob: &DevBlob) -> Result<()> {
 fn validate_normalized_residual_mix(blob: &DevBlob) -> Result<()> {
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
         if d.op != DevOp::AttnRes as u16 || d.i[7] != 1 { continue; }
-        let [rows, width, blocks, queries, stride, ..] = d.i.map(u64::from);
+        let [rows, width, blocks, queries, stride, query_offset, ..] = d.i.map(u64::from);
         let gamma = d.t[5] != TENSOR_NONE16;
         let bytes = |slot: usize, factors: &[u64]| {
             factors.iter().try_fold(1u64, |n, &v| n.checked_mul(v)).is_some_and(|n| {
@@ -1488,7 +1488,7 @@ fn validate_normalized_residual_mix(blob: &DevBlob) -> Result<()> {
             || !bytes(0, &[rows, width, queries, if gamma { 2 } else { 4 }])
             || !bytes(1, &[rows, width, 2])
             || (blocks != 0 && !bytes(2, &[blocks, stride, width, 2]))
-            || !bytes(3, &[queries, width, 4])
+            || !bytes(3, &[query_offset + queries, width, 4])
             || (gamma && !bytes(5, &[queries, width, 2]))
             || (d.t[7] != TENSOR_NONE16 && !bytes(7, &[rows, width, 2]))
         {

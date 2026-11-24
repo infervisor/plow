@@ -290,7 +290,7 @@ impl Emitter<'_> {
     }
 
     fn short_conv(&mut self, prefix: &str, kind: &str, visit: usize, full: bool,
-                  out: u32, src: u32, projection: u32, input: u32) -> u32 {
+                  out: u32, src: u32, projection: u32, input: (u32, u32)) -> u32 {
         let c = self.c;
         let channels = c.kvh * c.hd;
         let weight_name = if full { "static_w" } else { "weight" };
@@ -302,7 +302,7 @@ impl Emitter<'_> {
         let taps = if full {
             let w = self.w(&format!("{path}.weight_proj"), c.kvh as u64 * 4 * c.hidden as u64 * BF16);
             let taps = if kind == "k" { self.k_taps } else { self.v_taps };
-            deps.push(self.proj(taps, self.hn, w, TENSOR_NONE, c.kvh * 4, c.hidden, input));
+            deps.push(self.proj(taps, input.0, w, TENSOR_NONE, c.kvh * 4, c.hidden, input.1));
             taps
         } else {
             TENSOR_NONE
@@ -336,14 +336,22 @@ impl Emitter<'_> {
         })
     }
 
-    fn prelude_mix(&mut self, last: u32, addend: u32, name: &str, query_rows: u64, gamma: u32, dep: u32) -> u32 {
+    fn sliding_prelude(&self, layer: usize) -> bool {
+        !self.block_mode && layer < self.c.core_start && layer < self.c.residual_block_layers
+            && self.c.is_full[..=layer].iter().all(|&full| !full)
+    }
+
+    fn prelude_mix(&mut self, out: u32, last: u32, addend: u32, name: &str,
+                   query: (u32, u32), gamma: u32, dep: u32) -> u32 {
         let h = self.c.hidden;
-        let query = self.w(&format!("{}attn_res.{name}", self.c.prefix), query_rows * h as u64 * F32);
+        let (query_row, query_rows) = query;
+        let query = self.w(&format!("{}attn_res.{name}", self.c.prefix), query_rows as u64 * h as u64 * F32);
         self.b.emit(DevOp::AttnRes, self.rows(), &[dep], |d| {
-            d.t[..4].copy_from_slice(&[self.hn, last, self.embed_snapshot, query]);
+            d.t[..4].copy_from_slice(&[out, last, self.embed_snapshot, query]);
             d.t[5] = gamma;
             d.t[7] = addend;
             d.i[..5].copy_from_slice(&[self.t, h, 1, 1, self.t]);
+            d.i[5] = query_row;
             d.i[7] = 1;
             d.f[0] = 1e-6;
             d.f[1] = self.c.eps;
@@ -372,11 +380,25 @@ impl Emitter<'_> {
         // q/k/v projections. Decode fuses into GemvQkv when t == 1 and not under a ladder; batched decode and prefill use Gemm/GemmSmall.
         let (hn, kg, vg) = (self.hn, self.kg, self.vg);
         let q = self.q;
-        let (cq, ck, cv) = if self.prefill || t > 1 || self.ladder {
+        let global_prelude = full && l > 0 && self.sliding_prelude(l - 1)
+            && l < c.core_start && l < c.residual_block_layers;
+        let (k_input, v_input) = if global_prelude {
+            let query = format!("attn_queries.{}", l - 1);
+            let mut kv_input = |kind, row| {
+                let out = self.b.tensor(&format!("act.{kind}_input"), t as u64 * h as u64 * BF16);
+                let gamma = self.w(&format!("{p}{kind}_input_norm.weight"), h as u64 * BF16);
+                let ready = self.prelude_mix(out, self.x, TENSOR_NONE, &query, (row, 3), gamma, dep);
+                (out, ready)
+            };
+            (kv_input("k", 1), kv_input("v", 2))
+        } else {
+            ((hn, dep), (hn, dep))
+        };
+        let (cq, ck, cv) = if self.prefill || t > 1 || self.ladder || k_input.0 != hn {
             (
                 self.proj(q, hn, wq, TENSOR_NONE, qd, h, dep),
-                self.proj(kg, hn, wk, TENSOR_NONE, kd, h, dep),
-                self.proj(vg, hn, wv, TENSOR_NONE, kd, h, dep),
+                self.proj(kg, k_input.0, wk, TENSOR_NONE, kd, h, k_input.1),
+                self.proj(vg, v_input.0, wv, TENSOR_NONE, kd, h, v_input.1),
             )
         } else {
             let f = self.b.emit(DevOp::GemvQkv, self.b.all(), &[dep], |d| {
@@ -412,8 +434,8 @@ impl Emitter<'_> {
                                       packet::dev::ROPE_PAIR_RELATIVE_LOGITS]);
             d.f[0] = 1e-6;
         });
-        let ck = self.short_conv(&p, "k", pass_idx, full, self.k_conv, kg, ck, dep);
-        let cv = self.short_conv(&p, "v", pass_idx, full, self.v_conv, vg, cv, dep);
+        let ck = self.short_conv(&p, "k", pass_idx, full, self.k_conv, kg, ck, k_input);
+        let cv = self.short_conv(&p, "v", pass_idx, full, self.v_conv, vg, cv, v_input);
         let ck = self.clip_heads(self.k_clipped, self.k_conv, TENSOR_NONE, kvh, TENSOR_NONE, ck);
         let c_kn = self.rope(kc, self.k_clipped, kvh, Some((kvr, kvm)), false, ck);
         let c_vn = self.rope(vc, self.v_conv, kvh, Some((kvr, kvm)), true, cv);
@@ -497,8 +519,7 @@ impl Emitter<'_> {
         });
         let og = self.og;
         let c_o = self.proj(og, at, wo, TENSOR_NONE, h, qd, c_attn_out);
-        let use_prelude_mix = l == 0 || (!self.block_mode && l < c.core_start
-            && l < c.residual_block_layers && c.is_full[..=l].iter().all(|&full| !full));
+        let use_prelude_mix = l == 0 || self.sliding_prelude(l) || global_prelude;
         let attn_conv = if use_prelude_mix {
             self.b.tensor("act.attn_conv", t as u64 * h as u64 * BF16)
         } else {
@@ -509,7 +530,7 @@ impl Emitter<'_> {
             let conv = self.residual_conv(&p, "attn", pass_idx, attn_conv, og,
                 TENSOR_NONE, TENSOR_NONE, c_o);
             let (last, addend) = if l == 0 { (attn_conv, TENSOR_NONE) } else { (residual, attn_conv) };
-            self.prelude_mix(last, addend, &format!("mlp_queries.{l}"), 1, g_mlp, conv)
+            self.prelude_mix(hn, last, addend, &format!("mlp_queries.{l}"), (0, 1), g_mlp, conv)
         } else {
             self.add_norm(og, g_mlp, c_o)
         };
@@ -635,8 +656,8 @@ impl Emitter<'_> {
                     conv
                 } else {
                     let query_rows = if c.is_full.get(l + 1) == Some(&true) { 3 } else { 1 };
-                    let mix = self.prelude_mix(next, TENSOR_NONE, &format!("attn_queries.{l}"),
-                        query_rows, gamma_next, conv);
+                    let mix = self.prelude_mix(hn, next, TENSOR_NONE, &format!("attn_queries.{l}"),
+                        (0, query_rows), gamma_next, conv);
                     self.x = next;
                     mix
                 }

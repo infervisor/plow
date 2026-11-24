@@ -2367,7 +2367,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_ATTN_RES:
         if (in->i[7] != 1) __trap();
         else d_normalized_residual_mix(TEN(0), (const __nv_bfloat16*)TEN(1),
-            (const __nv_bfloat16*)TEN(2), (const float*)TEN(3),
+            (const __nv_bfloat16*)TEN(2), (const float*)TEN(3) + (size_t)in->i[5] * in->i[1],
             (const __nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(7),
             in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
             in->fj[0].f, in->fj[1].f, slice, nblk);
@@ -3790,6 +3790,7 @@ extern "C" __device__ unsigned plow_gemv_sm90_cta512_abi = 1;
 extern "C" __device__ unsigned plow_relative_attention_abi = 1;
 #if PLOW_HAS_ATTN_RES
 extern "C" __device__ unsigned plow_normalized_residual_mix_abi = 1;
+extern "C" __device__ unsigned plow_residual_mix_query_offset_abi = 1;
 #endif
 #endif
 #if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON

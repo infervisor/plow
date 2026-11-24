@@ -1195,7 +1195,8 @@ pub enum DevOp {
     /// block, slot 7 optionally adds to that last block in FP32, and slot 3
     /// holds unscaled FP32 queries. Slot 5 optionally holds BF16 gamma by query.
     /// Here i2 counts stack blocks, i3 counts queries and i4 is the stack stride
-    /// in rows. Output is query-major FP32 without gamma and BF16 with gamma.
+    /// in rows. i5 is the starting row in slot 3. Output is query-major FP32
+    /// without gamma and BF16 with gamma.
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).
