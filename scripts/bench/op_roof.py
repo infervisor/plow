@@ -468,7 +468,7 @@ def load_router(path, progs):
     if not path:
         return None
     ks = {p["k"] for _, _, insts in progs for _, op, _, p in insts
-          if op in ("MoeRouterGemmaPf", "MoeRouterGemmaTopk")}
+          if op in ("MoeRouterGemmaPf", "MoeRouterGemmaTopk", "MoeRouterTopkPf")}
     if len(ks) != 1:
         raise ValueError("--router-table needs a packet with one MoE top-k")
     with open(path, "rb") as f:

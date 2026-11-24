@@ -22,6 +22,16 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(idx, 0)
         self.assertEqual(op_roof.cost(op, params, 8, 8, 2, 2), (1472, 0))
 
+    def test_load_router_accepts_split_topk(self):
+        import struct
+
+        prog = ("prefill", 1, [(0, "MoeRouterTopkPf", "", {"k": 2})])
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "routing.bin"
+            path.write_bytes(struct.pack("<IfIf", 4, .5, 5, .5))
+            table = op_roof.load_router(path, [prog])
+        self.assertEqual(table.union(128, 2, 1), 2)
+
     def test_empty_sweep_is_not_treated_as_a_measurement(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "sweep.jsonl"
