@@ -412,6 +412,7 @@ pub fn classify(op: DevOp) -> OpClass {
         DevOp::GemmGluFp8 => a_rows("i0=M"),
         DevOp::GemmFp8Blk => a_rows("i0=M"),
         DevOp::GemmFp8Mx => a_rows("i0=M"),
+        DevOp::ActQuantMx => a_rows("i0=rows, per-row 32-element blocks"),
         DevOp::GemmMxfp4
         | DevOp::GemmMedMxfp4
         | DevOp::GemmSmallMxfp4
@@ -531,6 +532,11 @@ pub fn classify(op: DevOp) -> OpClass {
             "t3=pos supersedes i4 and is read at index 0 only; same single-step limit as \
              CompressPool, and the same hazard HeadNormRope's out_row0 form has",
         ),
+        DevOp::SparseAttnDecode => b("t5=pos[B]; t2 ring / t3 cache / t4 idx are [B][..] per slot"),
+        DevOp::SparseAttnMerge => b("t1=scratch[B][H/16][nsplit] partials"),
+        DevOp::CompressDecodeStep => b("t6=pos[B]; t1/t2 state [B][ratio][d]"),
+        DevOp::IndexScoreDecode => b("t4=pos[B]; t3 keys [B][cap][128]"),
+        DevOp::IndexSelectDecode => b("t2=pos[B]; t1 score [B][cap]"),
         // One ring per launch, shape [pool_size, head_dim], no request axis.
         DevOp::DsaPoolStash => d("t0/t1 ring [pool_size, head_dim], no batch axis"),
 

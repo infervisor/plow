@@ -295,6 +295,7 @@ struct Op {
     deps: Vec<Dep>,
     counter: u32,   // the coarse counter this op bumps
     work: Vec<u32>, // per-slice cost, from the cost model. See `select_granularity`.
+    gq_delay: u32,  // added to its ASAP rank: see `Builder::defer_gq`
 }
 
 /// Dependency graph for one complete emitted program. Fusion discovery runs on this graph only
@@ -465,6 +466,9 @@ pub struct Builder {
     tr_dropped: usize,
     /// First instruction of the KV-shared tail (see `plow_asset::kv_shared_tail`).
     shared_tail_mark: Option<u32>,
+    isolate_ignored: bool,
+    memo: std::collections::HashMap<String, Vec<u32>>,
+    gq_order_crit: bool,
 }
 
 fn mla_prefill_segment_class(op: u16, n_tok: u32) -> Option<u8> {
@@ -758,6 +762,9 @@ impl Builder {
             cu_cap: None,
             tr_dropped: 0,
             shared_tail_mark: None,
+            isolate_ignored: false,
+            memo: std::collections::HashMap::new(),
+            gq_order_crit: false,
         }
     }
 
@@ -842,6 +849,51 @@ impl Builder {
         self.gq_order_seg = on;
     }
 
+    /// Order the queue by a critical-path list schedule instead of ASAP levels: among the ops whose
+    /// producers are already placed, the one with the longest chain of consumers below it goes
+    /// first (ties keep emit order). For programs whose narrow chains (few-slice ops) would
+    /// otherwise queue behind a wide independent op of the same ASAP level: V4.1 decode's
+    /// compressor step -> index key -> norm -> append chain waited ~8 us behind the indexer's
+    /// `wq_b` GEMV. Still topological, so the queue's deadlock-freedom argument holds.
+    pub fn set_gq_order_critical(&mut self, on: bool) {
+        self.gq_order_crit = on;
+    }
+
+    /// Queue position per op under [`Builder::set_gq_order_critical`].
+    fn gq_crit_ranks(&self) -> Vec<u32> {
+        let n = self.ops.len();
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut indeg = vec![0u32; n];
+        for i in 0..n {
+            for d in &self.ops[i].deps {
+                let p = d.producer() as usize;
+                if p < i {
+                    succ[p].push(i);
+                    indeg[i] += 1;
+                }
+            }
+        }
+        let mut bl = vec![0u32; n];
+        for i in (0..n).rev() {
+            bl[i] = 1 + succ[i].iter().map(|&s| bl[s]).max().unwrap_or(0);
+        }
+        let mut ready: std::collections::BinaryHeap<(u32, std::cmp::Reverse<usize>)> =
+            (0..n).filter(|&i| indeg[i] == 0).map(|i| (bl[i], std::cmp::Reverse(i))).collect();
+        let mut rank = vec![0u32; n];
+        let mut k = 0u32;
+        while let Some((_, std::cmp::Reverse(i))) = ready.pop() {
+            rank[i] = k;
+            k += 1;
+            for &s in &succ[i] {
+                indeg[s] -= 1;
+                if indeg[s] == 0 {
+                    ready.push((bl[s], std::cmp::Reverse(s)));
+                }
+            }
+        }
+        rank
+    }
+
     /// Earliest-start rank per op. With `seg_of`, a producer in an earlier segment contributes
     /// start 0 (see [`Builder::set_gq_order_seg`]).
     fn gq_asap_ranks(&self, seg_of: Option<&[u16]>) -> Vec<u32> {
@@ -861,7 +913,7 @@ impl Builder {
                     s = s.max(start[p] + cost);
                 }
             }
-            start[i] = s;
+            start[i] = s + self.ops[i].gq_delay;
         }
         start
     }
@@ -1305,9 +1357,86 @@ impl Builder {
         self.cur_join += 1;
     }
 
+    /// Push an op `ranks` later in the ASAP claim order (`set_gq_order_asap`) without adding a
+    /// dependency: for work whose consumer is far off, so a short chain that is ready at the
+    /// same rank claims the grid first. The order stays topological (a consumer still ranks
+    /// above every producer).
+    pub fn defer_gq(&mut self, counter: u32, ranks: u32) {
+        self.ops[counter as usize].gq_delay += ranks;
+    }
+
+    /// Amend an emitted op's immediates and optionally re-place it (coarse deps only) on `cus`: for
+    /// a caller that fuses a neighbouring op into one a shared emit helper produced.
+    pub fn amend(&mut self, counter: u32, cus: Option<Vec<u32>>, f: impl FnOnce(&mut DevInst)) {
+        let op = &mut self.ops[counter as usize];
+        if let Some(cus) = cus {
+            assert!(op.deps.iter().all(|d| matches!(d, Dep::Coarse(_))));
+            op.inst.blocks = cus.len() as u16;
+            op.work = vec![1; cus.len()];
+            op.cus = cus;
+        }
+        f(&mut op.inst);
+    }
+
+    /// Replace an emitted op's dependencies with coarse ones on `deps` (all emitted before it).
+    pub fn rewire(&mut self, counter: u32, deps: &[u32]) {
+        assert!(deps.iter().all(|&d| d < counter));
+        self.ops[counter as usize].deps = deps.iter().map(|&c| Dep::Coarse(c)).collect();
+    }
+
+    /// A second instance of an emitted op (coarse deps only), on the same CUs and deps, amended
+    /// by `f`.
+    pub fn fork_op(&mut self, counter: u32, f: impl FnOnce(&mut DevInst)) -> u32 {
+        let src = &self.ops[counter as usize];
+        let deps = src
+            .deps
+            .iter()
+            .map(|d| match d {
+                Dep::Coarse(c) => Dep::Coarse(*c),
+                _ => panic!("fork_op: coarse deps only"),
+            })
+            .collect();
+        let (mut inst, cus) = (src.inst, src.cus.clone());
+        f(&mut inst);
+        let c = self.ops.len() as u32;
+        self.ops.push(Op {
+            inst,
+            isolated: false,
+            keep_single_grid: false,
+            gq_hoist: false,
+            join: self.cur_join,
+            work: vec![1; cus.len()],
+            cus,
+            deps,
+            counter: c,
+            gq_delay: 0,
+        });
+        c
+    }
+
     /// Preserve an operation as its own segment without dropping dependency edges.
     pub fn isolate(&mut self, counter: u32) {
-        self.ops[counter as usize].isolated = true;
+        self.ops[counter as usize].isolated |= !self.isolate_ignored;
+    }
+
+    /// Make [`Builder::isolate`] a no-op: a single-launch program (a decode rung on the one
+    /// interpreter object) reuses emitters that isolate ops for prefill role objects.
+    pub fn ignore_isolate(&mut self) {
+        self.isolate_ignored = true;
+    }
+
+    /// Emitter-owned memo of handles within this program, for reusing a derived value (e.g. a
+    /// quantized copy) whose key fully determines it.
+    pub fn memo(&mut self) -> &mut std::collections::HashMap<String, Vec<u32>> {
+        &mut self.memo
+    }
+
+    /// Amend already-emitted instructions: an operand a shared emit helper does not take, bound by
+    /// the one caller that needs it.
+    pub fn for_each_inst_mut(&mut self, mut f: impl FnMut(&mut DevInst)) {
+        for op in &mut self.ops {
+            f(&mut op.inst);
+        }
     }
 
     /// Global-queue order only: rank op `counter` WITH its latest producer instead of after it,
@@ -1406,6 +1535,7 @@ impl Builder {
             deps,
             counter,
             work,
+            gq_delay: 0,
         });
         if let (Some(mut r), Some(rcus)) = (reduce, rcus) {
             r.i[7] = 2;
@@ -1421,6 +1551,7 @@ impl Builder {
                 deps: vec![Dep::Coarse(counter)],
                 counter: rc,
                 work,
+                gq_delay: 0,
             });
             return rc;
         }
@@ -3136,7 +3267,9 @@ impl Builder {
         // op-major order within each window; cross-window deps remain counter-gated.
         // With `gq_order_asap`, each window is ordered by earliest-start rank instead (see
         // `set_gq_order_asap`); ties keep op-major order and the order stays topological.
-        let asap = if self.gq_order_asap {
+        let asap = if self.gq_order_crit {
+            Some(self.gq_crit_ranks())
+        } else if self.gq_order_asap {
             Some(self.gq_asap_ranks(self.gq_order_seg.then_some(&seg_of[..])))
         } else {
             None

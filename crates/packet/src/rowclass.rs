@@ -93,7 +93,7 @@ pub fn class_of(op: DevOp) -> RowClass {
         // grouping / combine chain, whose row maps are built from the batch it is given.
         Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | GluPitched | SituGlu | SoftCap
         | LayerNorm | NormResidual | AddNorm | NormResidualNorm | PerLayerInput | GluStrided
-        | QuantFp8 | ZeroF32 | CastF32Bf16 | MlaOutGate | KdaGatedNorm | QwenGatedNorm
+        | QuantFp8 | ActQuantMx | ZeroF32 | CastF32Bf16 | MlaOutGate | KdaGatedNorm | QwenGatedNorm
         | QwenQGateSplit | QwenSigmoidGate | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32
         | EmbedF16F32 | EmbedOverlayBf16 | EmbedPosBf16 | EmbedFrameBf16 | SampleFishBf16
         | GemvF32Out | SampleSmallF32 | LstmCellF32 | ReluF32 | BroadcastAddF32
@@ -208,6 +208,8 @@ pub fn class_of(op: DevOp) -> RowClass {
         // `t4 = pos[rows]` selects each row's ring slot (`pos % pool_size`); the position is
         // read per row rather than derived from a chunk end.
         DsaPoolStash => RowClass::B,
+        // V4.1 batched decode: every row reads its own `pos[b]` and its slot's state.
+        SparseAttnDecode | SparseAttnMerge | CompressDecodeStep | IndexScoreDecode | IndexSelectDecode => RowClass::B,
         // The terminal segment's own gather: an explicit `[S]` row-index table, which is
         // exactly the table the descriptor fills. Bounds-checked against live `M`.
         RowGather => RowClass::B,

@@ -847,6 +847,42 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
             COMMENT "nvcc interp_sm90a_pfgemm_w8a16_m1.cubin"
             VERBATIM)
         list(APPEND _cubin_outs "${_w8a16_m1_out}")
+
+        set(_fp8mx_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/interp_sm90a_pfgemm_fp8mx.cu")
+        set(_fp8mx_out "${PLOW_CUBIN_DIR}/interp_sm90a_pfgemm_fp8mx.cubin")
+        add_custom_command(OUTPUT "${_fp8mx_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_fp8mx_out}"
+                    plow_sm90a_pfgemm_fp8mx required
+                    -arch=sm_90a -O3 -std=c++17 -cubin ${_cubin_inc}
+                    "${_fp8mx_src}"
+            DEPENDS "${_fp8mx_src}" "${_cubin_run}" ${_cubin_headers}
+            COMMENT "nvcc interp_sm90a_pfgemm_fp8mx.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_fp8mx_out}")
+
+        set(_pfmoe_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/interp_sm90a_pfmoe_fp4.cu")
+        set(_pfmoe_out "${PLOW_CUBIN_DIR}/interp_sm90a_pfmoe_fp4.cubin")
+        add_custom_command(OUTPUT "${_pfmoe_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_pfmoe_out}"
+                    plow_sm90a_pfmoe_fp4 required
+                    -arch=sm_90a -O3 -std=c++17 -cubin ${_cubin_inc}
+                    "${_pfmoe_src}"
+            DEPENDS "${_pfmoe_src}" "${_cubin_run}" ${_cubin_headers}
+            COMMENT "nvcc interp_sm90a_pfmoe_fp4.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_pfmoe_out}")
+
+        set(_pfflash_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/interp_sm90a_pfflash_v41.cu")
+        set(_pfflash_out "${PLOW_CUBIN_DIR}/interp_sm90a_pfflash_v41.cubin")
+        add_custom_command(OUTPUT "${_pfflash_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_pfflash_out}"
+                    plow_sm90a_pfflash_v41 required
+                    -arch=sm_90a -O3 -std=c++17 -cubin ${_cubin_inc}
+                    "${_pfflash_src}"
+            DEPENDS "${_pfflash_src}" "${_cubin_run}" ${_cubin_headers}
+            COMMENT "nvcc interp_sm90a_pfflash_v41.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_pfflash_out}")
     endif()
 
     if(PLOW_SM90A_CUBIN AND PLOW_CUBIN_GEMM_F16_NODE)

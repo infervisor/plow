@@ -222,6 +222,15 @@ pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> 
     }
     if matches!(
         v["model_type"].as_str(),
+        Some("deepseek_v41" | "deepseek_v41_text")
+    ) {
+        return Err(format!(
+            "unsupported model_type {:?}: deepseek_v41 has no --hf-dir synthesis; it is not a Gemma-4 nested checkpoint",
+            v["model_type"].as_str().unwrap_or_default()
+        ));
+    }
+    if matches!(
+        v["model_type"].as_str(),
         Some("muse_spark" | "muse_spark_text")
     ) {
         return Err(format!(

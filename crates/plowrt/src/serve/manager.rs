@@ -737,12 +737,21 @@ pub trait ManagerDevice: Send + Sync {
 #[cfg(feature = "cuda")]
 pub struct CudaManagerDevice {
     be: Arc<CudaBackend>,
+    group: Vec<Arc<CudaBackend>>,
 }
 
 #[cfg(feature = "cuda")]
 impl CudaManagerDevice {
     pub fn new(be: Arc<CudaBackend>) -> Self {
-        Self { be }
+        Self {
+            be: Arc::clone(&be),
+            group: vec![be],
+        }
+    }
+
+    pub fn new_group(group: Vec<Arc<CudaBackend>>) -> Result<Self> {
+        let be = Arc::clone(group.first().ok_or_else(|| RuntimeError::Rejected("empty device group".into()))?);
+        Ok(Self { be, group })
     }
 }
 
@@ -769,9 +778,23 @@ impl ManagerDevice for CudaManagerDevice {
     fn pool_trim(&self, keep_bytes: u64) -> u64 {
         VmmOps::pool_trim(&*self.be, keep_bytes)
     }
+    fn supports_tp(&self) -> bool {
+        self.group.len() > 1 || crate::config::RuntimeConfig::get().group_devices.len() > 1
+    }
+    fn group_width(&self) -> u32 {
+        if self.group.len() > 1 {
+            self.group.len() as u32
+        } else {
+            (crate::config::RuntimeConfig::get().group_devices.len() as u32).max(1)
+        }
+    }
     fn load_engine(&self, dir: &Path, ckpt: &Path) -> Result<crate::serve::engine::ServeEngine> {
         let be = Arc::clone(&self.be);
         if tp_degree(dir)? > 1 {
+            if self.group.len() > 1 {
+                let engine = crate::exec::gpu::GpuEngine::load_tp_group(&self.group, dir, ckpt)?;
+                return Ok(crate::serve::engine::ServeEngine::Cuda(engine));
+            }
             let devices = &crate::config::RuntimeConfig::get().group_devices;
             let group = self.be.unload_modules_on_err(|| {
                 crate::serve::cuda_group::CudaGroupServe::load(be, dir, ckpt, devices)
@@ -797,14 +820,7 @@ impl ManagerDevice for CudaManagerDevice {
     fn live_modules(&self) -> Option<usize> {
         Some(self.be.live_modules())
     }
-    /// A process rank group (`PLOW_GROUP_DEVICES`) serves tensor-parallel packets: this
-    /// device is rank 0, each other group device runs a worker process.
-    fn supports_tp(&self) -> bool {
-        crate::config::RuntimeConfig::get().group_devices.len() > 1
-    }
-    fn group_width(&self) -> u32 {
-        (crate::config::RuntimeConfig::get().group_devices.len() as u32).max(1)
-    }
+
 }
 
 #[cfg(feature = "hsa")]
@@ -1045,6 +1061,24 @@ impl ModelManager {
     ) -> Result<ModelManager> {
         Self::with_device(
             Arc::new(CudaManagerDevice::new(be)),
+            state,
+            mux_cfg,
+            models,
+            budget,
+        )
+    }
+
+    /// [`Self::new`] over a device group (`group[0]` is the manager's backend).
+    #[cfg(feature = "cuda")]
+    pub fn new_group(
+        group: Vec<Arc<CudaBackend>>,
+        state: &Arc<AppState>,
+        mux_cfg: MuxConfig,
+        models: Vec<(String, PathBuf, PathBuf)>,
+        budget: Option<u64>,
+    ) -> Result<ModelManager> {
+        Self::with_device(
+            Arc::new(CudaManagerDevice::new_group(group)?),
             state,
             mux_cfg,
             models,

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use packet::dev::{DevOp, TENSOR_NONE, TENSOR_NONE_I, WG_THREADS, WG_WAVES};
 use packet::devbuild::{Builder, Model};
-use packet::rope::{GenTensor, RopeScale};
+use packet::rope::GenTensor;
 use serde_json::Value;
 
 use super::*;
@@ -872,23 +872,65 @@ pub(crate) fn emit_mhc_pre(
 ) -> u32 {
     let mix = (2 + hc_mult) * hc_mult;
     let (pre_pair, pre_in_half, pre_mode) = h.pre.operands();
-    let cm = b.emit(DevOp::GemvF32, b.all(), deps, |d| {
-        d.t[0] = h.mixes;
-        d.t[1] = h.residual;
-        d.t[2] = h.fn_w;
-        d.i[0] = rows;
-        d.i[1] = mix;
-        d.i[2] = hc_mult * hidden;
-    });
+    // NVIDIA prefill: split K 8 ways through a scratch of partials + row-block counters
+    // (op_gemm_f32.cuh d_gemv_f32_splitk); the 16-row form re-reads all of `fn_w` per row block.
+    let k = hc_mult * hidden;
+    let nv = !crate::emit_is_amd();
+    // NVIDIA decode: `d_gemv_f32_kpart`, one CTA per K slice of `4q` columns writing
+    // [S][rows][mix] partials that the pre-op sums (i6), so no CTA re-reads x or waits on another.
+    let kpart = (nv && rows <= 8 && mix <= 32)
+        .then(|| {
+            [32u32, 64, 128, 256]
+                .into_iter()
+                .find(|&q| k % (q * 4) == 0 && k / (q * 4) <= b.n_cu() && rows * mix * 2 <= 512)
+        })
+        .flatten()
+        .map(|q| k / (q * 4));
+    let splits = if let Some(s) = kpart {
+        s
+    } else if nv && rows >= 256 && k % (8 * 128) == 0 {
+        8u32
+    } else {
+        0
+    };
+    let scratch = if kpart.is_none() && splits > 1 {
+        let blocks = rows.div_ceil(64) as u64;
+        let bytes = (blocks * 4).div_ceil(256) * 256 + splits as u64 * rows as u64 * mix as u64 * 4;
+        b.tensor("act.gemv_f32_split", bytes)
+    } else {
+        TENSOR_NONE
+    };
+    let mixes = match kpart {
+        Some(s) => b.tensor("act.hc_mix_parts", s as u64 * rows as u64 * mix as u64 * 4),
+        None => h.mixes,
+    };
+    let cm = b.emit(
+        DevOp::GemvF32,
+        kpart.map_or_else(|| b.all(), |s| (0..s).collect()),
+        deps,
+        |d| {
+            d.t[0] = mixes;
+            d.t[1] = h.residual;
+            d.t[2] = h.fn_w;
+            d.t[3] = scratch;
+            d.i[0] = rows;
+            d.i[1] = mix;
+            d.i[2] = k;
+            d.i[3] = splits;
+            d.i[4] = kpart.is_some() as u32;
+        },
+    );
+    // NVIDIA decode: several blocks per token (`d_hyperconn_pre`'s `T <= nblk` path).
+    let pre_blocks = if nv { rows * 2 } else { rows };
     b.emit(
         DevOp::HyperConnPre,
-        (0..rows.min(b.n_cu())).collect(),
+        (0..pre_blocks.min(b.n_cu())).collect(),
         &[cm],
         |d| {
             d.t[0] = h.post_mix;
             d.t[1] = h.comb_mix;
             d.t[2] = h.layer_input;
-            d.t[3] = h.mixes;
+            d.t[3] = mixes;
             d.t[4] = h.residual;
             d.t[5] = h.scale;
             d.t[6] = h.base;
@@ -899,6 +941,7 @@ pub(crate) fn emit_mhc_pre(
             d.i[3] = sinkhorn;
             d.i[4] = pre_in_half;
             d.i[5] = pre_mode;
+            d.i[6] = kpart.unwrap_or(0);
             d.f[0] = eps;
             d.f[1] = hc_eps;
         },
@@ -919,9 +962,12 @@ pub(crate) fn emit_mhc_post(
     rows: u32,
     deps: &[u32],
 ) -> u32 {
+    // NVIDIA: one thread per 8 columns of a token, so a decode step's few rows want more than
+    // `rows` blocks of 256 threads.
+    let blocks = if crate::emit_is_amd() { rows } else { rows.max((rows * hidden / 8).div_ceil(256)) };
     b.emit(
         DevOp::HyperConnPost,
-        (0..rows.min(b.n_cu())).collect(),
+        (0..blocks.min(b.n_cu())).collect(),
         deps,
         |d| {
             d.t[0] = out;
@@ -935,7 +981,6 @@ pub(crate) fn emit_mhc_post(
         },
     )
 }
-
 /// `peer_input`: write the layer input into this rank's band of peer slot 3 (for a following
 /// all-gather) instead of the local band.
 #[allow(clippy::too_many_arguments)]
@@ -1644,6 +1689,7 @@ fn emit_glm53_program(
                 true,
                 None,
                 GLM_ROUTER_FLAGS,
+                0.0,
             )
         } else {
             emit_glm_moe_ffn(
@@ -2305,6 +2351,41 @@ pub(crate) enum MoeEnc {
     /// alternatives cost 2.26% (block-fp8, and it does not fit this host) or 9.96% (mxfp4) mean
     /// weight error. w4a16: the activation stays bf16, as on the block-fp8 arms.
     Int4G32 = 3,
+}
+
+/// The weight encoding of a checkpoint's DENSE (attention + shared-expert) projections.
+///
+/// Distinct from [`MoeEnc`] because models exist that quantize the two tiers differently:
+/// DeepSeek-V4.1 pairs [32,32] block-fp8 dense projections with fp4 routed experts. Reading
+/// only an "expert" encoding would declare scale grids for weights that do not have them on
+/// disk, and reading only "dense" would do the reverse.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DenseEnc {
+    /// Unquantized bf16.
+    Bf16,
+    /// Block-fp8 with e4m3 weights and an [N/128][K/128] f32 scale grid (GLM-5.2).
+    Fp8Blk128,
+    /// Block-fp8 with e4m3 weights and an [N/32][K/32] ue8m0 scale grid (DeepSeek-V4.1).
+    Fp8Mx32,
+}
+
+/// The full checkpoint quantization reading, carrying the two tiers independently.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CkptEnc {
+    pub(crate) expert: MoeEnc,
+    pub(crate) dense: DenseEnc,
+}
+
+impl CkptEnc {
+    /// True when the checkpoint quantizes its dense and expert weights uniformly, i.e. when
+    /// collapsing it to a single [`MoeEnc`] does not drop information.
+    pub(crate) fn is_uniform(&self) -> bool {
+        match (self.dense, self.expert) {
+            (DenseEnc::Bf16, MoeEnc::Bf16) => true,
+            (DenseEnc::Fp8Blk128, MoeEnc::Fp8Blk) => true,
+            _ => false,
+        }
+    }
 }
 
 impl MoeEnc {
@@ -3140,6 +3221,105 @@ pub(crate) fn emit_pf_gemm_fp8_mx(
     emit_pf_gemm_fp8_mx_band(b, cus, out, x, wt, sc, t, nn, k, 0, deps)
 }
 
+/// [`emit_pf_gemm_fp8_mx`] over `groups` diagonal blocks (op 210 `i3`): `out [T][groups*nn] = x
+/// [T][groups*k] . blockdiag(w [groups*nn][k])^T`, group g reading `x` columns `g*k..` and weight
+/// rows `g*nn..`. The output LoRA below TP8, where one rank owns several of `wo_a`'s groups.
+/// NVIDIA only: the sm_90a role object implements `i3`, the AMD arm traps on it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_pf_gemm_fp8_mx_grouped(
+    b: &mut Builder,
+    cus: &[u32],
+    out: u32,
+    x: u32,
+    wt: u32,
+    sc: u32,
+    t: u32,
+    nn: u32,
+    k: u32,
+    groups: u32,
+    deps: &[u32],
+) -> u32 {
+    if groups <= 1 {
+        return emit_pf_gemm_fp8_mx(b, cus, out, x, wt, sc, t, nn, k, deps);
+    }
+    assert!(!crate::emit_is_amd(), "GemmFp8Mx groups (i3 = {groups}) have no AMD arm; the AMD emit maps one group per rank");
+    assert!(nn % 32 == 0 && k % 32 == 0, "grouped GemmFp8Mx needs N % 32 == 0 and K % 32 == 0 (N = {nn}, K = {k}): a group's scale rows must not straddle");
+    let (wb, sb) = (b.tensor_bytes(wt), b.tensor_bytes(sc));
+    assert_eq!(wb, groups as u64 * nn as u64 * k as u64, "grouped GemmFp8Mx weight {:?}: {wb} bytes, want {groups} x [{nn}, {k}]", b.tensor_name(wt));
+    assert_eq!(sb, groups as u64 * (nn as u64 / 32) * (k as u64 / 32), "grouped GemmFp8Mx scale {:?}: {sb} bytes", b.tensor_name(sc));
+    // No activation quant: its one caller is V4.1's wo_a, which the reference runs as a bf16
+    // einsum against the dequantized weight (convert.py), not as an fp8 x fp8 product.
+    // Its own segment: the NVIDIA role object runs exactly one op 210 per segment.
+    let c = b.emit(DevOp::GemmFp8Mx, cus.to_vec(), deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = wt;
+        d.t[3] = sc;
+        d.i[0] = t;
+        d.i[1] = nn;
+        d.i[2] = k;
+        d.i[3] = groups;
+    });
+    if !crate::emit_is_amd() {
+        b.isolate(c);
+    }
+    c
+}
+
+/// NVIDIA GemmF32 split-K (`op_gemm_f32.cuh`): K slices so that 128 x 64 tiles x slices fill the
+/// CUs, summed in slice order. `(scratch, splits)` for `t3`/`i3`, or none. The scratch's counters are
+/// zero at load and reset after use, so ops that never overlap (the same role in successive layers)
+/// share one `act.gemm_f32_split.{role}`.
+pub(crate) fn nv_gemm_f32_split(b: &mut Builder, cus: usize, role: &str, m: u32, n: u32, k: u32) -> (u32, u32) {
+    if crate::emit_is_amd() || m as u64 * n as u64 <= 1024 {
+        return (TENSOR_NONE, 0);
+    }
+    let tiles = m.div_ceil(128) * n.div_ceil(64);
+    let mut s = 1u32;
+    while s < 8 && tiles * s * 2 <= cus as u32 && k % (s * 2 * 64) == 0 {
+        s *= 2;
+    }
+    if s == 1 {
+        return (TENSOR_NONE, 0);
+    }
+    let bytes = (tiles as u64 * 4).div_ceil(256) * 256 + s as u64 * m as u64 * n as u64 * 4;
+    (b.tensor(&format!("act.gemm_f32_split.{role}"), bytes), s)
+}
+
+/// kernel.py quantizes the activation of every block-fp8 projection (`act_quant(x, 32, "ue8m0")`);
+/// op 210 alone multiplies the bf16 row as it is. On NVIDIA the GEMM therefore reads a quantized
+/// copy (op 212) of its first `rows` rows of `x` (`k` wide), made just before it: e4m3 bytes plus
+/// ue8m0 scales for the fp8 wgmma tile when `fp8` (returned scale != TENSOR_NONE), else the
+/// fake-quantized bf16. Out of place: the same activation also feeds readers the reference does
+/// not quantize (the MoE router). The AMD emit keeps its w8a16 contract unchanged.
+fn nv_fp8_mx_act(b: &mut Builder, cus: &[u32], x: u32, rows: u32, k: u32, deps: &[u32], fp8: bool) -> (u32, u32, Vec<u32>) {
+    if crate::emit_is_amd() {
+        return (x, TENSOR_NONE, deps.to_vec());
+    }
+    // Same input, same producer completion => same bytes: several projections of one row share a copy.
+    let key = format!("act_quant_mx:{x}:{rows}:{k}:{fp8}:{deps:?}");
+    if let Some(v) = b.memo().get(&key) {
+        return (v[0], v[1], vec![v[2]]);
+    }
+    let name = format!("{}.fq{}", b.tensor_name(x), b.n_insts());
+    let fq = b.tensor(&name, rows as u64 * k as u64 * if fp8 { 1 } else { 2 });
+    let xs = if fp8 { b.tensor(&format!("{name}.s"), rows as u64 * (k as u64 / 32)) } else { TENSOR_NONE };
+    let c = b.emit(DevOp::ActQuantMx, cus.to_vec(), deps, |d| {
+        d.t[0] = fq;
+        d.t[1] = x;
+        d.t[2] = xs;
+        d.i[0] = rows;
+        d.i[1] = k;
+    });
+    b.memo().insert(key, vec![fq, xs, c]);
+    (fq, xs, vec![c])
+}
+
+/// [`Builder::memo`] key marking a decode program: there op 210 runs on the interpreter's
+/// decode-row arm, which quantizes a small x itself (i6 = 2, ActQuantMx's numerics, any K % 32)
+/// and so saves the op 212 and its hop.
+pub(crate) const NV_FOLD_ACT_QUANT: &str = "nv_fold_act_quant";
+
 /// [`emit_pf_gemm_fp8_mx`] over ONE row band: `t` rows starting at `row0` of both A and C. The
 /// weight and its scale grid are indexed by N and K only, so they do not move with the rows, and
 /// disjoint bands over the same tiles sum identically to the whole -- which is what lets the
@@ -3176,9 +3356,7 @@ pub(crate) fn emit_pf_gemm_fp8_mx_band(
     assert_eq!(
         wb,
         nn as u64 * k as u64,
-        "GemmFp8Mx weight {:?} is declared {wb} bytes but this emit reads it as [{nn}, {k}] e4m3 \
-         = {} bytes. A per-rank shape against a full-size declaration gives every rank the first \
-         shard of the weight, silently.",
+        "GemmFp8Mx weight {:?} is declared {wb} bytes but this emit reads it as [{nn}, {k}] e4m3          = {} bytes. A per-rank shape against a full-size declaration gives every rank the first          shard of the weight, silently.",
         b.tensor_name(wt),
         nn as u64 * k as u64
     );
@@ -3190,17 +3368,32 @@ pub(crate) fn emit_pf_gemm_fp8_mx_band(
         "GemmFp8Mx scale {:?} is declared {sb} bytes but a [{nn}, {k}] ue8m0 grid is {want_sc}",
         b.tensor_name(sc)
     );
-    b.emit(DevOp::GemmFp8Mx, cus.to_vec(), deps, |d| {
+    // The fp8 wgmma tile promotes per 32 over K steps of 128.
+    let rows = row0 + t;
+    let fold = !crate::emit_is_amd() && rows <= 64 && rows as u64 * k as u64 <= 64 << 10 && b.memo().contains_key(NV_FOLD_ACT_QUANT);
+    let (x, xs, deps, mode) = if fold {
+        (x, TENSOR_NONE, deps.to_vec(), 2)
+    } else {
+        let (x, xs, deps) = nv_fp8_mx_act(b, cus, x, rows, k, deps, k % 128 == 0);
+        (x, xs, deps, (xs != TENSOR_NONE) as u32)
+    };
+    let c = b.emit(DevOp::GemmFp8Mx, cus.to_vec(), &deps, |d| {
         d.t[0] = out;
         d.t[1] = x;
         d.t[2] = wt;
         d.t[3] = sc;
+        d.t[4] = xs;
+        d.i[6] = mode;
         d.i[0] = t;
         d.i[1] = nn;
         d.i[2] = k;
         d.i[4] = row0; // a_row0
         d.i[5] = row0; // c_row0
-    })
+    });
+    if !crate::emit_is_amd() {
+        b.isolate(c);
+    }
+    c
 }
 
 /// `GLM_SHARED_GLU_SPLIT=1` — run `GLM_LINEAR_FP8`'s shared gate/up as TWO CO-RESIDENT
@@ -3315,6 +3508,8 @@ const GLM_ROUTER_FLAGS: u32 =
     router_flag::SIGMOID | router_flag::NORM_TOPK | router_flag::BIAS | router_flag::F32_LOGIT;
 /// Expert/shared GLU activation = SiLU (SwiGLU). Mirrors ACT in the B4 harness.
 const GLM_ACT_SILU: u32 = 1;
+/// DeepSeek's clamped SwiGLU: `silu(min(g, L)) * clamp(u, -L, L)`, `f1 = L` (dev_isa op 5).
+pub(crate) const GLM_ACT_SWIGLU_CLAMP: u32 = 4;
 
 /// `(act, f1)` for this checkpoint's GLUs: the clamped pair form when the config carries
 /// `swiglu_limit`, plain SiLU (and an untouched `f1`) otherwise.
@@ -3339,7 +3534,7 @@ fn glm_require_gate_only_act(c: &GlmCfg, op: DevOp) {
 /// Per-layer GLM weights. Derived (absorbed / rope-folded) tensors are bf16 and named under a
 /// `.derived.` segment the host weight-prep writes; the block-fp8 projections, router, and experts
 /// keep their checkpoint names. `TENSOR_NONE` for the sub-block a layer does not have (dense vs MoE).
-struct GlmLW {
+pub(crate) struct GlmLW {
     // MXFP4 (w4a16) E8M0 scale rows for the matmul weights below — one byte per 32 K-elements,
     // row stride K/32. TENSOR_NONE on the bf16 and block-fp8 arms, which have no such tensor: bf16
     // needs no scale and block-fp8 keeps its own [N/128][K/128] f32 grid under the checkpoint's
@@ -4240,7 +4435,7 @@ fn declare_glm_rows_batched_for_prefill(
         // but the E8M0 rows have no bf16 counterpart and must be declared or the bridge writes to a
         // null handle.
         let fug_bytes = match enc {
-            MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
+            MoeEnc::Mxfp4 if crate::emit_is_amd() => pad_rows * (imoe_e / 2) as u64,
             _ => pad_rows * imoe_e as u64 * BF16,
         };
         let fug_bytes = if compact_native_scratch {
@@ -8238,7 +8433,10 @@ pub(crate) enum MoePfFuse {
     Det,
 }
 pub(crate) fn moe_pf_fuse(tk: u32) -> MoePfFuse {
-    if moe_pf_det() && tk != 0 && tk.is_power_of_two() && tk <= 16 {
+    // `tk <= 16` is the f64 exactness bound (op_moe.h: k * 2^49 <= 2^53). Power-of-two is NOT a
+    // requirement any more: a non-pow2 k binds `row_token` in the epilogue's t6 slot instead of
+    // `row_partidx`, so the token needs neither a shift nor a division. V4.1 routes top-6.
+    if moe_pf_det() && tk != 0 && tk <= 16 {
         MoePfFuse::Det
     } else {
         MoePfFuse::None
@@ -10916,6 +11114,7 @@ fn emit_glm_block_prefill(
         false,
         None,
         GLM_ROUTER_FLAGS,
+        0.0,
     )
 }
 
@@ -10962,7 +11161,7 @@ pub(crate) fn declare_moe_pf_scratch(
         if rows > 1 || emit_config::active().glm_moe_resident() {
             let pad_rows = rows * tk_all as u64 + (e_all * (MPF_BM - 1)) as u64;
             let fug_bytes = match enc {
-                MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
+                MoeEnc::Mxfp4 if crate::emit_is_amd() => pad_rows * (imoe_e / 2) as u64,
                 _ => pad_rows * imoe_e as u64 * BF16,
             };
             const ALIGN_BLOCKS: u64 = 64;
@@ -11043,6 +11242,7 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
     raw_output: bool,
     shared_pre: Option<u32>,
     router_flags: u32,
+    routed_swiglu_limit: f32,
 ) -> u32 {
     let all = b.all();
     let one = vec![0u32];
@@ -11178,12 +11378,16 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         } else {
             DevOp::GemmF32
         };
+        let (split, splits) = if router_mx { (TENSOR_NONE, 0) } else { nv_gemm_f32_split(b, all.len(), "router", tb, e, h) };
         let cs = b.emit(score_op, all.clone(), &[dep], |d| {
             d.t[0] = lb;
             d.t[1] = xb;
             d.t[2] = w.wr;
             if router_mx {
                 d.t[3] = w.wr_s;
+            } else {
+                d.t[3] = split;
+                d.i[3] = splits;
             }
             d.i[0] = tb;
             d.i[1] = e;
@@ -11201,12 +11405,16 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         } else {
             DevOp::GemmF32
         };
+        let (split, splits) = if router_mx { (TENSOR_NONE, 0) } else { nv_gemm_f32_split(b, all.len(), "router", t, e, h) };
         let cs = b.emit(score_op, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
             d.t[2] = w.wr;
             if router_mx {
                 d.t[3] = w.wr_s;
+            } else {
+                d.t[3] = split;
+                d.i[3] = splits;
             }
             d.i[0] = t;
             d.i[1] = e;
@@ -11522,18 +11730,37 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
         } else {
             c_rn2
         };
-        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_x], |d| {
+        // NVIDIA MXFP4 is the reference's W4A8 (`Expert.forward`): the GLU reads the activation
+        // fake-quantized per 32 (ActQuantMx), applies the routing weight in its epilogue with the
+        // clamp, and DOWN applies none. AMD keeps its A4W4 bridge with the gate after DOWN.
+        let nv_mx = enc == MoeEnc::Mxfp4 && !crate::emit_is_amd();
+        let (glu_x, glu_deps) = if nv_mx {
+            let (fq, _, dq) = nv_fp8_mx_act(b, &all, n.xn2, t, h, &[c_rn2], false);
+            if b.memo().contains_key(NV_FOLD_ACT_QUANT) {
+                // Decode: only the GLU (after top-k -> align) reads it. Queued at the router GEMM's
+                // rank it holds the grid in front of top-k; this puts it after the router chain.
+                b.defer_gq(dq[0], 3);
+            }
+            (fq, vec![c_align, dq[0]])
+        } else {
+            (n.xn2, vec![c_align, c_x])
+        };
+        let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &glu_deps, |d| {
             d.t[0] = n.fu_g;
-            d.t[1] = n.xn2;
+            d.t[1] = glu_x;
             d.t[2] = w.ewt;
             d.t[3] = w.est;
             d.t[4] = n.meta;
             d.t[5] = n.row_token;
+            // t6 = the gathered per-row gates, applied in this op under nv_mx.
+            if nv_mx {
+                d.t[6] = n.row_gate;
+            }
             // A4W4 binds two more: t6 = row_partidx, so the fused bridge can tell a PAD row from a live
             // one and skip it (the bf16/fp8 arms let pad rows fall out in DOWN's scatter instead, but a
             // bridge that quantized them would write E8M0 bytes for rows nothing reads); t7 = the E8M0
             // scale rows it WRITES, because the bridge is this op's epilogue rather than a separate op.
-            if enc == MoeEnc::Mxfp4 {
+            if enc == MoeEnc::Mxfp4 && !nv_mx {
                 d.t[6] = n.row_partidx;
                 d.t[7] = n.fu_scale;
             }
@@ -11542,8 +11769,16 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
             d.i[2] = e_all;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             let (act, limit) = glm_glu_act(c);
-            d.i[5] = act;
-            d.f[1] = limit;
+            d.i[5] = if nv_mx && routed_swiglu_limit > 0.0 {
+                GLM_ACT_SWIGLU_CLAMP
+            } else {
+                act
+            };
+            d.f[1] = if nv_mx && routed_swiglu_limit > 0.0 {
+                routed_swiglu_limit
+            } else {
+                limit
+            };
             // W8A8: A = the 1x128 fp8 rows + their [H/128][T] scales; the GLU writes fp8 `fu_g`
             // and its own 1x128 scales into `fu_scale`.
             // SPLIT: A stays the bf16 `xn2`; `fu_g` (bf16-sized) takes the [hi | lo] fp8 rows.
@@ -11559,6 +11794,9 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
                 d.i[7] = 2;
             }
         });
+        if nv_mx {
+            b.isolate(c_g);
+        }
         // 19 grouped down + gate-scale + SCATTER into part[T*k, H]. row_partidx carries each gathered
         //    row's fixed destination, so the align op's nondeterministic within-expert row ORDER does
         //    not reach the output — the combine below still sums part in FIXED slot order.
@@ -11571,11 +11809,16 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
             d.t[4] = n.meta;
             // t5 = the E8M0 rows the bridge wrote — DOWN's A operand is fp4 + these, so under A4W4 the
             // activation never returns to bf16 between the two GEMMs.
-            if enc == MoeEnc::Mxfp4 {
+            if enc == MoeEnc::Mxfp4 && !nv_mx {
                 d.t[5] = n.fu_scale;
             }
-            d.t[6] = n.row_partidx;
-            d.t[7] = n.row_gate;
+            // DET with a non-power-of-two k reads the TOKEN here, not the part index: see
+            // op_moe.h's `det_ksh` encoding note. Same type, same length, same indexing,
+            // and the padded rows carry PLOW_EXPERT_UNUSED in both tables.
+            d.t[6] = if det && !tk.is_power_of_two() { n.row_token } else { n.row_partidx };
+            if !nv_mx {
+                d.t[7] = n.row_gate;
+            }
             d.i[0] = h;
             d.i[1] = imoe_e;
             d.i[2] = e_all;
@@ -11585,7 +11828,7 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
             // acc[token][H]. i[4] was the retired atomic arm's field; an object carrying one arm can
             // never read a blob emitted for the other as its own.
             if det {
-                d.i[5] = tk.trailing_zeros() + 1;
+                d.i[5] = if tk.is_power_of_two() { tk.trailing_zeros() + 1 } else { 32 + tk };
             }
             if pf_w8a8 {
                 d.t[5] = n.fu_scale;
@@ -11600,6 +11843,9 @@ pub(crate) fn emit_glm_moe_ffn_prefill(
             !pf_acc || packet::devbuild::lean_moe_fp8_down_inst(b.inst(c_d)),
             "PLOW_MOE_FP8_PF_ACC's down must be the dedicated object's"
         );
+        if nv_mx {
+            b.isolate(c_d);
+        }
         c_d
     };
     // 20 T-token combine. Under TP `shared`/`part` are PARTIALS, so the combine residual must NOT be
@@ -12088,7 +12334,7 @@ fn mxfp4_bf16_exceptions() -> &'static [&'static str] {
 ///     field would read "bfloat16" off an fp8 checkpoint and be confidently wrong.
 ///
 /// So this reads `quantization_config` and nothing else.
-fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
+fn mla_ckpt_enc_full(dir: &Path) -> Option<CkptEnc> {
     let v: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
     // A multimodal wrapper nests `quantization_config` under `text_config` with the rest of the
     // text geometry. Reading only the root found NOTHING on such a checkpoint and returned None,
@@ -12121,17 +12367,29 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
             .unwrap_or_default();
         assert!(
             fmt.is_empty() || fmt == "e4m3",
-            "checkpoint quantization_config.fmt = {fmt:?}; the block-fp8 arms are e4m3 only. \
-             Missing capability: `fp8_fmt_{fmt}`."
+            "checkpoint quantization_config.fmt = {fmt:?}; the block-fp8 arms are e4m3 only.              Missing capability: `fp8_fmt_{fmt}`."
         );
+        // Two fields nothing here used to read. Both are load-bearing on DeepSeek-V4.1 and both
+        // are INVISIBLE to the generic block-size check below, which would refuse that checkpoint
+        // while naming only the block size -- sending the reader after a single constant when the
+        // actual gap is three separate things. Name them instead.
+        let scale_fmt = q.get("scale_fmt").and_then(|m| m.as_str()).unwrap_or("");
+        let expert_dtype = q.get("expert_dtype").and_then(|m| m.as_str()).unwrap_or("");
+        // DeepSeek-V4.1: [32,32] ue8m0 dense, fp4 experts. A FACT the parse can now state, so
+        // it returns rather than panicking. The refusal moved to `mla_ckpt_enc`, which is where
+        // the assumption that actually fails lives -- collapsing this to ONE encoding.
+        if blk == vec![32, 32] && scale_fmt == "ue8m0" {
+            assert_eq!(
+                expert_dtype, "fp4",
+                "a [32,32]/ue8m0 checkpoint with expert_dtype {expert_dtype:?} is not a shape                  this has seen: V4.1's routed experts are fp4 and its dense projections are                  block-fp8, and the mixed reading below assumes exactly that pairing. Missing                  capability: `ckpt_quant_fp8_blk32_experts_{expert_dtype}`."
+            );
+            return Some(CkptEnc { expert: MoeEnc::Mxfp4, dense: DenseEnc::Fp8Mx32 });
+        }
         assert!(
             blk == vec![128, 128],
-            "checkpoint quantization_config.weight_block_size = {blk:?}, but every scale-grid size \
-             in this emitter is written as div_ceil(128) — a different block size would bind grids \
-             of the wrong shape against weights that look fine. Missing capability: \
-             `fp8_block_size_{blk:?}`."
+            "checkpoint quantization_config.weight_block_size = {blk:?}, but every scale-grid size              in this emitter is written as div_ceil(128) — a different block size would bind grids              of the wrong shape against weights that look fine. Missing capability:              `fp8_block_size_{blk:?}`."
         );
-        return Some(MoeEnc::Fp8Blk);
+        return Some(CkptEnc { expert: MoeEnc::Fp8Blk, dense: DenseEnc::Fp8Blk128 });
     }
     if method == "quark" {
         let w = &q["global_quant_config"]["weight"];
@@ -12160,7 +12418,7 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
                 );
             }
         }
-        return Some(MoeEnc::Mxfp4);
+        return Some(CkptEnc { expert: MoeEnc::Mxfp4, dense: DenseEnc::Fp8Blk128 });
     }
     // compressed-tensors `pack-quantized` int4 (Kimi-K2.7-Code's routed experts). Every field is
     // CHECKED rather than assumed, because each one that differs is a different kernel: the
@@ -12189,7 +12447,7 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
             fmt == "pack-quantized" && ty == "int" && sym && bits == 4 && group == 32,
             "checkpoint compressed-tensors weights are format={fmt:?} type={ty:?}              symmetric={sym} num_bits={bits} group_size={group}; the int4 arm reads              pack-quantized int4, symmetric, group_size 32 and nothing else. Missing              capability: `ckpt_quant_ct_{ty}{bits}_g{group}`."
         );
-        return Some(MoeEnc::Int4G32);
+        return Some(CkptEnc { expert: MoeEnc::Int4G32, dense: DenseEnc::Bf16 });
     }
     // Anything else is a quantization we cannot emit. REFUSE rather than fall back to bf16: the
     // weights on disk are not bf16, so a bf16 packet is a WRONG packet, not an unoptimised one —
@@ -12203,15 +12461,22 @@ fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
     )
 }
 
-/// The MoE weight encoding an emit run asks for, from the environment.
+/// The single [`MoeEnc`] that describes a whole run, or a refusal when no such thing exists.
 ///
-/// `PLOW_MXFP4=1` now RETURNS [`MoeEnc::Mxfp4`] — both blockers are cleared. The decode experts
-/// took an encoding field (`i[6]`, not `i[3]`; see [`MoeEnc::DECODE_SLOT`]) and the combined object
-/// carries the A4W4 experts and the w4a16 projections together, so the packet no longer strands
-/// half its ops in an object that cannot run them.
-///
-/// Setting `PLOW_FP8=1` alongside asks for two encodings in one packet and is refused: a run is all
-/// of one thing. The single documented exception is [`mxfp4_bf16_exceptions`].
+/// Every caller here threads ONE encoding through both the declaration and the emit, which is
+/// correct exactly while a checkpoint is uniform. [`mla_ckpt_enc_full`] reads what the checkpoint
+/// actually says per weight class; this collapses that to the one value the existing emitters
+/// take, and REFUSES when the collapse would be a lie rather than picking a side.
+fn mla_ckpt_enc(dir: &Path) -> Option<MoeEnc> {
+    let ck = mla_ckpt_enc_full(dir)?;
+    assert!(
+        ck.is_uniform(),
+        "this checkpoint quantizes its DENSE projections and its ROUTED EXPERTS differently          (dense {:?}, experts {:?}) -- DeepSeek-V4.1's shape -- and every emitter on this path          threads ONE `MoeEnc` through the declaration and the emit alike. There is no honest          single value to return: answering with the expert encoding would declare bf16 or fp4          scale grids for projections that are block-fp8 on disk, and answering with the dense one          would do the reverse to the experts. Take `mla_ckpt_enc_full` and carry both. The          kernels are NOT the gap -- `DevOp::GemmFp8Mx` (210) and `d_gemm_t<WFP8MX>` exist and          pass on gfx942. Missing capability: `emit_mixed_dense_expert_encoding`.",
+        ck.dense,
+        ck.expert
+    );
+    Some(ck.expert)
+}
 fn mla_moe_enc_env(dir: &Path) -> MoeEnc {
     // THE AXIS NAMES MEAN THE SAME THING HERE AS ON THE DENSE PATH — which is why one of them is
     // refused rather than aliased.
@@ -12845,14 +13110,17 @@ fn emit_glm_moe_ffn_rows(
             if enc == MoeEnc::Mxfp4 {
                 d.t[5] = n.fu_scale;
             }
-            d.t[6] = n.row_partidx;
+            // DET with a non-power-of-two k reads the TOKEN here, not the part index: see
+            // op_moe.h's `det_ksh` encoding note. Same type, same length, same indexing,
+            // and the padded rows carry PLOW_EXPERT_UNUSED in both tables.
+            d.t[6] = if det && !tk.is_power_of_two() { n.row_token } else { n.row_partidx };
             d.t[7] = n.row_gate;
             d.i[0] = h;
             d.i[1] = imoe_e;
             d.i[2] = e_route;
             d.i[MoeEnc::PREFILL_SLOT] = enc.code();
             if det {
-                d.i[5] = tk.trailing_zeros() + 1;
+                d.i[5] = if tk.is_power_of_two() { tk.trailing_zeros() + 1 } else { 32 + tk };
             }
             if pf_w8a8 {
                 d.t[5] = n.fu_scale;
@@ -15946,16 +16214,23 @@ pub(crate) fn dsv41_emit_block(
     rope_gen: bool,
     target: &str,
     verify: Option<&crate::VerifyHook>,
+    model: bool,
 ) {
     let l = layers[0];
     let c = dsv41::cfg_dsv41(dir).unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: {e}"));
-    let (mut m, desc) = dsv41::emit_dsv41_block(&c, layers, tp, n_cu, ctx, t);
+    let (mut m, desc) = dsv41::emit_dsv41_chain(&c, layers, tp, n_cu, ctx, t, model);
     let section = write_block_descriptor(out, &desc);
     if !rope_gen {
         m.bake_gen();
     }
     let lean = crate::apply_verify_gate(&m, verify);
-    std::fs::write(out, m.to_blob_v6(&[section])).unwrap();
+    let mut sections = vec![section];
+    let roles = crate::dsv41_prefill_roles::apply_output_objects(&m, &mut sections, Path::new(out))
+        .unwrap_or_else(|e| panic!("deepseek_v41 --block {l}: segment roles: {e}"));
+    if !roles.is_empty() {
+        eprintln!("deepseek_v41 --block {l}: segment roles {roles:?}");
+    }
+    std::fs::write(out, m.to_blob_v6(&sections)).unwrap();
     eprintln!(
         "deepseek_v41 --block {}: {} layers, {} prefill ops at T={t}, tp={tp}, window={} -> {out}",
         if layers.len() == 1 {
@@ -15975,6 +16250,7 @@ mod kimi_k3;
 pub(crate) use kimi_k3::{k3_emit_full, kimi_k3_emit};
 
 mod dsv41;
+mod dsv41_decode;
 pub(crate) use dsv41::{cfg_dsv41, dsv41_emit_block_plan, dsv41_gaps, dsv41_shard_check};
 
 // ===== tests moved from lib.rs (module breakdown): access mla internals directly =====

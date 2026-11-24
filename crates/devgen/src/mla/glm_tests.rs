@@ -7077,6 +7077,7 @@ fn glm_seq_par_proj_routes_on_the_band() {
         false,
         None,
         GLM_ROUTER_FLAGS,
+        0.0,
     );
     let p = b.finish();
     let name = |h: u32| p.tensors[h as usize].name.as_str();
@@ -7186,6 +7187,7 @@ fn glm_router_overlap_runs_the_band_router_beside_the_hidden_gather() {
             false,
             None,
             GLM_ROUTER_FLAGS,
+            0.0,
         );
         (n, c, b.finish())
     };
@@ -7331,6 +7333,7 @@ fn glm_gemm_lt_pf_ext_routes_the_interpreter_projections() {
             false,
             None,
             GLM_ROUTER_FLAGS,
+            0.0,
         );
         b.finish()
     };

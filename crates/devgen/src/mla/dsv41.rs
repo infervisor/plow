@@ -169,7 +169,9 @@ pub(crate) fn dsv41_shard_check(c: &Dsv41Cfg, dir: &Path) -> Vec<String> {
     let mut bad = Vec::new();
     for (suffix, dims) in want {
         let name = format!("layers.0.{suffix}");
-        let Some((_dt, shape)) = hdr.get(&name).or_else(|| hdr.get(&format!("model.{name}")))
+        let Some((_dt, shape)) = hdr
+            .get(&name)
+            .or_else(|| hdr.get(&format!("model.{name}")))
         else {
             continue; // absent proves nothing
         };
@@ -194,7 +196,7 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
     let [ob, ib] = c.raw.quantization_config.weight_block_size;
     vec![
         // FIRST, because it is now the whole remaining job. The kernel gate that used to lead this
-        // list is CLOSED: op 198 / d_gemm_t<WFP8MX> reads the [{ob}, {ib}] ue8m0 grid, passes 12/12
+        // list is CLOSED: op 210 / d_gemm_t<WFP8MX> reads the [{ob}, {ib}] ue8m0 grid, passes 12/12
         // on gfx942, and `emit_pf_gemm_fp8_mx` emits it. What is left is the emitter around it.
         format!(
             "full-model emit: there is no `declare_dsv41_rows_batched` and no \
@@ -210,7 +212,7 @@ pub(crate) fn dsv41_gaps(c: &Dsv41Cfg) -> Vec<String> {
         format!(
             "CSA2 emit: the compressor runs on the {} kv_source layers {:?} and every one of the \
              {} layers READS that cache, so a per-layer compressor is the wrong shape (ops \
-             194/195 exist and dispatch)",
+             206/207 exist and dispatch)",
             c.kv_source.len(),
             c.kv_source,
             c.layers
@@ -404,16 +406,14 @@ impl Dsv41Weights {
     /// proceed without the handle: a `TENSOR_NONE` fallback would bind a null pointer and the
     /// kernel would read it, which is the silent-wrongness shape this whole path avoids.
     pub(crate) fn get(&self, layer: u32, suffix: &str) -> u32 {
-        *self.per_layer[layer as usize]
-            .get(suffix)
-            .unwrap_or_else(|| {
-                panic!(
-                    "layer {layer} has no weight {suffix:?}. `dsv41_layer_tensors` decides what a \
+        *self.per_layer[layer as usize].get(suffix).unwrap_or_else(|| {
+            panic!(
+                "layer {layer} has no weight {suffix:?}. `dsv41_layer_tensors` decides what a \
                  layer carries and it is checked against the shards, so this is a typo or a \
                  tensor this layer genuinely does not have -- the optional groups (compressor, \
                  indexer keys, engram) are on specific layers only"
-                )
-            })
+            )
+        })
     }
 
     /// Whether a layer carries an optional weight, for the groups that are not on every layer.
@@ -518,16 +518,21 @@ pub(crate) struct Dsv41ProjAct {
     /// `xn @ wkv`, the shared latent, `[T][head_dim]` bf16. ONE row per token for ALL 64
     /// heads -- the absorbed MLA's defining shape, and why num_key_value_heads is 1.
     pub(crate) kv: u32,
+    /// Completions of `xn` and `q_an`, for consumers that read only those (the decode
+    /// compressor and indexer projections), not the whole projection.
+    pub(crate) c_xn: u32,
+    pub(crate) c_qan: u32,
 }
 
 /// Emit one layer's attention PROJECTION chain: the four GEMMs that feed the attention core.
 ///
-/// This is where op 198 earns its place. Every GEMM here reads `[32, 32]` ue8m0 block-fp8 weights,
+/// This is where op 210 earns its place. Every GEMM here reads `[32, 32]` ue8m0 block-fp8 weights,
 /// and together with `wo_a`/`wo_b` they are **82.98 TFLOP of the 281.6 TFLOP 8k prefill** -- the
 /// single largest term after the routed experts, and the reason the block-fp8 arm was item 0.
 ///
-/// Returns the scratch plus the instruction id of the last op, so the caller can chain the
-/// attention core onto it.
+/// Returns the scratch plus the last op of each branch (`[kv, q]`): the two chains are parallel,
+/// so a consumer of `q` must wait on both. Prefill isolation orders them anyway; a single-segment
+/// decode program does not.
 ///
 /// # What is NOT here
 ///
@@ -545,7 +550,9 @@ pub(crate) fn emit_dsv41_attn_proj(
     x: u32,
     t: u32,
     deps: &[u32],
-) -> (Dsv41ProjAct, u32) {
+    // The HyperConnPre to fold this sublayer's RMSNorm into (see `dsv41_fuse_pre_norm`).
+    fuse_pre: Option<u32>,
+) -> (Dsv41ProjAct, [u32; 2]) {
     let hidden = c.hidden;
     let q_lora = c.q_lora;
     assert_eq!(c.heads % tp, 0, "tp={tp} must divide {} heads", c.heads);
@@ -564,7 +571,9 @@ pub(crate) fn emit_dsv41_attn_proj(
     // it, and num_key_value_heads is 1.
     let kv_out = c.head_dim;
 
-    let act = Dsv41ProjAct {
+    let mut act = Dsv41ProjAct {
+        c_xn: 0,
+        c_qan: 0,
         xn: b.tensor(&format!("act.l{l}.xn"), (t as u64) * (hidden as u64) * 2),
         q_a: b.tensor(&format!("act.l{l}.q_a"), (t as u64) * (q_lora as u64) * 2),
         q_an: b.tensor(&format!("act.l{l}.q_an"), (t as u64) * (q_lora as u64) * 2),
@@ -576,14 +585,17 @@ pub(crate) fn emit_dsv41_attn_proj(
     // eps is 1e-20 on this model, not the 1e-6 every other family uses. Reading it from the
     // config rather than writing a constant is the same rule the scale grid follows.
     let eps = c.eps;
-    let c_xn = b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
-        d.t[0] = act.xn;
-        d.t[1] = x;
-        d.t[2] = w.get(l, "attn_norm.weight");
-        d.i[0] = t;
-        d.i[1] = hidden;
-        d.f[0] = eps;
-    });
+    let c_xn = match fuse_pre {
+        Some(p) => dsv41_fuse_pre_norm(b, p, act.xn, w.get(l, "attn_norm.weight"), eps, t),
+        None => b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
+            d.t[0] = act.xn;
+            d.t[1] = x;
+            d.t[2] = w.get(l, "attn_norm.weight");
+            d.i[0] = t;
+            d.i[1] = hidden;
+            d.f[0] = eps;
+        }),
+    };
 
     let c_qa = emit_pf_gemm_fp8_mx(
         b,
@@ -605,6 +617,8 @@ pub(crate) fn emit_dsv41_attn_proj(
         d.i[1] = q_lora;
         d.f[0] = eps;
     });
+    act.c_xn = c_xn;
+    act.c_qan = c_qan;
     let c_q = emit_pf_gemm_fp8_mx(
         b,
         cus,
@@ -620,10 +634,12 @@ pub(crate) fn emit_dsv41_attn_proj(
     // The latent reads the NORMED input, not `q_an` -- it is a parallel branch off the same xn,
     // not a continuation of the query chain. Chaining it after `c_q` would serialise two GEMMs
     // that have no data dependence.
-    let c_kv = emit_pf_gemm_fp8_mx(
+    // `kv = kv_norm(wkv(x))` (model.py `_window_kv`).
+    let kv_raw = b.tensor(&format!("act.l{l}.kv_raw"), (t as u64) * (kv_out as u64) * 2);
+    let c_kvw = emit_pf_gemm_fp8_mx(
         b,
         cus,
-        act.kv,
+        kv_raw,
         act.xn,
         w.get(l, "attn.wkv.weight"),
         w.get(l, "attn.wkv.scale"),
@@ -632,8 +648,15 @@ pub(crate) fn emit_dsv41_attn_proj(
         hidden,
         &[c_xn],
     );
-    let _ = c_q;
-    (act, c_kv)
+    let c_kv = b.emit(DevOp::RmsNorm, all.clone(), &[c_kvw], |d| {
+        d.t[0] = act.kv;
+        d.t[1] = kv_raw;
+        d.t[2] = w.get(l, "attn.kv_norm.weight");
+        d.i[0] = t;
+        d.i[1] = kv_out;
+        d.f[0] = eps;
+    });
+    (act, [c_kv, c_q])
 }
 
 /// CSA2's write side: the compressed-KV cache the whole chain shares, and one source's scratch.
@@ -645,11 +668,11 @@ pub(crate) struct Dsv41Compress {
     /// sources use the prefix.
     pub(crate) cache: u32,
     /// `xn @ compressor.wkv^T`, `[T][head_dim]` bf16.
-    kv: u32,
+    pub(crate) kv: u32,
     /// `xn @ compressor.wgate^T`, `[T][head_dim]` bf16. Unused at ratio 1, which has no gate.
-    gate: u32,
+    pub(crate) gate: u32,
     /// The post-norm, PRE-RoPE latent, `[ctx][head_dim]` bf16 -- what the INDEXER reads, and the
-    /// reason op 194 stops after the norm. Separate from `cache` because op 199 must not
+    /// reason op 206 stops after the norm. Separate from `cache` because op 211 must not
     /// overwrite what the indexer still has to read.
     pub(crate) latent: u32,
 }
@@ -681,8 +704,9 @@ pub(crate) fn declare_dsv41_compress(
     let (r, hd, cx) = (t as u64, c.head_dim as u64, ctx as u64);
     Some(Dsv41Compress {
         cache: b.tensor("act.compress_kv", cx * hd * 2),
-        kv: b.tensor("act.compress_wkv", r * hd * 2),
-        gate: b.tensor("act.compress_wgate", r * hd * 2),
+        // f32 on NVIDIA: the pooled projections are fp32 in the reference (model.py:446).
+        kv: b.tensor("act.compress_wkv", r * hd * if crate::emit_is_amd() { 2 } else { 4 }),
+        gate: b.tensor("act.compress_wgate", r * hd * if crate::emit_is_amd() { 2 } else { 4 }),
         latent: b.tensor("act.compress_latent", cx * hd * 2),
     })
 }
@@ -693,18 +717,18 @@ pub(crate) fn declare_dsv41_compress(
 ///
 /// `kv_source_layer_ids` is `[2, 8, 14, 20]` and `compress_ratios` gives 2, 2, 2 and **1**. At
 /// ratio 1 `Compressor.forward` returns on its first line -- `self.norm(self.wkv(x))`, no gate, no
-/// fp32, no pooling (`model.py:461-462`) -- so layer 20 is a plain GEMM plus an RMSNorm and op 194
+/// fp32, no pooling (`model.py:461-462`) -- so layer 20 is a plain GEMM plus an RMSNorm and op 206
 /// must not run at all. `compressor_has_gate` is what the tensor table already keys the `wgate`
 /// weight on, and this uses the same predicate rather than a second reading of the ratio.
 ///
 /// # The pooled form
 ///
-/// Op 194 with `coff = 1` and a NULL `ape`. V4.1 has neither the overlap transform nor the
-/// position-in-block bias -- `scripts/dsv41_csa2_oracle.py` check [1] puts op 194 at max err
+/// Op 206 with `coff = 1` and a NULL `ape`. V4.1 has neither the overlap transform nor the
+/// position-in-block bias -- `scripts/dsv41_csa2_oracle.py` check [1] puts op 206 at max err
 /// 0.000e+00 against the reference on those terms, and check [2] shows a nonzero `ape` is worth
 /// 1.65, so omitting it is a claim and not a formality.
 ///
-/// `i7 = 2` stops the op after the norm. The rope and the fake quant are op 199, because
+/// `i7 = 2` stops the op after the norm. The rope and the fake quant are op 211, because
 /// `Compressor.forward` returns the latent BEFORE RoPE for the indexer's sake and `_compress_kv`
 /// finishes it afterwards (`model.py:751-761`).
 ///
@@ -726,6 +750,7 @@ pub(crate) fn emit_dsv41_compressor(
     cos: u32,
     sin: u32,
     t: u32,
+    chunk: Option<(u32, u32)>,
     deps: &[u32],
 ) -> u32 {
     let hd = c.head_dim;
@@ -785,22 +810,33 @@ pub(crate) fn emit_dsv41_compressor(
             "layer {l} pools at ratio {ratio} but has no `wgate`; the softmax gate is what pooling \
              IS"
         );
-        let c_kv = bf16_gemm(
-            b,
-            cp.kv,
-            xn,
-            w.get(l, "attn.compressor.wkv.weight"),
-            hd,
-            deps,
-        );
-        let c_gt = bf16_gemm(
-            b,
-            cp.gate,
-            xn,
-            w.get(l, "attn.compressor.wgate.weight"),
-            hd,
-            deps,
-        );
+        // `x.float()` through f32 `wkv`/`wgate` (model.py:446-465): bf16 products accumulated in
+        // f32 are GemmF32 exactly, and the pool then reads f32 (i5 = 4). AMD keeps the bf16 pair.
+        let f32_gemm = |b: &mut Builder, out: u32, weight: u32, role: &str| {
+            let (split, splits) = crate::mla::nv_gemm_f32_split(b, all.len(), role, t, hd, hidden);
+            b.emit(DevOp::GemmF32, all.clone(), deps, |d| {
+                d.t[0] = out;
+                d.t[1] = xn;
+                d.t[2] = weight;
+                d.t[3] = split;
+                d.i[0] = t;
+                d.i[1] = hd;
+                d.i[2] = hidden;
+                d.i[3] = splits;
+            })
+        };
+        let nv = !crate::emit_is_amd();
+        let (c_kv, c_gt) = if nv {
+            (
+                f32_gemm(b, cp.kv, w.get(l, "attn.compressor.wkv.weight"), "ckv"),
+                f32_gemm(b, cp.gate, w.get(l, "attn.compressor.wgate.weight"), "cgate"),
+            )
+        } else {
+            (
+                bf16_gemm(b, cp.kv, xn, w.get(l, "attn.compressor.wkv.weight"), hd, deps),
+                bf16_gemm(b, cp.gate, xn, w.get(l, "attn.compressor.wgate.weight"), hd, deps),
+            )
+        };
         b.emit(DevOp::CompressPool, all.clone(), &[c_kv, c_gt], |d| {
             d.t[0] = cp.latent;
             d.t[1] = cp.kv;
@@ -815,7 +851,7 @@ pub(crate) fn emit_dsv41_compressor(
             d.i[2] = 1; // coff: no overlap transform on V4.1
             d.i[3] = hd;
             d.i[4] = 0; // rd unused on arm 2
-            d.i[5] = 0; // qblk unused on arm 2
+            d.i[5] = if nv { 4 } else { 0 }; // arm 2: kv/score element bytes (0 = bf16)
             d.i[6] = 0; // out_base: one chunk, starting at position 0
             d.i[7] = 2; // pool, norm, STOP
             d.f[0] = c.eps;
@@ -839,6 +875,12 @@ pub(crate) fn emit_dsv41_compressor(
         d.i[4] = ratio;
         d.i[5] = 0;
         d.i[6] = 2; // PLOW_CMP_Q_FP4_E4M3
+        // A later prefill chunk appends at `pos[0] / ratio` instead of overwriting row 0.
+        if let Some((pos, kvlen)) = chunk {
+            d.t[4] = pos;
+            d.t[5] = kvlen;
+            d.j[1] = 1 << 30;
+        }
     })
 }
 
@@ -857,21 +899,21 @@ pub(crate) struct Dsv41Index {
     pub(crate) idx: u32,
     /// `qr @ indexer.wq_b^T`, then roped and fake-quantized in place of itself:
     /// `[T][index_n_heads][index_head_dim]` bf16.
-    q: u32,
-    qr: u32,
+    pub(crate) q: u32,
+    pub(crate) qr: u32,
     /// `xn @ indexer.weights_proj^T`, `[T][index_n_heads]` bf16 -- the per-head ReLU weights.
-    w: u32,
+    pub(crate) w: u32,
     /// `latent @ indexer.wk^T` and its norm, `[ctx][index_head_dim]` bf16.
-    k: u32,
-    kn: u32,
+    pub(crate) k: u32,
+    pub(crate) kn: u32,
     /// `[T][ctx/min_ratio]` f32. The widest score a layer in this chain needs.
-    score: u32,
+    pub(crate) score: u32,
     /// THE PER-PACK UNION (op 119), and the `u64[n_qt][kv_stride]` membership scratch it builds
     /// it through. This is what lets the gathered pass run the V2 arm instead of the scalar one:
     /// 8 queries share one staged KV slab and carry a 64-bit mask per row (8 queries x 8 heads),
     /// so the latent is read once per PACK rather than once per query.
-    uni: u32,
-    umask: u32,
+    pub(crate) uni: u32,
+    pub(crate) umask: u32,
 }
 
 /// Queries per union pack. Fixed by the kernel (`op_attention_common.h`, `QP`), which puts the
@@ -911,15 +953,18 @@ pub(crate) fn declare_dsv41_index(
         // Sized for the WIDEST case in the chain, like `score`: ratio 1, so `kv_rows == ctx`.
         // Layout (dev_isa.h op 119): u32 count[n_qt], 256 B aligned, then per pack
         // [cap i32 pos][cap u32 maskLo][cap u32 maskHi].
-        uni: b.tensor("act.index_uni", {
-            let n_qt = (r + DSV41_UNION_PACK as u64 - 1) / DSV41_UNION_PACK as u64;
-            let cap = dsv41_union_cap(c.index_topk, ctx) as u64;
-            (n_qt * 4).next_multiple_of(256) + n_qt * cap * 12
-        }),
-        umask: b.tensor("act.index_umask", {
-            let n_qt = (r + DSV41_UNION_PACK as u64 - 1) / DSV41_UNION_PACK as u64;
-            n_qt.max(b.n_cu() as u64) * cx * 8
-        }),
+        uni: b.tensor(
+            "act.index_uni",
+            {
+                let n_qt = (r + DSV41_UNION_PACK as u64 - 1) / DSV41_UNION_PACK as u64;
+                let cap = dsv41_union_cap(c.index_topk, ctx) as u64;
+                (n_qt * 4).next_multiple_of(256) + n_qt * cap * 12
+            },
+        ),
+        umask: b.tensor(
+            "act.index_umask",
+            ((r + DSV41_UNION_PACK as u64 - 1) / DSV41_UNION_PACK as u64) * cx * 8,
+        ),
     })
 }
 
@@ -962,6 +1007,7 @@ pub(crate) fn emit_dsv41_indexer(
     xn: u32,
     qr: u32,
     kvlen: u32,
+    pos: Option<u32>,
     cos: u32,
     sin: u32,
     t: u32,
@@ -993,35 +1039,28 @@ pub(crate) fn emit_dsv41_indexer(
     let topk = dsv41_index_topk(c, t, ratio);
     let all = cus.to_vec();
 
-    let bf16_gemm =
-        |b: &mut Builder, out: u32, x: u32, weight: u32, n: u32, k: u32, dep: &[u32]| {
-            let op = crate::pick_tile(t, n, k, b.n_cu(), kernelcaps::QuantScheme::None);
-            b.emit(op, all.clone(), dep, |d| {
-                d.t[0] = out;
-                d.t[1] = x;
-                d.t[2] = weight;
-                d.i[0] = t;
-                d.i[1] = n;
-                d.i[2] = k;
-            })
-        };
+    let bf16_gemm = |b: &mut Builder, out: u32, x: u32, weight: u32, n: u32, k: u32, dep: &[u32]| {
+        let op = crate::pick_tile(t, n, k, b.n_cu(), kernelcaps::QuantScheme::None);
+        b.emit(op, all.clone(), dep, |d| {
+            d.t[0] = out;
+            d.t[1] = x;
+            d.t[2] = weight;
+            d.i[0] = t;
+            d.i[1] = n;
+            d.i[2] = k;
+        })
+    };
 
     // ---- the index KEYS, on the four layers that own a compressor --------------------------
     // "the index keys are derived from the compressor's latent, so only a layer that compresses
     // its own KV can produce them; every other indexer reads them from that layer's cache"
     // (model.py:498-500). And they are derived from the PRE-RoPE latent, which is the whole
-    // reason op 194 stops after the norm.
+    // reason op 206 stops after the norm.
     let mut key_dep: Vec<u32> = Vec::new();
     if c.kv_source.contains(&l) {
         let cp = cp.expect("a kv_source layer has a compressor");
         let c_k = {
-            let op = crate::pick_tile(
-                n_pool,
-                di,
-                c.head_dim,
-                b.n_cu(),
-                kernelcaps::QuantScheme::None,
-            );
+            let op = crate::pick_tile(n_pool, di, c.head_dim, b.n_cu(), kernelcaps::QuantScheme::None);
             b.emit(op, all.clone(), deps, |d| {
                 d.t[0] = ix.k;
                 d.t[1] = cp.latent;
@@ -1040,7 +1079,7 @@ pub(crate) fn emit_dsv41_indexer(
             d.f[0] = c.eps;
         });
         // `fp4_act_quant(k, fp4_block_size, True)` -- blocks of 32 with an E8M0 scale, which is
-        // the OTHER of op 199's two settings. A key stands for its group's first token, so it
+        // the OTHER of op 211's two settings. A key stands for its group's first token, so it
         // ropes at `j * ratio` exactly as the cache row does.
         key_dep.push(b.emit(DevOp::CompressRopeQuant, all.clone(), &[c_kn], |d| {
             d.t[0] = ix.keys;
@@ -1056,6 +1095,11 @@ pub(crate) fn emit_dsv41_indexer(
             d.i[5] = 0;
             d.i[6] = 1; // PLOW_CMP_Q_FP4_POW2 -- E8M0, the fp4_act_quant default
             d.i[7] = 1;
+            if let Some(pos) = pos {
+                d.t[4] = pos;
+                d.t[5] = kvlen;
+                d.j[1] = 1 << 30;
+            }
         }));
     }
 
@@ -1073,7 +1117,7 @@ pub(crate) fn emit_dsv41_indexer(
         deps,
     );
     // One angle per TOKEN across all 32 heads, then fp4 at 32 over each head's whole 128 --
-    // op 199's third call site, `i7 = n_head`.
+    // op 211's third call site, `i7 = n_head`.
     let c_qr = b.emit(DevOp::CompressRopeQuant, all.clone(), &[c_q], |d| {
         d.t[0] = ix.qr;
         d.t[1] = ix.q;
@@ -1088,6 +1132,11 @@ pub(crate) fn emit_dsv41_indexer(
         d.i[5] = 0;
         d.i[6] = 1;
         d.i[7] = hi;
+        // Row r ropes at pos[r], the token's absolute position in any prefill chunk.
+        if let Some(pos) = pos {
+            d.t[4] = pos;
+            d.j[1] = 1 << 31;
+        }
     });
     let c_w = bf16_gemm(
         b,
@@ -1120,6 +1169,9 @@ pub(crate) fn emit_dsv41_indexer(
         d.i[4] = ratio; // POOLS, not tokens
         d.f[0] = scale;
     });
+    if !crate::emit_is_amd() {
+        b.isolate(c_sc);
+    }
     let c_sel = b.emit(DevOp::IndexSelectPf, all.clone(), &[c_sc], |d| {
         d.t[0] = ix.idx;
         d.t[1] = ix.score;
@@ -1239,7 +1291,8 @@ pub(crate) fn declare_dsv41_mhc(b: &mut Builder, c: &Dsv41Cfg, t: u32, tp: u32) 
 /// recovered `hidden` stays 5120 and 6144-based offsets are not multiples of 10 240 either.
 pub(crate) fn dsv41_peer_width(c: &Dsv41Cfg, layers: &[u32]) -> u32 {
     if layers.iter().any(|l| c.engram_layers.contains(l)) {
-        c.hidden.max(engram_cols(c) * c.raw.engram_head_dim as u32)
+        c.hidden
+            .max(engram_cols(c) * c.raw.engram_head_dim as u32)
     } else {
         c.hidden
     }
@@ -1261,7 +1314,7 @@ pub(crate) struct Dsv41Engram {
     pub(crate) emb: u32,
     /// `wkv`'s output: `hc_mult` keys then ONE shared value, `[T][(hc_mult + 1) * hidden]` bf16.
     pub(crate) kv: u32,
-    /// `[T][n_cols]` i32, the n-gram row ids. GLOBAL ids, not shard-local: op 197 does the
+    /// `[T][n_cols]` i32, the n-gram row ids. GLOBAL ids, not shard-local: op 209 does the
     /// signed subtract itself so one uploaded tensor serves every rank.
     pub(crate) ids: u32,
 }
@@ -1276,11 +1329,7 @@ pub(crate) fn declare_dsv41_engram(
     if !layers.iter().any(|l| c.engram_layers.contains(l)) {
         return None;
     }
-    let (r, cols, hd) = (
-        t as u64,
-        engram_cols(c) as u64,
-        c.raw.engram_head_dim as u64,
-    );
+    let (r, cols, hd) = (t as u64, engram_cols(c) as u64, c.raw.engram_head_dim as u64);
     let n = c.hc_mult as u64;
     Some(Dsv41Engram {
         part: b.tensor(PEER_SLOT_O, r * cols * hd * 2),
@@ -1304,22 +1353,22 @@ pub(crate) fn engram_cols(c: &Dsv41Cfg) -> u32 {
 ///
 /// `Block.__init__` constructs `self.engram` but `Block.forward` never calls it.
 /// `Transformer.forward` does, in the layer loop and ahead of the block (`model.py:1262-1267`),
-/// so op 196 is in place on the hc-EXPANDED stream `[T][hc_mult][hidden]` before this layer's mHC
+/// so op 208 is in place on the hc-EXPANDED stream `[T][hc_mult][hidden]` before this layer's mHC
 /// collapses it. See `dsv41_layer_parts` for what that cost when the table said otherwise.
 ///
 /// # Four ops, and the all-reduce is the reference's own
 ///
-///   1. **op 197**, the gather. The table is 384 006 168 rows of 256 fp8 -- 98.31 GB, so a
+///   1. **op 209**, the gather. The table is 384 006 168 rows of 256 fp8 -- 98.31 GB, so a
 ///      replicated copy does not fit on a 192 GB MI300X at all -- and is row-split. A rank writes
 ///      ZEROS for any id outside its shard.
 ///   2. **`XReduce`**, which sums those shards. This is `ParallelEngramEmbedding.forward`'s own
 ///      `dist.all_reduce(values)` (`model.py:323-324`), not an artifact of this emit, and it is
 ///      why the gather lands in a peer slot rather than in ordinary VRAM.
-///   3. **op 198**, `wkv`. Block-fp8 at a `[32, 32]` ue8m0 grid, `[T][6144] -> [T][25600]`. The
+///   3. **op 210**, `wkv`. Block-fp8 at a `[32, 32]` ue8m0 grid, `[T][6144] -> [T][25600]`. The
 ///      reduce comes BEFORE it, as the reference has it. `wkv` is linear and bias-free so the two
 ///      orders agree in exact arithmetic, but reducing after would quantize partial sums, and it
 ///      would also reduce a tensor four times wider.
-///   4. **op 196**, the gate and mix, in place on the residual.
+///   4. **op 208**, the gate and mix, in place on the residual.
 ///
 /// `token_mask` is `TENSOR_NONE`: it selects image spans, which take part in no n-gram, and a
 /// text-only prefill has none. A VL path must pass it -- a masked token has to pass through
@@ -1471,10 +1520,21 @@ pub(crate) fn dsv41_sp(t: u32, tp: u32) -> bool {
     crate::emit_config::active().dsv41_seq_par && tp > 1 && t > 1 && t % tp == 0
 }
 
-/// The rows this rank's per-token mHC and norm packets cover: its `t/tp` band under sequence
-/// parallelism, else all `t`.
-fn sp_rows(t: u32, tp: u32) -> u32 {
-    if dsv41_sp(t, tp) {
+/// CEILING INSTRUMENT ONLY (`PLOW_DSV41_SP_ABL=1`): run the per-token mHC and norm packets over
+/// `t/tp` rows instead of `t`.
+///
+/// The ANSWER IS WRONG -- 7/8 of the rows are never written, so the residual stream is garbage
+/// from the first layer on. What it measures is right: these packets are replicated across the
+/// ranks today (every rank computes all `t` rows of work that depends only on its own token), and
+/// sequence parallelism would leave each rank exactly this band. So the run time of this emit is
+/// the run time SP would reach, without building SP's reduce-scatter/all-gather plumbing or the
+/// third peer-slot region the dsv41 layout would need for it.
+///
+/// Read it against the unablated control and the difference is the SP budget, nothing more.
+fn sp_abl_rows(t: u32, tp: u32) -> u32 {
+    // The real thing and the instrument that prices it land on the same row count; only the real
+    // one also moves the addresses, which is the whole difference between a band and a wrong answer.
+    if dsv41_sp(t, tp) || (crate::emit_config::active().dsv41_sp_abl && tp > 1) {
         t / tp
     } else {
         t
@@ -1504,13 +1564,7 @@ pub(crate) fn emit_dsv41_mhc_pre(
         let hb = (t as u64) * (c.hidden as u64) * 2;
         let h2 = dsv41_sp_slot(b, "act.h2_tp", hb);
         (
-            dsv41_band(
-                b,
-                m.residual[ri],
-                t,
-                tp,
-                c.hc_mult as u64 * c.hidden as u64 * 2,
-            ),
+            dsv41_band(b, m.residual[ri], t, tp, c.hc_mult as u64 * c.hidden as u64 * 2),
             dsv41_band(b, h2, t, tp, c.hidden as u64 * 2),
         )
     } else {
@@ -1542,9 +1596,37 @@ pub(crate) fn emit_dsv41_mhc_pre(
         c.hc_sinkhorn_iters,
         c.eps,
         c.raw.hc_eps,
-        sp_rows(t, tp),
+        sp_abl_rows(t, tp),
         deps,
     )
+}
+
+/// NVIDIA decode: whether `dsv41_fuse_pre_norm` applies (one block per token, whole rows).
+pub(crate) fn dsv41_pre_fusable(t: u32, tp: u32) -> bool {
+    !crate::emit_is_amd() && t <= 8 && sp_abl_rows(t, tp) == t
+}
+
+/// Split decode `HyperConnPre` `p` (inputs `deps`) in two, one block per token each: `p` keeps
+/// only the collapse, whose gates are the PREVIOUS sublayer's pre, so it waits on `deps` rather
+/// than on the mixes GEMV; the returned twin computes this sublayer's pre/post/comb from the mixes
+/// and is what the sublayer's HyperConnPost must wait on. Pair with `dsv41_fuse_pre_norm`.
+pub(crate) fn dsv41_split_pre(b: &mut Builder, p: u32, t: u32, deps: &[u32]) -> u32 {
+    let twin = b.fork_op(p, |d| d.j[1] = 4);
+    b.amend(twin, Some((0..t).collect()), |_| {});
+    b.rewire(p, deps);
+    twin
+}
+
+/// Fold the sublayer RMSNorm into the collapse half of a `dsv41_split_pre` pair: `p` writes the
+/// normalized collapse into `xn` (bit-identical to the `RmsNorm` op). Removes the norm's hop.
+fn dsv41_fuse_pre_norm(b: &mut Builder, p: u32, xn: u32, gamma: u32, eps: f32, t: u32) -> u32 {
+    b.amend(p, Some((0..t).collect()), |d| {
+        assert_eq!((d.op, d.f[0], d.j[1]), (DevOp::HyperConnPre as u16, eps, 0));
+        d.t[2] = xn;
+        d.i[7] = gamma;
+        d.j[1] = 3;
+    });
+    p
 }
 
 /// The mHC POST half: mix `raw` back across the residual copies, into the OTHER buffer.
@@ -1567,10 +1649,19 @@ pub(crate) fn emit_dsv41_mhc_post(
             t / tp,
         )
     } else {
-        (m.residual[ri ^ 1], m.residual[ri], sp_rows(t, tp))
+        (m.residual[ri ^ 1], m.residual[ri], sp_abl_rows(t, tp))
     };
     super::emit_mhc_post(
-        b, out, raw, rin, m.post_mix, m.comb_mix, c.hidden, c.hc_mult, rw, deps,
+        b,
+        out,
+        raw,
+        rin,
+        m.post_mix,
+        m.comb_mix,
+        c.hidden,
+        c.hc_mult,
+        rw,
+        deps,
     )
 }
 
@@ -1613,11 +1704,13 @@ pub(crate) fn emit_dsv41_moe(
     xn2: u32,
     c_norm: u32,
     // The shared expert's output tensor and completion dep. V4.1's shared expert is block-FP8
-    // while these experts are MXFP4, so the caller emits it on op 198 and this only combines it.
+    // while these experts are MXFP4, so the caller emits it on op 210 and this only combines it.
     shared: (u32, u32),
     xgate: &mut u32,
     cus: &[u32],
     peer_w: u32,
+    // Rows of the blob's LARGEST program: slot B's offset is one value for every program.
+    slot_t: u32,
 ) -> u32 {
     let shared_pre = Some(shared.1);
     assert_eq!(
@@ -1712,7 +1805,7 @@ pub(crate) fn emit_dsv41_moe(
     n.fu_scale = sc.fu_scale;
     // The UNIT, not this op's width: see `dsv41_peer_width`. The combine writes `t * hidden * 2`
     // at this offset either way; what changes is where slot B begins.
-    n.slot_b = (t as u64 * peer_w as u64 * 2) as u32;
+    n.slot_b = (slot_t as u64 * peer_w as u64 * 2) as u32;
     super::emit_glm_moe_ffn_prefill(
         b,
         &gc,
@@ -1729,11 +1822,8 @@ pub(crate) fn emit_dsv41_moe(
         super::router_flag::SQRTSOFTPLUS
             | super::router_flag::BIAS
             | super::router_flag::F32_LOGIT
-            | if c.raw.norm_topk_prob {
-                super::router_flag::NORM_TOPK
-            } else {
-                0
-            },
+            | if c.raw.norm_topk_prob { super::router_flag::NORM_TOPK } else { 0 },
+        c.raw.swiglu_limit,
     )
 }
 
@@ -1779,6 +1869,8 @@ pub(crate) fn emit_dsv41_attn_core(
     kv: u32,
     kvlen: u32,
     pos: u32,
+    // The slot's window ring: a later prefill chunk reads the window's rows before it from here.
+    ring: Option<u32>,
     cos: u32,
     sin: u32,
     // The shared compressed cache, the shared selection and `index_topk`, when this layer reads
@@ -1820,17 +1912,20 @@ pub(crate) fn emit_dsv41_attn_core(
     // union grows with its position until top-k caps it. `gsplit` items per pack make the
     // quantization finer -- the same lever the dense arm's causal KV-split already pulls.
     let gsplit = crate::emit_config::active().mla_gather_split.max(1).min(8);
-    let nsplit = if compressed.is_some() {
-        1 + gsplit as u64
-    } else {
-        1u64
-    };
+    let nsplit = if compressed.is_some() { 1 + gsplit as u64 } else { 1u64 };
+    // NVIDIA ropes q and the latent IN PLACE: only the rotary suffix (64 of 512) is touched, and
+    // nothing but this core reads `q` / `kv`.
+    let nv = !crate::emit_is_amd();
     let act = Dsv41CoreAct {
-        qr: b.tensor(
-            &format!("act.l{l}.qr"),
-            (t as u64) * (nh_l as u64) * (hd as u64) * 2,
-        ),
-        kvr: b.tensor(&format!("act.l{l}.kvr"), (t as u64) * (hd as u64) * 2),
+        qr: if nv {
+            q
+        } else {
+            b.tensor(
+                &format!("act.l{l}.qr"),
+                (t as u64) * (nh_l as u64) * (hd as u64) * 2,
+            )
+        },
+        kvr: if nv { kv } else { b.tensor(&format!("act.l{l}.kvr"), (t as u64) * (hd as u64) * 2) },
         opart: b.tensor(
             &format!("act.l{l}.opart"),
             (t as u64) * (nh_l as u64) * (hd as u64) * 4 * nsplit,
@@ -1847,7 +1942,7 @@ pub(crate) fn emit_dsv41_attn_core(
     let all = cus.to_vec();
     // The interior RoPE, on q and on the shared latent. `normalize = 0`: q's norm was applied to
     // the q-LoRA before `wq_b` and the latent's by `kv_norm`, so this op only rotates.
-    let mut rope_op = |b: &mut Builder, out: u32, x: u32, heads: u32, dep: &[u32]| {
+    let rope_op = |b: &mut Builder, out: u32, x: u32, heads: u32, dep: &[u32]| {
         b.emit(DevOp::QwenHeadNormRope, all.clone(), dep, |d| {
             d.t[0] = out;
             d.t[1] = x;
@@ -1873,96 +1968,140 @@ pub(crate) fn emit_dsv41_attn_core(
     let c_q = rope_op(b, act.qr, q, nh_l, deps);
     // ONE latent row per token, shared by every head: heads = 1, not nh_l.
     let c_kv = rope_op(b, act.kvr, kv, 1, deps);
+    // `act_quant(kv, 32, ue8m0, inplace=True)` after the rope (model.py `_window_kv`): the window
+    // K is fp8 over the whole row, rope tail included.
+    let c_kv = if crate::emit_is_amd() {
+        c_kv
+    } else {
+        b.emit(DevOp::ActQuantMx, all.clone(), &[c_kv], |d| {
+            d.t[0] = act.kvr;
+            d.t[1] = act.kvr;
+            d.i[0] = t;
+            d.i[1] = hd;
+        })
+    };
     let scale = 1.0f32 / (hd as f32).sqrt();
     let window = c.sliding_window;
-    let c_fl = b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_q, c_kv], |d| {
-        d.t[0] = act.opart;
-        d.t[1] = act.mlpart;
-        d.t[2] = act.qr;
-        d.t[3] = act.qr; // NoPE: the rope operands are unused
-        d.t[4] = act.kvr;
-        d.t[5] = act.kvr;
-        d.t[6] = kvlen;
-        d.i[0] = 1; // one sequence per prefill chunk
-        d.i[1] = nh_l;
-        d.i[2] = ctx;
-        // Bit 31 NoPE + the sliding window in the low bits. A zero window here is FULL CAUSAL:
-        // the same answer at 32x the arithmetic, which shows up only as a missed latency target.
-        d.i[3] = (1u32 << 31) | window;
-        d.i[4] = t;
-        d.i[5] = KV_MASK_NONE;
-        // Write-only output split: this is partial 0 of `nsplit`. Zero when there is one partial,
-        // which is the layout every other emitter in the tree produces.
-        d.i[7] = if nsplit > 1 {
-            ((nsplit as u32) << 8) | 0
-        } else {
-            0
-        };
-        d.f[0] = scale;
-    });
-    // THE COMPRESSED READ. `compress_ratios[l] != 0` on 38 of 40 layers and every one of them
-    // attends over the shared CSA2 cache ON TOP of its window -- the parts table called this
-    // "38 of 40 layers silently attending over a fraction of what they should".
-    //
-    // No causal mask: the selector produced the set, and op 118 scanned only
-    // `(t + 1) / ratio` pools, so a query cannot name a compressed entry that is not complete
-    // yet (`scripts/dsv41_indexer_oracle.py` check [2]).
-    let c_fl = match compressed {
-        None => c_fl,
-        // OP 51, NOT OP 55, and `t7` is the per-pack UNION rather than the per-query top-k.
-        //
-        // Op 55 is `d_flash_gather_prefill`, the scalar body: one query at a time, its own top-k,
-        // the latent re-read for each. The same packet as op 51 with the NoPE bit and a union in
-        // t7 selects `d_flash_mla_prefill_v2<512, 0, GATHER=true>` instead, which stages the
-        // pack's union once for 8 queries with all 8 per-rank heads on the MFMA M dimension.
-        // That arm requires `n_head == 8`, which is what TP8 gives this model.
-        //
-        // i6 is the union's `cap` here, disambiguated by t7 exactly as the DR=64 chain does it.
-        Some((cache, uni, topk)) => b.emit(
-            DevOp::FlashMlaPrefill,
-            all.clone(),
-            &[c_q, c_kv, c_fl],
-            |d| {
-                d.t[0] = act.opart;
-                d.t[1] = act.mlpart;
+    let sink = w.get(l, "attn.attn_sink");
+    // NVIDIA, compressed layers: ONE pass over the window rows then the union rows with the sink
+    // folded in, normalized bf16 O written directly (interp_sm90a_pfflash_v41.cu FUSED arm, segment
+    // role 20). No partials, no FlashMerge.
+    let fused = match compressed {
+        Some((cache, uni, topk)) if !crate::emit_is_amd() => {
+            let c_fu = b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_q, c_kv], |d| {
+                d.t[0] = act.o;
+                d.t[1] = ring.unwrap_or(TENSOR_NONE);
                 d.t[2] = act.qr;
-                d.t[3] = act.qr;
+                d.t[3] = sink;
                 d.t[4] = cache;
-                d.t[5] = cache;
+                d.t[5] = act.kvr;
                 d.t[6] = kvlen;
                 d.t[7] = uni;
                 d.i[0] = 1;
                 d.i[1] = nh_l;
-                d.i[2] = ctx; // cache rows; the selection never names one past `ctx / ratio`
-                d.i[3] = 1u32 << 31; // NoPE, and NO window: the gather arm takes the whole set
+                d.i[2] = ctx;
+                d.i[3] = (1u32 << 31) | window;
                 d.i[4] = t;
                 d.i[5] = KV_MASK_NONE;
                 d.i[6] = dsv41_union_cap(topk, ctx);
-                // Partials 1..gsplit of nsplit; the body adds its split index to `out_sp0`.
-                d.i[7] = (gsplit << 16) | ((nsplit as u32) << 8) | 1;
                 d.f[0] = scale;
-            },
-        ),
+                d.j[0] = DSV41_UNION_PACK;
+            });
+            b.isolate(c_fu);
+            Some(c_fu)
+        }
+        _ => None,
     };
-    // nsplit = 1, so the merge is the softmax normalisation plus the attention SINKS -- one extra
-    // unscaled logit per head that joins the denominator with no value row. V4.1 has one per head
-    // and `FlashMerge` is the only place it can be folded.
-    let sink = w.get(l, "attn.attn_sink");
-    let c_mg = b.emit(DevOp::FlashMerge, all.clone(), &[c_fl], |d| {
-        d.t[0] = act.o;
-        d.t[1] = act.opart;
-        d.t[2] = act.mlpart;
-        d.t[3] = sink;
-        d.i[0] = t;
-        d.i[1] = nh_l;
-        d.i[2] = nsplit as u32;
-        d.i[3] = hd;
-        d.i[4] = 1; // 1 = F32 sinks
-    });
+    let c_mg = match fused {
+        Some(c_fu) => c_fu,
+        None => {
+            let c_fl = b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_q, c_kv], |d| {
+                d.t[0] = act.opart;
+                d.t[1] = act.mlpart;
+                d.t[2] = act.qr;
+                d.t[3] = ring.unwrap_or(act.qr); // NoPE: no rope operand; the role object's ring slot
+                d.t[4] = act.kvr;
+                d.t[5] = act.kvr;
+                d.t[6] = kvlen;
+                d.i[0] = 1; // one sequence per prefill chunk
+                d.i[1] = nh_l;
+                d.i[2] = ctx;
+                // Bit 31 NoPE + the sliding window in the low bits. A zero window here is FULL CAUSAL:
+                // the same answer at 32x the arithmetic, which shows up only as a missed latency target.
+                d.i[3] = (1u32 << 31) | window;
+                d.i[4] = t;
+                d.i[5] = KV_MASK_NONE;
+                // Write-only output split: this is partial 0 of `nsplit`. Zero when there is one partial,
+                // which is the layout every other emitter in the tree produces.
+                d.i[7] = if nsplit > 1 { ((nsplit as u32) << 8) | 0 } else { 0 };
+                d.f[0] = scale;
+            });
+            // THE COMPRESSED READ. `compress_ratios[l] != 0` on 38 of 40 layers and every one of them
+            // attends over the shared CSA2 cache ON TOP of its window -- the parts table called this
+            // "38 of 40 layers silently attending over a fraction of what they should".
+            //
+            // No causal mask: the selector produced the set, and op 118 scanned only
+            // `(t + 1) / ratio` pools, so a query cannot name a compressed entry that is not complete
+            // yet (`scripts/dsv41_indexer_oracle.py` check [2]).
+            // One op per segment on NVIDIA: the sm_90a attention role object (segment role 20) runs it.
+            if !crate::emit_is_amd() {
+                b.isolate(c_fl);
+            }
+            let c_fl = match compressed {
+                None => c_fl,
+                // OP 51, NOT OP 55, and `t7` is the per-pack UNION rather than the per-query top-k.
+                //
+                // Op 55 is `d_flash_gather_prefill`, the scalar body: one query at a time, its own top-k,
+                // the latent re-read for each. The same packet as op 51 with the NoPE bit and a union in
+                // t7 selects `d_flash_mla_prefill_v2<512, 0, GATHER=true>` instead, which stages the
+                // pack's union once for 8 queries with all 8 per-rank heads on the MFMA M dimension.
+                // That arm requires `n_head == 8`, which is what TP8 gives this model.
+                //
+                // i6 is the union's `cap` here, disambiguated by t7 exactly as the DR=64 chain does it.
+                Some((cache, uni, topk)) => b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_q, c_kv, c_fl], |d| {
+                    d.t[0] = act.opart;
+                    d.t[1] = act.mlpart;
+                    d.t[2] = act.qr;
+                    d.t[3] = act.qr;
+                    d.t[4] = cache;
+                    d.t[5] = cache;
+                    d.t[6] = kvlen;
+                    d.t[7] = uni;
+                    d.i[0] = 1;
+                    d.i[1] = nh_l;
+                    d.i[2] = ctx; // cache rows; the selection never names one past `ctx / ratio`
+                    d.i[3] = 1u32 << 31; // NoPE, and NO window: the gather arm takes the whole set
+                    d.i[4] = t;
+                    d.i[5] = KV_MASK_NONE;
+                    d.i[6] = dsv41_union_cap(topk, ctx);
+                    // Partials 1..gsplit of nsplit; the body adds its split index to `out_sp0`.
+                    d.i[7] = (gsplit << 16) | ((nsplit as u32) << 8) | 1;
+                    d.f[0] = scale;
+                }),
+            };
+            if !crate::emit_is_amd() {
+                b.isolate(c_fl);
+            }
+            // nsplit = 1, so the merge is the softmax normalisation plus the attention SINKS -- one extra
+            // unscaled logit per head that joins the denominator with no value row. V4.1 has one per head
+            // and `FlashMerge` is the only place it can be folded.
+            b.emit(DevOp::FlashMerge, all.clone(), &[c_fl], |d| {
+                d.t[0] = act.o;
+                d.t[1] = act.opart;
+                d.t[2] = act.mlpart;
+                d.t[3] = sink;
+                d.i[0] = t;
+                d.i[1] = nh_l;
+                d.i[2] = nsplit as u32;
+                d.i[3] = hd;
+                d.i[4] = 1; // `attn_sink` is f32
+            })
+        }
+    };
     // THE INVERSE ROPE, which this emit used to leave out entirely.
     //
     // `Attention.forward` ends `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` (model.py:781) on
-    // EVERY layer, window-only ones included -- op 195's own header calls it "STRUCTURAL, not
+    // EVERY layer, window-only ones included -- op 207's own header calls it "STRUCTURAL, not
     // cosmetic", because `o` mixes cached rows each rotated by its OWN position and de-rotating by
     // the QUERY's position is what leaves a position-independent latent for the fixed `wo_a`. The
     // op has existed since the CSA2 wiring and had no emit site; a layer without it runs, stays
@@ -1980,6 +2119,11 @@ pub(crate) fn emit_dsv41_attn_core(
         d.i[2] = hd;
         d.i[3] = rope;
         d.i[4] = 0;
+        // Per-row positions: a later prefill chunk's rows are not at 0..t.
+        if !crate::emit_is_amd() {
+            d.t[3] = pos;
+            d.i[5] = 1;
+        }
     });
     (act, c_ir)
 }
@@ -2057,23 +2201,25 @@ pub(crate) fn emit_dsv41_attn_out(
     deps: &[u32],
 ) -> (Dsv41OutAct, Vec<u32>) {
     let (groups, orow, ocol) = c.wo_a_groups();
-    assert_eq!(
-        tp, groups,
-        "the output LoRA is block-diagonal over {groups} groups and this emit maps ONE group to \
-         one rank, so it needs tp == o_groups (tp is {tp}). At tp=1 the same weight is 8 separate \
-         GEMMs over 8 slices of one checkpoint tensor, and the tensor table has no sub-tensor \
-         view to express that -- it would need a grouped-GEMM opcode or a slicing loader. \
-         Missing capability: `emit_dsv41_out_lora_tp{tp}`."
+    // Rank r's OutSplit rows of wo_a are groups r*gpr .. (r+1)*gpr -- the same cut as its heads,
+    // since a group is heads / o_groups heads -- so below TP8 the rank runs op 210's grouped form.
+    assert!(
+        groups % tp == 0 && (tp == groups || !crate::emit_is_amd()),
+        "the output LoRA is block-diagonal over {groups} groups; tp must divide it (tp is {tp}), \
+         and on AMD equal it -- the AMD arm has no grouped op 210. Missing capability: \
+         `emit_dsv41_out_lora_tp{tp}`."
     );
+    let gpr = groups / tp;
+    let orow_r = gpr * orow;
     let act = Dsv41OutAct {
-        o_a: b.tensor(&format!("act.l{l}.o_a"), (t as u64) * (orow as u64) * 2),
+        o_a: b.tensor(&format!("act.l{l}.o_a"), (t as u64) * (orow_r as u64) * 2),
         // NOT per-layer: the name is fixed by the runtime's peer-slot table, and the reduce
         // consumes the partial in the same layer that writes it, so one buffer serves all 40.
         o_part: b.tensor(PEER_SLOT_O, (t as u64) * (c.hidden as u64) * 2),
         o: b.tensor(&format!("act.l{l}.o"), (t as u64) * (c.hidden as u64) * 2),
     };
-    // This rank's group: [T, ocol] x [orow, ocol]^T -> [T, orow].
-    let c_oa = emit_pf_gemm_fp8_mx(
+    // This rank's groups: [T, gpr*ocol] x blockdiag([gpr*orow, ocol])^T -> [T, gpr*orow].
+    let c_oa = super::emit_pf_gemm_fp8_mx_grouped(
         b,
         cus,
         act.o_a,
@@ -2083,9 +2229,10 @@ pub(crate) fn emit_dsv41_attn_out(
         t,
         orow,
         ocol,
+        gpr,
         deps,
     );
-    // This rank's SLICE of wo_b: [T, orow] x [hidden, orow]^T -> a [T, hidden] PARTIAL.
+    // This rank's SLICE of wo_b: [T, orow_r] x [hidden, orow_r]^T -> a [T, hidden] PARTIAL.
     let xr = super::xr_cus_capped(b.n_cu(), cus);
     let kb = dsv41_xr_band(t);
     let c_xr = if dsv41_sp(t, tp) {
@@ -2101,7 +2248,7 @@ pub(crate) fn emit_dsv41_attn_out(
             w.get(l, "attn.wo_b.scale"),
             t,
             c.hidden,
-            orow,
+            orow_r,
             &[c_oa],
         );
         vec![crate::emit_xreduce_scatter(
@@ -2133,7 +2280,7 @@ pub(crate) fn emit_dsv41_attn_out(
                     w.get(l, "attn.wo_b.scale"),
                     rows,
                     c.hidden,
-                    orow,
+                    orow_r,
                     i * rows,
                     &[c_oa],
                 );
@@ -2152,6 +2299,20 @@ pub(crate) fn emit_dsv41_attn_out(
             })
             .collect();
         ends
+    } else if tp == 1 {
+        // A group of one has nothing to reduce: wo_b writes the attention output directly.
+        vec![emit_pf_gemm_fp8_mx(
+            b,
+            cus,
+            act.o,
+            act.o_a,
+            w.get(l, "attn.wo_b.weight"),
+            w.get(l, "attn.wo_b.scale"),
+            t,
+            c.hidden,
+            orow_r,
+            &[c_oa],
+        )]
     } else {
         let c_ob = emit_pf_gemm_fp8_mx(
             b,
@@ -2162,7 +2323,7 @@ pub(crate) fn emit_dsv41_attn_out(
             w.get(l, "attn.wo_b.scale"),
             t,
             c.hidden,
-            orow,
+            orow_r,
             &[c_oa],
         );
         vec![crate::emit_xreduce(
@@ -2255,6 +2416,8 @@ const DSV41_ACT_SWIGLU_CLAMP: u32 = 4;
 
 /// Scratch for the FFN's pre-norm and the shared expert.
 pub(crate) struct Dsv41FfnAct {
+    /// The FFN RMSNorm's completion: what the router needs, before the shared expert.
+    pub(crate) c_xn: u32,
     /// Residual after the FFN RMSNorm, `[T][hidden]` bf16.
     pub(crate) xn: u32,
     /// Shared-expert gate and up, each `[T][moe_inter / tp]` bf16.
@@ -2271,7 +2434,7 @@ pub(crate) struct Dsv41FfnAct {
 /// Emit the FFN pre-norm and the SHARED expert (not the routed ones).
 ///
 /// The shared expert is block-FP8 on the `[32, 32]` ue8m0 grid like every other dense projection,
-/// which is why it is 23.19 TFLOP of the 8k prefill and why it lands here on op 198 rather than
+/// which is why it is 23.19 TFLOP of the 8k prefill and why it lands here on op 210 rather than
 /// with the routed experts. The ROUTED experts are MXFP4 on ops 85/86 -- a different fetch path
 /// entirely, and the reason this checkpoint needs a mixed encoding at all.
 ///
@@ -2289,6 +2452,10 @@ pub(crate) fn emit_dsv41_ffn_shared(
     x: u32,
     t: u32,
     deps: &[u32],
+    // The combine reads the partial locally either way. Slot 0 is only safe while attention's
+    // reduce is two-shot (below); the decode program's one-shot reduce needs a local buffer.
+    local_part: bool,
+    fuse_pre: Option<u32>,
 ) -> (Dsv41FfnAct, u32) {
     let hidden = c.hidden;
     assert_eq!(
@@ -2300,15 +2467,10 @@ pub(crate) fn emit_dsv41_ffn_shared(
     // PER-RANK. `w1`/`w3` are OutSplit over `moe_inter` and `w2` is InSplit over it, so all three
     // are DECLARED at `inter / tp` and every intermediate activation is that wide too.
     let inter = c.moe_inter / tp;
-    let act = Dsv41FfnAct {
-        xn: b.tensor(
-            &format!("act.l{l}.ffn_xn"),
-            (t as u64) * (hidden as u64) * 2,
-        ),
-        sh_gate: b.tensor(
-            &format!("act.l{l}.sh_gate"),
-            (t as u64) * (inter as u64) * 2,
-        ),
+    let mut act = Dsv41FfnAct {
+        c_xn: 0,
+        xn: b.tensor(&format!("act.l{l}.ffn_xn"), (t as u64) * (hidden as u64) * 2),
+        sh_gate: b.tensor(&format!("act.l{l}.sh_gate"), (t as u64) * (inter as u64) * 2),
         sh_up: b.tensor(&format!("act.l{l}.sh_up"), (t as u64) * (inter as u64) * 2),
         sh_act: b.tensor(&format!("act.l{l}.sh_act"), (t as u64) * (inter as u64) * 2),
         // The DOWN projection's output is a PARTIAL over this rank's slice of the intermediate,
@@ -2331,26 +2493,29 @@ pub(crate) fn emit_dsv41_ffn_shared(
         // a rank cannot complete it until every peer has both contributed and published its band,
         // which is exactly "finished reading slot 0". `AmdTpGroup::run_rung` also drains every rank
         // between segments, and the two reduces are in different segments.
-        sh_part: if tp == 1 {
+        sh_part: if local_part && tp > 1 {
+            b.tensor("act.sh_part", (t as u64) * (hidden as u64) * 2)
+        } else if tp == 1 {
             // A group of one has no peer region, so the down projection writes an ordinary buffer.
-            b.tensor(
-                &format!("act.l{l}.sh_out"),
-                (t as u64) * (hidden as u64) * 2,
-            )
+            b.tensor(&format!("act.l{l}.sh_out"), (t as u64) * (hidden as u64) * 2)
         } else {
             b.tensor(PEER_SLOT_SHARED, (t as u64) * (hidden as u64) * 2)
         },
     };
     let all = cus.to_vec();
     let eps = c.eps;
-    let c_xn = b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
-        d.t[0] = act.xn;
-        d.t[1] = x;
-        d.t[2] = w.get(l, "ffn_norm.weight");
-        d.i[0] = t;
-        d.i[1] = hidden;
-        d.f[0] = eps;
-    });
+    let c_xn = match fuse_pre {
+        Some(p) => dsv41_fuse_pre_norm(b, p, act.xn, w.get(l, "ffn_norm.weight"), eps, t),
+        None => b.emit(DevOp::RmsNorm, all.clone(), deps, |d| {
+            d.t[0] = act.xn;
+            d.t[1] = x;
+            d.t[2] = w.get(l, "ffn_norm.weight");
+            d.i[0] = t;
+            d.i[1] = hidden;
+            d.f[0] = eps;
+        }),
+    };
+    act.c_xn = c_xn;
     // Gate and up read the SAME input and have no dependence on each other.
     let c_g = emit_pf_gemm_fp8_mx(
         b,
@@ -2376,27 +2541,51 @@ pub(crate) fn emit_dsv41_ffn_shared(
         hidden,
         &[c_xn],
     );
+    if local_part {
+        // Decode: the shared expert is needed only by the combine, after the routed experts. Let
+        // the router chain (router GEMM -> top-k -> align, 4 and 1 blocks) claim the grid first
+        // so the routed GLU is not queued behind the shared gate/up GEMVs.
+        b.defer_gq(c_g, 3);
+        b.defer_gq(c_u, 3);
+    }
     let limit = c.raw.swiglu_limit;
-    let c_act = b.emit(DevOp::Glu, all.clone(), &[c_g, c_u], |d| {
-        d.t[0] = act.sh_act;
-        d.t[1] = act.sh_gate;
-        d.t[2] = act.sh_up;
-        d.i[0] = t * inter;
-        d.i[1] = DSV41_ACT_SWIGLU_CLAMP;
-        d.f[1] = limit;
-    });
+    // Decode: the down GEMV applies the GLU while staging its input (GemmFp8Mx mode 3, the Glu
+    // op's bf16 rows then mode 2's quantization), which removes the Glu op and its hop.
+    let fold_glu = local_part && !crate::emit_is_amd() && b.memo().contains_key(super::NV_FOLD_ACT_QUANT);
+    let (down_x, down_deps) = if fold_glu {
+        (act.sh_gate, vec![c_g, c_u])
+    } else {
+        let c_act = b.emit(DevOp::Glu, all.clone(), &[c_g, c_u], |d| {
+            d.t[0] = act.sh_act;
+            d.t[1] = act.sh_gate;
+            d.t[2] = act.sh_up;
+            d.i[0] = t * inter;
+            d.i[1] = DSV41_ACT_SWIGLU_CLAMP;
+            d.f[1] = limit;
+        });
+        (act.sh_act, vec![c_act])
+    };
     let c_down = emit_pf_gemm_fp8_mx(
         b,
         cus,
         act.sh_part,
-        act.sh_act,
+        down_x,
         w.get(l, "ffn.shared_experts.w2.weight"),
         w.get(l, "ffn.shared_experts.w2.scale"),
         t,
         hidden,
         inter,
-        &[c_act],
+        &down_deps,
     );
+    if fold_glu {
+        b.amend(c_down, None, |d| {
+            assert_eq!(d.i[6], 2, "the GLU fold rides on the in-op quantization (mode 2)");
+            d.i[6] = 3;
+            d.t[4] = act.sh_up;
+            d.i[7] = DSV41_ACT_SWIGLU_CLAMP;
+            d.f[1] = limit;
+        });
+    }
     // NO CROSS-RANK SUM HERE, and that is the contract, not an omission. `d_moe_combine_pf`
     // computes `out = residual + shared + SUM_slot part` and the band reduce that FOLLOWS it sums
     // `out` across ranks, so the `shared` it is handed must be the row-parallel PARTIAL. GLM says
@@ -2407,6 +2596,9 @@ pub(crate) fn emit_dsv41_ffn_shared(
     // (~29 ms at 8k) on the way. `sh_part` is the answer the caller wants at every `tp`.
     (act, c_down)
 }
+
+/// Slices the decode shared-expert down GEMV runs on beside the routed DOWN.
+const DSV41_SHARED_DOWN_CUS: usize = 16;
 
 /// One sublayer a V4.1 rung has to emit, and whether it is emitted yet.
 ///
@@ -2456,7 +2648,7 @@ pub(crate) enum Part {
 ///
 /// The output side needs the same offset with the rotation INVERTED: `model.py:781` and `:1068`
 /// run `apply_rotary_emb(o[..., -rd:], freqs_cis, True)` on the attention output before the output
-/// LoRA reads it. Op 195 already does inverse RoPE; it needs the same interior range.
+/// LoRA reads it. Op 207 already does inverse RoPE; it needs the same interior range.
 ///
 /// Emitting `<512, 64>` here instead would read 64 bytes past every latent row and still produce
 /// fluent output, which is the failure this rung refuses on purpose.
@@ -2522,7 +2714,38 @@ pub(crate) fn emit_dsv41_block(
     ctx: u32,
     t: u32,
 ) -> (crate::Model, plow_asset::BlockDescriptor) {
+    emit_dsv41_chain(c, layers, tp, n_cu, ctx, t, false)
+}
+
+/// The whole model's token interface: embed in front of the chain, norm + head + greedy argmax
+/// behind it, token ids in and sampled ids out through `in.ids`.
+pub(crate) struct Dsv41ModelIo {
+    ids: u32,
+    embed: u32,
+    norm: u32,
+    /// This rank's `vocab / tp` rows; the loader slices by the declared size.
+    head: u32,
+    xn: u32,
+    logits: u32,
+    amax: u32,
+    vocab_l: u32,
+}
+
+/// `model`: embed + tail around the chain (`layers` must then be the whole stack).
+pub(crate) fn emit_dsv41_chain(
+    c: &Dsv41Cfg,
+    layers: &[u32],
+    tp: u32,
+    n_cu: u32,
+    ctx: u32,
+    t: u32,
+    model: bool,
+) -> (crate::Model, plow_asset::BlockDescriptor) {
     assert!(!layers.is_empty(), "--block needs at least one layer");
+    assert!(
+        !model || layers.iter().copied().eq(0..layers.len() as u32),
+        "a model emit runs layers 0.. in order"
+    );
     let l = layers[0];
     for &li in layers {
         let parts = dsv41_layer_parts(c, li);
@@ -2547,7 +2770,39 @@ pub(crate) fn emit_dsv41_block(
     let w = declare_dsv41_weights(&mut tb, c, layers, tp);
     let xnext = tb.tensor("act.xnext", (t as u64) * (c.hidden as u64) * 2);
     let pos = tb.tensor("in.pos", (ctx as u64) * 4);
-    let kvlen = tb.tensor("in.kvlen", 4);
+    // `PLOW_DSV41_DECODE`: a batched decode program over the widest decode rung's slots, and the
+    // per-slot state (`kv.*`) the prefill seeds for it.
+    let decode_mode = crate::emit_config::active().dsv41_decode.clone();
+    let dbatch = match decode_mode.as_deref() {
+        None => 0,
+        Some("attn") | Some("full") => *crate::emit_config::active().decode_rungs().last().unwrap(),
+        Some(m) => panic!("PLOW_DSV41_DECODE={m:?}: expected `attn` or `full`"),
+    };
+    assert!(dbatch <= 64, "V4.1 decode projections run the T <= 64 GEMV arm; dbatch {dbatch}");
+    let kvlen = tb.tensor("in.kvlen", dbatch.max(1) as u64 * 4);
+    let nv = !crate::emit_is_amd();
+    // Unused by a block, declared because the CUDA engine binds every packet's token-id input
+    // and logits output by name.
+    let ids = tb.tensor("in.ids", (t as u64) * 4);
+    tb.tensor("act.logits", 4);
+    let io = model.then(|| {
+        let vocab = c.raw.vocab_size as u32;
+        assert_eq!(vocab % tp, 0, "vocab {vocab} must split over tp={tp}");
+        let vocab_l = vocab / tp;
+        let rows = dbatch.max(1) as u64;
+        let h = c.hidden as u64;
+        Dsv41ModelIo {
+            ids,
+            embed: tb.tensor("embed.weight", vocab as u64 * h * 2),
+            norm: tb.tensor("norm.weight", h * 2),
+            head: tb.tensor("head.weight", vocab_l as u64 * h * 2),
+            xn: tb.tensor("act.head_xn", (t as u64) * h * 2),
+            logits: tb.tensor("act.logits", rows * vocab_l as u64 * 2),
+            amax: tb.tensor("act.amax", rows * crate::AMAX_BLOCKS as u64 * 8),
+            vocab_l,
+        }
+    });
+    assert!(!model || dbatch > 0, "a whole-model emit needs PLOW_DSV41_DECODE=full");
     // TWO ROPE TABLES, and which one a layer takes is decided by `compress_ratio`, not by what
     // the layer does with it. `Attention.__init__` (`model.py:680-687`) builds ONE `freqs_cis` per
     // layer and every rope in that layer -- the query's, the latent's, the compressor's, the
@@ -2581,12 +2836,10 @@ pub(crate) fn emit_dsv41_block(
         packet::rope::RopeScale::None,
     );
     let rs = &c.raw.rope_scaling;
-    let (cos_c, sin_c) = if layers.iter().any(|&l| {
-        !matches!(
-            c.raw.attn_kind(l),
-            nn_graph::models::config::V41Attn::Window
-        )
-    }) {
+    let (cos_c, sin_c) = if layers
+        .iter()
+        .any(|&l| !matches!(c.raw.attn_kind(l), nn_graph::models::config::V41Attn::Window))
+    {
         rope_tables(
             &mut tb,
             "_yarn",
@@ -2606,6 +2859,8 @@ pub(crate) fn emit_dsv41_block(
     let engram = declare_dsv41_engram(&mut tb, c, layers, t);
     let compress = declare_dsv41_compress(&mut tb, c, layers, t, ctx);
     let index = declare_dsv41_index(&mut tb, c, layers, t, ctx);
+    let st = (dbatch > 0).then(|| super::dsv41_decode::declare_dsv41_state(&mut tb, c, layers, ctx, dbatch));
+    let da = (dbatch > 0).then(|| super::dsv41_decode::declare_dsv41_decode_act(&mut tb, c, tp, ctx, dbatch));
     let peer_w = dsv41_peer_width(c, layers);
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
@@ -2686,7 +2941,10 @@ pub(crate) fn emit_dsv41_block(
             );
         }
     }
-    let mut deps: Vec<u32> = Vec::new();
+    let mut deps: Vec<u32> = match &io {
+        Some(io) => vec![emit_dsv41_embed(&mut b, c, io, &all, mhc.residual[0], t)],
+        None => Vec::new(),
+    };
     // The sublayer index, counting attention and FFN separately: it is what picks the `pre_pair`
     // half, so it must advance twice per layer and never reset. See `emit_dsv41_mhc_pre`.
     let mut pi = 0usize;
@@ -2736,7 +2994,7 @@ pub(crate) fn emit_dsv41_block(
             c_pre
         };
         let (proj, c_proj) =
-            emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre]);
+            emit_dsv41_attn_proj(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre], None);
         // Every rope in a layer reads that layer's ONE `freqs_cis`, and which table that is comes
         // from `compress_ratio` alone -- see the two tables above.
         let (lcos, lsin) = if matches!(
@@ -2752,24 +3010,25 @@ pub(crate) fn emit_dsv41_block(
         // dependency list even though the core does not read the cache yet: the cache is shared
         // with LATER layers, and an op outside the chain's dependency order is an op the
         // scheduler may float past the layer that reads it.
-        let mut core_deps = vec![c_proj];
+        let mut core_deps = c_proj.to_vec();
         if c.kv_source.contains(&l) {
             let cp = compress
                 .as_ref()
                 .expect("declare_dsv41_compress saw this layer in `layers`");
-            core_deps.push(emit_dsv41_compressor(
-                &mut b,
-                c,
-                &w,
-                &all,
-                cp,
-                l,
-                proj.xn,
-                lcos,
-                lsin,
-                t,
-                &[c_proj],
-            ));
+            // With decode state, this source's cache is its own per-slot `kv.cmp{l}`.
+            let cps = st.as_ref().map(|st| Dsv41Compress { cache: st.cmp[&l], kv: cp.kv, gate: cp.gate, latent: cp.latent });
+            let c_cmp = emit_dsv41_compressor(
+                &mut b, c, &w, &all, cps.as_ref().unwrap_or(cp), l, proj.xn, lcos, lsin, t, nv.then_some((pos, kvlen)),
+                &c_proj,
+            );
+            core_deps.push(c_cmp);
+            if let Some(st) = &st {
+                if let Some(c_seed) =
+                    super::dsv41_decode::emit_dsv41_state_seed(&mut b, c, st, &all, l, cp.kv, cp.gate, kvlen, &[c_cmp])
+                {
+                    core_deps.push(c_seed);
+                }
+            }
         }
         // THE SELECTION, on the 8 `index_source` layers. Every other layer REUSES the one its
         // source published -- `_compress_topk_idxs` returns `shared_attn.topk_idxs` unchanged
@@ -2777,20 +3036,40 @@ pub(crate) fn emit_dsv41_block(
         // exactly where the reference constructs one, and the layers between simply read the
         // table. That reuse is why 8 indexers serve 38 readers.
         if c.index_source.contains(&l) {
-            let ix = index
+            let ix0 = index
                 .as_ref()
                 .expect("declare_dsv41_index saw this layer in `layers`");
+            let ixs = st.as_ref().map(|st| Dsv41Index {
+                keys: st.ik[&super::dsv41_decode::dsv41_src_of(c, l).expect("an index layer has a key source")],
+                idx: ix0.idx,
+                q: ix0.q,
+                qr: ix0.qr,
+                w: ix0.w,
+                k: ix0.k,
+                kn: ix0.kn,
+                score: ix0.score,
+                uni: ix0.uni,
+                umask: ix0.umask,
+            });
+            let ix = ixs.as_ref().unwrap_or(ix0);
+            let cps = compress.as_ref().zip(st.as_ref()).map(|(cp, st)| Dsv41Compress {
+                cache: st.cmp.get(&l).copied().unwrap_or(cp.cache),
+                kv: cp.kv,
+                gate: cp.gate,
+                latent: cp.latent,
+            });
             core_deps.push(emit_dsv41_indexer(
                 &mut b,
                 c,
                 &w,
                 &all,
                 ix,
-                compress.as_ref(),
+                cps.as_ref().or(compress.as_ref()),
                 l,
                 proj.xn,
                 proj.q_an,
                 kvlen,
+                nv.then_some(pos),
                 lcos,
                 lsin,
                 t,
@@ -2804,16 +3083,24 @@ pub(crate) fn emit_dsv41_block(
             nn_graph::models::config::V41Attn::Window => None,
             nn_graph::models::config::V41Attn::Compressed { ratio } => {
                 let cp = compress.as_ref().expect("a compressed layer needs a cache");
-                let ix = index
-                    .as_ref()
-                    .expect("a compressed layer needs a selection");
-                Some((cp.cache, ix.uni, dsv41_index_topk(c, t, ratio)))
+                let ix = index.as_ref().expect("a compressed layer needs a selection");
+                let cache = match &st {
+                    Some(st) => st.cmp[&super::dsv41_decode::dsv41_src_of(c, l).expect("a compressed layer has a source")],
+                    None => cp.cache,
+                };
+                Some((cache, ix.uni, dsv41_index_topk(c, t, ratio)))
             }
         };
+        let ring = st.as_ref().filter(|_| nv).map(|st| st.win[&l]);
         let (core, c_core) = emit_dsv41_attn_core(
-            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, lcos, lsin, compressed, t,
+            &mut b, c, &w, &all, l, tp, proj.q, proj.kv, kvlen, pos, ring, lcos, lsin, compressed, t,
             ctx, &core_deps,
         );
+        // Decode state: the ring takes this chunk's tail only after the core read the previous one.
+        let c_core = match &st {
+            Some(st) => super::dsv41_decode::emit_dsv41_ring_seed(&mut b, c, st, &all, l, proj.kv, pos, kvlen, t, &[c_core]),
+            None => c_core,
+        };
         let (_out, c_out) =
             emit_dsv41_attn_out(&mut b, c, &w, &all, l, tp, core.o, t, &mut xgate, &[c_core]);
         // Under SP the attention answer never becomes `_out.o`: the seam reduce-SCATTERED it, so
@@ -2833,22 +3120,12 @@ pub(crate) fn emit_dsv41_block(
         } else {
             c_pre2
         };
-        let (ffn, c_sh) =
-            emit_dsv41_ffn_shared(&mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2]);
+        let (ffn, c_sh) = emit_dsv41_ffn_shared(
+            &mut b, c, &w, &all, l, tp, mhc.layer_input, t, &[c_pre2], false, None,
+        );
         let c_moe = emit_dsv41_moe(
-            &mut b,
-            c,
-            &w,
-            l,
-            tp,
-            t,
-            xnext,
-            ffn.xn,
-            c_sh,
-            (ffn.sh_part, c_sh),
-            &mut xgate,
-            &all,
-            peer_w,
+            &mut b, c, &w, l, tp, t, xnext, ffn.xn, c_sh, (ffn.sh_part, c_sh), &mut xgate, &all,
+            peer_w, t,
         );
         // CAPTURED, not discarded: it is the next layer's only dependency, and the thing that
         // makes the chain a chain rather than 40 layers racing on one residual buffer.
@@ -2864,6 +3141,10 @@ pub(crate) fn emit_dsv41_block(
         ri ^= 1;
         deps = vec![c_layer];
     }
+    if let Some(io) = &io {
+        let last = *layers.last().unwrap();
+        emit_dsv41_tail(&mut b, c, &w, &mhc, io, last, ri, pi, t, false, tp, &mut xgate, &all, &deps);
+    }
 
     // PLOW_DSV41_OPS=<n>: emit only the first n ops of the layer. A profiling cut, not a
     // feature -- the run times of successive prefixes difference into a per-op cost, which is
@@ -2877,11 +3158,7 @@ pub(crate) fn emit_dsv41_block(
         );
     }
     let prog = b.finish();
-    let out_name = if ri == 0 {
-        "act.hc_residual_a"
-    } else {
-        "act.hc_residual_b"
-    };
+    let out_name = if ri == 0 { "act.hc_residual_a" } else { "act.hc_residual_b" };
     let tensors = prog.tensors.clone();
 
     // A TRAILING, DELIBERATELY EMPTY DECODE PROGRAM.
@@ -2897,19 +3174,38 @@ pub(crate) fn emit_dsv41_block(
     // `decode_t: 0` to match, and `the_rung_states_it_cannot_decode` pins the pair, so a real
     // decode emit has to update both or fail.
     let mut db = Builder::new(n_cu);
+    db.ignore_isolate();
+    db.set_tensor_dedup(true);
     db.adopt_tensors(prog.tensors.clone());
+    let mut dec_out = None;
+    if let (Some(st), Some(da)) = (&st, &da) {
+        dec_out = Some(emit_dsv41_decode_program(
+            &mut db,
+            c,
+            &w,
+            st,
+            da,
+            layers,
+            tp,
+            ctx,
+            t,
+            pos,
+            (cos, sin),
+            (cos_c, sin_c),
+            decode_mode.as_deref() == Some("attn"),
+            io.as_ref(),
+        ));
+    }
     let decode = db.finish();
-    assert!(
-        decode.insts.is_empty(),
-        "the decode placeholder must stay empty"
-    );
+    assert!(dbatch > 0 || decode.insts.is_empty(), "the decode placeholder must stay empty");
+    let tensors = if dbatch > 0 { decode.tensors.clone() } else { tensors };
 
     let m = crate::Model {
         n_cu,
         target: 0,
         tensors,
         progs: vec![prog, decode],
-        prog_t: vec![t, 1],
+        prog_t: vec![t, dbatch.max(1)],
         kv_row_insts: Vec::new(),
         gen,
     };
@@ -2976,11 +3272,237 @@ pub(crate) fn emit_dsv41_block(
             // Prefill only. There is no decode program: the rung exists to prove the prefill
             // chain, and a `decode_t: 1` here would advertise one that was never emitted.
             prefill_buckets: vec![t as i64],
-            decode_t: 0,
+            decode_t: dbatch as i64,
         },
     };
+    if let Some(o) = dec_out {
+        eprintln!("  decode program: {dbatch} slots, output {o}");
+    }
     let _ = nh_l;
     (m, d)
+}
+
+/// `in.ids[0..rows]` -> `residual`, each token's row written `hc_mult` times (`[T][hc][hidden]`),
+/// which is `h.unsqueeze(2).repeat(1, 1, hc_mult, 1)` (model.py:1258).
+fn emit_dsv41_embed(b: &mut Builder, c: &Dsv41Cfg, io: &Dsv41ModelIo, all: &[u32], residual: u32, rows: u32) -> u32 {
+    b.emit(DevOp::Embed, all.to_vec(), &[], |d| {
+        d.t[0] = residual;
+        d.t[1] = io.embed;
+        d.t[2] = io.ids;
+        d.i[0] = rows;
+        d.i[1] = c.hidden;
+        d.i[2] = c.hc_mult;
+        d.f[0] = 1.0;
+    })
+}
+
+/// `hc_pre(h, pre_mix)` with the last FFN's pre-mix, `norm`, the vocab-sharded head, greedy argmax
+/// into `in.ids` (model.py:1268-1270). The collapse is a Deferred mHC pre on the last layer's attn
+/// weights: its own mixes are computed and never read, its `layer_input` is the collapse.
+/// Prefill samples the last real row (`i4`, re-patched per chunk); decode samples every slot.
+#[allow(clippy::too_many_arguments)]
+fn emit_dsv41_tail(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    mhc: &Dsv41Mhc,
+    io: &Dsv41ModelIo,
+    last: u32,
+    ri: usize,
+    pi: usize,
+    rows: u32,
+    decode: bool,
+    tp: u32,
+    xgate: &mut u32,
+    all: &[u32],
+    deps: &[u32],
+) -> u32 {
+    let c_pre = emit_dsv41_mhc_pre(b, c, w, mhc, last, false, ri, pi, rows, tp, deps);
+    let c_n = b.emit(DevOp::RmsNorm, all.to_vec(), &[c_pre], |d| {
+        d.t[0] = io.xn;
+        d.t[1] = mhc.layer_input;
+        d.t[2] = io.norm;
+        d.i[0] = rows;
+        d.i[1] = c.hidden;
+        d.f[0] = c.eps;
+    });
+    let (m, row0, op) = if decode {
+        (rows, 0, DevOp::Gemv)
+    } else {
+        (1, rows - 1, crate::pick_tile(1, io.vocab_l, c.hidden, b.n_cu(), kernelcaps::QuantScheme::None))
+    };
+    let c_lm = b.emit(op, all.to_vec(), &[c_n], |d| {
+        d.t[0] = io.logits;
+        d.t[1] = io.xn;
+        d.t[2] = io.head;
+        d.i[0] = m;
+        d.i[1] = io.vocab_l;
+        d.i[2] = c.hidden;
+        d.i[4] = row0;
+    });
+    let nb = if decode && rows > 1 { rows } else { 0 };
+    let c_am = b.emit(DevOp::Argmax, (0..crate::AMAX_BLOCKS).collect(), &[c_lm], |d| {
+        d.t[0] = io.amax;
+        d.t[1] = io.logits;
+        d.i[0] = io.vocab_l;
+        d.i[1] = nb;
+    });
+    if tp > 1 {
+        let n_batch = nb.max(1);
+        let value_lines = packet::devbuild::xargmax_value_lines(n_batch)
+            .unwrap_or_else(|| panic!("XArgmaxFin carries at most {} sequences", packet::devbuild::XARGMAX_MAX_BATCH));
+        let gate = *xgate;
+        *xgate += 1 + value_lines;
+        b.emit(DevOp::XArgmaxFin, vec![0u32], &[c_am], |d| {
+            d.t[0] = io.ids;
+            d.t[1] = io.amax;
+            d.i[0] = crate::AMAX_BLOCKS;
+            d.i[1] = n_batch;
+            d.i[2] = io.vocab_l;
+            d.i[3] = gate;
+            d.i[4] = gate + 1;
+        })
+    } else {
+        b.emit(DevOp::ArgmaxFin, vec![0u32], &[c_am], |d| {
+            d.t[0] = io.ids;
+            d.t[1] = io.amax;
+            d.i[0] = crate::AMAX_BLOCKS;
+            d.i[1] = nb;
+        })
+    }
+}
+
+/// The batched decode program for a block chain: rows are slots, one token each. `attn_only`
+/// stops each layer after the attention sublayer (bring-up). Returns the output residual's name.
+#[allow(clippy::too_many_arguments)]
+fn emit_dsv41_decode_program(
+    b: &mut Builder,
+    c: &Dsv41Cfg,
+    w: &Dsv41Weights,
+    st: &super::dsv41_decode::Dsv41State,
+    da: &super::dsv41_decode::Dsv41DecodeAct,
+    layers: &[u32],
+    tp: u32,
+    ctx: u32,
+    slot_t: u32,
+    pos: u32,
+    (cos, sin): (u32, u32),
+    (cos_c, sin_c): (u32, u32),
+    attn_only: bool,
+    io: Option<&Dsv41ModelIo>,
+) -> &'static str {
+    assert!(io.is_none() || !attn_only, "a whole-model decode runs the full layer");
+    let bsz = st.dbatch;
+    b.memo().insert(super::NV_FOLD_ACT_QUANT.into(), Vec::new());
+    b.set_gq_order_critical(true);
+    let all = b.all();
+    let peer_w = dsv41_peer_width(c, layers);
+    let mhc = declare_dsv41_mhc(b, c, bsz, tp);
+    let engram = declare_dsv41_engram(b, c, layers, bsz);
+    let compress = declare_dsv41_compress(b, c, layers, bsz, ctx);
+    let index = declare_dsv41_index(b, c, layers, bsz, ctx);
+    let nh_l = c.heads / tp;
+    let mut xgate = 0u32;
+    let mut ri = 0usize;
+    let mut pi = 0usize;
+    let mut deps: Vec<u32> = match io {
+        Some(io) => vec![emit_dsv41_embed(b, c, io, &all, mhc.residual[0], bsz)],
+        None => Vec::new(),
+    };
+    for &l in layers {
+        if c.engram_layers.contains(&l) {
+            let e = engram.as_ref().expect("declared for this chain");
+            deps = vec![emit_dsv41_engram(b, c, w, &all, e, l, tp, bsz, mhc.residual[ri], &mut xgate, &deps)];
+        }
+        let fuse = dsv41_pre_fusable(bsz, tp);
+        let c_pre = emit_dsv41_mhc_pre(b, c, w, &mhc, l, false, ri, pi, bsz, tp, &deps);
+        let c_mix = if fuse { dsv41_split_pre(b, c_pre, bsz, &deps) } else { c_pre };
+        pi += 1;
+        let (proj, c_proj) =
+            emit_dsv41_attn_proj(b, c, w, &all, l, tp, mhc.layer_input, bsz, &[c_pre], fuse.then_some(c_pre));
+        let (lcos, lsin) = if matches!(c.raw.attn_kind(l), nn_graph::models::config::V41Attn::Window) {
+            (cos, sin)
+        } else {
+            (cos_c, sin_c)
+        };
+        let attn_o = b.tensor(&format!("act.l{l}.attn_o"), bsz as u64 * nh_l as u64 * c.head_dim as u64 * 2);
+        let c_core = super::dsv41_decode::emit_dsv41_attn_decode(
+            b,
+            c,
+            w,
+            st,
+            da,
+            compress.as_ref(),
+            index.as_ref(),
+            &all,
+            l,
+            tp,
+            &proj,
+            pos,
+            lcos,
+            lsin,
+            ctx,
+            attn_o,
+            &c_proj,
+        );
+        let (out, c_out) = emit_dsv41_attn_out(b, c, w, &all, l, tp, attn_o, bsz, &mut xgate, &[c_core]);
+        let c_post = emit_dsv41_mhc_post(b, c, &mhc, out.o, ri, bsz, tp, &[&c_out[..], &[c_mix]].concat());
+        ri ^= 1;
+        if attn_only {
+            deps = vec![c_post];
+            continue;
+        }
+        let c_pre2 = emit_dsv41_mhc_pre(b, c, w, &mhc, l, true, ri, pi, bsz, tp, &[c_post]);
+        let c_mix2 = if fuse { dsv41_split_pre(b, c_pre2, bsz, &[c_post]) } else { c_pre2 };
+        pi += 1;
+        let (ffn, c_sh) = emit_dsv41_ffn_shared(
+            b,
+            c,
+            w,
+            &all,
+            l,
+            tp,
+            mhc.layer_input,
+            bsz,
+            &[c_pre2],
+            true,
+            fuse.then_some(c_pre2),
+        );
+        let xnext = b.tensor("act.xnext", bsz as u64 * c.hidden as u64 * 2);
+        let n_moe = b.n_insts() as u32;
+        let c_moe = emit_dsv41_moe(b, c, w, l, tp, bsz, xnext, ffn.xn, ffn.c_xn, (ffn.sh_part, c_sh), &mut xgate, &all, peer_w, slot_t);
+        // The shared down GEMV becomes ready while the routed GLU holds the grid; queued between
+        // GLU and DOWN it delays DOWN by its whole span. Give it its own DSV41_SHARED_DOWN_CUS
+        // slices so the grid runs it beside DOWN, which keeps the rest.
+        if !crate::emit_is_amd() && all.len() > 2 * DSV41_SHARED_DOWN_CUS {
+            let split = all.len() - DSV41_SHARED_DOWN_CUS;
+            let down = (n_moe..c_moe).find(|&k| b.inst(k).op == DevOp::MoeGroupDownPf as u16).expect("routed DOWN");
+            b.amend(down, Some(all[..split].to_vec()), |_| {});
+            b.amend(c_sh, Some(all[split..].to_vec()), |_| {});
+        }
+        let c_layer = emit_dsv41_mhc_post(b, c, &mhc, xnext, ri, bsz, tp, &[c_moe, c_mix2]);
+        ri ^= 1;
+        deps = vec![c_layer];
+    }
+    if let Some(io) = io {
+        let last = *layers.last().unwrap();
+        emit_dsv41_tail(b, c, w, &mhc, io, last, ri, pi, bsz, true, tp, &mut xgate, &all, &deps);
+    }
+    // The decode arm of op 85 reduces K-split items through scratch + self-resetting counters (t6).
+    let n_cu = all.len() as u64;
+    let scratch = b.tensor("act.moe_dec_scratch", (2 * n_cu * 8 * 512 + n_cu * 8) * 4);
+    b.for_each_inst_mut(|d| {
+        if d.op == DevOp::MoeGroupGluPf as u16 {
+            d.t[6] = scratch;
+        }
+        // Decode payloads are B rows: one-shot (one cross-GPU handshake) beats reduce-scatter +
+        // all-gather (two) until the peer reads dominate.
+        if d.op == DevOp::XReduceTwoShot as u16 && d.i[0] as u64 * 2 <= 256 << 10 && d.i[5] == 0 {
+            d.op = DevOp::XReduce as u16;
+            d.i[4] = 0;
+        }
+    });
+    if ri == 0 { "act.hc_residual_a" } else { "act.hc_residual_b" }
 }
 
 /// The ops one layer needs, in dataflow order, each marked done or not.
@@ -3011,28 +3533,25 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     //         h = layer.engram(h, engram_hashes[:, :, layer.engram.layer_hash_index, :], mask)
     //     h, pre_mix = layer(h, start_pos, pre_mix, image_mask)   # model.py:1262-1267
     //
-    // so it reads and writes the hc-EXPANDED residual stream (`[T, hc_mult, dim]`, op 196 is in
+    // so it reads and writes the hc-EXPANDED residual stream (`[T, hc_mult, dim]`, op 208 is in
     // place on it) before this layer's mHC pre ever runs -- not the post-attention activation an
-    // FFN-sublayer position would hand it. `scripts/dsv41_engram_oracle.py` confirms ops 196/197
+    // FFN-sublayer position would hand it. `scripts/dsv41_engram_oracle.py` confirms ops 208/209
     // themselves are the reference's, to 0.000e+00 on the embed and 2.2e-16 on the gate, so the
     // whole of what is left here is placement and plumbing.
     if c.engram_layers.contains(&l) {
         p.push((
-            "engram gather + all-reduce + wkv + gate (ops 197/198/196), BEFORE mhc_pre",
+            "engram gather + all-reduce + wkv + gate (ops 209/210/208), BEFORE mhc_pre",
             Part::Done,
         ));
     }
 
     p.push(("mhc_pre (ops 128/129, cross-sublayer `pre`)", Part::Done));
-    p.push(("attn_norm + q_a/q_b/wkv projections (op 198)", Part::Done));
+    p.push(("attn_norm + q_a/q_b/wkv projections (op 210)", Part::Done));
     if c.kv_source.contains(&l) {
-        // Ops 194 (arm 2: pool, norm, STOP) and 199 (rope + fp4/E4M3 quant), or at layer 20's
-        // ratio 1 a plain GEMM and RMSNorm with no op 194 at all. NOT 195 -- that is the inverse
+        // Ops 206 (arm 2: pool, norm, STOP) and 211 (rope + fp4/E4M3 quant), or at layer 20's
+        // ratio 1 a plain GEMM and RMSNorm with no op 206 at all. NOT 207 -- that is the inverse
         // rope on the attention OUTPUT, which every layer runs and which now sits in the core.
-        p.push((
-            "csa2 compressor (ops 194/199), writes the shared cache",
-            Part::Done,
-        ));
+        p.push(("csa2 compressor (ops 206/211), writes the shared cache", Part::Done));
     }
     if c.index_source.contains(&l) {
         // Ops 117/118, with the new pool-granular causal bound. "Two-level" is the candidate
@@ -3063,23 +3582,17 @@ pub(crate) fn dsv41_layer_parts(c: &Dsv41Cfg, l: u32) -> Vec<(&'static str, Part
     //
     // Only layers 0 and 1 are genuinely window-only (`compress_ratios` is [0, 0, 2 x18, 1 x20,
     // 0, 0, 0] -- the trailing three are the DSpark blocks, not layers).
-    if !matches!(
-        c.raw.attn_kind(l),
-        nn_graph::models::config::V41Attn::Window
-    ) {
+    if !matches!(c.raw.attn_kind(l), nn_graph::models::config::V41Attn::Window) {
         p.push((
             "compressed-KV attention (op 55 beside the window flash, merged at nsplit 2)",
             Part::Done,
         ));
     }
-    p.push(("output projection wo_a + wo_b (op 198)", Part::Done));
-    p.push((
-        "output all-reduce (XReduce, wo_b is input-parallel)",
-        Part::Done,
-    ));
+    p.push(("output projection wo_a + wo_b (op 210)", Part::Done));
+    p.push(("output all-reduce (XReduce, wo_b is input-parallel)", Part::Done));
     p.push(("ffn_norm", Part::Done));
     p.push(("moe router + routed experts (ops 85/86, MXFP4)", Part::Done));
-    p.push(("shared expert (op 198 + clamped SwiGLU)", Part::Done));
+    p.push(("shared expert (op 210 + clamped SwiGLU)", Part::Done));
     p.push(("mhc_post", Part::Done));
     p
 }
@@ -3121,7 +3634,7 @@ pub(crate) fn dsv41_emit_block_plan(c: &Dsv41Cfg, l: u32) -> Result<Vec<&'static
          \nA rung is a validation artifact, not a serving model, so it MAY be narrower than the \
          full emit -- but it must not be wrong. A blob missing its attention core loads, runs, and \
          produces fluent-looking garbage, so this refuses instead of writing one.\n\
-         Mostly the emit is the gap -- ops 194/195, 196/197, 198 and 55 exist and pass on gfx942 \
+         Mostly the emit is the gap -- ops 206/207, 208/209, 210 and 55 exist and pass on gfx942 \
          -- but not entirely, and the one kernel difference is easy to miss: `op_compress.h` \
          implements V4's contract, where the fake-quant rounds the per-block scale to a POWER OF \
          TWO. V4.1's compressed KV wants an E4M3 scale at group 16 (`fp4_act_quant(latent, 16, \
@@ -3205,10 +3718,7 @@ pub(crate) fn dsv41_layer_tensors(c: &Dsv41Cfg, l: u32) -> Vec<LayerTensor> {
     // mHC, on EVERY layer -- which is why there is no mHC-free block to extract.
     let mix = ((2 + c.hc_mult) * c.hc_mult) as u64;
     for side in ["attn", "ffn"] {
-        t.push(f32t(
-            &format!("hc_{side}_fn"),
-            mix * c.hc_mult as u64 * hidden,
-        ));
+        t.push(f32t(&format!("hc_{side}_fn"), mix * c.hc_mult as u64 * hidden));
         t.push(f32t(&format!("hc_{side}_base"), mix));
         t.push(f32t(&format!("hc_{side}_scale"), 3));
     }
@@ -3222,33 +3732,15 @@ pub(crate) fn dsv41_layer_tensors(c: &Dsv41Cfg, l: u32) -> Vec<LayerTensor> {
     t.push(f32t("ffn.gate.bias_vl", c.n_exp as u64));
     for e in 0..c.n_exp as u64 {
         for w in ["w1", "w3"] {
-            t.push(f8(
-                &format!("ffn.experts.{e}.{w}.weight"),
-                inter * hidden / 2,
-            ));
-            t.push(f8(
-                &format!("ffn.experts.{e}.{w}.scale"),
-                mxblk(inter, hidden),
-            ));
+            t.push(f8(&format!("ffn.experts.{e}.{w}.weight"), inter * hidden / 2));
+            t.push(f8(&format!("ffn.experts.{e}.{w}.scale"), mxblk(inter, hidden)));
         }
-        t.push(f8(
-            &format!("ffn.experts.{e}.w2.weight"),
-            hidden * inter / 2,
-        ));
-        t.push(f8(
-            &format!("ffn.experts.{e}.w2.scale"),
-            mxblk(hidden, inter),
-        ));
+        t.push(f8(&format!("ffn.experts.{e}.w2.weight"), hidden * inter / 2));
+        t.push(f8(&format!("ffn.experts.{e}.w2.scale"), mxblk(hidden, inter)));
     }
     for w in ["w1", "w3"] {
-        t.push(f8(
-            &format!("ffn.shared_experts.{w}.weight"),
-            inter * hidden,
-        ));
-        t.push(f8(
-            &format!("ffn.shared_experts.{w}.scale"),
-            blk(inter, hidden),
-        ));
+        t.push(f8(&format!("ffn.shared_experts.{w}.weight"), inter * hidden));
+        t.push(f8(&format!("ffn.shared_experts.{w}.scale"), blk(inter, hidden)));
     }
     t.push(f8("ffn.shared_experts.w2.weight", hidden * inter));
     t.push(f8("ffn.shared_experts.w2.scale", blk(hidden, inter)));
@@ -3279,7 +3771,7 @@ pub(crate) fn dsv41_layer_tensors(c: &Dsv41Cfg, l: u32) -> Vec<LayerTensor> {
     }
 
     // Engram, on 2 layers. `embed` is the 98 GB table; `q_weight`/`k_weight` are [hc_mult, hidden]
-    // -- one row per hyper-connection copy, which is what op 196 takes as `qw`/`kw`.
+    // -- one row per hyper-connection copy, which is what op 208 takes as `qw`/`kw`.
     if let Some(rows) = c.raw.engram_rows(l) {
         let rows = rows as u64;
         let (ehd, ehe) = (c.raw.engram_head_dim as u64, c.raw.engram_n_heads as u64);
