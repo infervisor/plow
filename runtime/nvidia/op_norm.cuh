@@ -1042,7 +1042,7 @@ static __device__ void d_head_l2_clip(__nv_bfloat16* __restrict__ out,
 #pragma unroll
         for (unsigned i = 0; i < HD / 32; ++i) {
             values[i] = __bfloat162float(x[offset + i * 32])
-                      * __bfloat162float(scale[scale_offset + i * 32]);
+                      * (scale ? __bfloat162float(scale[scale_offset + i * 32]) : 1.0f);
             sum_sq += values[i] * values[i];
         }
         const float factor = fminf(threshold / (sqrtf(warp_sum32(sum_sq)) + eps), 1.0f);

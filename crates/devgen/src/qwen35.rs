@@ -1751,9 +1751,9 @@ fn refuse_unimplemented_target(arch: &str, gpu: &str) {
     );
 }
 
-/// The RECURRENT STATE section (`plow_asset::recurrent_state`): every `state.qwen.*` buffer,
+/// The RECURRENT STATE section (`plow_asset::recurrent_state`): every `state.*` buffer,
 /// the active mask and the packed-prefill initstate scratch, slot-major over the decode slots.
-fn recurrent_state_section(m: &Model, slots: u32) -> packet::devbuild::SectionData {
+pub(super) fn recurrent_state_section(m: &Model, slots: u32) -> packet::devbuild::SectionData {
     use plow_asset::recurrent_state::{Buffer, Manifest, TensorFacts, SECTION, VERSION};
     let buffer = |index: usize| {
         let t = &m.tensors[index];
@@ -1773,14 +1773,15 @@ fn recurrent_state_section(m: &Model, slots: u32) -> packet::devbuild::SectionDa
         version: VERSION,
         slots,
         buffers: (0..m.tensors.len())
-            .filter(|&i| m.tensors[i].name.starts_with("state.qwen."))
+            .filter(|&i| m.tensors[i].name.starts_with("state."))
             .map(buffer)
             .collect(),
         active: u16::try_from(position("in.active").expect("in.active")).expect("tensor handle"),
         prefill_initstate: position("act.gdn.initstate").map(buffer),
         prefill_updates_state: m.progs[..dec_lo]
             .iter()
-            .all(|p| p.insts.iter().any(|i| i.op == DevOp::QwenGdnPrefill as u16)),
+            .all(|p| p.insts.iter().any(|i| i.op == DevOp::QwenGdnPrefill as u16
+                || (i.op == DevOp::QwenGdnConvPrefill as u16 && i.i[4] != 0))),
     };
     manifest
         .validate(slots, |h| {

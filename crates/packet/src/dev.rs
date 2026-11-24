@@ -156,7 +156,7 @@ pub enum DevOp {
     /// path byte-identical, so prefill and B=1 decode are unchanged.
     /// `cos = TENSOR_NONE` skips RoPE. `out_row0` lets K/V land directly at a row
     /// offset of the KV cache, so the cache write is not a separate copy.
-    /// CUDA pair mode 4 applies a BF16 scale per head and channel, then clips
+    /// CUDA pair mode 4 applies the optional BF16 scale per head and channel, then clips
     /// the FP32 L2 norm to the FP32 bits in `i4` (+ `f0` epsilon in the divisor). Output is dense.
     HeadNormRope = 3,
     /// `t0=out t1=a t2=b t3=pre?` · `i0=n` · `f0=scale`, computing
@@ -1823,6 +1823,9 @@ pub enum DevOp {
     /// column inside an N-concatenated projection's output (runtime contract 4).
     ///
     /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B` · `j1=source?`.
+    /// CUDA `i4 != 0` selects the four-tap residual mode: `i4` is channels
+    /// per group, `f0` scales the sum of input and convolution. Optional BF16
+    /// `t6` adds row/group/tap deltas to transposed static weights [W,C].
     QwenGdnConv = 136,
     /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
     ///
@@ -1861,6 +1864,8 @@ pub enum DevOp {
     /// `source` (j1) as [`DevOp::QwenGdnConv`].
     ///
     /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T` · `j1=source?`.
+    /// CUDA residual mode uses the same operands as [`DevOp::QwenGdnConv`]
+    /// and `i3` gives the padded row count. It consumes one request per launch.
     QwenGdnConvPrefill = 143,
     /// Unpack BF16 packed[T,2*HK*K+HV*V]; normalize Q/K[T,HK,K] and round to BF16, copy V[T,HV,V]. No Q scaling.
     ///

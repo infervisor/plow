@@ -1682,6 +1682,8 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("qwen_gdn") {
         req.push("PLOW_NV_QWEN_GDN=1".into());
+    }
+    if on("qwen_gdn") && s.gqa % 2 == 0 {
         req.push("PLOW_NV_FA_GF=2".into());
     } else if s.hd.iter().all(|&h| h <= 128) && s.gqa > 1 && s.gqa % 4 != 0 {
         // The hd128 flash-decode arm defaults to GF 4 and traps unless GF | gqa.

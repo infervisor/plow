@@ -1501,6 +1501,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     switch (in->op) {
 #if PLOW_NV_QWEN_GDN && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY
     case PLOW_DOP_QWEN_GDN_CONV:
+        if (in->i[4]) {
+            d_recurrent_residual_conv4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), (const int*)TEN(4),
+                (const __nv_bfloat16*)TEN(6), in->i[0], in->i[4], in->i[2],
+                0, false, in->fj[0].f, slice, nblk);
+            break;
+        }
         d_qwen_gdn_conv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), (const int*)TEN(4),
             in->i[0], in->i[1], in->i[2], slice, nblk, in->fj[2].u);
@@ -1539,6 +1546,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             (const int*)TEN(7), in->fj[2].u);
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
+        if (in->i[4]) {
+            d_recurrent_residual_conv4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), nullptr,
+                (const __nv_bfloat16*)TEN(6), in->i[0], in->i[4], in->i[2],
+                in->i[3], true, in->fj[0].f, slice, nblk);
+            break;
+        }
         d_qwen_gdn_conv_prefill<PLOW_NV_PREFILL != 0>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], slice, nblk, (const int*)TEN(5), in->fj[2].u);
@@ -2073,7 +2087,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * [rope, flash, flash, merge] chain into ONE FA-class launch. */
     case PLOW_DOP_HEADNORM_ROPE:
         if (in->i[5] == 4) {
-            if (in->i[2] != 128 || !TEN(2)) __trap();
+            if (in->i[2] != 128) __trap();
             else d_head_l2_clip<128>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                                    (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1],
                                    in->fj[0].f, __uint_as_float(in->i[4]), slice, nblk);
@@ -4671,6 +4685,13 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
             (const int*)LIGHT_TEN(7), in->fj[2].u);
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
+        if (in->i[4]) {
+            d_recurrent_residual_conv4((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), nullptr,
+                (const __nv_bfloat16*)LIGHT_TEN(6), in->i[0], in->i[4], in->i[2],
+                in->i[3], true, in->fj[0].f, slice, nblk);
+            break;
+        }
         d_qwen_gdn_conv_prefill<true, 2, PLOW_LIGHT_PF_MINBLOCKS>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
             (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), in->i[0], in->i[1],
             in->i[2], in->i[3], slice, nblk, (const int*)LIGHT_TEN(5), in->fj[2].u);
@@ -4688,6 +4709,13 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
     /* The decode conv step (a cuBLASLt-routed decode rung's window; exec/gpu.rs
      * qwen_decode_light_segments, gated on plow_light_pf_qwen_conv). */
     case PLOW_DOP_QWEN_GDN_CONV:
+        if (in->i[4]) {
+            d_recurrent_residual_conv4((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
+                (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), (const int*)LIGHT_TEN(4),
+                (const __nv_bfloat16*)LIGHT_TEN(6), in->i[0], in->i[4], in->i[2],
+                0, false, in->fj[0].f, slice, nblk);
+            break;
+        }
         d_qwen_gdn_conv((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
             (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), (const int*)LIGHT_TEN(4),
             in->i[0], in->i[1], in->i[2], slice, nblk, in->fj[2].u);

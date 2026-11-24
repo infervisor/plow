@@ -1453,7 +1453,7 @@ fn validate_head_l2_clip(blob: &DevBlob) -> Result<()> {
             || d.t[0] == d.t[2]
             || !extent(0, rows * 256)
             || !extent(1, rows * 256)
-            || !extent(2, heads * 256)
+            || (d.t[2] != TENSOR_NONE16 && !extent(2, heads * 256))
         {
             return Err(RuntimeError::Rejected("invalid scaled head L2 clip operands".into()));
         }
@@ -2743,6 +2743,44 @@ const INFLIGHT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// The external GDN prefill library has a fixed state layout: every `QwenGdnPrefill` state
 /// operand (`t[6]`) must be a declared recurrent buffer of that stride, with or without a
 /// section, before any launch.
+fn validate_residual_conv(blob: &DevBlob, recurrent: Option<&RecurrentState>) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let op = DevOp::from_u16(d.op);
+        if !matches!(op, Some(DevOp::QwenGdnConv | DevOp::QwenGdnConvPrefill)) || d.i[4] == 0 {
+            continue;
+        }
+        let prefill = op == Some(DevOp::QwenGdnConvPrefill);
+        let channels = u64::from(d.i[0]);
+        let group = u64::from(d.i[4]);
+        let rows = u64::from(d.i[2]);
+        let padded = if prefill { u64::from(d.i[3]) } else { rows };
+        let scale = f32::from_bits(d.fj[0]);
+        let bytes = |slot: usize| blob.tensors.get(d.t[slot] as usize).map(|t| t.bytes);
+        let extent = |slot: usize, cols: u64, count: u64| {
+            cols.checked_mul(count)
+                .and_then(|n| n.checked_mul(2))
+                .is_some_and(|n| bytes(slot).is_some_and(|b| b >= n))
+        };
+        let declared = recurrent.and_then(|state| {
+            state.tensors.iter().find(|&&(h, _)| h == d.t[3] as usize)
+        });
+        if channels == 0 || channels % group != 0 || d.i[1] != 4 || rows == 0 || padded < rows
+            || !scale.is_finite() || scale <= 0.0
+            || d.t[5] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16 || d.fj[2] != 0
+            || (0..=6).any(|slot| slot != 0 && d.t[slot] == d.t[0])
+            || [1, 2, 4, 6].iter().any(|&slot| d.t[slot] == d.t[3])
+            || !extent(0, channels, padded) || !extent(1, channels, rows) || !extent(2, channels, 4)
+            || declared.is_none_or(|&(_, stride)| stride != channels * 6)
+            || (!prefill && !extent(3, channels * 3, rows))
+            || (!prefill && d.t[4] != TENSOR_NONE16 && !extent(4, 2, rows))
+            || (d.t[6] != TENSOR_NONE16 && !extent(6, channels / group * 4, rows))
+        {
+            return Err(RuntimeError::Rejected("invalid recurrent residual conv operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn check_gdn_state_operands(
     prefill: &[&crate::asset::devblob::DevProg],
     recurrent: Option<&RecurrentState>,
@@ -5136,6 +5174,7 @@ impl GpuEngine {
             }
         }
         check_gdn_state_operands(&blob.prefill_progs(), recurrent.as_ref())?;
+        validate_residual_conv(&blob, recurrent.as_ref())?;
         let unsupported_hd128_fp8_kv = blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
             (inst.op == DevOp::HeadNormRopeFp8 as u16 && inst.i[2] == 128)
                 || (matches!(

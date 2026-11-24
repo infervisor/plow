@@ -143,12 +143,18 @@ struct Emitter<'a> {
     ns: u32,
     pos: u32,
     kvlen: u32,
+    active: u32,
+    k_conv: u32,
+    v_conv: u32,
+    k_taps: u32,
+    v_taps: u32,
     x: u32,
     hn: u32,
     kg: u32,
     vg: u32,
     q: u32,
     q_clipped: u32,
+    k_clipped: u32,
     opart: u32,
     mlpart: u32,
     attn_gate: u32,
@@ -227,6 +233,7 @@ impl Emitter<'_> {
         src: u32,
         nhead: u32,
         cache: Option<(u32, u32)>,
+        normalize: bool,
         dep: u32,
     ) -> u32 {
         let (pos, t, hd, eps) = (self.pos, self.t, self.c.hd, self.c.eps);
@@ -243,13 +250,57 @@ impl Emitter<'_> {
             d.i[1] = nhead;
             d.i[2] = hd;
             d.i[3] = 0;
-            d.i[4] = 1; // skip_norm
+            d.i[4] = u32::from(!normalize);
             d.f[0] = eps;
             if let Some((ring, mask)) = cache {
                 d.j[0] = ring;
                 d.j[1] = mask;
                 d.i[6] = batch_kv;
             }
+        })
+    }
+
+    fn clip_heads(&mut self, out: u32, src: u32, scale: u32, heads: u32, dep: u32) -> u32 {
+        self.b.emit(DevOp::HeadNormRope, self.b.all(), &[dep], |d| {
+            d.t[..3].copy_from_slice(&[out, src, scale]);
+            d.t[5] = self.pos;
+            d.i[0] = self.t;
+            d.i[1] = heads;
+            d.i[2] = self.c.hd;
+            d.i[4] = self.c.qk_clip.to_bits();
+            d.i[5] = packet::dev::ROPE_PAIR_L2_CLIP;
+            d.f[0] = 1e-6;
+        })
+    }
+
+    fn short_conv(&mut self, prefix: &str, kind: &str, visit: usize, full: bool,
+                  out: u32, src: u32, projection: u32, input: u32) -> u32 {
+        let c = self.c;
+        let channels = c.kvh * c.hd;
+        let weight_name = if full { "static_w" } else { "weight" };
+        let path = format!("{prefix}attn.{kind}_sconv");
+        let weight = self.w(&format!("{path}.{weight_name}"), channels as u64 * 4 * BF16);
+        let history = self.b.tensor(&format!("state.inkling.{visit}.{kind}"),
+                                   self.dbatch as u64 * channels as u64 * 3 * BF16);
+        let mut deps = vec![projection];
+        let taps = if full {
+            let w = self.w(&format!("{path}.weight_proj"), c.kvh as u64 * 4 * c.hidden as u64 * BF16);
+            let taps = if kind == "k" { self.k_taps } else { self.v_taps };
+            deps.push(self.proj(taps, self.hn, w, TENSOR_NONE, c.kvh * 4, c.hidden, input));
+            taps
+        } else {
+            TENSOR_NONE
+        };
+        let op = if self.prefill { DevOp::QwenGdnConvPrefill } else { DevOp::QwenGdnConv };
+        self.b.emit(op, self.b.all(), &deps, |d| {
+            d.t[..5].copy_from_slice(&[out, src, weight, history, self.active]);
+            d.t[6] = taps;
+            d.i[0] = channels;
+            d.i[1] = 4;
+            d.i[2] = self.t;
+            d.i[3] = if self.prefill { self.t } else { 0 };
+            d.i[4] = c.hd;
+            d.f[0] = if full { 1.0 / 3.0 } else { 1.0 / 5.0f32.sqrt() };
         })
     }
 
@@ -302,50 +353,14 @@ impl Emitter<'_> {
         let q_scale = self.w(&format!("{p}attn.q_l2_clip.scale"), qd as u64 * BF16);
         let q_in = q;
         let q = self.q_clipped;
-        let c_qn = self.b.emit(DevOp::HeadNormRope, self.b.all(), &[cq], |d| {
-            d.t[0] = q;
-            d.t[1] = q_in;
-            d.t[2] = q_scale;
-            d.t[5] = self.pos;
-            d.i[0] = t;
-            d.i[1] = heads;
-            d.i[2] = hd;
-            d.i[5] = packet::dev::ROPE_PAIR_L2_CLIP;
-            d.f[0] = 1e-6;
-            d.i[4] = c.qk_clip.to_bits();
-        });
-        let fuse_kv = !self.prefill && t == 1 && !self.ladder;
-        let (c_kn, c_vn) = if fuse_kv {
-            // Fuse K and V cache writes into a single HeadNormRope pair instruction (i[7] = 1).
-            let (pos, hd, eps) = (self.pos, self.c.hd, self.c.eps);
-            let c_kv = self.b.emit(DevOp::HeadNormRope, self.b.all(), &[ck], |d| {
-                d.t[0] = kc;
-                d.t[1] = kg;
-                d.t[5] = pos;
-                d.t[6] = vc;
-                d.t[7] = vg;
-                d.i[0] = t;
-                d.i[1] = kvh;
-                d.i[2] = hd;
-                d.i[3] = 0;
-                d.i[4] = 1; // skip_norm
-                d.i[7] = 1; // fused KV pair (writes V cache from t6/t7)
-                d.f[0] = eps;
-                d.j[0] = kvr;
-                d.j[1] = kvm;
-            });
-            (c_kv, c_kv)
-        } else {
-            (
-                self.rope(kc, kg, kvh, Some((kvr, kvm)), ck),
-                self.rope(vc, vg, kvh, Some((kvr, kvm)), cv),
-            )
-        };
+        let c_qn = self.clip_heads(q, q_in, q_scale, heads, cq);
+        let ck = self.short_conv(&p, "k", pass_idx, full, self.k_conv, kg, ck, dep);
+        let cv = self.short_conv(&p, "v", pass_idx, full, self.v_conv, vg, cv, dep);
+        let ck = self.clip_heads(self.k_clipped, self.k_conv, TENSOR_NONE, kvh, ck);
+        let c_kn = self.rope(kc, self.k_clipped, kvh, Some((kvr, kvm)), false, ck);
+        let c_vn = self.rope(vc, self.v_conv, kvh, Some((kvr, kvm)), true, cv);
         if !self.prefill {
-            self.kv_rows.push(c_kn);
-            if !fuse_kv {
-                self.kv_rows.push(c_vn);
-            }
+            self.kv_rows.extend([c_kn, c_vn]);
         }
 
         let (opart, mlpart, kvlen, ns, scale) =
@@ -381,11 +396,7 @@ impl Emitter<'_> {
                 },
             )
         } else {
-            let fa_deps = if fuse_kv {
-                vec![c_qn, c_kn]
-            } else {
-                vec![c_qn, c_kn, c_vn]
-            };
+            let fa_deps = [c_qn, c_kn, c_vn];
             self.b
                 .emit(DevOp::FlashDecode, self.b.all(), &fa_deps, |d| {
                     d.t[0] = opart;
@@ -572,6 +583,7 @@ fn phase_range(
     let ids = b.tensor("in.ids", ctx as u64 * F32);
     let pos = b.tensor("in.pos", ctx as u64 * F32);
     let kvlen = b.tensor("in.kvlen", dbatch as u64 * F32);
+    let active = b.tensor("in.active", dbatch as u64 * F32);
 
     let ns = if prefill {
         n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
@@ -585,8 +597,13 @@ fn phase_range(
     let hn = act(&mut b, "hn", tr * h as u64 * BF16);
     let kg = act(&mut b, "kg", tr * kd as u64 * BF16);
     let vg = act(&mut b, "vg", tr * kd as u64 * BF16);
+    let k_conv = act(&mut b, "k_conv", tr * kd as u64 * BF16);
+    let v_conv = act(&mut b, "v_conv", tr * kd as u64 * BF16);
+    let k_taps = act(&mut b, "k_taps", tr * c.kvh as u64 * 4 * BF16);
+    let v_taps = act(&mut b, "v_taps", tr * c.kvh as u64 * 4 * BF16);
     let q = act(&mut b, "q", tr * qd as u64 * BF16);
     let q_clipped = act(&mut b, "q_clipped", tr * qd as u64 * BF16);
+    let k_clipped = act(&mut b, "k_clipped", tr * kd as u64 * BF16);
     let opart = act(
         &mut b,
         "opart",
@@ -619,12 +636,18 @@ fn phase_range(
         ns,
         pos,
         kvlen,
+        active,
+        k_conv,
+        v_conv,
+        k_taps,
+        v_taps,
         x,
         hn,
         kg,
         vg,
         q,
         q_clipped,
+        k_clipped,
         opart,
         mlpart,
         attn_gate,
@@ -794,6 +817,9 @@ pub(super) fn run(
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
             .expect("inkling config JSON");
     let c = cfg_inkling(&v);
+    let text = v.get("text_config").unwrap_or(&v);
+    assert_eq!(text["sconv_kernel_size"].as_u64(), Some(4), "inkling requires four convolution taps");
+    assert_eq!(text["use_value_norm_no_gamma"].as_bool(), Some(true), "inkling requires unweighted V RMSNorm");
     let layers = block
         .map(|spec| parse_block(spec, c.layers as usize))
         .unwrap_or(0..c.layers as usize);
@@ -909,7 +935,8 @@ pub(super) fn run(
         &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
         block.map(|_| layers.clone()),
         &[
-            "_sconv.",
+            ".attn_sconv.",
+            ".mlp_sconv.",
             "wr_du",
             "rel_",
             "attn_res.",
@@ -929,7 +956,7 @@ pub(super) fn run(
     }
     let lean = apply_verify_gate(&m, verify);
     let outp = Path::new(out);
-    let mut sections = Vec::new();
+    let mut sections = vec![crate::qwen35::recurrent_state_section(&m, dbatch)];
     if block.is_some() {
         use plow_asset::*;
         let l = layers.start;

@@ -1260,6 +1260,8 @@ enum {
      *   i0=M i1=N i2=K */
     PLOW_DOP_GEMV_F32 = 135,
     /* Packed causal convolution + SiLU. t0=out,t1=in,t2=weight[Bf16,C,W],t3=history[Bf16,B,C,W-1],t4=active[I32,B]; i0=C,i1=W,i2=B. History is oldest-first. */
+    /* CUDA residual variant (i4=channels/group): (x + conv4) * f0. Optional t6
+     * holds token/group/tap deltas and selects lag-major static weights. */
     PLOW_DOP_QWEN_GDN_CONV = 136,
     /* Qwen recurrence. t0=out[Bf16,B,HV,V],t1=packed QKV,t2=a,t3=b,t4=A_log,t5=dt_bias,t6=state[F32,B,HV,V,K],t7=active[I32,B]. i0=HK,i1=HV,i2=K(128),i3=V,i4=B,i5=A_log F32 flag (else Bf16); f0=Q scale,f1=L2 eps. Other inputs Bf16; beta rounds Bf16. */
     PLOW_DOP_QWEN_GDN_STEP = 137,

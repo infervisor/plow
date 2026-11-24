@@ -112,6 +112,66 @@ static __device__ __forceinline__ float qwen_sigmoid(float x) {
 
 /* source (j1, 0 = contiguous in[B][C]): in_stride | in_col << 16 (elements), the row pitch and
  * column of x inside an N-concatenated projection's output (runtime contract 4). */
+static __device__ void d_recurrent_residual_conv4(
+    __nv_bfloat16* out, const __nv_bfloat16* in, const __nv_bfloat16* weight,
+    __nv_bfloat16* history, const int* active, const __nv_bfloat16* taps,
+    unsigned channels, unsigned group, unsigned rows, unsigned padded, bool prefill,
+    float scale, unsigned slice, unsigned nblk) {
+    const unsigned groups = channels / group;
+    constexpr unsigned TILE = 64;
+    const size_t lanes = (size_t)channels * (prefill ? ((size_t)padded + TILE - 1) / TILE : rows);
+    for (size_t i = slice * blockDim.x + threadIdx.x; i < lanes; i += nblk * blockDim.x) {
+        const unsigned c = i % channels, slot = i / channels;
+        if (!prefill && active && active[slot] <= 0) continue;
+        const unsigned first = prefill ? slot * TILE : slot;
+        const unsigned end = prefill ? first + min(TILE, padded - first) : slot + 1;
+        __nv_bfloat16* h = history + (prefill ? c : i) * 3;
+        const __nv_bfloat16* prior = prefill && first >= 3 && first < rows
+            ? in + (size_t)(first - 3) * channels + c : nullptr;
+        float x0 = 0.0f, x1 = 0.0f, x2 = 0.0f;
+        if (prior) {
+            x0 = __bfloat162float(prior[0]);
+            x1 = __bfloat162float(prior[channels]);
+            x2 = __bfloat162float(prior[2 * channels]);
+        } else if (!prefill || first == 0) {
+            x0 = __bfloat162float(h[0]);
+            x1 = __bfloat162float(h[1]);
+            x2 = __bfloat162float(h[2]);
+        }
+        float weights[4];
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j)
+            weights[j] = __bfloat162float(weight[taps ? (size_t)j * channels + c : (size_t)c * 4 + j]);
+        for (unsigned r = first; r < min(end, rows); ++r) {
+            const size_t col = (size_t)r * channels + c;
+            const float x3 = __bfloat162float(in[col]);
+            float w[4];
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j)
+                w[j] = weights[j] + (taps ? __bfloat162float(taps[((size_t)r * groups + c / group) * 4 + j]) : 0.0f);
+            const float sum = taps
+                ? fmaf(x0, w[3], fmaf(x1, w[2], fmaf(x2, w[1], x3 * w[0])))
+                : fmaf(x3, w[3], fmaf(x2, w[2], fmaf(x1, w[1], fmaf(x0, w[0], 0.0f))));
+            out[col] = __float2bfloat16((sum + x3) * scale);
+            x0 = x1; x1 = x2; x2 = x3;
+        }
+        if (!prefill || first == 0) {
+            if (prefill && rows > TILE) {
+                h[0] = in[(size_t)(rows - 3) * channels + c];
+                h[1] = in[(size_t)(rows - 2) * channels + c];
+                h[2] = in[(size_t)(rows - 1) * channels + c];
+            } else {
+                h[0] = __float2bfloat16(x0);
+                h[1] = __float2bfloat16(x1);
+                h[2] = __float2bfloat16(x2);
+            }
+        }
+        if (prefill)
+            for (unsigned r = max(first, rows); r < end; ++r)
+                out[(size_t)r * channels + c] = __float2bfloat16(0.0f);
+    }
+}
+
 static __device__ void d_qwen_gdn_conv(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* weight, __nv_bfloat16* history, const int* active,
     unsigned channels, unsigned width, unsigned batch, unsigned slice, unsigned nblk,
