@@ -1504,7 +1504,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[4]) {
             d_recurrent_residual_conv4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), (const int*)TEN(4),
-                (const __nv_bfloat16*)TEN(6), (const __nv_bfloat16*)TEN(7), in->i[0], in->i[4], in->i[2],
+                (const __nv_bfloat16*)TEN(6), (const __nv_bfloat16*)TEN(7),
+                (const __nv_bfloat16*)TEN(5), in->i[0], in->i[4], in->i[2],
                 0, false, in->fj[0].f, slice, nblk);
             break;
         }
@@ -1549,7 +1550,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         if (in->i[4]) {
             d_recurrent_residual_conv4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                 (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), nullptr,
-                (const __nv_bfloat16*)TEN(6), (const __nv_bfloat16*)TEN(7), in->i[0], in->i[4], in->i[2],
+                (const __nv_bfloat16*)TEN(6), (const __nv_bfloat16*)TEN(7),
+                (const __nv_bfloat16*)TEN(5), in->i[0], in->i[4], in->i[2],
                 in->i[3], true, in->fj[0].f, slice, nblk);
             break;
         }
@@ -3798,6 +3800,9 @@ extern "C" __device__ unsigned plow_gdn_prefill_abi = 0;
 #if PLOW_NV_QWEN_GDN
 /* object_requirements GDN_PITCHED_ABI: QwenGdnConv/ConvPrefill/GatedNorm honor j1 = pitch | col << 16. */
 extern "C" __device__ unsigned plow_gdn_pitched_abi = 1;
+#if !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON
+extern "C" __device__ unsigned plow_conv_residual_operand_abi = 1;
+#endif
 #endif
 #if PLOW_NV_QWEN_GDN && PLOW_NV_PREFILL && PLOW_NV_SCHED == 1 && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_SKELETON && defined(PLOW_NV_HOPPER) && PLOW_NV_TMA_GEMM && PLOW_NV_W8A8 && PLOW_NV_QUANT_FP8_VLLM && PLOW_NV_FP8_PF_SCALE_WFIRST && !PGM90_FP8_PROMOTE && (PLOW_NV_PF_GEMV_HEAD || !PLOW_PACKET_REQUIRES_PF_GEMV_HEAD) && PLOW_NV_THREADS == 256 && !PGM90_UNI_BN256 && !PLOW_NV_SEG_GEMM
 extern "C" __device__ unsigned plow_w8a8_vllm_prefill_abi = 1;
@@ -4729,7 +4734,8 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
         if (in->i[4]) {
             d_recurrent_residual_conv4((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
                 (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), nullptr,
-                (const __nv_bfloat16*)LIGHT_TEN(6), (const __nv_bfloat16*)LIGHT_TEN(7), in->i[0], in->i[4], in->i[2],
+                (const __nv_bfloat16*)LIGHT_TEN(6), (const __nv_bfloat16*)LIGHT_TEN(7),
+                (const __nv_bfloat16*)LIGHT_TEN(5), in->i[0], in->i[4], in->i[2],
                 in->i[3], true, in->fj[0].f, slice, nblk);
             break;
         }
@@ -4753,7 +4759,8 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
         if (in->i[4]) {
             d_recurrent_residual_conv4((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
                 (const __nv_bfloat16*)LIGHT_TEN(2), (__nv_bfloat16*)LIGHT_TEN(3), (const int*)LIGHT_TEN(4),
-                (const __nv_bfloat16*)LIGHT_TEN(6), (const __nv_bfloat16*)LIGHT_TEN(7), in->i[0], in->i[4], in->i[2],
+                (const __nv_bfloat16*)LIGHT_TEN(6), (const __nv_bfloat16*)LIGHT_TEN(7),
+                (const __nv_bfloat16*)LIGHT_TEN(5), in->i[0], in->i[4], in->i[2],
                 0, false, in->fj[0].f, slice, nblk);
             break;
         }

@@ -1840,7 +1840,8 @@ pub enum DevOp {
     /// CUDA `i4 != 0` selects the four-tap residual mode: `i4` is channels
     /// per group, `f0` scales the sum of input and convolution. Optional BF16
     /// `t6` adds row/group/tap deltas to transposed static weights [W,C].
-    /// Optional BF16 slot 7 adds to the rounded convolution output.
+    /// Optional BF16 slot 7 adds to the rounded convolution output. With slot
+    /// 7 present, optional BF16 slot 5 adds to it in FP32 before convolution output is added.
     QwenGdnConv = 136,
     /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
     ///

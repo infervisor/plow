@@ -115,6 +115,7 @@ static __device__ __forceinline__ float qwen_sigmoid(float x) {
 static __device__ void d_recurrent_residual_conv4(
     __nv_bfloat16* out, const __nv_bfloat16* in, const __nv_bfloat16* weight,
     __nv_bfloat16* history, const int* active, const __nv_bfloat16* taps, const __nv_bfloat16* addend,
+    const __nv_bfloat16* residual,
     unsigned channels, unsigned group, unsigned rows, unsigned padded, bool prefill,
     float scale, unsigned slice, unsigned nblk) {
     const unsigned groups = channels / group;
@@ -153,9 +154,13 @@ static __device__ void d_recurrent_residual_conv4(
                 ? fmaf(x0, w[3], fmaf(x1, w[2], fmaf(x2, w[1], x3 * w[0])))
                 : fmaf(x3, w[3], fmaf(x2, w[2], fmaf(x1, w[1], fmaf(x0, w[0], 0.0f))));
             const __nv_bfloat16 value = __float2bfloat16((sum + x3) * scale);
-            out[col] = addend
-                ? __float2bfloat16(__bfloat162float(addend[col]) + __bfloat162float(value))
-                : value;
+            if (addend) {
+                float base = __bfloat162float(addend[col]);
+                if (residual) base += __bfloat162float(residual[col]);
+                out[col] = __float2bfloat16(base + __bfloat162float(value));
+            } else {
+                out[col] = value;
+            }
             x0 = x1; x1 = x2; x2 = x3;
         }
         if (!prefill || first == 0) {

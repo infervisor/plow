@@ -300,8 +300,9 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         MoeDownMxPf if all(&[0, 1, 2, 3, 4, 6, 7]) => Some(&[0]),
         MoeCombinePf if all(&[0, 3]) => Some(&[0]),
         QwenGatedNorm if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0]),
-        QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3]) && none(&[5])
-            && (d.i[4] != 0 || none(&[6, 7])) => Some(&[0, 3]),
+        QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3])
+            && (if d.i[4] != 0 { !has(5) || has(7) } else { none(&[5, 6, 7]) })
+            => Some(&[0, 3]),
         AttnRes if d.i[7] == 1 && all(&[0, 1, 3]) && (d.i[2] == 0 || has(2)) => Some(&[0]),
         QwenGdnGatePrep if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
         QwenGdnQkvPrep if all(&[0, 1, 2, 3]) && none(&[4, 5, 6, 7]) => Some(&[0, 1, 2]),
@@ -1148,6 +1149,8 @@ mod tests {
         (DevOp::QwenGatedNorm, &[0, 1, 2, 3, 4], &[], 0, Some(&[0]), "op_qwen_gdn.cuh:365"),
         (DevOp::QwenGdnConv, &[0, 1, 2, 3, 4], &[], 0, Some(&[0, 3]), "op_qwen_gdn.cuh:134 history in place"),
         (DevOp::QwenGdnConvPrefill, &[0, 1, 2, 3, 4], &[], 0, Some(&[0, 3]), "op_qwen_gdn.cuh:962"),
+        (DevOp::QwenGdnConvPrefill, &[0, 1, 2, 3, 5, 7], &[(4, 2304)], 0, Some(&[0, 3]), "residual update reads t5 and t7"),
+        (DevOp::QwenGdnConvPrefill, &[0, 1, 2, 3, 5], &[(4, 2304)], 0, None, "residual update requires addend"),
         (DevOp::QwenGdnGatePrep, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0, 1]), "op_qwen_gdn.cuh:1296"),
         (DevOp::QwenGdnQkvPrep, &[0, 1, 2, 3], &[], 0, Some(&[0, 1, 2]), "op_qwen_gdn.cuh:1217"),
         (DevOp::QwenGdnStep, &[0, 1, 2, 3, 4, 5, 6, 7], &[], 0, Some(&[0, 6]), "op_qwen_gdn.cuh:308/353 core, state"),

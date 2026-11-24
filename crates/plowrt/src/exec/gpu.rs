@@ -2845,9 +2845,10 @@ fn validate_residual_conv(blob: &DevBlob, recurrent: Option<&RecurrentState>) ->
         });
         if channels == 0 || channels % group != 0 || d.i[1] != 4 || rows == 0 || padded < rows
             || !scale.is_finite() || scale <= 0.0
-            || d.t[5] != TENSOR_NONE16 || d.fj[2] != 0
+            || d.fj[2] != 0
+            || (d.t[5] != TENSOR_NONE16 && (d.t[7] == TENSOR_NONE16 || !extent(5, channels, rows)))
             || (1..=7).any(|slot| d.t[slot] == d.t[0])
-            || [1, 2, 4, 6, 7].iter().any(|&slot| d.t[slot] == d.t[3])
+            || [1, 2, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[3])
             || !extent(0, channels, padded) || !extent(1, channels, rows) || !extent(2, channels, 4)
             || declared.is_none_or(|&(_, stride)| stride != channels * 6)
             || (!prefill && !extent(3, channels * 3, rows))

@@ -13,6 +13,7 @@ struct Facts {
     gdn: bool,
     relative: bool,
     normalized_residual_mix: bool,
+    conv_residual_operand: bool,
     /// Runs a GDN conv or gated norm over a row-pitched source.
     gdn_pitched: bool,
     /// Runs the full-tile FP8 GEMM, the opcode the route-specific arms serve.
@@ -26,6 +27,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
         gdn: false,
         relative: false,
         normalized_residual_mix: false,
+        conv_residual_operand: false,
         gdn_pitched: false,
         fp8_gemm: false,
         rows: 0,
@@ -36,6 +38,9 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
             f.fp8_arms |= req::fp8_arm_op(inst.op);
             f.gdn |= req::gdn_op(inst.op);
             f.normalized_residual_mix |= inst.op == DevOp::AttnRes as u16 && inst.i[7] == 1;
+            f.conv_residual_operand |= matches!(DevOp::from_u16(inst.op),
+                Some(DevOp::QwenGdnConv | DevOp::QwenGdnConvPrefill))
+                && inst.i[4] != 0 && inst.t[5] != packet::TENSOR_NONE;
             f.relative |= (inst.op == DevOp::FlashDecode as u16
                 && inst.j[1] == packet::dev::FLASH_DECODE_RELATIVE)
                 || (inst.op == DevOp::FlashPrefill as u16
@@ -88,6 +93,9 @@ fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requireme
     if f.gdn {
         out.push(Requirement::new(req::GDN_PREFILL_ABI, 1));
     }
+    if f.conv_residual_operand {
+        out.push(Requirement::new(req::CONV_RESIDUAL_OPERAND_ABI, 1));
+    }
     if f.gdn_pitched {
         out.push(Requirement::new(req::GDN_PITCHED_ABI, 1));
     }
@@ -112,6 +120,9 @@ fn decode_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requiremen
     let mut out = Vec::new();
     if f.relative { out.push(Requirement::new(req::RELATIVE_ATTENTION_ABI, 1)); }
     if f.normalized_residual_mix { out.push(Requirement::new(req::NORMALIZED_RESIDUAL_MIX_ABI, 1)); }
+    if f.conv_residual_operand {
+        out.push(Requirement::new(req::CONV_RESIDUAL_OPERAND_ABI, 1));
+    }
     if f.gdn_pitched {
         out.push(Requirement::new(req::GDN_PITCHED_ABI, 1));
     }
