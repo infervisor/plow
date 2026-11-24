@@ -664,6 +664,7 @@ pub struct EmitConfig {
     // MoE (Gemma MoE family)
     // ──────────────────────────────────────────────────────────────────────────
     /// MoE prefill control. "0" to disable, unset = auto (on for MoE bf16).
+    /// "inkling-nvfp4" selects the experimental grouped down projection on Hopper.
     #[arg(long, env = "PLOW_MOE_PREFILL")]
     pub moe_prefill: Option<String>,
 

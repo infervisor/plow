@@ -14,6 +14,7 @@ struct Facts {
     relative: bool,
     normalized_residual_mix: bool,
     residual_copy: bool,
+    nvfp4_grouped_down: bool,
     residual_message_controller: bool,
     residual_mix_query_offset: bool,
     conv_residual_operand: bool,
@@ -31,6 +32,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
         relative: false,
         normalized_residual_mix: false,
         residual_copy: false,
+        nvfp4_grouped_down: false,
         residual_message_controller: false,
         residual_mix_query_offset: false,
         conv_residual_operand: false,
@@ -49,6 +51,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
                 && inst.i[4] != 0 && inst.t[5] != packet::TENSOR_NONE;
             f.residual_mix_query_offset |= inst.op == DevOp::AttnRes as u16 && inst.i[7] == 1 && inst.i[5] != 0;
             f.residual_message_controller |= inst.op == DevOp::AttnRes as u16 && matches!(inst.i[7], 2 | 3);
+            f.nvfp4_grouped_down |= inst.op == DevOp::MoeDownMxPf as u16 && inst.i[7] == 3;
             f.residual_copy |= inst.op == DevOp::Residual as u16 && inst.i[7] == 1;
             f.relative |= (inst.op == DevOp::FlashDecode as u16
                 && inst.j[1] == packet::dev::FLASH_DECODE_RELATIVE)
@@ -104,6 +107,9 @@ fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requireme
     }
     if f.residual_message_controller {
         out.push(Requirement::new(req::RESIDUAL_MESSAGE_CONTROLLER_ABI, 1));
+    }
+    if f.nvfp4_grouped_down {
+        out.push(Requirement::new(req::NVFP4_GROUPED_DOWN_ABI, 1));
     }
     if f.residual_copy {
         out.push(Requirement::new(req::RESIDUAL_COPY_ABI, 1));
@@ -294,6 +300,19 @@ mod tests {
         append(&m, &mut sections).unwrap();
         assert_eq!(sections.len(), 1);
         assert!(append(&m, &mut sections).unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn grouped_nvfp4_down_requires_the_hopper_prefill_arm() {
+        let mut m = model(&[DevOp::MoeDownMxPf], &[DevOp::MoeDownMx], &[1, 4]);
+        assert!(manifest(&m, None).prefill.is_empty());
+        m.progs[0].insts[0].i[7] = 3;
+        let requirements = manifest(&m, None);
+        assert_eq!(
+            requirements.prefill,
+            vec![Requirement::new(req::NVFP4_GROUPED_DOWN_ABI, 1)]
+        );
+        assert!(requirements.decode.is_empty());
     }
 
     #[test]

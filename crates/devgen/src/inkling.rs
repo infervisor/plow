@@ -147,6 +147,7 @@ struct Emitter<'a> {
     b: Builder,
     c: &'a InklingCfg,
     prefill: bool,
+    grouped_nvfp4_down: bool,
     t: u32,
     dbatch: u32,
     ladder: bool,
@@ -708,22 +709,40 @@ impl Emitter<'_> {
             d.f[0] = gate_cap;
             d.f[1] = up_cap;
         });
-        let c_d = self.b.emit(DevOp::MoeDownMx, self.b.all(), &[c_g], |d| {
-            d.t[0] = part;
-            d.t[1] = fu;
-            d.t[2] = tab;
-            d.t[3] = w_d;
-            d.t[4] = s_d;
-            d.t[6] = down_amax;
-            d.t[7] = down_denominator;
-            d.i[0] = k;
-            d.i[1] = h;
-            d.i[2] = inter;
-            d.i[3] = e;
-            d.i[5] = 1; // Router weight was applied before the activation rounded to BF16.
-            d.i[6] = t;
-            d.i[7] = quant_mode;
-        });
+        let c_d = if self.grouped_nvfp4_down && !is_fp8 {
+            let slots = t * k;
+            let aligned_rows = slots + 63 * e;
+            let meta = self.b.tensor("act.moe_meta", (3 * u64::from(e) + 1) * 4);
+            let row_token = self.b.tensor("act.moe_row_token", u64::from(aligned_rows) * 4);
+            let row_partidx = self.b.tensor("act.moe_row_partidx", u64::from(aligned_rows) * 4);
+            let row_gate = self.b.tensor("act.moe_row_gate", u64::from(aligned_rows) * 4);
+            let aligned = self.b.emit(DevOp::MoeAlignPf, vec![0], &[c_tk], |d| {
+                d.t[..5].copy_from_slice(&[meta, tab, row_token, row_partidx, row_gate]);
+                d.i[..3].copy_from_slice(&[t, e, k]);
+            });
+            self.b.emit(DevOp::MoeDownMxPf, self.b.all(), &[c_g, aligned], |d| {
+                d.t.copy_from_slice(&[part, fu, w_d, s_d, meta, down_amax, row_partidx, down_denominator]);
+                d.i[..5].copy_from_slice(&[h, inter, e, slots, aligned_rows]);
+                d.i[7] = 3;
+            })
+        } else {
+            self.b.emit(DevOp::MoeDownMx, self.b.all(), &[c_g], |d| {
+                d.t[0] = part;
+                d.t[1] = fu;
+                d.t[2] = tab;
+                d.t[3] = w_d;
+                d.t[4] = s_d;
+                d.t[6] = down_amax;
+                d.t[7] = down_denominator;
+                d.i[0] = k;
+                d.i[1] = h;
+                d.i[2] = inter;
+                d.i[3] = e;
+                d.i[5] = 1; // Router weight was applied before the activation rounded to BF16.
+                d.i[6] = t;
+                d.i[7] = quant_mode;
+            })
+        };
 
         if !use_residual_stack && crate::emit_config::active().nv_moe_combine_fold {
             self.add_norm_moe_fold(part, gamma_next, k, c_d)
@@ -780,6 +799,7 @@ fn phase_range(
     dbatch: u32,
     chunk: u32,
     prefill: bool,
+    grouped_nvfp4_down: bool,
     tensors: Option<Vec<TensorDecl>>,
     layers: std::ops::Range<usize>,
 ) -> Phase {
@@ -850,6 +870,7 @@ fn phase_range(
         b,
         c,
         prefill,
+        grouped_nvfp4_down,
         t,
         dbatch,
         ladder,
@@ -1081,6 +1102,8 @@ pub(super) fn run(
         "inkling: --block currently extracts one layer"
     );
     let ecfg = emit_config::active();
+    let grouped_nvfp4_down = arch == "sm_90a"
+        && ecfg.moe_prefill.as_deref() == Some("inkling-nvfp4");
     let mut rungs = ecfg.decode_rungs();
     let mut dbatch = *rungs.last().expect("decode_rungs is non-empty");
     let chunk = ecfg.max_chunk.unwrap_or(DEFAULT_CHUNK.min(ctx));
@@ -1099,6 +1122,7 @@ pub(super) fn run(
                     dbatch,
                     dbatch,
                     chunk,
+                    false,
                     false,
                     None,
                     layers.clone(),
@@ -1146,6 +1170,7 @@ pub(super) fn run(
             dbatch,
             chunk,
             true,
+            grouped_nvfp4_down,
             tensors.take(),
             layers.clone(),
         );
@@ -1162,6 +1187,7 @@ pub(super) fn run(
             rb,
             dbatch,
             chunk,
+            false,
             false,
             tensors.take(),
             layers.clone(),

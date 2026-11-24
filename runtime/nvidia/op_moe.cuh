@@ -40,6 +40,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#if defined(PLOW_NV_HOPPER)
+#include <mma.h>
+#endif
 
 #ifndef PLOW_NV_BF16_T
 #define PLOW_NV_BF16_T
@@ -5010,6 +5013,76 @@ static __device__ void d_moe_glu_mx_pf(
     }
     __syncthreads();
 }
+
+#if defined(PLOW_NV_HOPPER)
+static __device__ void d_nvfp4_grouped_down_hopper(
+    float* part, const bf16* fu, const uint8_t* weight, const uint8_t* scales,
+    const int* meta, const float* amax, const unsigned* row_partidx, const float* denominator,
+    unsigned H, unsigned I, unsigned E, unsigned slots, unsigned aligned_rows,
+    unsigned slice, unsigned nblk) {
+    using namespace nvcuda;
+    constexpr unsigned M = 16, N = 16, K = 16;
+    struct alignas(32) WarpTiles {
+        bf16 a[M * K];
+        bf16 b[N * K];
+        float c[M * N];
+    };
+    __shared__ WarpTiles tiles[PLOW_NV_WARPS];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned warps = blockDim.x >> 5;
+    WarpTiles& stage = tiles[warp];
+    const unsigned work_items = E * ((H + N - 1u) / N);
+    for (unsigned work = slice * warps + warp; work < work_items; work += nblk * warps) {
+        const unsigned expert = work % E;
+        const unsigned col0 = work / E * N;
+        const unsigned begin = meta[expert], count = meta[E + expert];
+        if (count == 0 || begin >= aligned_rows || count > aligned_rows - begin) continue;
+        const float outer = amax[expert] / *denominator;
+        for (unsigned row0 = 0; row0 < count; row0 += M) {
+            wmma::fragment<wmma::accumulator, M, N, K, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            for (unsigned k0 = 0; k0 < I; k0 += K) {
+                for (unsigned j = lane; j < M * K; j += 32) {
+                    const unsigned row = row0 + j / K, k = k0 + j % K;
+                    const unsigned slot = row < count ? row_partidx[begin + row] : PLOW_EXPERT_UNUSED;
+                    stage.a[j] = slot < slots && k < I
+                        ? fu[(size_t)slot * I + k] : __float2bfloat16(0.0f);
+                }
+                for (unsigned j = lane; j < N * K; j += 32) {
+                    const unsigned col = col0 + j / K, k = k0 + j % K;
+                    float w = 0.0f;
+                    if (col < H && k < I) {
+                        const size_t row = (size_t)expert * H + col;
+                        const unsigned packed = weight[row * ((I + 1u) / 2u) + k / 2u];
+                        const unsigned nibble = (packed >> ((k & 1u) * 4u)) & 15u;
+                        w = plow_mxfp4_e2m1(nibble)
+                            * plow_nvfp4_scale(scales[row * ((I + 15u) / 16u) + k / 16u]);
+                    }
+                    stage.b[j] = __float2bfloat16(w);
+                }
+                __syncwarp();
+                wmma::fragment<wmma::matrix_a, M, N, K, bf16, wmma::row_major> a;
+                wmma::fragment<wmma::matrix_b, M, N, K, bf16, wmma::col_major> b;
+                wmma::load_matrix_sync(a, stage.a, K);
+                wmma::load_matrix_sync(b, stage.b, K);
+                wmma::mma_sync(acc, a, b, acc);
+                __syncwarp();
+            }
+            wmma::store_matrix_sync(stage.c, acc, N, wmma::mem_row_major);
+            __syncwarp();
+            for (unsigned j = lane; j < M * N; j += 32) {
+                const unsigned row = row0 + j / N, col = col0 + j % N;
+                if (row >= count || col >= H) continue;
+                const unsigned slot = row_partidx[begin + row];
+                if (slot < slots)
+                    part[(size_t)slot * H + col] = stage.c[j] * outer;
+            }
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+}
+#endif
 
 static __device__ void d_moe_down_mx_pf(
     float* part, const bf16* fu, const uint8_t* W, const uint8_t* S, const int* meta,

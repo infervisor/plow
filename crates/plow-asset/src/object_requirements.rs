@@ -97,6 +97,8 @@ pub const GDN_PITCHED_ABI: &str = "plow_gdn_pitched_abi";
 pub const CONV_RESIDUAL_OPERAND_ABI: &str = "plow_conv_residual_operand_abi";
 pub const RELATIVE_ATTENTION_ABI: &str = "plow_relative_attention_abi";
 pub const NORMALIZED_RESIDUAL_MIX_ABI: &str = "plow_normalized_residual_mix_abi";
+/// Hopper grouped NVFP4 down uses original routed-slot inputs and outputs.
+pub const NVFP4_GROUPED_DOWN_ABI: &str = "plow_nvfp4_grouped_down_abi";
 /// CUDA Residual supports exact BF16 block copies.
 pub const RESIDUAL_COPY_ABI: &str = "plow_residual_copy_abi";
 /// CUDA normalized residual mixes can select a starting query row.

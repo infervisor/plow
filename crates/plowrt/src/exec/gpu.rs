@@ -1636,6 +1636,32 @@ fn validate_moe_outer_scales(blob: &DevBlob) -> Result<()> {
     Ok(())
 }
 
+fn validate_grouped_nvfp4_down(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::MoeDownMxPf as u16 || d.i[7] != 3 {
+            continue;
+        }
+        let [hidden, inner, experts, slots, aligned_rows, ..] = d.i.map(u64::from);
+        let fits = |slot: usize, factors: &[u64]| {
+            factors.iter().try_fold(1u64, |n, &factor| n.checked_mul(factor))
+                .is_some_and(|bytes| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= bytes))
+        };
+        if hidden == 0 || inner == 0 || experts == 0 || slots == 0 || aligned_rows < slots
+            || !fits(0, &[slots, hidden, 4])
+            || !fits(1, &[slots, inner, 2])
+            || !fits(2, &[experts, hidden, inner.div_ceil(2)])
+            || !fits(3, &[experts, hidden, inner.div_ceil(16)])
+            || !fits(4, &[3 * experts + 1, 4])
+            || !fits(5, &[experts, 4])
+            || !fits(6, &[aligned_rows, 4])
+            || !fits(7, &[4])
+        {
+            return Err(RuntimeError::Rejected("invalid grouped NVFP4 down operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_mxfp4_moe_role_inst(
     d: &DevInst64,
     rows: u32,
@@ -4774,6 +4800,7 @@ impl GpuEngine {
                 image.blob.check_l2_dispatch(false)?;
                 let blob = image.blob.clone();
                 validate_moe_outer_scales(&blob)?;
+                validate_grouped_nvfp4_down(&blob)?;
                 validate_gated_flash_merge(&blob)?;
                 validate_head_preparation(&blob)?;
                 validate_relative_attention(&blob)?;

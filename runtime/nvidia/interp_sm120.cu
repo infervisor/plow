@@ -3252,6 +3252,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #if PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX_PF
     case PLOW_DOP_MOE_DOWN_MX_PF:
+        if (in->i[7] == 3u) {
+#if defined(PLOW_NV_HOPPER)
+            d_nvfp4_grouped_down_hopper((float*)TEN(0), (const bf16*)TEN(1),
+                (const uint8_t*)TEN(2), (const uint8_t*)TEN(3), (const int*)TEN(4),
+                (const float*)TEN(5), (const unsigned*)TEN(6), (const float*)TEN(7),
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], slice, nblk);
+#else
+            __trap();
+#endif
+            break;
+        }
         d_moe_down_mx_pf((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
                          (const uint8_t*)TEN(2), (const uint8_t*)TEN(3),
                          (const int*)TEN(4), (const __nv_bfloat16*)TEN(5),
@@ -3814,6 +3825,9 @@ extern "C" __device__ unsigned plow_residual_message_controller_abi = 1;
 extern "C" __device__ unsigned plow_gdn_prefill_abi = 1;
 #else
 extern "C" __device__ unsigned plow_gdn_prefill_abi = 0;
+#endif
+#if defined(PLOW_NV_HOPPER) && PLOW_NV_MXFP4_MOE && PLOW_HAS_MOE_DOWN_MX_PF
+extern "C" __device__ unsigned plow_nvfp4_grouped_down_abi = 1;
 #endif
 #if PLOW_NV_QWEN_GDN
 /* object_requirements GDN_PITCHED_ABI: QwenGdnConv/ConvPrefill/GatedNorm honor j1 = pitch | col << 16. */

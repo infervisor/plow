@@ -1953,7 +1953,12 @@ pub enum DevOp {
     /// (`row_partidx == EXPERT_UNUSED`) are dropped.
     ///
     /// `t0=part(f32[T*k][H]) t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx(u32)
-    /// t7=row_gate(f32)` · `i0=H i1=I i2=n_exp`.
+    /// t7=row_gate(f32)` · `i0=H i1=I i2=n_exp i3=routed_slots i4=aligned_rows i7=mode`.
+    /// Hopper mode `i7=3` uses NVFP4 weights and block-16 E4M3 scales.
+    /// Slot 6 maps expert-grouped rows to original routed slots in both fu
+    /// and part. Slots 5 and 7 hold per-expert FP32 amax and the FP32 outer
+    /// scale denominator. i3 and i4 bound routed slots and grouped rows.
+    /// The activation already includes the router weight.
     MoeDownMxPf = 153,
     /// `t0=out(bf16 [S][H]) t1=x(bf16 [M][H]) t2=rows(u32 [S])` · `i0=S i1=H i2=M`, computing
     /// `out[s][h] = x[rows[s]][h]`.
