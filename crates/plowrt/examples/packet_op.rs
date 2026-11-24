@@ -3,12 +3,12 @@
 //! real packet (stream entries, counters, segment launch).
 //!
 //! `packet_op --object FILE --symbol SYM [--block B] [--arena-symbol NAME] --op NAME [--n-cu N]
-//!   [--i a,b,..] [--f x,y] [--t NAME:BYTES[:INFILE]]... [--x NAME:BYTES[:INFILE]]...
+//!   [--i a,b,..] [--f x,y] [--j a,b] [--t NAME:BYTES[:INFILE]]... [--x NAME:BYTES[:INFILE]]...
 //!   [--ptrs NAME=T,T,..]... [--out NAME=FILE]... [--iters K]`
 //!
 //! `--op` is the `DevOp` variant name (e.g. `GemmFp8Mx`). `--t` declares the tensors in operand
 //! order (`t0`, `t1`, ...); `-` as NAME leaves a slot absent. Inputs are raw little-endian bytes,
-//! zero-padded; an output is the whole tensor. `--x` declares a tensor that is no operand (e.g. an
+//! zero-padded. Repeating a name with the same byte count binds the same tensor; an output is the whole tensor. `--x` declares a tensor that is no operand (e.g. an
 //! expert's weights), and `--ptrs` fills a tensor with the u64 device addresses of the named ones
 //! (`T+BYTES` for an offset into one, `0` for a null entry) -- a pointer table such as `expert_weight_table`. Prints the median GPU
 //! time over `--iters` runs.
@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut object, mut symbol, mut block, mut arena) = (None, None, 256u32, "plow_arena_bytes".to_string());
+    let mut jumps = Vec::new();
     let (mut op, mut n_cu, mut ints, mut floats, mut iters) = (None, 132u32, Vec::new(), Vec::new(), 1usize);
     let (mut tensors, mut outputs): (Vec<(String, u64, Option<String>)>, Vec<(String, String)>) = (Vec::new(), Vec::new());
     let (mut extra, mut ptrs): (Vec<(String, u64, Option<String>)>, Vec<(String, Vec<String>)>) = (Vec::new(), Vec::new());
@@ -43,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--op" => op = Some(DevOp::ALL.iter().copied().find(|o| format!("{o:?}") == *v).ok_or(format!("no DevOp {v}"))?),
             "--n-cu" => n_cu = v.parse()?,
             "--i" => ints = v.split(',').map(str::parse::<u32>).collect::<Result<_, _>>()?,
+            "--j" => jumps = v.split(',').map(str::parse::<u32>).collect::<Result<_, _>>()?,
             "--f" => floats = v.split(',').map(str::parse::<f32>).collect::<Result<_, _>>()?,
             "--iters" => iters = v.parse()?,
             "--t" | "--x" => {
@@ -64,12 +66,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let (object, symbol, op) = (object.ok_or("--object")?, symbol.ok_or("--symbol")?, op.ok_or("--op")?);
-    if tensors.len() > 8 || ints.len() > 8 || floats.len() > 2 {
-        return Err("at most 8 tensors, 8 ints, 2 floats".into());
+    if tensors.len() > 8 || ints.len() > 8 || floats.len() > 2 || jumps.len() > 2 {
+        return Err("at most 8 tensors, 8 ints, 2 floats and 2 auxiliary integers".into());
     }
 
     let mut b = Builder::new(n_cu);
     b.force_uniseg();
+    b.set_tensor_dedup(true);
     let handles: Vec<u32> = tensors.iter().map(|(n, bytes, _)| if n == "-" { TENSOR_NONE } else { b.tensor(n, *bytes) }).collect();
     for (n, bytes, _) in &extra {
         b.tensor(n, *bytes);
@@ -79,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         d.t[..handles.len()].copy_from_slice(&handles);
         d.i[..ints.len()].copy_from_slice(&ints);
         d.f[..floats.len()].copy_from_slice(&floats);
+        d.j[..jumps.len()].copy_from_slice(&jumps);
     });
     let prog = b.finish();
     let model = Model { n_cu, target: 0, tensors: prog.tensors.clone(), progs: vec![prog], kv_row_insts: vec![], prog_t: vec![1], gen: vec![] };
