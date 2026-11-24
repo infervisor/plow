@@ -1,7 +1,4 @@
-# GLM-5.3-FP8 on 4x MI300X.
-#
-# Transcribed from scripts/glm53_mi300x.sh and docs/amd/glm53-mi300x.md.
-# `scripts/check_recipe.py` asserts this against what a build produced.
+# GLM-5.3-FP8 on 4x MI300X (gfx942, 304 CUs): TP4, 18k context.
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -22,13 +19,7 @@ parallel = "tp"
 max_ctx = 18432
 toolchain = "rocm-7.14.0-nix"
 
-# The PREPPED directory, not the raw HF snapshot: the blob binds
-# `derived.q_absorb`/`v_absorb`/`kv_a_latent` and bf16 `q_a_proj`/`o_proj`/
-# `shared_experts`, which only the prep writes. A raw-HF checkpoint either
-# refuses on a shard-size mismatch or, with folds armed, faults the GPU at load.
-# The FP8 release is the base repository (`GLM-5.3-FP8` is its lab nickname;
-# `zai-org/GLM-5.3-BF16` is the other precision). The same commit the MI350X
-# campaign recipe and the `/opt/models/GLM-5.3-full-aca966e4` prep dirs use.
+# Prepped checkpoint overlay directory containing derived and dequantized tensors.
 [checkpoint]
 source = "hf:zai-org/GLM-5.3"
 revision = "aca966e4e02791568aa6a4ced368624b3d897f42"
@@ -49,12 +40,7 @@ shell = "nix develop .#quantize"
 args = ["--model", "$CKPT", "--out", "$WORK/glm53-lite"]
 produces = ["zz-derived-00001.safetensors"]
 
-# `PLOW_DECODE_BATCH` is the ladder's widest rung (docs/amd/glm53-mi300x.md §4,
-# `PLOW_DECODE_BATCH_LADDER = "1,2,4"` below). It was missing here, which made
-# the whole `[objects]` surface describe a B=1 build: the script derives every
-# tier from it (`w >= PLOW_DECODE_BATCH` is skipped, so "1,2,4,8" at the default
-# batch of 1 built no tier at all) and refuses `PLOW_DECODE_TIER=2` against it.
-# Found by scripts/tests/test_recipe_objects_env.py.
+# PLOW_DECODE_BATCH sets ladder maximum; script derives lowrung tiers.
 [objects]
 script = "scripts/build_gfx942.sh"
 env = { PLOW_DECODE_BATCH = "4", PLOW_DECODE_TIERS = "1,2", JOBS = "8" }
@@ -95,8 +81,4 @@ lowrung_from_objects = true
 name = "smoke"
 cmd = "scripts/glm53_mi300x.sh smoke 18930"
 
-# No [measured] block: this records the CONFIGURATION, and the bench tables in
-# docs/amd/glm53-mi300x.md were taken with a different harness invocation than
-# the one a release gate runs. `emits` is therefore the honest status — it is
-# publishable and selectable, and it ranks BELOW a validated variant. Promoting
-# it to `validated` requires a release that fills [measured] from its own gate.
+# Status: emits.

@@ -3,14 +3,8 @@
 # glm-5.3-flash/gfx950-mi350x-tp8-fp8.toml. The emitter is `crates/devgen/src/muse.rs`; the plan is
 # plans/muse-spark-full-emit.md.
 #
-# Status `emits`: prefill buckets 128/512/1024/2048/8192 (FlashPrefill hd64, grouped MoE prefill
-# A4W4) and decode rungs 1/8/32. Teacher-forced vs vLLM ROCm (TP8, W4A4 AITER, 4 prompts): decode
-# walk top1_decisive 0.996, mean |dlogprob| 0.058; prefill buckets 1.0 / 0.071 (gates >= 0.95,
-# <= 0.1). Per-block prefill vs the W4A16 oracle is rel_l2 0.04-0.07 (A4W4 activation quant and
-# router near-ties; kernels match an A4W4 oracle fed device inputs at 0.012).
-# The measurements above were taken at plow_git below (branch muse-spark-s1s2). Consolidation into
-# kv-block-store (2026-10-26) renumbered the Muse ops to 226..229 to clear the speech ops at 218..225:
-# packets emitted at that commit do not load on later plowrt; re-emit and re-qualify before serving.
+# Status: emits. Prefill buckets 128..8192 (FlashPrefill hd64, grouped MoE prefill A4W4),
+# decode rungs 1, 8, 32. Teacher-forced parity vs vLLM ROCm TP8 (W4A4 AITER).
 
 schema = "plow.recipe.v1"
 namespace = "infervisor"
@@ -51,12 +45,7 @@ source = "checkpoint"
 script = "scripts/build_gfx950.sh"
 env = { PLOW_XR_TAG_SLOT = "90112", PLOW_FA_MERGE_LDS = "1", PLOW_MUSE_CMB_ILP = "1" }
 
-# `PLOW_MUSE_LATENT_TP` (default 1): pre/post_expert_proj row-parallel. TP8 block 1: 524/526 us
-# vs 531/533 us replicated, same numerics, 6.9 GB/rank less weight.
-# Ladder 1,8,32: rungs 8/32 match the B=1 run of each slot (per-row rel_l2 <= 6.7e-3, same routing).
-# Rung 1 only, bit-identical logits on 440 decode-walk positions: `PLOW_MUSE_QKVG` (one GemvQkvg
-# for q/k/v/gate) and `PLOW_MUSE_NGN` (norm -> residual gate -> norm as one MuseNormGateNorm).
-# With the two object knobs: plowrt bench c1 TPOT 18.26 -> 16.32 ms; c8/c32 unchanged.
+# Ladder 1,8,32: rung 1 uses combined QKVG and NGN kernels.
 [emit]
 env = { PLOW_DECODE_BATCH_LADDER = "1,8,32", PLOW_MUSE_QKVG = "1", PLOW_MUSE_NGN = "1" }
 args = [
@@ -69,8 +58,7 @@ args = [
   "--n-cu", "256",
 ]
 
-# `PLOW_DECODE_MIN_RUNG = "1"`: a lone row runs rung 1, not the TP default floor 8. Same job: TP8
-# block 1 534/536 us vs 782/786 us; serve c1 38.4 vs 22.4 tok/s, c8/c32 unchanged (65.9/64.8).
+# PLOW_DECODE_MIN_RUNG=1 routes single row to rung 1.
 [serve]
 env = { PLOW_XR_TAG_SLOT = "90112", PLOW_DECODE_MIN_RUNG = "1" }
 
