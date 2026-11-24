@@ -228,7 +228,7 @@ pub enum DevOp {
     /// compact row `b`; when absent, physical slot and compact row are identical. Packed
     /// extension forms retain their extension-specific operands.
     FlashDecode = 12,
-    /// `t0=O t1=Opart t2=mlpart t3=sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
+    /// `t0=O t1=Opart t2=mlpart t3=sinks? t4=gate? t5=row_sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
     ///
     /// `sinks` (optional bf16 `[n_head]`, GPT-OSS `self_attn.sinks`) is one extra UNSCALED logit
     /// per head that joins the softmax denominator with no value row, folded HERE and only here:
@@ -236,6 +236,10 @@ pub enum DevOp {
     /// `O = sum_s O_s e^(m_s - gm') / gl'`. With sinks present the emitter must emit the merge at
     /// every `nsplit` (including 1) and leave [`DevOp::FlashPrefill`]'s `t5` (`O_final`, which
     /// normalises inside the flash) at `TENSOR_NONE`. See `dev_isa.h` op 13.
+    ///
+    /// CUDA HD128 accepts paired BF16 `gate[n_batch,n_head,hd]` and
+    /// `row_sinks[n_batch,n_head]` instead of the static sink vector. The
+    /// sigmoid gate scales the FP32 merge result before BF16 storage.
     FlashMerge = 13,
     /// As [`DevOp::Gemm`], 64x128 tile.
     GemmSmall = 14,
@@ -505,7 +509,7 @@ pub enum DevOp {
     /// routing table `[k]` of `(u32 expert_id, f32 gate)`, padding unused slots with the
     /// `EXPERT_UNUSED` sentinel. Its completion counter is the data-dependent gate the K
     /// expert slots wait on.
-    /// `t0=routing_table(out) t1=x t2=Wr [t3=e_score_correction_bias f32[n_exp]]` ·
+    /// `t0=table t1=x t2=wr t3=bias?` ·
     /// `i0=H i1=n_exp i2=k i3=flags` · `f0=route_scale`.
     /// `flags` bit0 = scoring (1 sigmoid, 0 softmax), bit1 = norm_topk, bit2 = apply t3
     /// `e_score_correction_bias` to the top-k SELECTION only (DeepSeek/GLM noaux_tc — the

@@ -3199,6 +3199,16 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_NV_LEAN_DECODE || PLOW_NV_FA_ONLY_HD256_EXACT
         __trap();
 #else
+#if PLOW_NV_GEMMA || PLOW_NV_FA_HD == 128
+        if (in->i[3] == 128 && (TEN(4) || TEN(5))) {
+            if (!TEN(4) || !TEN(5)) __trap();
+            else d_flash_merge<128, false, true>(
+                (__nv_bfloat16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
+                in->i[0], in->i[1], in->i[2], slice, nblk, nullptr,
+                (const __nv_bfloat16*)TEN(5), (const __nv_bfloat16*)TEN(4));
+            break;
+        }
+#endif
 #if PLOW_HAS_FLASH_HD64
         /* HD64 with or without sinks (GPT-OSS carries them; Chatterbox T3 does not). */
         if (in->i[3] == 64 && PLOW_HAS_FLASH_HD64)

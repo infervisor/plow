@@ -212,7 +212,9 @@ enum {
      *     O   = sum_s O_s * e^(m_s - gm') / gl'
      * m_s/l_s are in the natural-exp domain the flash ops write (m_s = running max of the SCALED
      * logits, l_s = sum e^(logit - m_s)); a split with m_s == -inf (empty) is skipped as today.
-     * With t3 == NONE the arithmetic is byte-for-byte the old merge.
+     * With t3, t4 and t5 absent the arithmetic is byte-for-byte the old merge.
+     * CUDA HD128 accepts paired t4=gate(bf16[B,H,D]), t5=row_sinks(bf16[B,H])
+     * with t3 absent. It folds the per-row sink and applies sigmoid(gate) before BF16 storage.
      *
      * THE FOLD POINT IS THE MERGE AND ONLY THE MERGE. FLASH_PREFILL / FLASH_DECODE never see the
      * sinks, so with sinks present the emitter MUST emit a FLASH_MERGE at every nsplit (including

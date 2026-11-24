@@ -148,7 +148,8 @@ struct Emitter<'a> {
     q: u32,
     opart: u32,
     mlpart: u32,
-    mrgc: u32,
+    attn_gate: u32,
+    attn_sink: u32,
     at: u32,
     og: u32,
     rlogit: u32,
@@ -333,12 +334,12 @@ impl Emitter<'_> {
 
         let (opart, mlpart, kvlen, ns, scale) =
             (self.opart, self.mlpart, self.kvlen, self.ns, c.attn_scale);
-        let merge_fold = !self.prefill
-            && self.mrgc != TENSOR_NONE
-            && crate::emit_config::active().nv_fa_fold
-            && !crate::emit_is_amd()
-            && !crate::emit_is_apple();
-        let at = self.at;
+        let attn_gate = self.attn_gate;
+        let attn_sink = self.attn_sink;
+        let wg = self.w(&format!("{p}attn.gate_attn.weight"), qd as u64 * h as u64 * BF16);
+        let ws = self.w(&format!("{p}attn.attn_sink_proj.weight"), heads as u64 * h as u64 * BF16);
+        let c_gate = self.proj(attn_gate, hn, wg, TENSOR_NONE, qd, h, dep);
+        let c_sink = self.proj(attn_sink, hn, ws, TENSOR_NONE, heads, h, dep);
         let c_fa = if self.prefill {
             self.b.emit(
                 DevOp::FlashPrefill,
@@ -350,7 +351,6 @@ impl Emitter<'_> {
                     d.t[2] = q;
                     d.t[3] = kc;
                     d.t[4] = vc;
-                    d.t[5] = at;
                     d.i[0] = t;
                     d.i[1] = t;
                     d.i[2] = heads;
@@ -390,29 +390,22 @@ impl Emitter<'_> {
                     if t > 1 || self.ladder {
                         d.j[0] = t * kvh * kvr;
                     }
-                    if merge_fold {
-                        assert!(self.at < (1 << 16) && self.mrgc < (1 << 16));
-                        d.j[1] = self.at | (self.mrgc << 16);
-                    }
                 })
         };
 
         let at = self.at;
-        let c_attn_out = if merge_fold {
-            c_fa
-        } else {
-            let mg: Vec<u32> = (0..(t * heads).min(self.b.n_cu()).max(1)).collect();
-            self.b.emit(DevOp::FlashMerge, mg, &[c_fa], |d| {
-                d.t[0] = at;
-                d.t[1] = opart;
-                d.t[2] = mlpart;
-                d.t[3] = TENSOR_NONE;
-                d.i[0] = t;
-                d.i[1] = heads;
-                d.i[2] = ns;
-                d.i[3] = hd;
-            })
-        };
+        let mg: Vec<u32> = (0..(t * heads).min(self.b.n_cu()).max(1)).collect();
+        let c_attn_out = self.b.emit(DevOp::FlashMerge, mg, &[c_fa, c_gate, c_sink], |d| {
+            d.t[0] = at;
+            d.t[1] = opart;
+            d.t[2] = mlpart;
+            d.t[4] = attn_gate;
+            d.t[5] = attn_sink;
+            d.i[0] = t;
+            d.i[1] = heads;
+            d.i[2] = ns;
+            d.i[3] = hd;
+        });
         let og = self.og;
         let c_o = self.proj(og, at, wo, TENSOR_NONE, h, qd, c_attn_out);
         let c_n1 = self.add_norm(og, g_mlp, c_o);
@@ -583,11 +576,8 @@ fn phase_range(
         tr * heads as u64 * ns as u64 * hd as u64 * F32,
     );
     let mlpart = act(&mut b, "mlpart", tr * heads as u64 * ns as u64 * 2 * F32);
-    let mrgc = if !prefill && crate::emit_config::active().nv_fa_fold && !crate::emit_is_amd() && !crate::emit_is_apple() {
-        act(&mut b, "mrgc", (dbatch.max(1) * heads) as u64 * 4)
-    } else {
-        TENSOR_NONE
-    };
+    let attn_gate = act(&mut b, "attn_gate", tr * qd as u64 * BF16);
+    let attn_sink = act(&mut b, "attn_sink", tr * heads as u64 * BF16);
     let at = act(&mut b, "at", tr * qd as u64 * BF16);
     let og = act(&mut b, "og", tr * h as u64 * BF16);
     let rlogit = act(&mut b, "rlogit", tr * e as u64 * BF16);
@@ -619,7 +609,8 @@ fn phase_range(
         q,
         opart,
         mlpart,
-        mrgc,
+        attn_gate,
+        attn_sink,
         at,
         og,
         rlogit,
@@ -901,8 +892,6 @@ pub(super) fn run(
         block.map(|_| layers.clone()),
         &[
             "_sconv.",
-            "gate_attn.",
-            "attn_sink_proj.",
             "wr_du",
             "rel_",
             "q_l2_clip",

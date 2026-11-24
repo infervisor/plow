@@ -9078,10 +9078,6 @@ fn apply_production_defaults(
     n_cu: u32,
 ) {
     if capabilities.inkling && arch == "sm_90a" && tp == 1 {
-        if !emit_config::explicitly_set("nv_fa_fold") {
-            cfg.nv_fa_fold = true;
-            emit_config::note_production_default("nv_fa_fold", "true".into());
-        }
         if !emit_config::explicitly_set("nv_moe_combine_fold") {
             cfg.nv_moe_combine_fold = true;
             emit_config::note_production_default("nv_moe_combine_fold", "true".into());

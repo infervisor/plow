@@ -1428,6 +1428,37 @@ fn validate_gemv_decode_role_inst(
     Ok(())
 }
 
+fn validate_gated_flash_merge(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::FlashMerge as u16
+            || (d.t[4] == TENSOR_NONE16 && d.t[5] == TENSOR_NONE16)
+        {
+            continue;
+        }
+        let rows = u64::from(d.i[0]) * u64::from(d.i[1]);
+        let extent = |slot: usize, count: u64, stride: u64| {
+            count.checked_mul(stride).is_some_and(|need| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= need)
+            })
+        };
+        let partials = rows.checked_mul(u64::from(d.i[2]));
+        if d.i[3] != 128
+            || rows == 0
+            || rows > u64::from(u32::MAX)
+            || d.i[2] == 0
+            || d.t[3] != TENSOR_NONE16
+            || [1, 2, 4, 5].iter().any(|&slot| d.t[slot] == d.t[0])
+            || !extent(0, rows, 256)
+            || !partials.is_some_and(|n| extent(1, n, 512) && extent(2, n, 8))
+            || !extent(4, rows, 256)
+            || !extent(5, rows, 2)
+        {
+            return Err(RuntimeError::Rejected("invalid gated FlashMerge operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_moe_outer_scales(blob: &DevBlob) -> Result<()> {
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
         if !matches!(DevOp::from_u16(d.op), Some(DevOp::MoeGluMx | DevOp::MoeDownMx))
@@ -4543,6 +4574,7 @@ impl GpuEngine {
                 image.blob.check_l2_dispatch(false)?;
                 let blob = image.blob.clone();
                 validate_moe_outer_scales(&blob)?;
+                validate_gated_flash_merge(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {

@@ -3277,12 +3277,13 @@ __device__ __noinline__ void d_flash_decode_slots(
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).
  * Deliberately NOT split over the feature axis — see the AMD comment: widening the merge
  * widens its consumer's gate and made the TOKEN slower there. Kept identical here. */
-template <int D, bool SINKS = false>
+template <int D, bool SINKS = false, bool GATED = false>
 __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __restrict__ Opart,
                               const float* __restrict__ mlpart, unsigned n_batch, unsigned n_head,
                               unsigned nsplit, unsigned slice, unsigned nblk,
                               const int* req = nullptr,
-                              const __nv_bfloat16* __restrict__ sinks = nullptr) {
+                              const __nv_bfloat16* __restrict__ sinks = nullptr,
+                              const __nv_bfloat16* __restrict__ gate = nullptr) {
     /* BRANCHLESS: the old body computed the exp weight under an `== NEG_INF` guard per (d, s)
      * element — nsplit FSETP+guarded-EX2 chains per output, predicate pressure high enough that
      * ptxas spilled predicates (P2R). The guard is unnecessary: an empty split carries
@@ -3307,8 +3308,8 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
         float gm = FA_NEG_INF;
         for (unsigned s = 0; s < nsplit; s++) gm = fmaxf(gm, ml2[s].x);
         float sink = FA_NEG_INF;
-        if constexpr (SINKS) {
-            sink = FA_SCALE(__bfloat162float(sinks[h]));
+        if constexpr (SINKS || GATED) {
+            sink = FA_SCALE(__bfloat162float(sinks[GATED ? w : h]));
             gm = fmaxf(gm, sink);
         }
         float gl = 0.0f;
@@ -3316,14 +3317,17 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
             const float2 ml = ml2[s];
             gl += ml.y * FA_EXP(ml.x - gm);
         }
-        if constexpr (SINKS) gl += FA_EXP(sink - gm);
+        if constexpr (SINKS || GATED) gl += FA_EXP(sink - gm);
         const float inv = (gl > 0.0f) ? (1.0f / gl) : 0.0f;
 
         for (unsigned d = threadIdx.x; d < D; d += PLOW_NV_THREADS) {
             float acc = 0.0f;
             for (unsigned s = 0; s < nsplit; s++)
                 acc += Opart[((size_t)(b * n_head + h) * nsplit + s) * D + d] * FA_EXP(ml2[s].x - gm);
-            O[((size_t)b * n_head + h) * D + d] = __float2bfloat16(acc * inv);
+            const size_t col = (size_t)w * D + d;
+            float out = acc * inv;
+            if constexpr (GATED) out *= 1.0f / (1.0f + __expf(-__bfloat162float(gate[col])));
+            O[col] = __float2bfloat16(out);
         }
     }
 }

@@ -1252,7 +1252,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.fuse_hnr", Some("PLOW_FUSE_HNR"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.fuse_merge", Some("PLOW_FUSE_MERGE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_fold_wide", Some("PLOW_NV_FA_FOLD_WIDE"), Layer::Emit, Domain::Bool, NV_FA_FOLD_WIDE_DEFAULT, PROMOTED),
-    KnobSpec::new("emit.nv_fa_fold", Some("PLOW_NV_FA_FOLD"), Layer::Emit, Domain::Bool, INKLING_HOPPER_ON, PROMOTED),
+    KnobSpec::new("emit.nv_fa_fold", Some("PLOW_NV_FA_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_moe_combine_fold", Some("PLOW_NV_MOE_COMBINE_FOLD"), Layer::Emit, Domain::Bool, INKLING_HOPPER_ON, PROMOTED),
     KnobSpec::new("emit.nv_moe_router_fold", Some("PLOW_NV_MOE_ROUTER_FOLD"), Layer::Emit, Domain::Bool, INKLING_HOPPER_ON, PROMOTED),
     KnobSpec::new("emit.nv_dense_tune", Some("PLOW_NV_DENSE_TUNE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
