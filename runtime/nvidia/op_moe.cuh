@@ -3719,6 +3719,12 @@ __device__ __forceinline__ float plow_mxfp4_row_dot_nv(
 
 /* NVFP4 row dot: block size 16 (1 UE8M0 scale per 16 weights).
  * Vectorized with uint4 (32 weights per thread, 1024 weights per chunk). */
+__device__ __forceinline__ float plow_nvfp4_scale(uint8_t encoded) {
+    __nv_fp8_e4m3 value;
+    value.__x = encoded;
+    return float(value);
+}
+
 __device__ __forceinline__ float plow_nvfp4_row_dot_nv(
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ s,
     const bf16* __restrict__ x, unsigned K,
@@ -3805,7 +3811,7 @@ __device__ __forceinline__ float plow_nvfp4_row_dot_nv(
             : (plow_mxfp4_dot8(cur_wv.x, xa0, xa1, xa2, xa3) +
                plow_mxfp4_dot8(cur_wv.y, xb0, xb1, xb2, xb3));
         if (cur_live0) {
-            acc += pa * plow_mxfp4_scale(cur_s0);
+            acc += pa * plow_nvfp4_scale(cur_s0);
         }
 
         const __nv_bfloat162* x2c = (const __nv_bfloat162*)&cur_xc;
@@ -3826,7 +3832,7 @@ __device__ __forceinline__ float plow_nvfp4_row_dot_nv(
             : (plow_mxfp4_dot8(cur_wv.z, xc0, xc1, xc2, xc3) +
                plow_mxfp4_dot8(cur_wv.w, xd0, xd1, xd2, xd3));
         if (cur_live1) {
-            acc += pb * plow_mxfp4_scale(cur_s1);
+            acc += pb * plow_nvfp4_scale(cur_s1);
         }
 
         cur_wv = next_wv;
@@ -4107,8 +4113,8 @@ __device__ __forceinline__ float2 plow_nvfp4_glu_dot_nv(
                plow_mxfp4_dot8(cur_wuv.y, xb0, xb1, xb2, xb3));
 
         if (cur_live0) {
-            acc_g += pga * plow_mxfp4_scale(cur_sg0);
-            acc_u += pua * plow_mxfp4_scale(cur_su0);
+            acc_g += pga * plow_nvfp4_scale(cur_sg0);
+            acc_u += pua * plow_nvfp4_scale(cur_su0);
         }
 
         const __nv_bfloat162* x2c = (const __nv_bfloat162*)&cur_xc;
@@ -4135,8 +4141,8 @@ __device__ __forceinline__ float2 plow_nvfp4_glu_dot_nv(
                plow_mxfp4_dot8(cur_wuv.w, xd0, xd1, xd2, xd3));
 
         if (cur_live1) {
-            acc_g += pgb * plow_mxfp4_scale(cur_sg1);
-            acc_u += pub * plow_mxfp4_scale(cur_su1);
+            acc_g += pgb * plow_nvfp4_scale(cur_sg1);
+            acc_u += pub * plow_nvfp4_scale(cur_su1);
         }
 
         cur_wgv = next_wgv;
@@ -4401,8 +4407,8 @@ __device__ __forceinline__ float2 plow_nvfp4_glu_dot_nv_reg(
             : (plow_mxfp4_dot8(wuv[c].x, xa0, xa1, xa2, xa3) +
                plow_mxfp4_dot8(wuv[c].y, xb0, xb1, xb2, xb3));
 
-        acc_g += pga * plow_mxfp4_scale(sg0[c]);
-        acc_u += pua * plow_mxfp4_scale(su0[c]);
+        acc_g += pga * plow_nvfp4_scale(sg0[c]);
+        acc_u += pua * plow_nvfp4_scale(su0[c]);
 
         if (live1) {
             const __nv_bfloat162* x2c = (const __nv_bfloat162*)&xc;
@@ -4428,8 +4434,8 @@ __device__ __forceinline__ float2 plow_nvfp4_glu_dot_nv_reg(
                 : (plow_mxfp4_dot8(wuv[c].z, xc0, xc1, xc2, xc3) +
                    plow_mxfp4_dot8(wuv[c].w, xd0, xd1, xd2, xd3));
 
-            acc_g += pgb * plow_mxfp4_scale(sg1[c]);
-            acc_u += pub * plow_mxfp4_scale(su1[c]);
+            acc_g += pgb * plow_nvfp4_scale(sg1[c]);
+            acc_u += pub * plow_nvfp4_scale(su1[c]);
         }
     }
     return make_float2(plow_warp_sum(acc_g), plow_warp_sum(acc_u));
@@ -4495,7 +4501,7 @@ __device__ __forceinline__ float plow_nvfp4_row_dot_nv_reg(
                plow_mxfp4_dot8_lut(wv[c].y, xb0, xb1, xb2, xb3, s_lut))
             : (plow_mxfp4_dot8(wv[c].x, xa0, xa1, xa2, xa3) +
                plow_mxfp4_dot8(wv[c].y, xb0, xb1, xb2, xb3));
-        acc += pa * plow_mxfp4_scale(s0[c]);
+        acc += pa * plow_nvfp4_scale(s0[c]);
 
         if (live1) {
             const __nv_bfloat162* x2c = (const __nv_bfloat162*)&xc;
@@ -4515,7 +4521,7 @@ __device__ __forceinline__ float plow_nvfp4_row_dot_nv_reg(
                    plow_mxfp4_dot8_lut(wv[c].w, xd0, xd1, xd2, xd3, s_lut))
                 : (plow_mxfp4_dot8(wv[c].z, xc0, xc1, xc2, xc3) +
                    plow_mxfp4_dot8(wv[c].w, xd0, xd1, xd2, xd3));
-            acc += pb * plow_mxfp4_scale(s1[c]);
+            acc += pb * plow_nvfp4_scale(s1[c]);
         }
     }
     return plow_warp_sum(acc);
@@ -4602,7 +4608,7 @@ static __device__ void d_moe_glu_mx(
                 const float sigmoid = 1.0f / (1.0f + __expf(-g));
                 const float gate = alpha > 0.0f ? alpha * tanhf(g / alpha) : g;
                 const float up = limit > 0.0f ? limit * tanhf(u / limit) : u;
-                const float weight = *(const float*)(table + (size_t)slot * 8u + 4u);
+                const float weight = plow_moe_slot_gate(table, slot);
                 v = ((gate * sigmoid) * up) * weight;
             } else {
                 v = act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
@@ -4657,7 +4663,7 @@ static __device__ void d_moe_down_mx(
                     : plow_mxfp4_row_dot_nv(wr, sr, fur, I, s_lut));
             if (mode == 2u && amax && denominator) v *= amax[eid] / *denominator;
             if (bias) v += __bfloat162float(bias[(size_t)eid * H + h]);
-            if (!preweighted) v *= *(const float*)(table + (size_t)slot * 8u + 4u);
+            if (!preweighted) v *= plow_moe_slot_gate(table, slot);
         }
         if ((threadIdx.x & 31u) == 0) part[(size_t)slot * H + h] = v;
     }
