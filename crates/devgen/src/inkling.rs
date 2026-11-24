@@ -601,6 +601,8 @@ fn phase_range(
     let mut b = Builder::new(n_cu);
     b.force_uniseg();
     let block_mode = layers.start != 0 || layers.end != c.layers as usize;
+    let existing_log_scale = tensors.as_ref()
+        .and_then(|table| table.iter().position(|t| t.name == "const.log_scale"));
     if let Some(tensors) = tensors {
         b.adopt_tensors(tensors);
     }
@@ -634,7 +636,10 @@ fn phase_range(
     let k_clipped = act(&mut b, "k_clipped", tr * kd as u64 * BF16);
     let rel = act(&mut b, "rel", tr * heads as u64 * 16 * BF16);
     let rel_logits = act(&mut b, "rel_logits", tr * heads as u64 * c.rel_extent as u64 * BF16);
-    let log_scale = b.tensor_init("const.log_scale", [c.log_floor.to_le_bytes(), c.log_alpha.to_le_bytes()].concat());
+    let log_scale = existing_log_scale.map_or_else(
+        || b.tensor_init("const.log_scale", [c.log_floor.to_le_bytes(), c.log_alpha.to_le_bytes()].concat()),
+        |handle| handle as u32,
+    );
     let opart = act(
         &mut b,
         "opart",
