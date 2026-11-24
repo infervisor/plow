@@ -1328,6 +1328,7 @@ pub(super) fn run(
     };
     std::fs::write(outp, bytes).expect("write inkling blob");
     if !arch.is_empty() {
+        crate::write_lean_receipts(outp, &lean);
         let man = manifest::build_without_depth(&m, arch, &lean);
         crate::report_dispatch_audit(&man);
         manifest::write_config_header(&outp.with_file_name("plow_config.h"), &man)
