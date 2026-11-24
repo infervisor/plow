@@ -404,7 +404,9 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     need(not spec_errors, "; ".join(spec_errors))
 
     if bundle and (bundle / "model.pkt").exists():
-        notes += [f"{level}: {message}" for level, message in rc.check_packet_speech_tags(bundle / "model.pkt", recipe, recipe_path) if level != "NOTICE"]
+        for level, message in rc.check_packet_speech_tags(bundle / "model.pkt", recipe, recipe_path):
+            if level != "NOTICE":
+                notes.append(f"{'info' if level == 'ok' else level}: {message}")
     if bundle:
         bj = rc.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
         wj = rc.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}
