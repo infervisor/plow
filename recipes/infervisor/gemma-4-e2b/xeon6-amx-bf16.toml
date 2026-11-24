@@ -14,7 +14,7 @@
 # Qualified (2026-10-09, plowrt 53581658 with PLOW_CPU_COMBINE=16, packet 4fea6d8c3932):
 # campaign.py report MATCHED + EQUIVALENT vs vLLM 0.30 CPU at 1000/128 c1/c8/c32; FP32-reference gate PASS,
 # KL mean 0.0004 vs vLLM 0.0005. Throughput 1.46-3.67x, TTFT P99 0.52-0.81x, TPOT P99 0.25-0.68x, memory 0.27-0.34x (wins every row).
-# docs/bringup/results/gemma4-xeon6-bf16-20261006/comparison.md.
+# perf-data/campaign/gemma4-xeon6-bf16-20261006/comparison.md.
 #
 # 16K agentic serving (same plowrt, packet 42aadb1b2d38): this recipe's emit/serve env with --max-ctx 16384,
 # PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32,64, and serve PLOW_SESSION_SLACK=64. A recipe carries one max_ctx, so the

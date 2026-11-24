@@ -1,163 +1,134 @@
-# Stage 1 — Add the architecture to the nn-graph IR and the devblob emitter
+# Stage 1 — NN-Graph IR & Devblob Emitter
 
-Target-independent: name no GPU, ISA, CU count or toolchain here. The target block
-([`target.md`](target.md)) is filled at Stage 4.
+Target-independent stage (CPU-only). Name no GPU, ISA, CU count, or vendor toolchain here; target hardware parameters are populated in [`target.md`](target.md) at Stage 4.
 
-Output: a shape-inferred `nn_graph::Graph` for the model, and the same model wired through the
-shipping `--emit devblob` path.
+* **Input:** Hugging Face checkpoint directory or model ID containing `config.json`, `modeling_*.py`, and `model.safetensors.index.json`.
+* **Output:** Shape-inferred `nn_graph::Graph` and fully wired `plowc --emit devblob` pipeline that simulates cleanly.
+* **Architecture Reference:** [`docs/arch/01-compiler-pipeline.md`](../arch/01-compiler-pipeline.md) and [`docs/arch/model_bringup_and_stability_roadmap.md`](../arch/model_bringup_and_stability_roadmap.md) §1.1.
 
-## Inputs
+---
 
-- `MODEL`: HF id (e.g. `Qwen/Qwen3-8B`) or a local checkpoint dir.
-- `REFERENCE`: `modeling_*.py`, `config.json`, `model.safetensors.index.json`. Ground truth for op
-  order, norms, activation, RoPE style, head geometry and weight names.
+## 1. Silent Numerical Correctness Invariants
 
-## What the IR feeds
+Before writing IR code, audit the reference implementation (`modeling_*.py`) against five critical numerical traps ([`model_bringup_and_stability_roadmap.md`](../arch/model_bringup_and_stability_roadmap.md) §1.1.2):
 
-- `crates/nn-graph` turns `config.json` into a typed operator DAG, infers shapes and lists the
-  per-op weights (`Graph::weight_manifest`).
-- The graph reaches packets through the rewrite: `rewrite::fused_sites_for_config` extracts fused
-  sites and devgen lowers them at the seams a rule covers (`PLOW_EMIT_REWRITE`, default on).
-  Without a rewrite for the checkpoint the emit keeps the hand fusions; only an explicit
-  `PLOW_EMIT_REWRITE=1` refuses. `plowc` also builds the graph for fusion coverage
-  (`crates/plowc/src/fusion_coverage.rs`).
-- The device `LayerPlan`, weight binding and packets come from `crates/plowc/src/hf_config.rs` →
-  `crates/devgen`. A builder in `nn-graph` alone does not make the model emit; step 7 does.
-- `DType` is load-bearing (`costmodel::dtype_cost`, every `rewrite::OpSpec`). Do not touch it for a
-  new model.
+| Invariant Area | Upstream Divergence | Verification Contract in IR |
+|---|---|---|
+| **1. RMSNorm Epsilon** | $\sqrt{\frac{1}{d}\sum x^2 + \epsilon}$ vs $\sqrt{\frac{1}{d}\sum x^2} + \epsilon$ | Epsilon must be placed strictly inside the square root prior to reciprocal. Ensure epsilon precision (FP32) is preserved before downcasting to activation dtype. |
+| **2. RoPE Interleaving** | Neox style ($[-x_{d/2..}, x_{..d/2}]$) vs GPT-J style ($[-x_1, x_0, -x_3, x_2]$) | Inspect HF RotaryEmbedding implementation. For partial RoPE ($D_{\text{rope}} < D_{\text{head}}$), assert pass-through slice $[D_{\text{rope}}..D_{\text{head}}]$ remains unrotated. |
+| **3. Attention Scale** | Fused $1/\sqrt{d_k}$ in Q weights vs in-kernel scaling | Never absorb scale factor into weights if model uses QK-Norm or FP8 scales; unabsorbed factors cause silent underflow/overflow. |
+| **4. Tied Embeddings** | Reused input embedding for LM head | Check if output projection applies $d_{\text{model}}^{-0.5}$ scaling, transposition, or un-tied bias vectors. |
+| **5. Recurrent State** | Hybrid linear models (GDN / KDA / linear RNN) | State tensors $[B, H, K, V]$ require strict contiguous memory layout for chunked prefix scans. Strides must be verified at emit. |
 
-## Geometry audit — record before building
+---
 
-| field | decides downstream |
+## 2. Geometry Audit
+
+Record these parameters from `config.json` before building the model:
+
+| Parameter | Meaning & Downstream Decision |
 |---|---|
-| `layer_types` (full vs sliding) | flash arms needed; sliding layers get a KV ring |
-| `head_dim` per family | one kernel instantiation per head dim |
-| `num_key_value_heads` per family | distinct GEMV/flash shapes per kvh |
-| `sliding_window` | KV ring floor in the Stage 6 VRAM budget |
-| `vocab_size` | lm_head GEMV width, sampler scratch |
-| `rope_parameters` | per-family RoPE (partial RoPE, per-layer-type theta) |
-| MoE vs dense | router / experts / combine op family |
-| `num_hidden_layers` | segment count (the loader caps segments) |
+| `layer_types` | Full-attention vs sliding-window layers; determines KV ring allocation in Stage 6. |
+| `head_dim` | Distinct head dimensions require separate attention kernel instantiations. |
+| `num_key_value_heads` | Number of KV heads determines GEMV launch geometry for decode. |
+| `sliding_window` | Ring buffer size floor in the VRAM budget calculation. |
+| `vocab_size` | Dimensions of LM head GEMV and sampler scratch allocation. |
+| `rope_parameters` | Base frequency $\theta$, partial rotary dimension, and scaling factors. |
+| MoE vs Dense | Number of routed experts, top-$k$, shared experts, and routing activation. |
+| `num_hidden_layers` | Segment count; loader enforces physical segment limits. |
 
-Check GEMM tile divisibility for every projection: `N` must divide the object's N-tile, `K` its
-K-tile, or the GEMM leaves the tiled path (refuses at emit or falls back). AMD tile:
-`hwspec::IsaLevel::geometry()`; NVIDIA: read it off the built object (`plowc tune inventory`). See
-[`target.md`](target.md).
+**GEMM Divisibility Rule:** For all projections ($Q, K, V, O$, MLP gate/up/down), verify that projection dimensions $N$ and $K$ divide the target GEMM tile (probed via `plowc tune inventory` or `hwspec::IsaLevel::geometry()`). Non-divisible dimensions require padding or fall back to slow unfused kernels.
 
-## Templates
+---
 
-| new model is | copy from |
+## 3. Template Reference
+
+| Architecture Pattern | Template Source (`crates/nn-graph/src/models/`) |
 |---|---|
-| dense GQA + SwiGLU, RoPE, pre-norm | `models/llama.rs` |
-| + per-head qk-norm / explicit `head_dim` | `models/qwen3.rs` |
-| MLA + MoE | `models/deepseek.rs` |
-| local/global attention, softcap | `models/gemma.rs` |
-| hybrid softmax/linear attention | `models/kimi_k3.rs` |
-| ViT / vision encoder | `models/siglip.rs` |
-| diffusion DiT / VAE (resolution-bucketed) | `models/qwen_image_*.rs` |
+| Dense GQA + SwiGLU + RoPE (Standard Pre-Norm) | `models/llama.rs` |
+| GQA + Per-Head QK-Norm + Explicit Head Dim | `models/qwen3.rs` |
+| Multi-Head Latent Attention (MLA) + Sparse MoE | `models/deepseek.rs` |
+| Hybrid Local Sliding-Window + Global Softcap | `models/gemma.rs` |
+| Hybrid Linear Attention (GDN / KDA) | `models/kimi_k3.rs` |
+| Vision Encoder / Multi-Modal Transformer | `models/siglip.rs` |
+| Diffusion DiT / Resolution-Bucketed VAE | `models/qwen_image_*.rs` |
 
-Paths are under `crates/nn-graph/src/`.
+---
 
-## Steps
+## 4. Step-by-Step Implementation
 
-All commands run inside `nix develop`.
+Execute all commands inside `nix develop`.
 
-0. **Baseline green.**
-   ```bash
-   nix develop --command bash -c '
-     cargo build -p nn-graph --no-default-features &&
-     cargo build -p nn-graph &&
-     cargo build -p nn-graph --features hub &&
-     cargo test -p nn-graph'
-   ```
-1. **Config** — `models/config/<arch>.rs`: `#[derive(Deserialize)]` with only the geometry the
-   builder needs. `#[serde(default = "…")]` only for fields the reference defaults; never blanket
-   `#[serde(default)]` over required dimensions. `#[serde(alias)]` for alternate spellings. Add
-   `kv_heads()` / `head_dim()` helpers.
-2. **Detection** — `models/config/mod.rs`: `mod <arch>;`, `pub use <arch>::<Arch>Config;`, a
-   `ModelConfig::<Arch>` variant, a `from_json` arm on `model_type`, and an `architectures[]` arm in
-   `model_type()` if the model may ship without `model_type`. Reject near-variants you do not
-   implement with `ConfigError::Unsupported`.
-3. **Builder** — `models/<arch>.rs`: `pub fn build(cfg: &<Arch>Config) -> Graph` driving `Nn`
-   (`src/builder.rs`). Symbolic `B`/`S`; per layer `begin_block("layers.{i}")` … `end_block()`; ops
-   in reference order; weight names exactly as in the checkpoint; `mark_output` logits (decoder) or
-   final hidden states (encoder). Add the arm to `models/mod.rs::build_graph` (and
-   `build_encoder_graph` for a text encoder).
-4. **New op only if forced** — `Op` variant (`op.rs`) + shape rule (`infer.rs`) + `Nn` helper +
-   `Op::name`. Bar: any expression with existing ops would be numerically close but wrong (see the
-   `op.rs` doc comments).
-5. **Test** — a case in `tests/build_graphs.rs` with a scaled-down, structurally faithful inline
-   config: `assert_fully_inferred(&g)`, expected `output_shape_str(&g)`, per-op `count_ops` for the
-   ops that define the architecture. Add a "missing required field is rejected" test.
-6. **Weight manifest and binding** — compare `weight_manifest()` names/shapes to the checkpoint
-   index (pattern: `tests/bind_and_weights.rs`). Bind a bucket with
-   `g.bind(&Bindings::new().set("B", 1).set("S", 512))`; diffusion models specialize at build time
-   via `build_from_config_json_at(json, &ShapeBucket::square(N))`.
-7. **Devblob emit wiring** — wire the model independently through:
-   - `crates/plowc/src/hf_config.rs`: parse and validate the real config, synthesize the full-model
-     `LayerPlan`, refuse unsupported near-variants;
-   - `crates/devgen`: dispatch the family and emit full-model and `--block` packets with
-     checkpoint-exact weight names and shapes.
-
-   Mirror the Stage-1 geometry and manifest. Add parser/plan tests in `hf_config.rs`, emitter tests
-   in the matching `devgen` module and an `hf_dir_compile`-style test
-   (`crates/plowc/tests/hf_dir_compile.rs`). A structural fixture may use zero weights; its manifest
-   is compared to the real checkpoint index.
-   ```bash
-   nix develop --command cargo test -p plowc -p devgen
-   nix develop --command plowc --hf-dir <checkpoint> --emit devblob --out <scratch>/emit
-   nix develop --command plowrt simulate --assets <scratch>/emit --all-buckets
-   ```
-
-## Inspecting a graph
-
-`plowc viz` builds every network of a source, infers shapes and writes or serves a viewer. Source
-flags are top-level: `plowc --hf-dir <dir> viz …` or `plowc --model <hf-id> viz …`.
-
+### Step 0: Ensure Clean Baseline
 ```bash
-nix develop --command plowc --hf-dir <dir> viz --port 0 --out <scratch>/graph.html
-nix develop --command plowc --model <hf-id> viz --revision <commit> --validate-checkpoint \
-  --port 0 --dump-assets <scratch>/viz
-nix develop --command plowc viz --packet <assets>/model.pkt --open false
+nix develop --command bash -c '
+  cargo build -p nn-graph --no-default-features &&
+  cargo build -p nn-graph &&
+  cargo build -p nn-graph --features hub &&
+  cargo test -p nn-graph'
 ```
+Must pass with exit code 0.
 
-`--validate-checkpoint` checks graph weights against the safetensors headers only; it does not
-prove numerical equivalence. Multi-stage models get named stages from an arm in
-`viz::bundle_from_model_config`. Weightless structure-only packets: `scripts/tts/header_only.py`.
+### Step 1: Config Parsing (`crates/nn-graph/src/models/config/<arch>.rs`)
+* Create `#[derive(Deserialize)]` struct containing only dimensions the graph builder requires.
+* Apply `#[serde(default = "...")]` strictly to fields where the reference config specifies defaults; never apply blanket `#[serde(default)]` over required geometry.
+* Provide helper methods `pub fn kv_heads(&self) -> usize` and `pub fn head_dim(&self) -> usize`.
 
-## Gate (all before Stage 2)
+### Step 2: Register Config in Dispatch (`crates/nn-graph/src/models/config/mod.rs`)
+* Add `mod <arch>;` and `pub use <arch>::<Arch>Config;`.
+* Add variant `ModelConfig::<Arch>(<Arch>Config)`.
+* Wire `from_json` on `model_type` and add matching identifier in `architectures[]`. Reject unsupported variants with `ConfigError::Unsupported`.
 
-- `nn-graph` builds with `--no-default-features`, default and `--features hub`; `cargo test -p
-  nn-graph` green including the new `build_graphs` case and the rejection test.
-- `assert_fully_inferred` passes; `weight_manifest()` matches the checkpoint names and shapes.
-- Op order and attributes match `REFERENCE` (norms, activation, RoPE, routing).
-- Full and `--block` emit succeed, `plowrt simulate --all-buckets` terminates on every program, and
-  the shipping manifest matches the Stage-1 / reference tensor names and shapes.
+### Step 3: Implement Graph Builder (`crates/nn-graph/src/models/<arch>.rs`)
+* Expose `pub fn build(cfg: &<Arch>Config) -> Graph` using `Nn` (`src/builder.rs`).
+* Use symbolic dimensions `"B"` and `"S"`.
+* Wrap each layer body in `builder.begin_block("layers.{i}")` ... `builder.end_block()`.
+* Operator ordering and weight tensor naming must match checkpoint keys bit-for-bit.
+* Mark final outputs: logits for decoders (`mark_output`), hidden states for encoders.
+* Wire builder in `models/mod.rs::build_graph` (and `build_encoder_graph` if applicable).
 
-## Pitfalls
+### Step 4: Operator Addition (Only If Unavoidable)
+* Add new `Op` variant in `crates/nn-graph/src/op.rs` only when existing operators cannot express the computation without precision or performance degradation.
+* Implement shape inference in `crates/nn-graph/src/infer.rs`.
+* Provide builder helper on `Nn` and wire operator name in `Op::name`.
 
-- Blanket `#[serde(default)]` fabricates models: a partial config builds a plausible wrong one
-  (`kimi_partial_config_is_rejected_not_defaulted`).
-- Config keys vary by checkpoint (`num_expert_group` vs `n_group`, `dtype` vs `torch_dtype`); use
-  aliases.
-- An `architectures[]` prefix can route a new model to an older family's builder. Claim the prefix
-  explicitly.
-- `rope` (pairs `x[i]`, `x[i+d/2]`) and `rope_interleaved` (pairs `x[2i]`, `x[2i+1]`) are different
-  rotations; partial RoPE (`dim < head_dim`) is common.
-- `GeluTanh` ≠ `Gelu` ≠ `QuickGelu`; SwiGLU is `mul(silu(gate), up)`.
-- Drive per-layer heterogeneity (local/global, dense-before-MoE, hybrid attention) from the config's
-  layer list, never a hardcoded stride.
-- Flat top-k and group-limited routing select different experts; use `moe_router_grouped` with
-  `MoeGroups` when the checkpoint was trained grouped.
-- Attention output width is the value head dim (`qk_head_dim != v_head_dim` under MLA).
-- Anything needing serde/hub stays behind the `models` / `hub` features.
+### Step 5: Unit Tests (`crates/nn-graph/tests/build_graphs.rs`)
+* Add a test case with a scaled-down, structurally faithful inline configuration.
+* Assert:
+  ```rust
+  assert_fully_inferred(&graph);
+  assert_eq!(output_shape_str(&graph), "[B, S, vocab_size]");
+  assert_eq!(graph.count_ops(Op::FlashAttention), expected_layer_count);
+  ```
+* Add a negative test verifying missing required fields trigger descriptive `ConfigError` failures.
 
-## Stop and ask
+### Step 6: Weight Manifest & Shape Binding (`crates/nn-graph/tests/bind_and_weights.rs`)
+* Assert all tensor names and shapes from `graph.weight_manifest()` match the checkpoint's `model.safetensors.index.json`.
+* Bind concrete runtime dimensions:
+  ```rust
+  let bound_graph = graph.bind(&Bindings::new().set("B", 1).set("S", 512));
+  assert!(bound_graph.is_fully_bound());
+  ```
 
-- A new `Op` meets the bar: propose name, inputs, shape rule and why existing ops cannot express it.
-- `config.json` semantics or checkpoint tensor names disagree with the reference.
-- Detection would collide with an existing family (`model_type` or `architectures` prefix).
-- Keeping `--no-default-features` green would mean moving something into the core IR.
-- Multimodal / multi-network model: unclear whether to build one graph or a `PipelineConfig`.
+### Step 7: Devblob Pipeline Wiring
+* In `crates/plowc/src/hf_config.rs`: Parse model config, validate layer plan, and synthesize `LayerPlan`.
+* In `crates/devgen`: Implement architecture dispatch to emit full-model and `--block` packets matching exact checkpoint weight layouts.
 
-Do not edit `DType` or start GPU work in this stage.
+### Step 8: CPU Simulation Sanity Check
+Confirm packet dependency DAG resolves without hardware:
+```bash
+nix develop --command ./scripts/block_sim.sh <scratch>/assets decode:1:128
+```
+Verifies makespan is finite, topological sort is acyclic, and memory buffers remain within bounds.
+
+---
+
+## 5. Gate Checklist
+
+Before advancing to Stage 2:
+- [ ] `cargo test -p nn-graph` passes with 0 failures and 0 warnings.
+- [ ] Graph builds cleanly from reference `config.json` with `assert_fully_inferred`.
+- [ ] Weight manifest names and shapes match `model.safetensors.index.json` exactly.
+- [ ] All 5 numerical correctness invariants (§1) are verified against upstream reference code.
+- [ ] `plowc --emit devblob` produces valid full-model and single-block packets.
+- [ ] `./scripts/block_sim.sh` executes clean CPU simulation with finite makespan.

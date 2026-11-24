@@ -1,61 +1,41 @@
-# Model bringup
+# Model Bringup
 
-From a HuggingFace `config.json` to a served, measured deployment, one gated stage at a time.
-Each stage file holds its steps, gate, pitfalls and stop-and-ask conditions. Cross-cutting rules
-live once in [`agent-tools.md`](agent-tools.md); read it before any GPU or performance work.
+From a Hugging Face `config.json` to a verified, served deployment, one gated stage at a time.
 
-## Stages
+Cross-cutting rules, execution environments, and CLI tools live in [`agent-tools.md`](agent-tools.md). Consult it before initiating GPU work.
 
-| stage | file | gate (must pass before the next stage) |
+---
+
+## Bringup Stages
+
+| Stage | Document | Gate Criterion |
 |---|---|---|
-| 1. nn-graph + emit wiring | [01-nn-graph.md](01-nn-graph.md) | graph builds and infers; manifest matches the checkpoint; full and `--block` devblob emit simulate clean |
-| 2. egglog rewrite | [02-egglog-rewrite.md](02-egglog-rewrite.md) | intended fusions fire, no weight dropped; every rule in `soundRules` |
-| 3. Lean verify | [03-lean-verify.md](03-lean-verify.md) | `proof_audit` clean; emit checkpoints `ok`; `plowc qualify` has no unnamed gap |
-| 4. kernel tuning | [04-kernel-tuning.md](04-kernel-tuning.md) | hot kernels correct and at the calibrated roofline, or the gap is explained |
-| 5. single-block sweep | [05-single-block-sweep.md](05-single-block-sweep.md) | block matches the oracle; block latency vs its roofline recorded |
-| 6. runtime optimization | [06-runtime-opt.md](06-runtime-opt.md) | memory fits; TTFT/TPOT at target concurrency via `plowrt bench`; recipe TOML records the settings |
-| 7. perf campaign | [07-perf-campaign.md](07-perf-campaign.md) | `llm_fp32_ref` gate passes; `campaign.py report` strict report written |
-| 8. rung campaign | [08-rung-campaign.md](08-rung-campaign.md) | per-rung lever decided against its floor; recipe updated only for qualified wins |
+| 1. NN Graph & Emitter | [01-nn-graph.md](01-nn-graph.md) | `cargo test -p nn-graph` clean; weight manifest matches checkpoint; CPU simulation (`block_sim.sh`) finishes with finite makespan. |
+| 2. Egglog Rewrite | [02-egglog-rewrite.md](02-egglog-rewrite.md) | Fusible patterns fire without dropping weights; every rewrite rule verified in Lean 4 `soundRules`. |
+| 3. Lean Verification | [03-lean-verify.md](03-lean-verify.md) | `proof_audit` clean; emit checkpoints return `ok`; `plowc qualify` has 0 unapproved gaps. |
+| 4. Kernel Tuning | [04-kernel-tuning.md](04-kernel-tuning.md) | Hot kernels verified against oracles; certified by `certify_kernel.py` against calibrated roofline ($\eta \ge 80\%$ decode, $\ge 75\%$ prefill). |
+| 5. Single-Block Sweep | [05-single-block-sweep.md](05-single-block-sweep.md) | Block matches host oracle; latency certified by `certify_kernel.py` against roofline; 5-column table generated. |
+| 6. Runtime Optimization | [06-runtime-opt.md](06-runtime-opt.md) | Fits Tiered Memory (Tiers 0–3); preserves Invariants 1–3; TTFT/TPOT within budget; recipe TOML recorded. |
+| 7. Performance Campaign | [07-perf-campaign.md](07-perf-campaign.md) | Symmetric serving matches reference; `llm_fp32_ref` passes; strict 12-row report rendered via `campaign.py report`. |
+| 8. Rung Campaign | [08-rung-campaign.md](08-rung-campaign.md) | Per-rung lever evaluated through T1–T4 ladder; qualified gains update production recipe. |
 
-Stages 4/5 iterate; stage 8 is the steady-state optimization loop after stage 6.
+* Stages 1–3 are target-independent (CPU only).
+* Stages 4–8 evaluate against physical hardware defined in [`target.md`](target.md). Fill target parameters before entering Stage 4.
+* Kernel implementations start from the target architecture reference in [`isa/README.md`](isa/README.md).
 
-## Target
+---
 
-- Stages 1–3 are target-independent: they compile and prove; their gates hold on any host with
-  the dev shell.
-- Stages 4+ measure one part. Fill the parameter block in [`target.md`](target.md) first; commands
-  are written in its names (`--gpu $GPU --arch $ISA`). A row you cannot fill is a blocker.
-- Kernel work starts from the ISA reference for `$ISA`: [`isa/README.md`](isa/README.md).
+## Stage Execution Protocol
 
-## Running a stage with an agent
+1. **Environment:** Execute all commands within `nix develop --command <cmd>`.
+2. **Context:** Provide the agent with the target stage file, model identifier/checkpoint, and the filled `target.md` parameters.
+3. **Hard Gates:** Every stage gate must pass before advancing. Gates are never waived without documented, measured justification.
+4. **Queueing:** All GPU runs must be dispatched via `scripts/bench/gpuq.py submit <label> <ngpu> <cmd...>`.
 
-1. Start the agent at the repo root with `nix develop --command` available.
-2. Give it the stage file and, for stages 4+, the filled `target.md` block, plus the model
-   inputs (HF id or checkpoint dir, reference implementation).
-3. The agent passes the stage gate or stops and reports; it never weakens a gate or carries a red
-   gate forward. A human reviews the gate evidence before the next stage.
+---
 
-## Cross-cutting rules (agent-tools.md)
+## Results Directory Structure
 
-- Single-block screening against the roofline before any whole-network run: "HARD RULE".
-- Team rules (prefix cache on, one binary, packet contract, static runtime, vLLM-peer judging,
-  GPU budget, `prod-next`, kernel reviews): "Working rules".
-- Environment variables and the nix shell: "Environment".
-- Every GPU process through `scripts/bench/gpuq.py submit`: "Queue".
-- Campaign order and recipe start (default-on template, doctor): "Campaign playbook".
-- Per-rung choice and the `recipes/infervisor` TOML: "Per-rung gate and recipe selection".
-- FP32, multimodal and serve-golden gates, gate relaxation: "Gates".
-- Same-session A/B, repeats and noise: "A/B rule".
-- Measurement hazards: "Measurement hazards".
-- ASR/TTS stages: served split (step time vs occupancy), codec invariance before timing,
-  per-bucket objects, fail-closed variants: §9 "Speech serving campaigns".
-- Per-stage precision parity with the peer, before any ratio: "HARD RULE: precision parity with
-  the peer, stage by stage".
-- Final plow-vs-baseline comparison: "Final performance report (strict)".
-
-## Results
-
-- Campaign summary: `docs/bringup/results/<campaign>/comparison.{md,csv}`
-  ([results/README.md](results/README.md)).
-- Raw logs, JSON, captures and temporary CSVs stay in scratch outside the repo.
-- `perf-data/campaign/` holds only reference CSVs for `campaign.py compare`.
+* **Campaign Summary:** `perf-data/campaign/<campaign>/comparison.{md,csv}`.
+* **Reference CSVs:** `perf-data/campaign/` (used by `campaign.py compare`).
+* **Scratch & Artifacts:** All raw logs, traces, captures, and intermediate JSON files must remain in external scratch directories outside the Git repository.

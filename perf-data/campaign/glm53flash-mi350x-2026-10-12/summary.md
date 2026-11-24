@@ -14,7 +14,7 @@ the fused MoE combine with the shared expert folded in as an expert, on top of v
 interpreter (MLA flash prefill, block-FP8 grouped MoE prefill, batched KDA decode, grouped KDA prefill GEMM),
 fused decode mHC and grouped split-K projections, lean KDA in packed serving prefill, and vLLM's precision for
 the MoE (W8A8 block FP8 with 1x128 activation groups, prefill and decode). Campaign log:
-[`docs/amd/glm53-flash-mi350x.md`](../../../amd/glm53-flash-mi350x.md).
+[`docs/amd/glm53-mi300x.md`](../../../amd/glm53-mi300x.md).
 
 Baseline: vLLM 0.31.1rc1 ROCm (Docker `vllm/vllm-openai-rocm:nightly-rocm100`), TP8, AITER on,
 prefix caching off, same box, same client (`scripts/bench/llm_grid.sh`, greedy, OSL 128, two

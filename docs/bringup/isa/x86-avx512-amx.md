@@ -9,7 +9,7 @@
 | SKUs plow ships | Xeon 6975P-C (AWS c8i.metal-48xl class), recipes `recipes/infervisor/{gemma-4-e2b,gemma-4-e4b,gemma-4-12b,gemma-4-26b-a4b,gemma-4-31b}/xeon6-amx-bf16.toml` (31B = `emits`, the rest `validated`) |
 | other hosts the tier runs on | AMD EPYC 9654 (Zen 4): AVX-512 tier only, verified in `docs/runtime/cpu.md` "Verification on EPYC 9654". aarch64 NEON tier (`runtime/cpu/dev/neon/`) is out of scope here |
 | kernels | `runtime/cpu/dev/{amx,avx512,golden}/`, dispatch `runtime/cpu/dev/{isa_detect,dispatch}.c`; host engine `crates/plowrt/src/exec/cpu/{engine,workers,interp,topology,ffi}.rs`. `runtime/cpu/*.c` at the top level is the old correctness-only scalar runtime, not the serving path |
-| runtime docs | `docs/runtime/cpu.md`; campaign evidence `docs/bringup/results/gemma4-xeon6-bf16-20261006/`, `docs/bringup/results/xeon6-l2r-bf16-20261008/` |
+| runtime docs | `docs/runtime/cpu.md`; campaign evidence `perf-data/campaign/gemma4-xeon6-bf16-20261006/` |
 
 Sources: ORM 248966-049 (SPR/Golden Cove; no GNR chapter, so its AMX and port numbers are assumed to carry over to GNR, consistent with plow's GNR measurements; UNVERIFIED for GNR), SDM instruction pages, Linux `xstate.rst`, Intel 6972P spec page; fetched 2026-11-03. Full list in §9. x86 encodings below were checked by GCC 15.2 compile + `objdump` only (no AVX-512/AMX execution).
 
@@ -19,7 +19,7 @@ The "SM" in `GpuSpec` is one physical core. The "warp" is one 512-bit vector of 
 
 | resource | Xeon 6975P-C value | source |
 |---|---|---|
-| cores / SMT | 96 P-cores, 2 threads each (sibling = cpu + 96) | `xeon6.rs` `sm_count`, `GNR_CORE.max_threads`; P0 lscpu [measured in plow: docs/bringup/results/xeon6-l2r-bf16-20261008/p0_baseline.md] |
+| cores / SMT | 96 P-cores, 2 threads each (sibling = cpu + 96) | `xeon6.rs` `sm_count`, `GNR_CORE.max_threads`; P0 lscpu [measured in plow: docs/runtime/cpu.md] |
 | dies / NUMA | 3 compute dies, SNC3 = 3 NUMA nodes of 32 cores (node0 cpus 0-31, node1 32-63, node2 64-95), ~126 GiB each | `xeon6.rs` `ChipletGrouping`; p0_baseline.md |
 | vector registers | 32 zmm x 512 bit + 8 opmask (k0-k7) | `GNR_CORE.regs_32bit = 32*16` |
 | 512-bit FP FMA | 2 ports (p0, which fuses p0+p1 for 512-bit ops, and p5) | [vendor documented: ORM 049 Table 2-1/2-2, Golden Cove server]; Intel lists 2 AVX-512 FMA units for the sibling 6972P |
@@ -98,7 +98,7 @@ AVX10: GNR enumerates AVX10.1, a re-enumeration of its AVX-512 set. The AVX10 bi
   * strip driver (fp8 weights, oversized slices, `PLOW_AMX_DEBUG=pack`): packed 32 KiB B strip (`KP` = 512) L1-resident, A streamed with T1.
 * **Prefetch** per streamed weight row: GEMM packing uses T1, 512 B ahead for bf16 (`PACK_PF_B`), 256 B for fp8; AMX GEMV and streamed MoE weights use T0, 1024 B ahead (`XGV_PF` `gemv_amx.c:70`, `XM_PF` `moe_amx.c:73,484`). Results:
   * T0 prefetch two K steps ahead in `wm_block` measured −13 to −18% single-core and is not used there [measured in plow: a25488237].
-  * NTA prefetch is worse than none: the line still allocates in L2 and only gets a shorter life [measured in plow: docs/bringup/results/xeon6-l2r-bf16-20261008/p4_kv_policy.md].
+  * NTA prefetch is worse than none: the line still allocates in L2 and only gets a shorter life [measured in plow: docs/runtime/cpu.md].
   * Prefetching KV d rows ahead hides DRAM latency (257 to 193 µs per step). A bulk early prefetch burst stalls the GEMVs behind it [measured in plow: p4_kv_policy.md].
 * **Non-temporal stores**: `plowrt` kernels issue none. In the l2r stage bench, per-SNC-node replicas written with full-line NT stores plus `sfence` cut the all-gather cost by about 83% (E2B layer 147.8 to 51.8 µs) [measured in plow: p3_sync.md]. This is not ported into plowrt.
 * **CLDEMOTE**: hand-encoded (`.byte 0x0f,0x1c,0x07`) in `gemv_amx.c` because the build passes no `-mcldemote`. It is behind `PLOW_AMX_DEBUG=demote` and measured neutral [measured in plow: a25488237].

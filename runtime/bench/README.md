@@ -164,6 +164,6 @@ The per-campaign directories under `amd/` hold only tooling (`compare.py`, `reco
 `serve.py`, `kernels.hip`); their measurement files (`mi300x-*.json`, `perf-data/*.csv`) and
 result write-ups are kept out of the repository (see `.gitignore`). Regenerate results with the
 campaign's own scripts; a campaign's decisions are recorded in its
-`docs/bringup/results/<campaign>/comparison.md`. Only inputs the code reads stay
+`perf-data/campaign/<campaign>/comparison.md`. Only inputs the code reads stay
 tracked: `amd/glm_fold_tail/gemm-selected.json`, `tuning/**/*.jsonl`,
 `../ubench/mfma_shape_results/summary.csv`.
