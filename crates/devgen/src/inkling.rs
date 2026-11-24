@@ -134,7 +134,7 @@ fn cfg_inkling(v: &Value) -> InklingCfg {
         qk_clip: t["qk_l2_clip_threshold"].as_f64().expect("missing qk_l2_clip_threshold") as f32,
         prefix,
         is_full,
-        residual_block_layers: t["n_layers_per_attn_res_block"].as_u64().unwrap_or(6) as usize,
+        residual_block_layers: t["n_layers_per_attn_res_block"].as_u64().filter(|&n| n > 0).unwrap_or(6) as usize,
         core_start,
         core_end,
         num_passes,
@@ -160,7 +160,8 @@ struct Emitter<'a> {
     k_taps: u32,
     v_taps: u32,
     x: u32,
-    embed_snapshot: u32,
+    residual_stack: u32,
+    completed_blocks: u32,
     hn: u32,
     kg: u32,
     vg: u32,
@@ -336,21 +337,39 @@ impl Emitter<'_> {
         })
     }
 
-    fn sliding_prelude(&self, layer: usize) -> bool {
-        !self.block_mode && layer < self.c.core_start && layer < self.c.residual_block_layers
-            && self.c.is_full[..=layer].iter().all(|&full| !full)
+    fn uses_residual_stack(&self, layer: usize, visit: usize) -> bool {
+        if self.block_mode {
+            return layer == 0;
+        }
+        let block = self.c.residual_block_layers;
+        let first_core_block = self.c.core_start == block && visit == layer
+            && layer < self.c.core_end && layer < block.saturating_mul(2);
+        layer < self.c.core_start.min(block) || first_core_block || layer == 0
     }
 
-    fn prelude_mix(&mut self, out: u32, last: u32, addend: u32, name: &str,
+    fn complete_residual_block(&mut self, dep: u32) -> u32 {
+        let elements = self.t * self.c.hidden;
+        let copy = self.b.emit(DevOp::Residual, self.b.all(), &[dep], |d| {
+            d.t[0] = self.residual_stack;
+            d.t[1] = self.x;
+            d.i[0] = elements;
+            d.i[1] = self.completed_blocks;
+            d.i[7] = 1;
+        });
+        self.completed_blocks += 1;
+        copy
+    }
+
+    fn residual_mix(&mut self, out: u32, last: u32, addend: u32, name: &str,
                    query: (u32, u32), gamma: u32, dep: u32) -> u32 {
         let h = self.c.hidden;
         let (query_row, query_rows) = query;
         let query = self.w(&format!("{}attn_res.{name}", self.c.prefix), query_rows as u64 * h as u64 * F32);
         self.b.emit(DevOp::AttnRes, self.rows(), &[dep], |d| {
-            d.t[..4].copy_from_slice(&[out, last, self.embed_snapshot, query]);
+            d.t[..4].copy_from_slice(&[out, last, self.residual_stack, query]);
             d.t[5] = gamma;
             d.t[7] = addend;
-            d.i[..5].copy_from_slice(&[self.t, h, 1, 1, self.t]);
+            d.i[..5].copy_from_slice(&[self.t, h, self.completed_blocks, 1, self.t]);
             d.i[5] = query_row;
             d.i[7] = 1;
             d.f[0] = 1e-6;
@@ -380,14 +399,16 @@ impl Emitter<'_> {
         // q/k/v projections. Decode fuses into GemvQkv when t == 1 and not under a ladder; batched decode and prefill use Gemm/GemmSmall.
         let (hn, kg, vg) = (self.hn, self.kg, self.vg);
         let q = self.q;
-        let global_prelude = full && l > 0 && self.sliding_prelude(l - 1)
-            && l < c.core_start && l < c.residual_block_layers;
-        let (k_input, v_input) = if global_prelude {
+        let use_residual_stack = self.uses_residual_stack(l, pass_idx);
+        let first_in_block = l % c.residual_block_layers == 0;
+        let global_residual_input = full && !self.block_mode && l > 0 && pass_idx > 0
+            && self.uses_residual_stack(l - 1, pass_idx - 1);
+        let (k_input, v_input) = if global_residual_input {
             let query = format!("attn_queries.{}", l - 1);
             let mut kv_input = |kind, row| {
                 let out = self.b.tensor(&format!("act.{kind}_input"), t as u64 * h as u64 * BF16);
                 let gamma = self.w(&format!("{p}{kind}_input_norm.weight"), h as u64 * BF16);
-                let ready = self.prelude_mix(out, self.x, TENSOR_NONE, &query, (row, 3), gamma, dep);
+                let ready = self.residual_mix(out, self.x, TENSOR_NONE, &query, (row, 3), gamma, dep);
                 (out, ready)
             };
             (kv_input("k", 1), kv_input("v", 2))
@@ -519,18 +540,18 @@ impl Emitter<'_> {
         });
         let og = self.og;
         let c_o = self.proj(og, at, wo, TENSOR_NONE, h, qd, c_attn_out);
-        let use_prelude_mix = l == 0 || self.sliding_prelude(l) || global_prelude;
-        let attn_conv = if use_prelude_mix {
+        let attn_conv = if use_residual_stack {
             self.b.tensor("act.attn_conv", t as u64 * h as u64 * BF16)
         } else {
             TENSOR_NONE
         };
-        let residual = if use_prelude_mix && l != 0 { self.x } else { TENSOR_NONE };
-        let c_n1 = if use_prelude_mix {
+        let residual = if use_residual_stack && !first_in_block { self.x } else { TENSOR_NONE };
+        let c_n1 = if use_residual_stack {
+            let ready = if first_in_block && l != 0 { self.complete_residual_block(c_o) } else { c_o };
             let conv = self.residual_conv(&p, "attn", pass_idx, attn_conv, og,
-                TENSOR_NONE, TENSOR_NONE, c_o);
-            let (last, addend) = if l == 0 { (attn_conv, TENSOR_NONE) } else { (residual, attn_conv) };
-            self.prelude_mix(hn, last, addend, &format!("mlp_queries.{l}"), (0, 1), g_mlp, conv)
+                TENSOR_NONE, TENSOR_NONE, ready);
+            let (last, addend) = if first_in_block { (attn_conv, TENSOR_NONE) } else { (residual, attn_conv) };
+            self.residual_mix(hn, last, addend, &format!("mlp_queries.{l}"), (0, 1), g_mlp, conv)
         } else {
             self.add_norm(og, g_mlp, c_o)
         };
@@ -633,7 +654,7 @@ impl Emitter<'_> {
             d.i[7] = quant_mode;
         });
 
-        if !use_prelude_mix && crate::emit_config::active().nv_moe_combine_fold {
+        if !use_residual_stack && crate::emit_config::active().nv_moe_combine_fold {
             self.add_norm_moe_fold(part, gamma_next, k, c_d)
         } else {
             let c_c = self.b.emit(DevOp::MoeCombinePf, self.b.all(), &[c_d], |d| {
@@ -644,7 +665,7 @@ impl Emitter<'_> {
                 d.i[2] = t;
             });
 
-            if use_prelude_mix {
+            if use_residual_stack {
                 let next = if self.block_mode {
                     self.x
                 } else {
@@ -656,7 +677,7 @@ impl Emitter<'_> {
                     conv
                 } else {
                     let query_rows = if c.is_full.get(l + 1) == Some(&true) { 3 } else { 1 };
-                    let mix = self.prelude_mix(hn, next, TENSOR_NONE, &format!("attn_queries.{l}"),
+                    let mix = self.residual_mix(hn, next, TENSOR_NONE, &format!("attn_queries.{l}"),
                         (0, query_rows), gamma_next, conv);
                     self.x = next;
                     mix
@@ -712,7 +733,8 @@ fn phase_range(
     };
     let tr = t as u64;
     let act = |b: &mut Builder, n: &str, bytes: u64| b.tensor(&format!("act.{n}"), bytes);
-    let x = act(&mut b, "x", tr * h as u64 * BF16);
+    let stack_blocks = if block_mode { 1 } else { 2 };
+    let x = act(&mut b, "x", stack_blocks * tr * h as u64 * BF16);
     let hn = act(&mut b, "hn", tr * h as u64 * BF16);
     let kg = act(&mut b, "kg", tr * kd as u64 * BF16);
     let vg = act(&mut b, "vg", tr * kd as u64 * BF16);
@@ -768,7 +790,8 @@ fn phase_range(
         k_taps,
         v_taps,
         x,
-        embed_snapshot: x,
+        residual_stack: x,
+        completed_blocks: 1,
         hn,
         kg,
         vg,

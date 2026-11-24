@@ -75,6 +75,7 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         Nop => 0,
         ZeroF32 => 1,
         CastF32Bf16 => 2,
+        Residual if d.i[7] == 1 && d.t[2..].iter().all(|&h| h == TENSOR_NONE16) => 2,
         Residual | Glu | GluStrided | NormResidual | Gemm | QuantFp8Block128 => 3,
         AddNorm | NormResidualNorm | MlaBmmFp8 => 4,
         GemmFp8Block128 => 5,

@@ -167,6 +167,8 @@ pub enum DevOp {
     /// `(a + b) * scale`, or `(pre + bf16(a + b)) * scale` when `pre` is present.
     /// `scale` absorbs Gemma's per-layer `layer_scalar` on the SECOND residual
     /// add; pass 1.0 for the first.
+    /// CUDA mode `i7=1` copies `i0` BF16 elements from block `i2` in slot 1
+    /// into block `i1` in slot 0. Block offsets are measured in units of `i0`.
     Residual = 4,
     /// `t0=out t1=gate t2=up` · `i0=n i1=act` · `f0=alpha f1=limit` (act 0 = gelu_tanh,
     /// 1 = silu, 3 = swiglu_oai). Gemma is GeGLU (gelu_tanh), not SwiGLU.

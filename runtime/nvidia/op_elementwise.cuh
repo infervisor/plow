@@ -1308,6 +1308,13 @@ static __device__ void d_row_gather(__nv_bfloat16* __restrict__ out,
 
 /* out = (a + b) * scale. Prefill-only on Qwen (decode fuses this into ADD_NORM).
  * i0=n is the FLAT element count (t*hidden), not a row count. */
+static __device__ void d_copy_bf16(
+    __nv_bfloat16* out, const __nv_bfloat16* src, unsigned n, unsigned slice, unsigned nblk) {
+    const size_t stride = (size_t)nblk * blockDim.x;
+    for (size_t i = (size_t)slice * blockDim.x + threadIdx.x; i < n; i += stride)
+        out[i] = src[i];
+}
+
 static __device__ void d_residual(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ a,
                            const __nv_bfloat16* __restrict__ b, unsigned n, float scale,
                            unsigned slice, unsigned nblk) {

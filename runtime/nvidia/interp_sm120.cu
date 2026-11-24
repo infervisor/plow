@@ -2375,6 +2375,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
 #endif
     case PLOW_DOP_RESIDUAL:
+        if (in->i[7] == 1) {
+            d_copy_bf16((__nv_bfloat16*)TEN(0) + (size_t)in->i[0] * in->i[1],
+                (const __nv_bfloat16*)TEN(1) + (size_t)in->i[0] * in->i[2], in->i[0], slice, nblk);
+            break;
+        }
         d_residual((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                    (const __nv_bfloat16*)TEN(2), in->i[0], in->fj[0].f, slice, nblk);
         break;
@@ -3788,6 +3793,7 @@ extern "C" __device__ unsigned plow_gemv_sm90_cta512_abi = 1;
 #endif
 #if !PLOW_NV_LEAN_DECODE && !PLOW_NV_SEG_GEMM && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY && !PLOW_NV_FATLITE && !PLOW_NV_SKELETON && !PLOW_MIXED_STEP
 extern "C" __device__ unsigned plow_relative_attention_abi = 1;
+extern "C" __device__ unsigned plow_residual_copy_abi = 1;
 #if PLOW_HAS_ATTN_RES
 extern "C" __device__ unsigned plow_normalized_residual_mix_abi = 1;
 extern "C" __device__ unsigned plow_residual_mix_query_offset_abi = 1;
@@ -4684,6 +4690,11 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
                   nblk, part, nullptr, nullptr, 32u);
         break;
     case PLOW_DOP_RESIDUAL:
+        if (in->i[7] == 1) {
+            d_copy_bf16((__nv_bfloat16*)LIGHT_TEN(0) + (size_t)in->i[0] * in->i[1],
+                (const __nv_bfloat16*)LIGHT_TEN(1) + (size_t)in->i[0] * in->i[2], in->i[0], slice, nblk);
+            break;
+        }
         d_residual((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
                    (const __nv_bfloat16*)LIGHT_TEN(2), in->i[0], in->fj[0].f, slice, nblk);
         break;

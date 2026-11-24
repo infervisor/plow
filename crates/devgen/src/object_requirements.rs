@@ -13,6 +13,7 @@ struct Facts {
     gdn: bool,
     relative: bool,
     normalized_residual_mix: bool,
+    residual_copy: bool,
     residual_mix_query_offset: bool,
     conv_residual_operand: bool,
     /// Runs a GDN conv or gated norm over a row-pitched source.
@@ -28,6 +29,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
         gdn: false,
         relative: false,
         normalized_residual_mix: false,
+        residual_copy: false,
         residual_mix_query_offset: false,
         conv_residual_operand: false,
         gdn_pitched: false,
@@ -44,6 +46,7 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
                 Some(DevOp::QwenGdnConv | DevOp::QwenGdnConvPrefill))
                 && inst.i[4] != 0 && inst.t[5] != packet::TENSOR_NONE;
             f.residual_mix_query_offset |= inst.op == DevOp::AttnRes as u16 && inst.i[7] == 1 && inst.i[5] != 0;
+            f.residual_copy |= inst.op == DevOp::Residual as u16 && inst.i[7] == 1;
             f.relative |= (inst.op == DevOp::FlashDecode as u16
                 && inst.j[1] == packet::dev::FLASH_DECODE_RELATIVE)
                 || (inst.op == DevOp::FlashPrefill as u16
@@ -96,6 +99,9 @@ fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requireme
     if f.gdn {
         out.push(Requirement::new(req::GDN_PREFILL_ABI, 1));
     }
+    if f.residual_copy {
+        out.push(Requirement::new(req::RESIDUAL_COPY_ABI, 1));
+    }
     if f.residual_mix_query_offset {
         out.push(Requirement::new(req::RESIDUAL_MIX_QUERY_OFFSET_ABI, 1));
     }
@@ -126,6 +132,9 @@ fn decode_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requiremen
     let mut out = Vec::new();
     if f.relative { out.push(Requirement::new(req::RELATIVE_ATTENTION_ABI, 1)); }
     if f.normalized_residual_mix { out.push(Requirement::new(req::NORMALIZED_RESIDUAL_MIX_ABI, 1)); }
+    if f.residual_copy {
+        out.push(Requirement::new(req::RESIDUAL_COPY_ABI, 1));
+    }
     if f.residual_mix_query_offset {
         out.push(Requirement::new(req::RESIDUAL_MIX_QUERY_OFFSET_ABI, 1));
     }

@@ -1467,6 +1467,26 @@ fn validate_head_preparation(blob: &DevBlob) -> Result<()> {
     Ok(())
 }
 
+fn validate_residual_copies(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::Residual as u16 || d.i[7] != 1 {
+            continue;
+        }
+        let elements = u64::from(d.i[0]);
+        let fits = |slot: usize, block: u32| {
+            elements.checked_mul(u64::from(block) + 1)
+                .and_then(|n| n.checked_mul(2))
+                .is_some_and(|n| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n))
+        };
+        if elements == 0 || d.t[0] == d.t[1] || d.t[2..].iter().any(|&h| h != TENSOR_NONE16)
+            || !fits(0, d.i[1]) || !fits(1, d.i[2])
+        {
+            return Err(RuntimeError::Rejected("invalid BF16 residual block copy".into()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_normalized_residual_mix(blob: &DevBlob) -> Result<()> {
     for d in blob.progs.iter().flat_map(|p| &p.insts) {
         if d.op != DevOp::AttnRes as u16 || d.i[7] != 1 { continue; }
@@ -4730,6 +4750,7 @@ impl GpuEngine {
                 validate_head_preparation(&blob)?;
                 validate_relative_attention(&blob)?;
                 validate_normalized_residual_mix(&blob)?;
+                validate_residual_copies(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {

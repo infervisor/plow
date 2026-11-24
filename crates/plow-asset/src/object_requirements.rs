@@ -97,6 +97,8 @@ pub const GDN_PITCHED_ABI: &str = "plow_gdn_pitched_abi";
 pub const CONV_RESIDUAL_OPERAND_ABI: &str = "plow_conv_residual_operand_abi";
 pub const RELATIVE_ATTENTION_ABI: &str = "plow_relative_attention_abi";
 pub const NORMALIZED_RESIDUAL_MIX_ABI: &str = "plow_normalized_residual_mix_abi";
+/// CUDA Residual supports exact BF16 block copies.
+pub const RESIDUAL_COPY_ABI: &str = "plow_residual_copy_abi";
 /// CUDA normalized residual mixes can select a starting query row.
 pub const RESIDUAL_MIX_QUERY_OFFSET_ABI: &str = "plow_residual_mix_query_offset_abi";
 
