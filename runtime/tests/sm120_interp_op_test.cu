@@ -35,6 +35,14 @@
 #ifndef PLOW_PACKET_LINEAR_BIAS
 #define PLOW_PACKET_LINEAR_BIAS 1
 #endif
+/* The sm_12x tensor-core W8A16 decode GEMV (op_gemv_fp8_tc.cuh) behind the arena overload, as a
+ * Nemotron-H decode object (tuning `fp8_decode_tc` = 4) compiles it. */
+#ifndef PLOW_NV_FP8_DECODE_TC_ON
+#define PLOW_NV_FP8_DECODE_TC_ON 1
+#endif
+#ifndef PLOW_NV_FP8_DECODE_TC
+#define PLOW_NV_FP8_DECODE_TC 4
+#endif
 
 #include "sm120_common.cuh"   /* pulls op_attention.cuh (flash + bf16v8/reductions) */
 #include "op_norm.cuh"
@@ -619,7 +627,14 @@ __global__ void k_gemv_fp8(bf16* C, const bf16* x, const uint8_t* W, const float
  * x row. The pre-batch fp8 arm was scalar-accumulator, so rows 1..M-1 came back as whatever the
  * buffer held; dC is pre-poisoned with NaN so an unwritten row fails loudly instead of passing
  * on a zeroed allocation. Ragged M (5, 17) exercises the {1,2,4,8}-ladder + block-walk remainder. */
-static void test_gemv_fp8(const char* label, unsigned N, unsigned K, unsigned M = 1) {
+/* The interpreter's arena overload: from M = PLOW_NV_FP8_DECODE_TC the tensor-core walk on 48 CTAs
+ * (GB10's SM count, the per-CTA row split of the served object). */
+__global__ void k_gemv_fp8_arena(bf16* C, const bf16* x, const uint8_t* W, const float* sc,
+                                 unsigned M, unsigned N, unsigned K) {
+    extern __shared__ __align__(16) unsigned char gemv_arena[];
+    d_gemv_fp8(C, x, W, sc, M, N, K, blockIdx.x, gridDim.x, (bf16*)gemv_arena);
+}
+static void test_gemv_fp8(const char* label, unsigned N, unsigned K, unsigned M = 1, bool arena = false) {
     seed(0x5000u + N*3 + K);
     std::vector<float> W = gen_bf16((size_t)N*K, 1.0f);
     std::vector<float> x = gen_bf16((size_t)M*K, 1.0f);
@@ -640,7 +655,12 @@ static void test_gemv_fp8(const char* label, unsigned N, unsigned K, unsigned M 
     CK(cudaMemset(dC,0x7f,(size_t)M*N*sizeof(bf16))); /* NaN-poison: unwritten row -> FAIL */
     uint8_t* dW; CK(cudaMalloc(&dW,(size_t)N*K));
     CK(cudaMemcpy(dW,W8.data(),(size_t)N*K,cudaMemcpyHostToDevice));
-    k_gemv_fp8<<<64,256>>>(dC,dx,dW,dsc,M,N,K);
+    if (arena) {
+        const unsigned bytes = PLOW_FP8TC_ARENA_BYTES > 2u * K ? PLOW_FP8TC_ARENA_BYTES : 2u * K;
+        k_gemv_fp8_arena<<<48,256,bytes>>>(dC,dx,dW,dsc,M,N,K);
+    } else {
+        k_gemv_fp8<<<64,256>>>(dC,dx,dW,dsc,M,N,K);
+    }
     CK(cudaDeviceSynchronize());
     report(label, ref, from_dev(dC,(size_t)M*N), true, 5e-3);
     cudaFree(dx);cudaFree(dC);cudaFree(dW);cudaFree(dsc);
@@ -1786,6 +1806,17 @@ int main() {
     test_gemv_fp8("gemv_fp8 q_proj N4096 K3840 M=5 (ragged)",  4096, 3840, 5);
     test_gemv_fp8("gemv_fp8 o_proj N3840 K4096 M=17 (ragged)", 3840, 4096, 17);
     test_gemv_fp8("gemv_fp8 down N3840 K15360 M=32", 3840, 15360, 32);
+    /* Tensor-core walk (stream-K on sm_12x): Nemotron-H in_proj / out_proj at the verify rungs,
+     * ragged M, and a CTA with fewer (tile, chunk) units than warps. */
+    test_gemv_fp8("gemv_fp8 tc in_proj N18560 K4096 M=4", 18560, 4096, 4, true);
+    test_gemv_fp8("gemv_fp8 tc in_proj N18560 K4096 M=5", 18560, 4096, 5, true);
+    test_gemv_fp8("gemv_fp8 tc in_proj N18560 K4096 M=16", 18560, 4096, 16, true);
+    test_gemv_fp8("gemv_fp8 tc in_proj N18560 K4096 M=32", 18560, 4096, 32, true);
+    test_gemv_fp8("gemv_fp8 tc out_proj N4096 K8192 M=4", 4096, 8192, 4, true);
+    test_gemv_fp8("gemv_fp8 tc out_proj N4096 K8192 M=17", 4096, 8192, 17, true);
+    test_gemv_fp8("gemv_fp8 tc q_proj N4096 K4096 M=8", 4096, 4096, 8, true);
+    test_gemv_fp8("gemv_fp8 tc tiny N40 K128 M=4", 40, 128, 4, true);
+    test_gemv_fp8("gemv_fp8 tc N1000 K192 M=7", 1000, 192, 7, true);
     test_gemv_glu_fp8("gemv_glu_fp8 gelu N15360 K3840 M=2",  15360, 3840, PLOW_ACT_GELU_TANH_, 2);
     test_gemv_glu_fp8("gemv_glu_fp8 gelu N15360 K3840 M=8",  15360, 3840, PLOW_ACT_GELU_TANH_, 8);
     test_gemv_glu_fp8("gemv_glu_fp8 gelu N15360 K3840 M=32", 15360, 3840, PLOW_ACT_GELU_TANH_, 32);

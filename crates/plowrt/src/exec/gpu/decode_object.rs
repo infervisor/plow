@@ -669,7 +669,7 @@ mod tests {
     }
     #[test]
     fn image_identity_isa_and_entry_are_checked_without_external_files() {
-        for cc in [(9, 0), (12, 0)] {
+        for cc in [(9, 0), (12, 0), (12, 1)] {
             let profile = interpreter_profile(cc).unwrap();
             let mut s = spec();
             s.profile = profile.tag.into();

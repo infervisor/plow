@@ -87,6 +87,18 @@ def decode_floor(progs, b, ctx, ceil, wb, kvb, router):
     return floor_ms(priced), priced
 
 
+def padded_decode_floor(progs, b, ctx, ceil, wb, kvb, router):
+    """B active rows on the narrowest rung that holds them: (floor at the B real rows, what the
+    rung's inactive rows add, the rung, priced)."""
+    fits = sorted(p[1] for p in progs if p[0] == "decode" and p[1] >= b)
+    if not fits:
+        raise ValueError(f"block packet has no decode rung B={b}")
+    rung, _ = decode_floor(progs, fits[0], ctx, ceil, wb, kvb, router)
+    priced = op_roof.price(at_rows(program(progs, "decode", fits[0]), b), ctx, wb, kvb, *ceil, router=router)
+    real = floor_ms(priced)
+    return real, rung - real, fits[0], priced
+
+
 # Op fields that count launch rows: a padded bucket scales them to the real rows. `n` is rows x
 # width only on the elementwise ops.
 ROW_FIELDS = ("M", "rows", "ntok", "T", "B", "n_batch")
@@ -179,8 +191,8 @@ def build_rows(progs, desc, plow, current, vllm, ceil, wb, kvb, router):
     for key in sorted(set(plow) | set(current), key=str):
         if key[0] == "decode":
             _, b, ctx = key
-            floor, priced = decode_floor(progs, b, ctx, ceil, wb, kvb, router)
-            point, pad = f"decode B={b}, ctx {ctx}", 0.0
+            floor, pad, rung, priced = padded_decode_floor(progs, b, ctx, ceil, wb, kvb, router)
+            point = f"decode B={b}, ctx {ctx}" + (f" (rung {rung}, +{pad:.3f} ms pad floor)" if rung != b else "")
         else:
             _, n, q, prior, riders, rctx = key
             floor, pad, priced = packed_floor(progs, n, q, prior, riders, rctx, ceil, wb, kvb, router)
@@ -189,7 +201,10 @@ def build_rows(progs, desc, plow, current, vllm, ceil, wb, kvb, router):
             if launch > n * q + riders:
                 point += f" (bucket {launch}: {launch - n * q - riders} pad rows, +{pad:.3f} ms floor)"
         top = max(priced.values(), key=lambda e: e[3])
-        rows.append({"block": name, "point": point, "key": list(key), "floor_ms": floor,
+        t = plow.get(key)
+        # `phase` + `efficiency` (floor / measured) are what certify_kernel.py gates on.
+        rows.append({"block": name, "point": point, "key": list(key), "phase": key[0],
+                     "efficiency": floor / t if t else 0.0, "floor_ms": floor,
                      "pad_floor_ms": pad,
                      "time_ms": plow.get(key), "current_ms": current.get(key), "vllm_ms": vllm.get(key),
                      "top_op": top[0], "top_op_floor_ms": top[3]})

@@ -227,6 +227,8 @@ fn recurrent_state_comes_from_the_section() {
             slot_bytes: 3145728,
         }),
         prefill_updates_state: true,
+        step_seed: false,
+        verify: None,
     };
     let state = recurrent_state_from(Some(&manifest), &tensors, 4)
         .unwrap()
@@ -250,6 +252,32 @@ fn recurrent_state_comes_from_the_section() {
     assert!(recurrent_state_from(None, &[tensor("kv.0.k", 4096)], 4)
         .unwrap()
         .is_none());
+    // Verify snapshots are declared state-class tensors; undeclared they are refused.
+    let mut snap_tensors = tensors.to_vec();
+    snap_tensors.push(tensor("state.qwen.0.conv.snap", 4 * 2 * 61440));
+    snap_tensors.push(tensor("state.qwen.0.gdn.snap", 4 * 2 * 3145728));
+    assert!(recurrent_state_from(Some(&manifest), &snap_tensors, 4).is_err());
+    let mut rollback = manifest.clone();
+    rollback.verify = Some(plow_asset::recurrent_state::VerifyRollback {
+        depth: 2,
+        snapshots: vec![
+            plow_asset::recurrent_state::Snapshot {
+                buffer: 0,
+                tensor: 5,
+            },
+            plow_asset::recurrent_state::Snapshot {
+                buffer: 1,
+                tensor: 6,
+            },
+        ],
+        replay: None,
+    });
+    let state = recurrent_state_from(Some(&rollback), &snap_tensors, 4)
+        .unwrap()
+        .unwrap();
+    let (v, buffers) = state.verify.as_ref().unwrap();
+    assert_eq!(v.depth, 2);
+    assert_eq!(buffers.len(), 2);
     // The GDN prefill operand must be a declared buffer of the library's stride, section or not.
     let mut scan = DevInst64::default();
     scan.op = DevOp::QwenGdnPrefill as u16;
@@ -278,4 +306,137 @@ fn recurrent_state_comes_from_the_section() {
     assert!(check_gdn_state_operands(&[&other], Some(&declared)).is_err());
     other.insts[0].op = DevOp::Gemm as u16;
     assert!(check_gdn_state_operands(&[&other], None).is_ok());
+}
+
+/// The verify-rollback contract end to end on a host model of the span kernels: a span chains
+/// its rows through the state, keeps each non-final row's state in the snapshot and the final
+/// one in the buffer; after greedy acceptance the commit's copies leave every buffer exactly
+/// where plain decode of the committed rows would.
+#[test]
+fn verify_rollback_commit_matches_plain_decode_of_the_committed_rows() {
+    use crate::orch::speculative::accept_greedy;
+    use plow_asset::recurrent_state::{Buffer, Snapshot, VerifyRollback};
+    const SLOTS: usize = 3;
+    const DEPTH: u32 = 3;
+    // Two buffers of different strides (a conv history and a recurrent state).
+    let buffers = vec![
+        Buffer {
+            tensor: 0,
+            slot_bytes: 6,
+        },
+        Buffer {
+            tensor: 1,
+            slot_bytes: 16,
+        },
+    ];
+    let rollback = VerifyRollback {
+        depth: DEPTH,
+        snapshots: vec![
+            Snapshot {
+                buffer: 0,
+                tensor: 2,
+            },
+            Snapshot {
+                buffer: 1,
+                tensor: 3,
+            },
+        ],
+        replay: None,
+    };
+    let step = |state: &mut [Vec<u8>], token: u32| {
+        for (i, s) in state.iter_mut().enumerate() {
+            for (j, x) in s.iter_mut().enumerate() {
+                *x = x
+                    .wrapping_mul(31)
+                    .wrapping_add(token as u8)
+                    .wrapping_add((i * 7 + j) as u8);
+            }
+        }
+    };
+    let argmax = |state: &[Vec<u8>]| u32::from(state[1][0] % 5);
+    let slot_state = |mem: &[Vec<u8>], slot: usize| -> Vec<Vec<u8>> {
+        buffers
+            .iter()
+            .map(|b| {
+                let n = b.slot_bytes as usize;
+                mem[b.tensor as usize][slot * n..(slot + 1) * n].to_vec()
+            })
+            .collect()
+    };
+    // (slot, drafts): none = oracle drafts (plain decode's own), else fixed (mostly rejected).
+    for (slot, drafts) in [
+        (1usize, vec![]),
+        (0, vec![9, 9, 9]),
+        (2, vec![]),
+        (1, vec![4, 4]),
+        (2, vec![1]),
+    ] {
+        // Device memory: buffers 0/1, snapshots 2/3.
+        let mut mem: Vec<Vec<u8>> = buffers
+            .iter()
+            .map(|b| {
+                (0..SLOTS * b.slot_bytes as usize)
+                    .map(|i| i as u8)
+                    .collect()
+            })
+            .collect();
+        for b in &buffers {
+            mem.push(vec![0xEE; SLOTS * DEPTH as usize * b.slot_bytes as usize]);
+        }
+        let before = slot_state(&mem, slot);
+        let mut inputs = vec![3u32];
+        if drafts.is_empty() {
+            let mut s = before.clone();
+            for _ in 0..DEPTH {
+                step(&mut s, *inputs.last().unwrap());
+                inputs.push(argmax(&s));
+            }
+        } else {
+            inputs.extend(&drafts);
+        }
+        // The span kernels.
+        let mut s = before.clone();
+        let mut rows = Vec::new();
+        for (j, &t) in inputs.iter().enumerate() {
+            step(&mut s, t);
+            rows.push(argmax(&s));
+            for (b, state) in buffers.iter().zip(&s) {
+                let n = b.slot_bytes as usize;
+                let (tensor, at) = if j + 1 < inputs.len() {
+                    let snap = rollback
+                        .snapshots
+                        .iter()
+                        .find(|x| x.buffer == b.tensor)
+                        .unwrap()
+                        .tensor as usize;
+                    (snap, (slot * DEPTH as usize + j) * n)
+                } else {
+                    (b.tensor as usize, slot * n)
+                };
+                mem[tensor][at..at + n].copy_from_slice(state);
+            }
+        }
+        let v = accept_greedy(&inputs, &rows, 0, 0, &[]);
+        let n = u32::from(v.n_emit);
+        for c in rollback
+            .commit(&buffers, slot as u32, inputs.len() as u32, n)
+            .unwrap()
+        {
+            let src = mem[c.snapshot as usize][c.src as usize..(c.src + c.bytes) as usize].to_vec();
+            mem[c.buffer as usize][c.dst as usize..(c.dst + c.bytes) as usize]
+                .copy_from_slice(&src);
+        }
+        let mut plain = before;
+        for &t in &inputs[..n as usize] {
+            step(&mut plain, t);
+        }
+        assert_eq!(
+            slot_state(&mem, slot),
+            plain,
+            "slot {slot} inputs {inputs:?} n {n}"
+        );
+        if drafts.is_empty() {
+            assert_eq!(n as usize, inputs.len(), "oracle drafts are all accepted");
+        }
+    }
 }

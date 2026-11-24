@@ -1907,6 +1907,12 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub lt_fp8_fast_accum_max_k: Option<u32>,
 
+    /// cuBLASLt BF16 plans take the heuristic's first workspace-free algorithm (no split-K /
+    /// stream-K partial reductions, no per-process timed pick): the Nemotron prefill latent fc1
+    /// at M=128 otherwise takes two output states 1e-3 apart run to run.
+    #[arg(long = "lt-deterministic", env = "PLOW_LT_DETERMINISTIC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub lt_deterministic: bool,
+
     /// Prefill light NormResidual+RmsNorm launches of at most this many rows run one block per
     /// row when the segment object supports it (`plow_norm_rms_pf` ABI 2); larger launches keep
     /// one warp per row. 0 = always warp per row.

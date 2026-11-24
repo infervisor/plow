@@ -191,10 +191,15 @@ extern "C" __device__ unsigned plow_pdl_wait_1 = 1;
      PLOW_HAS_MOE_DOWN_MX_PF)
 #define PLOW_NV_MOE_COMMON                                                                 \
     (PLOW_HAS_MOE_ROUTER_TOPK_PF || PLOW_HAS_MOE_ALIGN_PF || PLOW_HAS_MOE_COMBINE_PF)
+#define PLOW_NV_NVFP4_MOE                                                                  \
+    (PLOW_HAS_MOE_ROUTER_LOGITS_F32 || PLOW_HAS_MOE_ROUTER_SIGMOID_TOPK ||                 \
+     PLOW_HAS_MOE_UP_NVFP4 || PLOW_HAS_MOE_DOWN_NVFP4 || PLOW_HAS_MOE_ALIGN_NVFP4 ||       \
+     PLOW_HAS_MOE_UP_NVFP4_PF || PLOW_HAS_MOE_DOWN_NVFP4_PF || PLOW_HAS_MOE_QUANT_NVFP4)
 #else
 #define PLOW_NV_MXFP4_PROJ 0
 #define PLOW_NV_MXFP4_MOE 0
 #define PLOW_NV_MOE_COMMON 0
+#define PLOW_NV_NVFP4_MOE 0
 #define PLOW_PACKET_LINEAR_BIAS 0
 #define PLOW_PACKET_ROPE_HALF_HD64 0
 #define PLOW_PACKET_ATTENTION_SINKS 0
@@ -359,13 +364,20 @@ extern "C" __global__ void __launch_bounds__(256, 1) speech_conv_node(const Plow
 #include "quant_group.cuh"
 #include "op_moe.cuh"        /* Gemma-4 26B-A4B bf16 MoE decode bodies (router/glu/down/combine) */
 #include "op_mamba.cuh"      /* Nemotron-3 Mamba-2 SSD mixer (UNVERIFIED on GPU; nvcc-compile only) */
+#include "op_mamba_pf.cuh"   /* its chunked-prefill bodies on tensor cores (prefill object, PLOW_NV_MAMBA_PF) */
+#include "op_flash_pf128.cuh" /* hd128 causal prefill, FA2 body (PLOW_NV_FA2_PF128) */
+#include "op_mamba_span.cuh" /* their speculative-verify span bodies (row-slot objects) */
+#if PLOW_NV_NVFP4_MOE
+#include "op_moe_nvfp4.cuh"  /* Nemotron-3.5 NVFP4 latent MoE (router, decode GEMV, grouped GEMM) */
+#include "op_moe_nvfp4_pf.cuh" /* its W4A4 prefill arm (NVFP4 activations, block-scaled MMA) */
+#endif
 /* Cross-rank all-reduce bodies, compiled only into objects of a packet that emits them. */
 #if (defined(PLOW_PACKET_HAS_XREDUCE) && PLOW_PACKET_HAS_XREDUCE) || \
     (defined(PLOW_PACKET_HAS_XREDUCE2) && PLOW_PACKET_HAS_XREDUCE2)
 #define NV_XR_ON 1
 #include "op_collective.cuh"
 extern "C" __device__ unsigned plow_xr_staged_1 = 1;
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X
 extern "C" __device__ unsigned plow_xr_partial_f32_1 = 1;
 #endif
 #else
@@ -598,7 +610,7 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 /* 3 is a whole odd GQA group (Llama-3.2-3B: 24/8). Only the generic hd<=128 body instantiates it;
  * the hd512 full-attention arms exist only in Gemma builds. */
 #if PLOW_NV_FA_GF_FULL != 1 && PLOW_NV_FA_GF_FULL != 2 && PLOW_NV_FA_GF_FULL != 4 && \
-    PLOW_NV_FA_GF_FULL != 8 && !(PLOW_NV_FA_GF_FULL == 16 && PLOW_NV_FA_GF16_BENCH) && \
+    PLOW_NV_FA_GF_FULL != 8 && !(PLOW_NV_FA_GF_FULL == 16 && (PLOW_NV_FA_GF16_BENCH || !PLOW_NV_GEMMA)) && \
     !(PLOW_NV_FA_GF_FULL == 3 && !PLOW_NV_GEMMA)
 #error "PLOW_NV_FA_GF_FULL requires {1,2,4,8}, or16 with wide softmax reductions"
 #endif
@@ -821,6 +833,38 @@ extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 #endif
 #ifndef PLOW_NV_MAMBA
 #define PLOW_NV_MAMBA 1
+#endif
+/* The prefill object of a packet with the Mamba-2 chunked scan: op_mamba_pf.cuh bodies. */
+#if PLOW_NV_MAMBA && PLOW_NV_PREFILL && defined(PLOW_HAS_MAMBA2_CHUNK_OUT) && PLOW_HAS_MAMBA2_CHUNK_OUT
+#define PLOW_NV_MAMBA_PF 1
+#else
+#define PLOW_NV_MAMBA_PF 0
+#endif
+/* PLOW_NV_MAMBA_SCAN_FUSE (default 1): MAMBA2_CHUNK_STATE also runs the next instruction's
+ * MAMBA2_CHUNK_PASS recurrence (d_mamba2_chunk_scan_state_tc, bit-identical) and the pass is a
+ * no-op. Reads the neighbouring instruction record, so not with PLOW_NV_INST_PRELOAD's copy. */
+#ifndef PLOW_NV_MAMBA_SCAN_FUSE
+#define PLOW_NV_MAMBA_SCAN_FUSE 1
+#endif
+#define MPF_SCAN_FUSE (PLOW_NV_MAMBA_PF && PLOW_NV_MAMBA_SCAN_FUSE && !PLOW_NV_INST_PRELOAD)
+#if PLOW_NV_MAMBA_PF
+__device__ __forceinline__ bool mpf_scan_pair(const PlowDevInst* s, const PlowDevInst* p) {
+    return s->op == PLOW_DOP_MAMBA2_CHUNK_STATE && p->op == PLOW_DOP_MAMBA2_CHUNK_PASS && s->t[0] == p->t[0] &&
+           s->t[6] == p->t[1] && s->t[7] == p->t[7] && p->t[2] != PLOW_TENSOR_NONE &&
+           p->i[5] == MAMBA_STATE_BYTES && s->i[0] == p->i[0] && s->i[1] == p->i[1] && s->i[2] == p->i[2] &&
+           s->i[3] == p->i[3] && s->i[4] == p->i[4];
+}
+/* The fused walk stores bf16 entering states (half the bytes) when the next CHUNK_OUT reads them. */
+__device__ __forceinline__ bool mpf_scan_ebf(const PlowDevInst* s) {
+    const PlowDevInst* o = s + 2;
+    return o->op == PLOW_DOP_MAMBA2_CHUNK_OUT && o->t[2] == s->t[0] && o->t[3] == s->t[6] && o->t[7] == s->t[7];
+}
+#endif
+/* hd128 causal FlashPrefill on the FA2 body (op_flash_pf128.cuh): prefill objects whose packet's
+ * tuning asks for it (`fa2_pf128`, plow_config.h; also set for E4M3 hd128 caches, FA2 being the
+ * only E4M3 prefill reader); other packets keep d_flash_prefill. */
+#ifndef PLOW_NV_FA2_PF128
+#define PLOW_NV_FA2_PF128 0
 #endif
 #ifndef PLOW_NV_DSA
 #define PLOW_NV_DSA 1
@@ -1093,11 +1137,34 @@ extern "C" __device__ __constant__ unsigned plow_fp8_kv_abi = 1;
 #ifndef PGM90_FP8_DECODE_ROWS
 #define PGM90_FP8_DECODE_ROWS 1u
 #endif
+#if PLOW_NV_NVFP4_MOE && PLOW_NV_PREFILL && defined(PLOW_HAS_MOE_QUANT_NVFP4) && PLOW_HAS_MOE_QUANT_NVFP4 && \
+    !defined(PLOW_NV_ARENA_MIN_BYTES)
+/* W4A4 prefill ring (op_moe_nvfp4_pf.cuh, widest tile): above the NVFP4 and Mamba floors. */
+#define PLOW_NV_ARENA_MIN_BYTES (NF4W_ARENA_BYTES > NF4_TILE_ARENA_BYTES ? NF4W_ARENA_BYTES : NF4_TILE_ARENA_BYTES)
+#endif
+#if PLOW_NV_NVFP4_MOE && !defined(PLOW_NV_ARENA_MIN_BYTES)
+/* NVFP4 MoE tiles (op_moe_nvfp4.cuh): covers the decode grouping scratch up to E = 1024 too. */
+#define PLOW_NV_ARENA_MIN_BYTES NF4_TILE_ARENA_BYTES
+#endif
+#if PLOW_NV_MAMBA_PF && !defined(PLOW_NV_ARENA_MIN_BYTES)
+#define PLOW_NV_ARENA_MIN_BYTES MAMBA_PF_ARENA_BYTES
+#endif
 #ifndef PLOW_NV_ARENA_MIN_BYTES
 #define PLOW_NV_ARENA_MIN_BYTES 0
 #endif
+/* E4M3 FA2 prefill: the bf16 K/V ring plus one raw e4m3 tile. */
+#if PLOW_NV_FA2_PF128 && PLOW_NV_KV_E4M3
+#define PLOW_NV_FA2_ARENA_BYTES FP2_SMEM8_BYTES
+#else
+#define PLOW_NV_FA2_ARENA_BYTES 0
+#endif
+#define PLOW_NV_ARENA_FLOOR_BYTES                                                              \
+    (PLOW_NV_ARENA_MIN_BYTES > PLOW_NV_FA2_ARENA_BYTES ? PLOW_NV_ARENA_MIN_BYTES : PLOW_NV_FA2_ARENA_BYTES)
+#if PLOW_NV_FA2_PF128
+static_assert(FP2_SMEM_BYTES <= 4 * (PLOW_NV_FA_ARENA), "op_flash_pf128 ring exceeds the prefill arena");
+#endif
 #define PLOW_NV_KERNEL_ARENA (PLOW_NV_FA_ARENA > PLOW_NV_FP8_M1_ARENA ? PLOW_NV_FA_ARENA : PLOW_NV_FP8_M1_ARENA)
-#define PLOW_NV_OP_ARENA (PLOW_NV_KERNEL_ARENA > (PLOW_NV_ARENA_MIN_BYTES + 3u) / 4u ? PLOW_NV_KERNEL_ARENA : (PLOW_NV_ARENA_MIN_BYTES + 3u) / 4u)
+#define PLOW_NV_OP_ARENA (PLOW_NV_KERNEL_ARENA > (PLOW_NV_ARENA_FLOOR_BYTES + 3u) / 4u ? PLOW_NV_KERNEL_ARENA : (PLOW_NV_ARENA_FLOOR_BYTES + 3u) / 4u)
 #define PLOW_NV_BASE_ARENA_FLOATS                                                              \
     (PLOW_NV_OP_ARENA > 2 * (int)PLOW_NV_WARPS ? PLOW_NV_OP_ARENA : 2 * (int)PLOW_NV_WARPS)
 #if defined(PLOW_NV_GEMM_SPLITK) && PLOW_NV_GEMM_SPLITK && !defined(PLOW_NV_GEMV_STAGING_BYTES)
@@ -1183,6 +1250,16 @@ static_assert(PLOW_NV_GEMV_STAGING_BYTES <= PLOW_NV_BASE_ARENA_FLOATS * sizeof(f
 #if PLOW_NV_FP8_DECODE_TC_ACTIVE
 static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_FP8TC_ARENA_BYTES,
               "FP8 decode tensor-core GEMV reduces its K split through the arena");
+#endif
+#if PLOW_NV_MAMBA_PF
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= MAMBA_PF_ARENA_BYTES,
+              "Mamba-2 tensor-core chunk scan stages its tiles in the arena");
+#endif
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FA2_ARENA_BYTES,
+              "E4M3 FA2 prefill stages its raw tile behind the bf16 ring");
+#if PLOW_NV_NVFP4_MOE && PLOW_NV_PREFILL && defined(PLOW_HAS_MOE_QUANT_NVFP4) && PLOW_HAS_MOE_QUANT_NVFP4
+static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= NF4W_ARENA_BYTES,
+              "W4A4 prefill GEMM stages its cp.async ring in the arena");
 #endif
 #if PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
 static_assert(PLOW_NV_ARENA_FLOATS * sizeof(float) >= PLOW_NV_FP8_DECODE_WGMMA_ARENA_BYTES,
@@ -1496,11 +1573,33 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     switch (in->op) {
 #if PLOW_NV_QWEN_GDN && !PLOW_NV_GEMM_ONLY && !PLOW_NV_FA_ONLY
     case PLOW_DOP_QWEN_GDN_CONV:
+#if PLOW_NV_ROW_SLOT
+        /* Span-mode verify: t5 = in.rowslot, t6 = history snapshots, i3 = depth. */
+        if (TEN(5)) {
+            d_qwen_gdn_conv_span((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), (const int*)TEN(4),
+                in->i[0], in->i[1], in->i[2], slice, nblk, in->fj[2].u, (const int*)TEN(5),
+                (__nv_bfloat16*)TEN(6), in->i[3]);
+            break;
+        }
+#endif
         d_qwen_gdn_conv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (__nv_bfloat16*)TEN(3), (const int*)TEN(4),
             in->i[0], in->i[1], in->i[2], slice, nblk, in->fj[2].u);
         break;
     case PLOW_DOP_QWEN_GDN_STEP:
+#if PLOW_NV_ROW_SLOT
+        /* Span-mode verify: j1 = in.rowslot, i6 = state snapshots, i7 = depth. */
+        if (in->fj[2].u) {
+            d_qwen_gdn_step_span((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), TEN(4),
+                (const __nv_bfloat16*)TEN(5), (float*)TEN(6), (const int*)TEN(7),
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
+                in->fj[1].f, in->i[5], slice, nblk, (const int*)T[in->fj[2].u],
+                (float*)T[in->i[6]], in->i[7]);
+            break;
+        }
+#endif
         d_qwen_gdn_step((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), TEN(4),
             (const __nv_bfloat16*)TEN(5), (float*)TEN(6), (const int*)TEN(7),
@@ -1522,7 +1621,10 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             (const __nv_bfloat16*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1], slice, nblk);
         break;
     case PLOW_DOP_QWEN_RMSNORM:
-        d_qwen_rmsnorm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+        /* Decode rows up to 4096 wide take the register-resident walk (same bits) when the
+         * object has the one-block-per-SM register budget: the strided walk is ~32 dependent
+         * round trips. 16 elements per thread: 32 spilled inside the interpreter. */
+        d_qwen_rmsnorm<false, PLOW_NV_MINBLK == 1, 16>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
             (const __nv_bfloat16*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
             in->fj[0].f, in->fj[1].f, slice, nblk, arena, (const __nv_bfloat16*)TEN(4));
         break;
@@ -1531,7 +1633,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
             (const int*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1], in->i[2],
             in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6],
-            (const int*)TEN(7), in->fj[2].u);
+            (const int*)TEN(7), in->fj[2].u, in->i[7]);
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
         d_qwen_gdn_conv_prefill<PLOW_NV_PREFILL != 0>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
@@ -1709,6 +1811,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
+        /* Per-tensor scales run on the cuBLASLt route only (plowrt Nops the instruction). */
+        if (in->i[5] == PLOW_FP8_TENSOR_SCALE) { __trap(); break; }
         d_gemm_w8a8((__nv_bfloat16*)TEN(0), (const uint8_t*)TEN(1), (const uint8_t*)TEN(2),
                     (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2],
                     in->i[4], slice, nblk, (__nv_bfloat16*)arena);
@@ -1743,6 +1847,11 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * T16 classing v2: ALSO in the uni256 GEMM object — quant packets classed 8 merge the
      * [gate/up, gluquant, down] chain into ONE GEMM-class launch. */
     case PLOW_DOP_QUANT_FP8:
+        if (in->i[5] == PLOW_FP8_TENSOR_SCALE) {
+            d_quant_fp8_tensor((uint8_t*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2),
+                               in->i[0], in->i[1], slice, nblk);
+            break;
+        }
         if (in->i[3]) {
             d_quant_fp8_group((uint8_t*)TEN(0), (const __nv_bfloat16*)TEN(1), (float*)TEN(2),
                               in->i[0], in->i[1], in->i[4], slice, nblk);
@@ -1845,7 +1954,9 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #if PLOW_MIXED_STEP
     case PLOW_DOP_FLASH_PREFILL:
 #if !PLOW_NV_FA_ONLY
-        if (in->i[6] == 128)
+        if (in->i[6] == 128 && PLOW_NV_KV_E4M3)
+            __trap();
+        else if (in->i[6] == 128)
             d_flash_prefill_mixed<128, 64, PLOW_NV_FA128_BKV>(
                 mixed, (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
@@ -1895,7 +2006,17 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         else
 #endif
 #if !PLOW_NV_FA_ONLY /* lean hd512-only FA object does not carry the Qwen arm */
-        if (in->i[6] == 128)
+#if PLOW_NV_FA2_PF128
+        if (in->i[6] == 128 && in->i[5] == 0 && in->i[7] == 1 && TEN(5))
+            d_flash_pf128<0, PLOW_NV_KV_E4M3 != 0>((const int*)TEN(6), (const __nv_bfloat16*)TEN(2),
+                            (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
+                            (__nv_bfloat16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3],
+                            in->i[4], in->fj[1].u, in->fj[2].u, in->fj[0].f, slice, nblk, arena);
+        else
+#endif
+        if (in->i[6] == 128 && PLOW_NV_KV_E4M3) /* E4M3 KV: only the FA2 hd128 arm reads it */
+            __trap();
+        else if (in->i[6] == 128)
             d_flash_prefill_mux<128, 64, PLOW_NV_FA128_BKV>(
                 (const int*)TEN(6), (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
@@ -2204,7 +2325,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                         (const float*)TEN(3), (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
                         in->i[3], slice, nblk);
         break;
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && PLOW_NV_PREFILL
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X && PLOW_NV_PREFILL
     case PLOW_DOP_GEMM_F32:
         d_gemm((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2),
                in->i[0], in->i[1], in->i[2], 0, slice, nblk, (__nv_bfloat16*)arena);
@@ -2227,7 +2348,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_CONV2D_F32:
     case PLOW_DOP_PACK_NCFW_ROWS_F32:
     case PLOW_DOP_GROUPED_ATTENTION_F32:
-#if !(PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && PLOW_NV_PREFILL)
+#if !(PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X && PLOW_NV_PREFILL)
     case PLOW_DOP_GEMM_F32:
 #endif
     case PLOW_DOP_GATHER_ROWS_F32:
@@ -2279,7 +2400,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             __trap();
 #endif
         else
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && !PLOW_NV_SPEECH && !PLOW_NV_PREFILL
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X && !PLOW_NV_SPEECH && !PLOW_NV_PREFILL
             d_gemv_tp_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1), (const __nv_bfloat16*)TEN(2), in->i[0],
                          in->i[1], in->i[2], slice, nblk);
 #else
@@ -2341,6 +2462,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif
 
+#if ROW_COL_SCALE_ARMS
+    case PLOW_DOP_ROW_COL_SCALE:
+        d_row_col_scale((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2),
+                        (const float*)TEN(3), in->i[0], in->i[1], slice, nblk);
+        break;
+#endif
+
 #if PLOW_NV_PREFILL && defined(PLOW_NV_PF_GEMV_HEAD) && PLOW_NV_PF_GEMV_HEAD
     /* ---- PX-6 recommendation A: the M=1 GEMV arm, in the PREFILL object, for lm_head only ----
      *
@@ -2373,6 +2501,35 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                      1u, in->i[1], in->i[2], slice, nblk);
         break;
 #endif /* PLOW_NV_PREFILL && PLOW_NV_PF_GEMV_HEAD */
+#if PLOW_NV_PREFILL && !PLOW_MIXED_STEP && defined(PLOW_NV_PF_GEMV_FP8_HEAD) && PLOW_NV_PF_GEMV_FP8_HEAD
+    /* The same M=1 prefill lm_head for an FP8 head (Nemotron-H: e4m3 weight, per-channel f32
+     * scale, bf16 row = the decode arm's W8A16 numerics). plow_config.h sets the define only for
+     * a packet whose prefill programs carry GemvFp8; every other prefill object is unchanged.
+     * t0=C t1=x t2=W(e4m3) t5=scale(f32[N])  i0=1 i1=N i2=K i4=a_row0. */
+    case PLOW_DOP_GEMV_FP8:
+#if PLOW_NV_SEGMENTS
+        if (in->i[0] != 1u || (in->i[2] & 7u) != 0u) { __trap(); break; }
+#else
+        if (in->i[0] == 0u || (in->i[2] & 7u) != 0u) { __trap(); break; }
+#endif
+        if (in->i[0] == 1u) {
+            gemv_rows_fp8<1>((__nv_bfloat16*)TEN(0),
+                             (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                             (const uint8_t*)TEN(2), (const float*)TEN(5), 1u, in->i[1], in->i[2],
+                             slice, nblk);
+            break;
+        }
+#if !PLOW_NV_SEGMENTS
+        /* The packed compact terminal (the fat object only): one row per request, 8 rows per
+         * weight pass (each row's FMA order is the M=1 arm's). */
+        for (unsigned m0 = 0; m0 < in->i[0]; m0 += 8u)
+            gemv_rows_fp8<8>((__nv_bfloat16*)TEN(0) + (size_t)m0 * in->i[1],
+                             (const __nv_bfloat16*)TEN(1) + (size_t)(in->i[4] + m0) * in->i[2],
+                             (const uint8_t*)TEN(2), (const float*)TEN(5),
+                             in->i[0] - m0 < 8u ? in->i[0] - m0 : 8u, in->i[1], in->i[2], slice, nblk);
+#endif
+        break;
+#endif /* PLOW_NV_PREFILL && PLOW_NV_PF_GEMV_FP8_HEAD */
 #endif /* !PLOW_NV_GEMM_ONLY (pointwise + lm_head GEMV) */
 
 #if !PLOW_NV_PREFILL || PLOW_MIXED_STEP
@@ -2910,6 +3067,12 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
             break;
         }
 #endif
+/* FlashDecode t7 on E4M3 objects: a per-tensor {k_scale, v_scale} cache (the MTP drafter). */
+#if PLOW_NV_KV_E4M3
+#define PLOW_NV_FA_KVS(TT) ((const float*)TT(7))
+#else
+#define PLOW_NV_FA_KVS(TT) nullptr
+#endif
 #if PLOW_NV_TOKEN_BATCH_BF16
 #define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
     do {                                                                                       \
@@ -2919,14 +3082,26 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
-                (const int*)TEN(6), fold_out, fold_ctr BF16_TB_ARG);                                        \
+                (const int*)TEN(6), fold_out, fold_ctr BF16_TB_ARG, PLOW_NV_FA_KVS(TEN));                                        \
         else                                                                                   \
             d_flash_decode<DD, GG>(                                                            \
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
-                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,     \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, PLOW_NV_FA_KVS(TEN),     \
                 nullptr, nullptr, fold_out, fold_ctr BF16_TB_NRF_ARG);                                         \
+    } while (0)
+#elif PLOW_NV_ROW_SLOT
+/* Span-mode verify on a BF16 cache: t6 is in.rowslot, whose padding rows carry bit 31 (read
+ * their slot, store nothing): the masked row-slot read, not the trapping physical-slot map. */
+#define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
+    do {                                                                                       \
+        d_flash_decode<DD, GG>(                                                                \
+            (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                      \
+            (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                       \
+            (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],             \
+            in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, PLOW_NV_FA_KVS(TEN),         \
+            nullptr, (const int*)TEN(6), fold_out, fold_ctr);                                  \
     } while (0)
 #else
 #define PLOW_NV_FLASH_DECODE(DD, GG)                                                            \
@@ -2937,13 +3112,13 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
                 in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,              \
-                (const int*)TEN(6), fold_out, fold_ctr);                                        \
+                (const int*)TEN(6), fold_out, fold_ctr, PLOW_NV_FA_KVS(TEN));                                        \
         else                                                                                   \
             d_flash_decode<DD, GG>(                                                            \
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),                  \
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),                   \
                 (const int*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
-                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,     \
+                in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, PLOW_NV_FA_KVS(TEN),     \
                 nullptr, nullptr, fold_out, fold_ctr);                                         \
     } while (0)
 #endif
@@ -3164,10 +3339,92 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
 #if PLOW_NV_MOE_COMMON && PLOW_HAS_MOE_COMBINE_PF
     case PLOW_DOP_MOE_COMBINE_PF:
+#if PLOW_NV_NVFP4_MOE && defined(PLOW_HAS_MOE_QUANT_NVFP4) && PLOW_HAS_MOE_QUANT_NVFP4
+        if (in->i[5] == 1u && !in->i[3] && !in->i[4]) {
+            d_moe_combine_nvfp4_bf16((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(3),
+                                     (const unsigned char*)TEN(4), in->i[0], in->i[1], in->i[2], slice,
+                                     nblk);
+            break;
+        }
+#endif
         if (in->i[3] || in->i[4] || in->i[7]) { __trap(); break; }
         d_moe_combine_pf_nv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                             (const __nv_bfloat16*)TEN(2), (const float*)TEN(3), in->i[0],
                             in->i[1], in->i[2], slice, nblk);
+        break;
+#endif
+#if PLOW_NV_NVFP4_MOE && PLOW_HAS_MOE_ROUTER_LOGITS_F32
+    case PLOW_DOP_MOE_ROUTER_LOGITS_F32:
+        d_moe_router_logits_f32((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                                (const __nv_bfloat16*)TEN(2), in->i[0], in->i[1], in->i[2],
+                                in->i[3], slice, nblk, arena);
+        break;
+#endif
+#if PLOW_NV_NVFP4_MOE && PLOW_HAS_MOE_ROUTER_SIGMOID_TOPK
+    case PLOW_DOP_MOE_ROUTER_SIGMOID_TOPK:
+        d_moe_router_sigmoid_topk((unsigned char*)TEN(0), (const float*)TEN(1),
+                                  (const float*)TEN(2), (const int*)TEN(3), in->i[0], in->i[1],
+                                  in->i[2], in->i[3],
+                                  in->i[4], in->fj[0].f, slice, nblk, arena);
+        break;
+#endif
+#if PLOW_NV_NVFP4_MOE && PLOW_HAS_MOE_UP_NVFP4
+    case PLOW_DOP_MOE_UP_NVFP4:
+        d_moe_up_nvfp4((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                       (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
+                       (const uint8_t*)TEN(4), (const float*)TEN(5), in->i[0], in->i[1],
+                       in->i[2], in->i[3], in->i[4], slice, nblk, arena);
+        break;
+#endif
+#if PLOW_NV_NVFP4_MOE && PLOW_HAS_MOE_DOWN_NVFP4
+    case PLOW_DOP_MOE_DOWN_NVFP4:
+        d_moe_down_nvfp4(TEN(0), (const __nv_bfloat16*)TEN(1), (const unsigned char*)TEN(2),
+                         (const uint8_t*)TEN(3), (const uint8_t*)TEN(4), (const float*)TEN(5),
+                         in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], slice,
+                         nblk, arena);
+        break;
+#endif
+#if PLOW_NV_NVFP4_MOE && PLOW_HAS_MOE_ALIGN_NVFP4
+    case PLOW_DOP_MOE_ALIGN_NVFP4:
+        d_moe_align_nvfp4((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
+                          (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                          slice, nblk, arena);
+        break;
+#endif
+#if PLOW_NV_NVFP4_MOE && PLOW_HAS_MOE_UP_NVFP4_PF
+    case PLOW_DOP_MOE_UP_NVFP4_PF:
+        if (in->i[5] == 1u) {
+            d_moe_up_nvfp4_pf_w4a4((uint8_t*)TEN(0), (const uint8_t*)TEN(1), (const int*)TEN(2),
+                                   (const uint8_t*)TEN(3), (const uint8_t*)TEN(4), (const float*)TEN(5),
+                                   (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0], in->i[1],
+                                   in->i[2], in->i[3], in->i[4], in->i[6], slice, nblk, arena);
+            break;
+        }
+        d_moe_up_nvfp4_pf((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                          (const int*)TEN(2), (const uint8_t*)TEN(3), (const uint8_t*)TEN(4),
+                          (const float*)TEN(5), (const unsigned*)TEN(6), in->i[0], in->i[2],
+                          in->i[3], in->i[4], slice, nblk, arena);
+        break;
+#endif
+#if PLOW_NV_NVFP4_MOE && PLOW_HAS_MOE_QUANT_NVFP4
+    case PLOW_DOP_MOE_QUANT_NVFP4:
+        d_moe_quant_nvfp4((uint8_t*)TEN(0), (const __nv_bfloat16*)TEN(1), (const float*)TEN(2), in->i[0],
+                          in->i[1], in->i[2], slice, nblk, arena);
+        break;
+#endif
+#if PLOW_NV_NVFP4_MOE && PLOW_HAS_MOE_DOWN_NVFP4_PF
+    case PLOW_DOP_MOE_DOWN_NVFP4_PF:
+        if (in->i[6] == 1u) {
+            d_moe_down_nvfp4_pf_w4a4(TEN(0), (const uint8_t*)TEN(1), (const int*)TEN(2),
+                                     (const uint8_t*)TEN(3), (const uint8_t*)TEN(4), (const float*)TEN(5),
+                                     (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0], in->i[1],
+                                     in->i[2], in->i[3], in->i[4], in->i[5], slice, nblk, arena);
+            break;
+        }
+        d_moe_down_nvfp4_pf(TEN(0), (const __nv_bfloat16*)TEN(1), (const int*)TEN(2),
+                            (const uint8_t*)TEN(3), (const uint8_t*)TEN(4), (const float*)TEN(5),
+                            (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0], in->i[2],
+                            in->i[3], in->i[4], in->i[5], slice, nblk, arena);
         break;
 #endif
 
@@ -3391,18 +3648,176 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 #endif /* !PLOW_NV_GEMM_ONLY (flash merge + sampling) */
 
-    /* Nemotron-3 Mamba-2 SSD mixer core (M4). UNVERIFIED on GPU — see op_mamba.cuh. Single-CU
-     * correctness-first: reads/writes the carried conv_state (t6) + ssm_state (t7). Gated behind
-     * PLOW_NV_MAMBA (default ON): a Gemma object never emits it, and it owns the prefill stack
-     * frame — sm_90a 1744 -> 672 B, sm_120a 1024 -> 0 B when gated out. It costs 2 regs on the
-     * sm_120a prefill object to gate it out (238 -> 240); see the payoff table at the default. */
+    /* Mamba-2 (Nemotron-H) mixer, op_mamba.cuh (ops 240-245; the single-CU op 90 is retired:
+     * it traps at default). Gated behind PLOW_NV_MAMBA (default ON; speech objects pass 0). */
 #if PLOW_NV_MAMBA
-    case PLOW_DOP_MAMBA2_SCAN:
-        d_mamba2_scan((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+#if PLOW_NV_MAMBA_PF
+/* Packed prefill (t7 = request table): a launch of several requests runs the packed bodies; a
+ * one-request launch (rows 0..R of one slot, the planner's layout) runs the serial bodies on that
+ * slot's state, the same arithmetic at the serial instantiation's speed. */
+#if PLOW_NV_PACKED_REQUEST || !PLOW_NV_SEGMENTS
+#define MPF_MULTI (TEN(7) && ((const int*)TEN(7))[0] > 1)
+#define MPF_SLOT (TEN(7) ? (unsigned)((const int*)TEN(7))[3] : 0u)
+#else
+/* The unpacked segment pair runs unbound launches only (t7 null; plowrt picks it only for an
+ * unpatched bucket): the serial bodies alone. */
+#define MPF_MULTI false
+#define MPF_SLOT 0u
+#endif
+#endif
+    case PLOW_DOP_MAMBA2_CONV:
+#if PLOW_NV_MAMBA_PF
+        if (in->i[4]) {
+#define MPF_CONV(PK, HIST)                                                                         \
+    d_mamba2_conv_pf<PK>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),                     \
+                         (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3), HIST,         \
+                         in->i[0], in->i[1], in->i[2], in->i[3], in->fj[2].u, slice, nblk,         \
+                         (const int*)TEN(7))
+            if (MPF_MULTI) MPF_CONV(true, (__nv_bfloat16*)TEN(4));
+            else MPF_CONV(false, (__nv_bfloat16*)TEN(4) + (size_t)MPF_SLOT * in->i[0] * (in->i[1] - 1u));
+#undef MPF_CONV
+            break;
+        }
+#endif
+#if PLOW_NV_ROW_SLOT
+        /* Span-mode verify: t6 = in.rowslot, t7 = conv-input record, i5 = depth | table << 16. */
+        if (TEN(6)) {
+            d_mamba2_conv_span((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                               (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                               (__nv_bfloat16*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1],
+                               in->i[2], in->fj[2].u, (const int*)TEN(6), (__nv_bfloat16*)TEN(7),
+                               in->i[5] & 0xFFFFu, (const int*)T[in->i[5] >> 16], slice, nblk);
+            break;
+        }
+#endif
+        d_mamba2_conv((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                       (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
-                      (const __nv_bfloat16*)TEN(4), (const float*)TEN(5), (float*)TEN(6),
-                      (float*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5],
-                      in->i[6], in->i[7], in->fj[0].f, slice);
+                      (__nv_bfloat16*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1], in->i[2],
+                      in->i[3], in->i[4], in->fj[2].u, slice, nblk);
+        break;
+    case PLOW_DOP_MAMBA2_STEP:
+#if PLOW_NV_ROW_SLOT
+        /* Span-mode verify: i6 >> 16 = in.rowslot, i7 >> 16 = step record, i5 >> 8 & 0xFF = depth,
+         * i5 >> 16 = replay table, i5 & 0xFF = state element bytes (0 = f32). */
+        if (in->i[6] >> 16) {
+            if ((in->i[5] & 0xFFu) == 2u)
+                d_mamba2_step_span<__half>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                    (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(5), (__half*)TEN(6),
+                    (const int*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                    in->fj[2].u, in->fj[0].f, in->fj[1].f, (const int*)T[in->i[6] >> 16],
+                    (unsigned char*)T[in->i[7] >> 16], (const int*)T[in->i[5] >> 16],
+                    (in->i[5] >> 8) & 0xFFu, slice, nblk);
+            else if ((in->i[5] & 0xFFu) == 0u || (in->i[5] & 0xFFu) == 4u)
+                d_mamba2_step_span<float>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                    (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                    (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(5), (float*)TEN(6),
+                    (const int*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                    in->fj[2].u, in->fj[0].f, in->fj[1].f, (const int*)T[in->i[6] >> 16],
+                    (unsigned char*)T[in->i[7] >> 16], (const int*)T[in->i[5] >> 16],
+                    (in->i[5] >> 8) & 0xFFu, slice, nblk);
+            else if (threadIdx.x == 0)
+                __trap();
+            break;
+        }
+#endif
+        d_mamba2_step((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                      (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                      (const __nv_bfloat16*)TEN(4), (const __nv_bfloat16*)TEN(5), (__half*)TEN(6),
+                      (const int*)TEN(7), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
+                      in->fj[2].u, in->fj[0].f, in->fj[1].f, in->i[5] & 0xFFu, in->i[6] & 0xFFFFu,
+                      in->i[7] & 0xFFFFu, slice, nblk);
+        break;
+    case PLOW_DOP_MAMBA2_GATED_NORM:
+        d_mamba2_gated_norm((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                            (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                            (const int*)TEN(4), in->i[0], in->i[1], in->i[2], in->fj[0].f,
+                            in->fj[2].u, slice, nblk, in->i[3] ? (uint8_t*)TEN(0) : nullptr,
+                            in->i[3] ? (const float*)TEN(5) : nullptr);
+        break;
+    case PLOW_DOP_MAMBA2_CHUNK_STATE:
+#if PLOW_NV_MAMBA_PF
+#if MPF_SCAN_FUSE
+        if (mpf_scan_pair(in, in + 1)) {
+            const PlowDevInst* ps = in + 1;
+            __half* st = (__half*)T[ps->t[2]];
+#define MPF_SCAN(PK, ST)                                                                           \
+    d_mamba2_chunk_scan_state_tc<PK>((float*)TEN(0), (const __nv_bfloat16*)TEN(1),                 \
+                                     (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),   \
+                                     (const __nv_bfloat16*)TEN(4), (float*)TEN(5), (float*)TEN(6), \
+                                     ST, in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],         \
+                                     in->i[5], in->fj[0].f, in->fj[1].f, in->fj[2].u,              \
+                                     (float*)arena, slice, nblk, (const int*)TEN(7), mpf_scan_ebf(in))
+            if (MPF_MULTI) MPF_SCAN(true, st);
+            else MPF_SCAN(false, st + (size_t)MPF_SLOT * ps->i[0] * ps->i[1] * ps->i[4]);
+#undef MPF_SCAN
+            break;
+        }
+#endif
+#define MPF_STATE(PK)                                                                              \
+    d_mamba2_chunk_state_tc<PK>((float*)TEN(0), (const __nv_bfloat16*)TEN(1),                      \
+                                (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),        \
+                                (const __nv_bfloat16*)TEN(4), (float*)TEN(5), (float*)TEN(6),      \
+                                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5],        \
+                                in->fj[0].f, in->fj[1].f, in->fj[2].u, (float*)arena, slice, nblk, \
+                                (const int*)TEN(7))
+        if (MPF_MULTI) MPF_STATE(true);
+        else MPF_STATE(false);
+#undef MPF_STATE
+        break;
+#endif
+        if (TEN(7)) __trap(); /* packed requests: the op_mamba_pf.cuh bodies only */
+        d_mamba2_chunk_state((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                             (const __nv_bfloat16*)TEN(2), (const __nv_bfloat16*)TEN(3),
+                             (const __nv_bfloat16*)TEN(4), (float*)TEN(5), (float*)TEN(6),
+                             in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5],
+                             in->fj[0].f, in->fj[1].f, in->fj[2].u, (float*)arena, slice, nblk);
+        break;
+    case PLOW_DOP_MAMBA2_CHUNK_PASS:
+#if PLOW_NV_MAMBA_PF
+#if MPF_SCAN_FUSE
+        if (mpf_scan_pair(in - 1, in)) break; /* CHUNK_STATE ran the recurrence */
+#endif
+        if (MPF_MULTI)
+            d_mamba2_chunk_pass_pf<true>((float*)TEN(0), (const float*)TEN(1), (__half*)TEN(2),
+                                         in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5],
+                                         slice, nblk, (const int*)TEN(7));
+        else
+            d_mamba2_chunk_pass_pf<false>((float*)TEN(0), (const float*)TEN(1),
+                                          (__half*)TEN(2) + (size_t)MPF_SLOT * in->i[0] * in->i[1] * in->i[4],
+                                          in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5],
+                                          slice, nblk);
+        break;
+#endif
+        if (TEN(7)) __trap();
+        d_mamba2_chunk_pass((float*)TEN(0), (const float*)TEN(1), (__half*)TEN(2), in->i[0],
+                            in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], slice, nblk);
+        break;
+    case PLOW_DOP_MAMBA2_CHUNK_OUT:
+#if PLOW_NV_MAMBA_PF
+#define MPF_OUT(PK)                                                                                \
+    d_mamba2_chunk_out_tc<PK>((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),                \
+                              (const float*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),    \
+                              (const __nv_bfloat16*)TEN(5), in->i[0], in->i[1], in->i[2],          \
+                              in->i[3], in->i[4], in->i[5], (float*)arena, slice, nblk,            \
+                              (const int*)TEN(7), ebf)
+        {
+#if MPF_SCAN_FUSE
+        const bool ebf = mpf_scan_pair(in - 2, in - 1) && mpf_scan_ebf(in - 2);
+#else
+        const bool ebf = false;
+#endif
+        if (MPF_MULTI) MPF_OUT(true);
+        else MPF_OUT(false);
+        }
+#undef MPF_OUT
+        break;
+#endif
+        if (TEN(7)) __trap();
+        d_mamba2_chunk_out((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
+                           (const float*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+                           (const __nv_bfloat16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3],
+                           in->i[4], in->i[5], (float*)arena, slice, nblk);
         break;
 #endif /* PLOW_NV_MAMBA */
 
@@ -4627,7 +5042,7 @@ extern "C" __global__ void PLOW_LIGHT_PF_BOUNDS PLOW_SYM(plow_sm120_light_pf)(Pl
             (const __nv_bfloat16*)LIGHT_TEN(2), (const float*)LIGHT_TEN(3), (const float*)LIGHT_TEN(4),
             (const int*)LIGHT_TEN(5), (const int*)LIGHT_TEN(6), in->i[0], in->i[1], in->i[2],
             in->i[3], in->i[4], in->i[5], in->fj[0].f, in->fj[1].f, slice, nblk, in->i[6],
-            (const int*)LIGHT_TEN(7), in->fj[2].u);
+            (const int*)LIGHT_TEN(7), in->fj[2].u, in->i[7]);
         break;
     case PLOW_DOP_QWEN_GDN_CONV_PREFILL:
         d_qwen_gdn_conv_prefill<true, 2, PLOW_LIGHT_PF_MINBLOCKS>((__nv_bfloat16*)LIGHT_TEN(0), (const __nv_bfloat16*)LIGHT_TEN(1),
@@ -5094,14 +5509,14 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
                     (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),
                     (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
                     in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,
-                    (const int*)LIGHT_TEN(6), fold_out, fold_ctr);
+                    (const int*)LIGHT_TEN(6), fold_out, fold_ctr, PLOW_NV_FA_KVS(LIGHT_TEN));
             else
                 d_flash_decode<PLOW_NV_FA_HD, PLOW_NV_FA_GF>(
                     (float*)LIGHT_TEN(0), (float*)LIGHT_TEN(1), (const __nv_bfloat16*)LIGHT_TEN(2),
                     (const __nv_bfloat16*)LIGHT_TEN(3), (const __nv_bfloat16*)LIGHT_TEN(4),
                     (const int*)LIGHT_TEN(5), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
-                    in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u, nullptr,
-                    nullptr, nullptr, fold_out, fold_ctr);
+                    in->fj[0].f, in->i[5], in->i[7], slice, nblk, arena, in->fj[1].u,
+                    PLOW_NV_FA_KVS(LIGHT_TEN), nullptr, nullptr, fold_out, fold_ctr);
         } else {
             __trap();
         }
@@ -5110,8 +5525,8 @@ extern "C" __global__ void __launch_bounds__(PLOW_NV_THREADS, 1)
 }
 extern "C" __device__ unsigned PLOW_SYM(plow_light_attn_hd) = PLOW_NV_FA_HD;
 /* The streamed body (cp.async.bulk + mbarrier) is sm_90+; Ada folds on the interpreter's item. */
-#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4 && \
-    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)
+#if PLOW_NV_FA_HD == 128 && PLOW_NV_FA_RG && PLOW_NV_FA_RG_U == 4 && PLOW_NV_FA_GF <= 4 && \
+    !PLOW_NV_KV_E4M3 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)
 /* A light attention segment's merge-folded hd128 FlashDecode (nsplit 1, no window, no ring wrap)
  * on the streamed body, bit-identical to the row-group one (d_flash_decode_stream). `hnr[0..3]`
  * = the q, k, v HeadNormRope instructions it folds in (~0u: none, Q is already roped); their x

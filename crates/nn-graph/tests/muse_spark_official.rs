@@ -135,7 +135,7 @@ fn official_muse_spark_text_manifest_is_exact() {
         .expert_bindings
         .iter()
         .flat_map(|l| &l.routed_experts)
-        .filter(|e| e.gate.scale.is_some())
+        .filter(|e| e.gate.as_ref().unwrap().scale.is_some())
         .count();
     assert_eq!(scaled, 60 * 256);
 }

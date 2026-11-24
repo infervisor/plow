@@ -1618,6 +1618,50 @@ fn a_gdn_prefill_program_needs_the_gdn_library_beside_it() {
     assert!(names(&g.objset.unwrap().0).contains(&GDN_PREFILL_OBJECT));
 }
 
+/// `NativeGdn::load` takes the CuTe library on sm_90 and the native cubin elsewhere; the packet's
+/// declared ISA picks which one the bundle must carry.
+#[test]
+fn a_gdn_prefill_program_declares_its_targets_gdn_object() {
+    let declared = |isa: &str| {
+        let mut b = packet::devbuild::Builder::new(1);
+        b.emit(packet::dev::DevOp::QwenGdnPrefill, vec![0], &[], |_| {});
+        let p = b.finish();
+        let model = packet::devbuild::Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: Vec::new(),
+            prog_t: vec![1],
+            gen: Vec::new(),
+        };
+        let abi = plow_asset::abi::Abi {
+            version: plow_asset::abi::VERSION,
+            target: Some(plow_asset::abi::Target {
+                isa: isa.into(),
+                n_cu: 1,
+                tuned_on: None,
+            }),
+            ..Default::default()
+        };
+        let section = packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::abi::SECTION.into(),
+            data: serde_json::to_vec(&abi).unwrap(),
+        };
+        let assets = tmp(&format!("gdn-{isa}"));
+        std::fs::write(assets.join("model.pkt"), model.to_blob_v6(&[section])).unwrap();
+        declared_objects(&assets.join("model.pkt")).unwrap()
+    };
+    assert_eq!(declared("sm_90a"), [(GDN_PREFILL_OBJECT.to_string(), None)]);
+    for isa in ["sm_120a", "sm_121a"] {
+        assert_eq!(
+            declared(isa),
+            [(GDN_PREFILL_NATIVE_OBJECT.to_string(), None)]
+        );
+    }
+}
+
 /// A packet that embeds its interpreters ships only its library and segment objects.
 #[test]
 fn an_embedded_interpreter_build_packs_its_other_objects() {

@@ -45,8 +45,8 @@ pub mod slots;
 pub mod typed_abi;
 
 pub use typed_abi::{
-    FlashMergeArgs, FlashPrefillArgs, GemmArgs, GemmFp8MxArgs, InstructionBuilder, KdaScanArgs,
-    MoeRouterArgs, RmsNormArgs, RopeArgs, SwiGluArgs,
+    FlashMergeArgs, FlashPrefillArgs, GemmArgs, GemmFp8MxArgs, GluArgs, InstructionBuilder,
+    KdaScanArgs, MoeRouterArgs, RmsNormArgs, RopeArgs, TypedOp,
 };
 
 use core::mem::size_of;

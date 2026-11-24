@@ -7,6 +7,20 @@ from pathlib import Path
 import op_roof
 
 
+FLOOR_TABLE = Path(__file__).resolve().parents[2] / "crates/costmodel/data/op_floor_cases.json"
+
+
+class SharedFloorTests(unittest.TestCase):
+    def test_reproduces_costmodels_floor_table(self):
+        """crates/costmodel/src/op_floor.rs reproduces the same rows: one floor for both."""
+        for case in json.loads(FLOOR_TABLE.read_text())["cases"]:
+            params = {k: float(v) for k, v in case["params"].items()}
+            got = op_roof.cost(case["op"], params, case["rows"], 0, 2, 2)
+            if got is None:
+                got = op_roof.moe_cost(case["op"], params, case["rows"], 2)
+            self.assertEqual((float(got[0]), float(got[1])), (case["bytes"], case["flops"]), case)
+
+
 class SweepTests(unittest.TestCase):
     def test_roofline_rejects_unpriced_instructions(self):
         program = ("prefill", 128, [(1, "HeadNormRopeFp8", "", {})])
@@ -464,6 +478,26 @@ class MoeCostTests(unittest.TestCase):
         prog = op_roof.parse(self.DECODE)[0]
         priced = op_roof.price(prog, 128, 2, 2, 3000, 989, 1979, router=table)
         self.assertAlmostEqual(priced[19][1], 8 * (2816 * 704 + 4 * 2816) + 2 * 4 * 8 * 704 + 4 * 8 * 4 * 2816)
+
+    def test_router_table_loads_for_sigmoid_topk_router(self):
+        import os
+        import struct
+        import tempfile
+        text = ("===== program T=1  3 insts, 3 counters\n"
+                "#0 MoeRouterLogitsF32 b=48 logits<-act.moe.logits x<-act.hn W<-g.w | T=1 E=512 H=4096 KS=16\n"
+                "#1 MoeRouterSigmoidTopk b=48 table<-act.moe.table logits<-act.moe.logits bias<-g.b | T=1 E=512 k=22 KS=16 flags=1 scale=5\n"
+                "#2 MoeUpNvfp4 b=48 fu<-act.moe.fu x<-act.moe.xl table<-act.moe.table W<-e.w S<-e.s gs<-e.g | T=1 k=22 I=2688 K=1024 E=512\n")
+        raw = b"".join(struct.pack("<If", e, 0.5) for e in range(22))
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(raw)
+        try:
+            progs = op_roof.parse(text)
+            table = op_roof.load_router(f.name, progs)
+        finally:
+            os.unlink(f.name)
+        self.assertEqual(table.union(512, 22, 1), 22)
+        priced = op_roof.price(progs[0], 128, 2, 2, 238, 93.9, 181.1, router=table)
+        self.assertEqual(priced[2][1], 22 * (2688 * 1024 // 2 + 2688 * 1024 // 16 + 4) + 2 * 1024 + 2 * 22 * 2688)
 
     def test_router_table_rejects_duplicate_or_foreign_experts(self):
         import struct

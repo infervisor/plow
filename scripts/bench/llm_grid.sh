@@ -21,7 +21,8 @@
 # REPS (2), SAMPLED ("--temperature 1 --top-p 0.95"; empty = skip), PREFILL_CONCS (64),
 # DECODE ("1x1024 64x1024 128x1024"), PACKLOG (1), PORT.
 # Add --quality <corpus files...> after resdir to capture natural-text completions instead.
-# QUALITY_LENGTHS ("128 1024 4096 7000"), QUALITY_PER_LENGTH (2), QUALITY_CONCURRENCY (1).
+# QUALITY_LENGTHS ("128 1024 4096 7000"), QUALITY_PER_LENGTH (2), QUALITY_CONCURRENCY (1),
+# QUALITY_MAX_TOKENS (64); /metrics before/after the capture (speculative acceptance counters).
 # Add --needle for exact-length retrieval; NEEDLE_LENGTHS ("128,1024,4096,7000").
 # NEEDLE_CONCURRENCY/NEEDLE_REPEATS (1), NEEDLE_MAX_TOKENS (32), NEEDLE_IGNORE_EOS (unset).
 # NEEDLE_CHAT_TEMPLATE_HF optionally supplies the local checkpoint's instruction template.
@@ -167,13 +168,18 @@ if [ "${3:-}" = --needle ]; then
 fi
 if [ "${3:-}" = --quality ]; then
     shift 3
+    # /metrics before and after: the capture's speculative-decode counters (acceptance) are the
+    # difference.
+    curl -s "http://127.0.0.1:$PB_SERVER_PORT/metrics" > "$RES/quality.metrics.before.txt"
     # shellcheck disable=SC2086
     "$PYREF" "$HERE/scripts/gemma4_greedy_quality.py" capture \
         --url "http://127.0.0.1:$PB_SERVER_PORT" --label "$SIDE" --out "$RES/quality.jsonl" \
         --tokenizer "$HF/tokenizer.json" --corpus "$@" \
-        --lengths ${QUALITY_LENGTHS:-128 1024 4096 7000} \
+        --lengths ${QUALITY_LENGTHS:-128 1024 4096 7000} --max-tokens "${QUALITY_MAX_TOKENS:-64}" \
         --per-length "${QUALITY_PER_LENGTH:-2}" --concurrency "${QUALITY_CONCURRENCY:-1}"
-    exit $?
+    rc=$?
+    curl -s "http://127.0.0.1:$PB_SERVER_PORT/metrics" > "$RES/quality.metrics.after.txt"
+    exit $rc
 fi
 MODEL=$(pb_model_id)
 export PB_VLLM=$PYREF PB_TOKENIZER=$HF

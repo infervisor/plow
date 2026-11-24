@@ -241,6 +241,7 @@ mod tests {
                 outputs: vec![],
                 fp8_scale_bindings: vec![],
                 expert_bindings: vec![],
+                quant_linear_bindings: vec![],
             },
             &fused,
             0,

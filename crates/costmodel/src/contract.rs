@@ -9,7 +9,7 @@ use hwspec::{GpuSpec, MmaDtype};
 use crate::roofline::peak_compute_tflops;
 
 /// The architectural bottleneck category for a block or kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BoundCategory {
     /// Bounded by high-bandwidth memory (HBM/GDDR) throughput.
     MemoryBoundHbm,
@@ -35,7 +35,21 @@ impl BoundCategory {
             BoundCategory::ComputeBoundTensorCore | BoundCategory::ComputeBoundVectorAlu
         )
     }
+
+    /// The certification gate: the fraction of the floor a kernel must attain.
+    pub fn certification_threshold(&self) -> f64 {
+        if self.is_memory_bound() {
+            CERTIFY_MEMORY_BOUND
+        } else {
+            CERTIFY_COMPUTE_BOUND
+        }
+    }
 }
+
+/// Memory-bound ops (decode GEMV, linear recurrent scan) certify at >= 80% of the floor.
+pub const CERTIFY_MEMORY_BOUND: f64 = 0.80;
+/// Compute-bound ops (prefill GEMM, MoE dense) certify at >= 75% of the floor.
+pub const CERTIFY_COMPUTE_BOUND: f64 = 0.75;
 
 /// Formal computational and memory contract for a single block / operator invocation.
 #[derive(Clone, Debug, PartialEq)]
@@ -108,13 +122,8 @@ impl BlockContract {
     /// >= 80% for memory-bound ops (e.g. Decode GEMV, linear RNN scan)
     /// >= 75% for compute-bound ops (e.g. Prefill GEMM, MoE dense)
     pub fn satisfies_certification(&self, gpu: &GpuSpec, measured_latency_secs: f64) -> bool {
-        let efficiency = self.empirical_efficiency(gpu, measured_latency_secs);
-        match self.bound_category {
-            BoundCategory::MemoryBoundHbm | BoundCategory::MemoryBoundL2 => efficiency >= 0.80,
-            BoundCategory::ComputeBoundTensorCore | BoundCategory::ComputeBoundVectorAlu => {
-                efficiency >= 0.75
-            }
-        }
+        self.empirical_efficiency(gpu, measured_latency_secs)
+            >= self.bound_category.certification_threshold()
     }
 
     /// Standard decode GEMV block contract helper.

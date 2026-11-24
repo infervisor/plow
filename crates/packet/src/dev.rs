@@ -222,11 +222,13 @@ pub enum DevOp {
     /// `crate::slots`' drift test; see that module for why the table is checked
     /// against these comments rather than generated from them.
     FlashPrefill = 11,
-    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32) t6=decode_slot(i32)?` ·
-    /// `i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd` ·
-    /// `f0=scale`. For ordinary BF16, `decode_slot[b]` selects the physical KV slot for
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32) t6=decode_slot(i32)? t7=kv_scale(f32)?` ·
+    /// `i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd i7=kv_mask` ·
+    /// `f0=scale`. `kv_mask` is the sliding-window ring mask (`0xFFFF_FFFF` = flat). For ordinary BF16, `decode_slot[b]` selects the physical KV slot for
     /// compact row `b`; when absent, physical slot and compact row are identical. Packed
-    /// extension forms retain their extension-specific operands.
+    /// extension forms retain their extension-specific operands. `kv_scale` (E4M3 objects): the
+    /// cache's per-tensor `{k_scale, v_scale}`, applied as FlashInfer XQA's bmm1 / bmm2 scales
+    /// (K / V dequantize at unit scale; the logit scale takes `k_scale`, the output `v_scale`).
     FlashDecode = 12,
     /// `t0=O t1=Opart t2=mlpart t3=sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
     ///
@@ -364,7 +366,8 @@ pub enum DevOp {
     /// `i6`=gamma_b `i7`=gamma_n, with `f0`=eps `f1`=layer_scale (always 1.0 for NRN1).
     /// Bit-exact to op 23 followed by op 31 — see `d_gemv_glu_fp8_nrn` in op_gemm.h.
     GemvGluFp8 = 31,
-    /// `t0=xq(fp8) t1=x(bf16) t2=a_scale(f32[M]) t3=gate? t4=up?` · `i0=M i1=K i2=act`.
+    /// `t0=xq(fp8) t1=x(bf16) t2=a_scale(f32[M]) t3=gate? t4=up?` · `i0=M i1=K i2=act i5=scale_mode`.
+    /// `scale_mode` [`FP8_TENSOR_SCALE`]: one static per-tensor scale read from `a_scale[0]`.
     /// Per-row (per-token) fp8 activation quant — the w8a8 prefill's activation half.
     /// `a_scale[m] = rowmax|x[m,:]|/448`, `xq[m,k] = round_e4m3(x[m,k]/a_scale[m])`.
     /// Emitted once per activation, reused by every fp8 GEMM.
@@ -373,12 +376,14 @@ pub enum DevOp {
     /// what [`DevOp::Glu`] writes) then quantizes it; token-identical to the split form (needs a
     /// t3/t4-aware cubin).
     QuantFp8 = 32,
-    /// `t0=C t1=A(fp8) t2=B(fp8) t3=a_scale(f32[M]) t4=w_scale(f32[N])` · `i0=M i1=N i2=K i4=a_row0`.
+    /// `t0=C t1=A(fp8) t2=B(fp8) t3=a_scale(f32[M]) t4=w_scale(f32[N])` · `i0=M i1=N i2=K i4=a_row0 i5=scale_mode`.
     /// The fp8 (w8a8) prefill twin of [`DevOp::Gemm`]: BOTH operands fp8 e4m3. NOTE the 2x-rate MFMA
     /// on gfx950 is the WIDE-K `mfma_scale_f32_32x32x64_f8f6f4` (measured 2x bf16), NOT the K16
     /// `mfma_f32_32x32x16_fp8_fp8` the design first named (measured 1x = bf16). The f32 accumulator is
     /// dequantized `acc*a_scale[m]*w_scale[n]` in the epilogue; its layout is identical to the bf16
     /// 32x32 MFMA, so the epilogue carries over. See op_gemm.h d_gemm_fp8_t.
+    /// `i5` = scale mode: 0 per-row/per-channel vectors, [`FP8_BLOCK_GROUP`] block-scaled,
+    /// [`FP8_UNIT_SCALE`] unscaled (`t3`/`t4` absent; a [`DevOp::RowColScale`] applies them).
     GemmFp8 = 33,
     /// 128x128 fp8 tile — the medium-tile twin of [`DevOp::GemmMed`]. Same operands as [`DevOp::GemmFp8`].
     GemmMedFp8 = 34,
@@ -922,8 +927,11 @@ pub enum DevOp {
     MoeGroupDownPf = 86,
     /// T-token combine — same expression and same FIXED slot order as [`DevOp::MoeCombine`], so at
     /// `T=1` it is bit-identical to it.
-    /// `t0=out t1=residual[T,H]|NONE t2=shared[T,H]|NONE t3=part(f32[T*k,H])` ·
-    /// `i0=H i1=k i2=T i3=t_row0 i4=det`.
+    /// `t0=out t1=residual[T,H]|NONE t2=shared[T,H]|NONE t3=part(f32[T*k,H]) t4=table?` ·
+    /// `i0=H i1=k i2=T i3=t_row0 i4=det i5=bf16`.
+    ///
+    /// `i5 = 1` (NVFP4 MoE, sm_120): `t3` is bf16 ungated expert outputs and `t4` the routing
+    /// table (`{u32 expert, f32 w}` per slot): `out = bf16(sum_j w_j part_j)`, no residual/shared.
     ///
     /// `t1 = TENSOR_NONE` IS the zero residual — the kernel spells it `residual ? ... : 0.0f`,
     /// which is what the TP path wants (xmid is added after the all-reduce). `i3 = t_row0` bands
@@ -1816,11 +1824,19 @@ pub enum DevOp {
     /// `source` (j1, 0 = contiguous x) is `in_stride | in_col << 16` in elements: x's row pitch and
     /// column inside an N-concatenated projection's output (runtime contract 4).
     ///
-    /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B` · `j1=source?`.
+    /// Span-mode verify (row-slot objects, `t5` present): rows sharing an `in.rowslot` entry
+    /// (bit 31 clear) chain through `history[slot]`; the history after span row `j < n-1` goes to
+    /// `snap[slot][j]` (`i3` rows per slot), after the last row to `history[slot]`.
+    ///
+    /// `t0=out t1=x t2=weight t3=history t4=active? t5=rowslot? t6=snap?` · `i0=C i1=W i2=B
+    /// i3=depth?` · `j1=source?`.
     QwenGdnConv = 136,
     /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
     ///
-    /// `t0=out t1=qkv t2=a t3=b t4=A_log t5=dt_bias t6=state t7=active?` · `i0=HK i1=HV i2=K i3=V i4=B i5=alog_f32` · `f0=q_scale f1=l2_eps`.
+    /// Span-mode verify (row-slot objects, `j1` nonzero): as [`DevOp::QwenGdnConv`], the state
+    /// after span row `j < n-1` goes to `snap[slot][j]` (handle `i6`, `i7` rows per slot).
+    ///
+    /// `t0=out t1=qkv t2=a t3=b t4=A_log t5=dt_bias t6=state t7=active?` · `i0=HK i1=HV i2=K i3=V i4=B i5=alog_f32 i6=snap? i7=depth?` · `f0=q_scale f1=l2_eps` · `j1=rowslot?`.
     QwenGdnStep = 137,
     /// Ordinary per-head RMSNorm(core) times SiLU(z). BF16 core/z/out[B,HV,V] and gamma[V]; optional I32 active[B].
     ///
@@ -1841,14 +1857,24 @@ pub enum DevOp {
     QwenSigmoidGate = 140,
     /// BF16 RMSNorm over width with FP32 (gamma + gamma_offset); gamma[width], x/out[B,width], optional I32 active[B].
     ///
-    /// `t0=out t1=x t2=gamma t3=active?` · `i0=width i1=B` · `f0=eps f1=gamma_offset`.
+    /// `radd` (optional) is added into `x` first (`x += radd`, bf16), the deferred residual of the
+    /// previous block.
+    ///
+    /// `t0=out t1=x t2=gamma t3=active? t4=radd?` · `i0=width i1=B` · `f0=eps f1=gamma_offset`.
     QwenRmsNorm = 141,
     /// D=256; rotary is 0 or 64. BF16 x[rows,H,D] and optional gamma[D]. FP32 cos/sin tables are required when rotary is nonzero and round to BF16 before rotation; normalization also rounds to BF16 first. Optional I32 pos[rows] defaults to zero; optional I32 active[rows] masks writes. ctx=0 writes contiguous output; otherwise writes KV[slot,H,ctx,D]. prefill=1 treats rows as query tokens and writes the single selected KV slot, while decode uses one slot per row.
     ///
     /// `source` (j1, 0 = contiguous x) is `in_stride | in_col << 16` in elements: x's row pitch and
     /// column inside an N-concatenated projection's output (runtime contract 4).
     ///
-    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill` · `f0=eps f1=gamma_offset` · `j1=source?`.
+    /// `layout` (i7): the cache's row layout in the low byte (`live_kv::LAYOUT_*`); bit 8
+    /// (`live_kv::KV_E4M3`) stores saturated E4M3 at unit scale instead of BF16; bit 9 with bit 8
+    /// and no rotary (`live_kv::KV_SCALE`) stores `sat_e4m3(x / s)` with `s` the f32 per-tensor
+    /// scale in `cos` (t3).
+    ///
+    /// `rowslot` (t7, cache writers): row `r` stores into slot `rowslot[r]` (span verify, drafter caches).
+    ///
+    /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos? t6=active? t7=rowslot?` · `i0=H i1=D i2=rotary i3=rows i4=ctx i5=normalize i6=prefill i7=layout` · `f0=eps f1=gamma_offset` · `j1=source?`.
     QwenHeadNormRope = 142,
     /// BF16 causal convolution plus SiLU for exactly T valid tokens: x/out[T,C], weight[C,W], mutable oldest-first history[1,C,W-1]. Updates history after the chunk.
     ///
@@ -2632,6 +2658,90 @@ pub enum DevOp {
     /// `t0=out t1=gu` · `i0=n i1=act i2=width i3=in_stride i4=up_col` · `f0=alpha f1=limit`.
     /// `n = rows*width`; strides and `up_col` count elements; requires `up_col + width <= in_stride`.
     GluPitched = 230,
+    /// Outer scaling of an unscaled ([`FP8_UNIT_SCALE`]) FP8 GEMM's output:
+    /// `out[m*N + n] = bf16(f32(x[m*N + n]) * row[m] * col[n])`.
+    /// `t0=out t1=x t2=row(f32[M]) t3=col(f32[N])` · `i0=M i1=N`. `out` may alias `x`; N % 8 == 0.
+    RowColScale = 231,
+    // ===== NVFP4 latent MoE (Nemotron-3.5), runtime/nvidia/op_moe_nvfp4.cuh =====
+    // W4A16: e2m1 x e4m3 dequantised exactly to bf16, f32 accumulate. NVFP4 tensors per
+    // projection: `W` u8 `[E][N][K/2]` (low nibble = even k), `S` e4m3 `[E][N][K/16]`, `gs` f32
+    // `[E]`. `table` = `{u32 eid, f32 w}` x `T*k`. The latent combine is [`DevOp::MoeCombinePf`].
+    /// f32 router logits `logits[ks][t][e] = sum_{k in chunk ks} x[t][k] W[e][k]` (exact bf16
+    /// products). `t0=logits(f32 [KS][T][E]) t1=x(bf16 [T][H]) t2=W(bf16 [E][H])` ·
+    /// `i0=T i1=E i2=H i3=KS` (0 = 1; `T > 16` needs `KS = 1`).
+    MoeRouterLogitsF32 = 232,
+    /// Top-k of `sigmoid(sum_ks logits) + bias`, weights the unbiased sigmoid, renormalised when
+    /// `flags & 1`, times `f0` (0 = 1). `t0=table t1=logits t2=bias? t3=active?` ·
+    /// `i0=T i1=E i2=k(<=32) i3=KS i4=flags` · `f0=scale`. With `KS > 1`, a row whose
+    /// `active[t] <= 0` (i32) writes k unused slots.
+    MoeRouterSigmoidTopk = 233,
+    /// Decode (`T <= 16`) grouped up + relu^2: `fu[s] = bf16(relu(gs_e W_e x[s/k])^2)`.
+    /// `t0=fu t1=x t2=table? t3=W t4=S t5=gs` · `i0=T i1=k i2=I i3=K i4=E`; table NONE = dense E=1.
+    MoeUpNvfp4 = 234,
+    /// Decode grouped down: mode 0 `part[s] = w_s gs_e W_e fu[s]` (f32), mode 1 dense bf16.
+    /// `t0=out t1=fu t2=table? t3=W t4=S t5=gs` · `i0=T i1=k i2=H i3=I i4=E i5=mode`.
+    MoeDownNvfp4 = 235,
+    /// CSR of the slots by expert (all blocks): `meta` i32 `[3E+1]` (rowoff | cnt | 64-row tile
+    /// prefix), unpadded rows. `t0=meta t1=table t2=row_token t3=row_partidx t4=row_gate` ·
+    /// `i0=T i1=E i2=k`.
+    MoeAlignNvfp4 = 236,
+    /// Prefill grouped up + relu^2 into sorted rows. `t0=fu_g t1=x t2=meta? t3=W t4=S t5=gs
+    /// t6=row_token? t7=s2?` · `i0=T i1=k i2=I i3=K i4=E i5=w4a4 i6=n2`; meta NONE = dense E=1.
+    /// w4a4 = 1: x is the NVFP4 q tensor of [`DevOp::MoeQuantNvfp4`] and fu_g the q tensor of
+    /// relu^2 (T*k sorted rows, or T dense) quantized with 1 / max(s2[0..n2)) (the down
+    /// projection's input_scales).
+    MoeUpNvfp4Pf = 237,
+    /// Prefill grouped down. `t0=out t1=fu_g t2=meta? t3=W t4=S t5=gs t6=row_partidx? t7=row_gate?`
+    /// · `i0=T i1=k i2=H i3=I i4=E i5=mode i6=w4a4` (as [`DevOp::MoeDownNvfp4`]); w4a4 = 1: fu_g
+    /// is the up projection's q tensor. mode 2 (routed): `out[row_partidx]` = bf16 of the ungated
+    /// expert output, for the bf16 [`DevOp::MoeCombinePf`] (`i5 = 1`).
+    MoeDownNvfp4Pf = 238,
+    /// NVFP4 activation quant (W4A4 prefill arm). `t0=q t1=x t2=in_scale` · `i0=R i1=K i2=n`:
+    /// q = `[R][K/2]` e2m1 | `[R][K/16]` e4m3 | f32 alpha of x bf16 `[R][K]`, global scale
+    /// 1 / max(in_scale[0..n)), alpha = that max.
+    MoeQuantNvfp4 = 239,
+    // ===== Mamba-2 (Nemotron-H) mixer, runtime/nvidia/op_mamba.cuh =====
+    // Prefill-mode instructions carry the real rows in `i2` and the bucket rows `T` in `i3`
+    // (plowrt patches `i2` per chunk); pad rows are the identity on every state and write 0.
+    // `j1` sources are `row pitch | column << 16` (elements) inside the in_proj output.
+    /// Causal depthwise conv + bias + SiLU over xBC. Decode (`i4 = 0`): row `r` is slot `r`;
+    /// prefill (`i4 = 1`): one sequence continuing from its slot's history, which it rewrites
+    /// from the last real rows. History is bf16 `[slots][C][W-1]`, oldest first.
+    /// Span verify (row-slot objects): `t6` = the launch's row map; rows sharing an entry chain
+    /// through the slot's history without writing it, recording their inputs in `t7` (replay
+    /// rollback); `i5` = depth | replay table << 16.
+    /// `t0=out[rows,C] t1=x t2=weight[C,W] t3=bias? t4=history t5=active? t6=rowslot? t7=rec?` ·
+    /// `i0=C i1=W i2=rows i3=T i4=prefill i5=depth?` · `j1=source?`.
+    Mamba2Conv = 240,
+    /// Decode SSM update: `s = exp(dt A) s + dt x B`, `y = C.s + D x`, `A = -exp(A_log)`,
+    /// `dt = clamp(softplus(dt_raw + dt_bias), f0, f1)`; f32 math, fp16 state `[slots][H][P][N]`
+    /// stored with stochastic rounding keyed by `active[i6]` (the step seed) and layer `i7`.
+    /// Span verify packs its operands in the high bits (op_mamba_span.cuh): depth and the replay
+    /// table (`i5`), the row map, the step record (replay rollback).
+    /// `t0=y t1=xbc t2=proj t3=A_log t4=D t5=dt_bias t6=state t7=active?` ·
+    /// `i0=H i1=P i2=N i3=G i4=B i5=state_bytes|depth<<8|table<<16 i6=seed_word|rowslot<<16
+    /// i7=layer|rec<<16` · `f0=dt_lo f1=dt_hi` ·
+    /// `j1=dt_source`.
+    Mamba2Step = 241,
+    /// Grouped gated RMSNorm, gate before the norm:
+    /// `out = bf16(bf16(v * rsqrt(mean_group(v^2) + eps)) * gamma)`, `v = y * silu(z)`.
+    /// `fp8_out != 0`: `out` is the e4m3 input of the next FP8 GEMM, quantized with the static
+    /// per-tensor `in_scale`.
+    /// `t0=out t1=y t2=z t3=gamma t4=active? t5=in_scale?` · `i0=groups i1=group i2=rows i3=fp8_out` ·
+    /// `f0=eps` · `j1=source?` (of z).
+    Mamba2GatedNorm = 242,
+    /// Chunked prefill phase 1 (chunk 128): dt, the in-chunk decay cumsum and each chunk's local
+    /// state. `t0=cstate(f32[T/128,H,P,N]) t1=xbc t2=proj t3=A_log t4=dt_bias t5=dtv(f32[H,T])
+    /// t6=cum(f32[H,T])` · `i0=H i1=P i2=R i3=T i4=N i5=G` · `f0=dt_lo f1=dt_hi` ·
+    /// `j1=dt_source`.
+    Mamba2ChunkState = 243,
+    /// Chunked prefill phase 2: the inter-chunk recurrence from the slot state; entering states
+    /// overwrite the local ones, the final state lands in the slot (fp16, round-to-nearest).
+    /// `t0=cstate t1=cum t2=state` · `i0=H i1=P i2=R i3=T i4=N i5=state_bytes`.
+    Mamba2ChunkPass = 244,
+    /// Chunked prefill phase 3: `y = (C B^T o decay) dt x + exp(cum) C.entering + D x`.
+    /// `t0=y t1=xbc t2=cstate t3=cum t4=dtv t5=D` · `i0=H i1=P i2=R i3=T i4=N i5=G`.
+    Mamba2ChunkOut = 245,
 }
 
 /// [`DevOp::FlashPrefillFp8`]'s split count (`i7` low half).
@@ -2930,6 +3040,21 @@ impl DevOp {
         DevOp::MuseMoeCombineNorm,
         DevOp::MuseNormGateNorm,
         DevOp::GluPitched,
+        DevOp::RowColScale,
+        DevOp::MoeRouterLogitsF32,
+        DevOp::MoeRouterSigmoidTopk,
+        DevOp::MoeUpNvfp4,
+        DevOp::MoeDownNvfp4,
+        DevOp::MoeAlignNvfp4,
+        DevOp::MoeUpNvfp4Pf,
+        DevOp::MoeDownNvfp4Pf,
+        DevOp::MoeQuantNvfp4,
+        DevOp::Mamba2Conv,
+        DevOp::Mamba2Step,
+        DevOp::Mamba2GatedNorm,
+        DevOp::Mamba2ChunkState,
+        DevOp::Mamba2ChunkPass,
+        DevOp::Mamba2ChunkOut,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -3181,6 +3306,21 @@ impl DevOp {
             DevOp::MuseMoeCombineNorm => "PLOW_DOP_MUSE_MOE_COMBINE_NORM",
             DevOp::MuseNormGateNorm => "PLOW_DOP_MUSE_NORM_GATE_NORM",
             DevOp::GluPitched => "PLOW_DOP_GLU_PITCHED",
+            DevOp::RowColScale => "PLOW_DOP_ROW_COL_SCALE",
+            DevOp::MoeRouterLogitsF32 => "PLOW_DOP_MOE_ROUTER_LOGITS_F32",
+            DevOp::MoeRouterSigmoidTopk => "PLOW_DOP_MOE_ROUTER_SIGMOID_TOPK",
+            DevOp::MoeUpNvfp4 => "PLOW_DOP_MOE_UP_NVFP4",
+            DevOp::MoeDownNvfp4 => "PLOW_DOP_MOE_DOWN_NVFP4",
+            DevOp::MoeAlignNvfp4 => "PLOW_DOP_MOE_ALIGN_NVFP4",
+            DevOp::MoeUpNvfp4Pf => "PLOW_DOP_MOE_UP_NVFP4_PF",
+            DevOp::MoeDownNvfp4Pf => "PLOW_DOP_MOE_DOWN_NVFP4_PF",
+            DevOp::MoeQuantNvfp4 => "PLOW_DOP_MOE_QUANT_NVFP4",
+            DevOp::Mamba2Conv => "PLOW_DOP_MAMBA2_CONV",
+            DevOp::Mamba2Step => "PLOW_DOP_MAMBA2_STEP",
+            DevOp::Mamba2GatedNorm => "PLOW_DOP_MAMBA2_GATED_NORM",
+            DevOp::Mamba2ChunkState => "PLOW_DOP_MAMBA2_CHUNK_STATE",
+            DevOp::Mamba2ChunkPass => "PLOW_DOP_MAMBA2_CHUNK_PASS",
+            DevOp::Mamba2ChunkOut => "PLOW_DOP_MAMBA2_CHUNK_OUT",
         }
     }
 
@@ -3250,7 +3390,10 @@ impl DevOp {
     /// 225 -> 226 for `TrimSilenceF32 = 225` (reference-audio silence trim).
     /// 226 -> 230 for `MuseRmsNorm = 226` .. `MuseNormGateNorm = 229` (Muse Spark).
     /// 230 -> 231 for `GluPitched = 230` (N-concatenated gate|up projections).
-    pub const COUNT: u16 = 231;
+    /// 231 -> 232 for `RowColScale = 231` (unit-scale FP8 GEMM outer scaling).
+    /// 232 -> 246 for `Mamba2Conv = 240` .. `Mamba2ChunkOut = 245` (Nemotron-H mixer).
+    /// 232..239 for `MoeRouterLogitsF32` .. `MoeQuantNvfp4` (NVFP4 latent MoE); 246 unchanged.
+    pub const COUNT: u16 = 246;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -3369,6 +3512,17 @@ pub const TENSOR_NONE16: u16 = 0xFFFF;
 /// activation groups (`QuantFp8` writes f32 scales `[K/128][i4]`, `i4` = rows padded to 4) and
 /// 128x128 weight blocks (`GemmFp8` `t4` = f32 `[N/128][K/128]`). Runs on cuBLASLt only.
 pub const FP8_BLOCK_GROUP: u32 = 128;
+
+/// `GemmFp8` `i5`: unscaled FP8 GEMM (unit scalar scales, `t3`/`t4` absent) whose per-row and
+/// per-channel scales a following [`DevOp::RowColScale`] applies to its bf16 output. The cuBLASLt
+/// route on targets without vector-scale FP8 algorithms (sm_12x).
+pub const FP8_UNIT_SCALE: u32 = 1;
+
+/// `QuantFp8` / `GemmFp8` `i5`: per-tensor static FP8 (ModelOpt `input_scale` / `weight_scale`).
+/// `QuantFp8` reads its scale `t2` (f32 `[1]`) and writes only `xq = e4m3(x / s)`; `GemmFp8`
+/// takes `t3` = activation scale and `t4` = weight scale (f32 `[1]` each) as cuBLASLt scalar
+/// scale pointers. cuBLASLt prefill route only (no interpreter body).
+pub const FP8_TENSOR_SCALE: u32 = 2;
 
 /// One instruction, WIRE format. Fixed 64-byte stride — no variable-length
 /// records on device. Byte-for-byte mirror of `PlowDevInst` in

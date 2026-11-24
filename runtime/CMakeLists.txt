@@ -180,9 +180,9 @@ if(PLOW_CUDA)
         nvidia/register_rtx6000.cu)
     target_include_directories(plow_runtime_cuda PUBLIC ${PLOW_INCLUDE})
     # Hopper sm_90a / datacenter Blackwell sm_100a / consumer Blackwell (RTX 6000
-    # Pro, RTX 5090) sm_120a. All compiled; the loader picks the per-arch table.
+    # Pro, RTX 5090) sm_120a / GB10 sm_121a. All compiled; the loader picks the per-arch table.
     set_target_properties(plow_runtime_cuda PROPERTIES
-        CUDA_ARCHITECTURES "90a;100a;120a"
+        CUDA_ARCHITECTURES "90a;100a;120a;121a"
         OUTPUT_NAME plow_rt_cuda)
     # PRIVATE: the core is absorbed, not re-exported to whoever dlopens us.
     target_link_libraries(plow_runtime_cuda PRIVATE plow_runtime)
@@ -650,8 +650,10 @@ if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN OR PLOW_SM89_CUBIN)
     # Segmented prefill axes (PLOW_SM120_CUBIN_SEG). The fat object carries all
     # arms at occ-1; the lean GEMM object compiles out flash arms and caps at
     # __maxnreg__(128) for occ-2 (2 blocks/SM).
-    set(_ax_seg_fat -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1)
-    set(_ax_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1)
+    # The unpacked pair never sees a masked (-1) slot row: a packed packet's copy, which serves
+    # its one-request launches, compiles exactly as the serial packet's.
+    set(_ax_seg_fat -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_MASKED_PADDING=0)
+    set(_ax_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPLOW_NV_MASKED_PADDING=0)
     set(_ax_packed_seg_fat -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_PACKED_REQUEST=1)
     set(_ax_packed_seg_gemm -DPLOW_BUCKET_DECODE=0 -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPLOW_NV_PACKED_REQUEST=1)
     # Second axis of the routed decode object: the decode axis minus the expert GEMV arms.

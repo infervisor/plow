@@ -335,6 +335,57 @@ fn validates_direct_kv_ladder_and_rejects_stale_slot_addressing() {
     }
 }
 
+/// devgen nemotron_h.rs: the decode Mamba-2 mixer and the NVFP4 latent MoE carry the rung's rows
+/// in a per-op immediate; without their arms the ladder silently keeps the widest rung.
+#[test]
+fn validates_nemotron_h_rows() {
+    let nemotron = || {
+        let mut blob = fixture();
+        for p in &mut blob.progs {
+            for (op, field) in [
+                (DevOp::Mamba2Conv, 2),
+                (DevOp::Mamba2Step, 4),
+                (DevOp::Mamba2GatedNorm, 2),
+                (DevOp::MoeRouterLogitsF32, 0),
+                (DevOp::MoeRouterSigmoidTopk, 0),
+                (DevOp::MoeUpNvfp4, 0),
+                (DevOp::MoeDownNvfp4, 0),
+            ] {
+                let mut d = DevInst64 {
+                    op: op as u16,
+                    blocks: 1,
+                    t: [TENSOR_NONE16; 8],
+                    ..Default::default()
+                };
+                d.i[field] = p.t;
+                let inst = p.insts.len() as u32;
+                p.insts.push(d);
+                let entry = StreamEnt {
+                    inst,
+                    ..Default::default()
+                };
+                p.stream.push(entry);
+                p.gq_stream.push(entry);
+            }
+            p.stream_len = vec![p.stream.len() as u32];
+            p.gq_seg_ofs = vec![0, p.gq_stream.len() as u32];
+        }
+        blob
+    };
+    assert!(validate_decode_ladder(&nemotron()).unwrap());
+    let mutations: &[fn(&mut DevBlob)] = &[
+        |b| b.progs[1].insts[4].i[2] = 16,
+        |b| b.progs[1].insts[4].i[3] = 2,
+        |b| b.progs[1].insts[5].i[4] = 1,
+        |b| b.progs[2].insts[10].i[0] = 16,
+    ];
+    for (case, mutate) in mutations.iter().enumerate() {
+        let mut blob = nemotron();
+        mutate(&mut blob);
+        assert!(validate_decode_ladder(&blob).is_err(), "case={case}");
+    }
+}
+
 /// devgen PLOW_DECODE_HNR_FOLD=<rows>: the widest rung's FlashDecode writes the caches itself
 /// (t7 = the fold descriptor, no HeadNormRope), the narrower rungs keep their writers.
 #[test]
@@ -1857,4 +1908,82 @@ fn actual_packet_ladder_qualification() {
         matches!(qualified, Ok(true)),
         "narrow rungs not qualified: {qualified:?}"
     );
+}
+
+/// A row-counted class A/B op in an emitted decode packet with no row-normalisation arm keeps the
+/// whole ladder on its widest rung, silently (Nemotron-H B=1 ran 2.5x slow that way). Emits the
+/// sm_12x production-default ladders host-only from config.json and runs every such instruction
+/// of every rung through `normalize_rows`.
+#[test]
+fn every_row_counted_decode_op_has_a_rows_field() {
+    use crate::opaudit::{classify, RowClass, RowExtent};
+    static EMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const QWEN3: &str = r#"{"model_type": "qwen3", "hidden_size": 512, "intermediate_size": 1024,
+      "num_hidden_layers": 2, "num_attention_heads": 8, "head_dim": 128, "num_key_value_heads": 2,
+      "rms_norm_eps": 1e-6, "vocab_size": 4096, "rope_theta": 1000000.0, "rope_scaling": null,
+      "tie_word_embeddings": true}"#;
+    const QWEN35: &str = r#"{"model_type": "qwen3_5", "text_config": {
+      "hidden_size": 5120, "intermediate_size": 17408, "vocab_size": 4096,
+      "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256,
+      "linear_num_key_heads": 16, "linear_num_value_heads": 48,
+      "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+      "linear_conv_kernel_dim": 4, "num_hidden_layers": 4,
+      "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+      "attention_bias": false, "attn_output_gate": true, "hidden_act": "silu",
+      "mamba_ssm_dtype": "float32", "output_gate_type": "swish",
+      "tie_word_embeddings": false, "rms_norm_eps": 1e-6,
+      "rope_parameters": {"rope_theta": 10000000, "partial_rotary_factor": 0.25, "rope_type": "default"}
+    }}"#;
+    let _g = EMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, cfg, ladder) in [("qwen3", QWEN3, None), ("qwen3_5", QWEN35, Some("1,2,4,8,16"))] {
+        // SAFETY: test-only; no other test of this crate reads the emit env.
+        unsafe {
+            match ladder {
+                Some(l) => std::env::set_var("PLOW_DECODE_BATCH_LADDER", l),
+                None => std::env::remove_var("PLOW_DECODE_BATCH_LADDER"),
+            }
+        }
+        let root = std::env::temp_dir().join(format!("plowrt_rows_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.json"), cfg).unwrap();
+        let out = root.join("model.pkt");
+        devgen::run(devgen::EmitArgs {
+            dir: root.clone(),
+            ctx: 8192,
+            out: out.to_str().unwrap().to_string(),
+            n_cu: 48,
+            tp: 1,
+            block_spec: None,
+            embed_cubin: None,
+            embed_hsaco: None,
+            rope_gen: true,
+            l2_layout: None,
+            gpu: "GB10".to_string(),
+            arch: "sm_121a".to_string(),
+            emit_cfg: None,
+            whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
+        });
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("PLOW_DECODE_BATCH_LADDER") };
+        let blob = DevBlob::parse_l2(&std::fs::read(&out).unwrap(), true).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let rungs = blob.decode_progs();
+        assert!(rungs.len() > 1, "{name}: no decode ladder");
+        let mut missing = std::collections::BTreeSet::new();
+        for g in rungs {
+            for d in &g.insts {
+                let Some(op) = DevOp::from_u16(d.op) else { continue };
+                let c = classify(op);
+                if matches!(c.class, RowClass::A | RowClass::B)
+                    && c.extent == RowExtent::RowCounted
+                    && !super::decode_rung::normalize_rows(&mut d.clone(), g.t, false)
+                        .unwrap_or(true)
+                {
+                    missing.insert(format!("{op:?}"));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "{name}: decode ops without a rows field: {missing:?}");
+    }
 }

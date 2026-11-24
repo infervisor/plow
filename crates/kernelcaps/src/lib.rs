@@ -29,6 +29,7 @@
 //! arithmetic, not tuning, and [`Inventory::alias_groups`] makes that visible
 //! instead of leaving it to be rediscovered from a flat benchmark.
 
+pub mod arms;
 pub mod build;
 pub mod contract;
 pub mod probe;

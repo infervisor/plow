@@ -6,7 +6,8 @@
 
 `prepare` freezes both block asset dirs, the block_run binary and the plowrt used for the floor,
 and writes `run.sh`: ctl / treat / ctl2 / treat2 `block_run` runs with identical arguments in one
-lease, then the scorer. `score` (also `nv_block_ab.py score <dir>`, CPU) refuses arms whose packet,
+lease, then the scorer. A runtime candidate (same packet, new binary) passes the production
+binary as `control_block_run`: the control arms run it, the treatment arms run `block_run`. `score` (also `nv_block_ab.py score <dir>`, CPU) refuses arms whose packet,
 binary or device do not pair up, and per point prints the HARD RULE table (block time = treatment
 mean, roofline floor of the treatment packet, % of floor, delta vs current = control mean) with an
 A/B verdict: PASS (faster) / REGRESSION only when |delta| exceeds max(control drift, treatment
@@ -37,7 +38,13 @@ def sha(path):
     return h.hexdigest()
 
 
-def prepare(control, treatment, block_run, plowrt, out, verb, args, env, note):
+def arm_binary(out, arm):
+    """The frozen block_run an arm ran: the control binary when one was frozen."""
+    ctl = out / "block_run_control"
+    return ctl if PAIRS[arm] == "control" and ctl.is_file() else out / "block_run"
+
+
+def prepare(control, treatment, block_run, plowrt, out, verb, args, env, note, control_block_run=None):
     out = Path(out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     for name, src in (("control", control), ("treatment", treatment)):
@@ -45,13 +52,16 @@ def prepare(control, treatment, block_run, plowrt, out, verb, args, env, note):
         if not (src / "model.pkt").is_file() or not (src / "block.json").is_file():
             raise SystemExit(f"{src}: not a block asset dir (model.pkt + block.json)")
         shutil.copytree(src, out / name, symlinks=True)
-    for name, src in (("block_run", block_run), ("plowrt", plowrt)):
+    bins = [("block_run", block_run), ("plowrt", plowrt)]
+    if control_block_run:
+        bins.append(("block_run_control", control_block_run))
+    for name, src in bins:
         shutil.copy2(src, out / name)
         (out / name).chmod(0o755)
     lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
     lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(env.items())]
     for arm in ARMS:
-        cmd = [str(out / "block_run"), str(out / PAIRS[arm]), verb, *shlex.split(args),
+        cmd = [str(arm_binary(out, arm)), str(out / PAIRS[arm]), verb, *shlex.split(args),
                "--out-dir", str(out / arm)]
         lines.append(f"{shlex.join(cmd)} > {shlex.quote(str(out / (arm + '.log')))} 2>&1")
     run = out / "run.sh"
@@ -62,6 +72,8 @@ def prepare(control, treatment, block_run, plowrt, out, verb, args, env, note):
               "control_packet_sha256": sha(out / "control/model.pkt"),
               "treatment_packet_sha256": sha(out / "treatment/model.pkt"),
               "block_run_sha256": sha(out / "block_run"), "plowrt_sha256": sha(out / "plowrt")}
+    if control_block_run:
+        record["control_block_run_sha256"] = sha(out / "block_run_control")
     (out / "record.json").write_text(json.dumps(record, indent=2) + "\n")
     return out
 
@@ -91,7 +103,7 @@ def score(out, ceilings=None, router_table=None, gpu="h100"):
         want = sha(out / PAIRS[arm] / "model.pkt")
         if prov.get("packet_sha256") != want:
             raise ValueError(f"{arm}: measured packet {prov.get('packet_sha256')} is not the frozen {PAIRS[arm]}")
-        if prov.get("binary_sha256") != sha(out / "block_run"):
+        if prov.get("binary_sha256") != sha(arm_binary(out, arm)):
             raise ValueError(f"{arm}: block_run binary differs from the frozen one")
     if len({prov.get("device") for _, prov in arms.values()}) != 1:
         raise ValueError("arms ran on different devices")

@@ -6,8 +6,8 @@
 //! right.
 
 use crate::dim::SymId;
-use crate::graph::ExpertLayerBinding;
-use crate::op::{ActKind, EwKind, MoeScoring, Op, ReduceKind};
+use crate::graph::{ExpertLayerBinding, QuantLinearBinding};
+use crate::op::{ActKind, EwKind, MoeExpertAct, MoeScoring, Op, ReduceKind};
 use crate::{DType, Dim, Graph, GraphBuilder, Shape, TensorId};
 
 pub struct Nn {
@@ -583,6 +583,29 @@ impl Nn {
                 intermediate_size,
                 block_fp8,
                 post_expert_norm: None,
+                act: MoeExpertAct::SwiGlu,
+            },
+            vec![x, routes],
+        )
+    }
+
+    /// Gate-less `down(relu(up(x))^2)` routed experts.
+    pub fn moe_experts_relu2(
+        &mut self,
+        x: TensorId,
+        routes: TensorId,
+        num_experts: u32,
+        top_k: u32,
+        intermediate_size: u32,
+    ) -> TensorId {
+        self.emit(
+            Op::MoeExperts {
+                num_experts,
+                top_k,
+                intermediate_size,
+                block_fp8: false,
+                post_expert_norm: None,
+                act: MoeExpertAct::Relu2,
             },
             vec![x, routes],
         )
@@ -610,6 +633,7 @@ impl Nn {
                 intermediate_size,
                 block_fp8: false,
                 post_expert_norm: Some(eps),
+                act: MoeExpertAct::SwiGlu,
             },
             vec![x, routes, w],
         )
@@ -617,6 +641,10 @@ impl Nn {
 
     pub fn expert_binding(&mut self, binding: ExpertLayerBinding) {
         self.g.expert_binding(binding);
+    }
+
+    pub fn quant_linear_binding(&mut self, binding: QuantLinearBinding) {
+        self.g.quant_linear_binding(binding);
     }
 
     pub fn rope_interleaved_with_frequency_dim(
@@ -712,6 +740,36 @@ impl Nn {
             weight_dtype,
         );
         self.emit(Op::Conv1dDepthwise { kernel }, vec![x, w])
+    }
+
+    /// [`Nn::conv1d_depthwise`] with a `{name}.bias` of shape `[channels]`.
+    pub fn conv1d_depthwise_bias(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        channels: i64,
+        kernel: u32,
+        weight_dtype: DType,
+    ) -> TensorId {
+        let w = self.param_dtype(
+            &format!("{name}.weight"),
+            [Dim::stat(channels), Dim::stat(1), Dim::stat(kernel as i64)],
+            weight_dtype,
+        );
+        let b = self.param_dtype(&format!("{name}.bias"), [Dim::stat(channels)], weight_dtype);
+        self.emit(Op::Conv1dDepthwise { kernel }, vec![x, w, b])
+    }
+
+    /// Bias-free `Op::Linear` over an already-declared weight whose storage
+    /// shape is not `[out, in]` (packed NVFP4).
+    pub fn linear_weight(&mut self, x: TensorId, weight: TensorId, out_f: i64) -> TensorId {
+        self.emit(
+            Op::Linear {
+                out_features: out_f,
+                bias: false,
+            },
+            vec![x, weight],
+        )
     }
 
     /// Channels-last 1-D convolution of `[B, T, in_c]` with checkpoint tensors named exactly
@@ -821,6 +879,23 @@ impl Nn {
             },
             vec![q, k, v, gate, beta, a_log, dt_bias],
         )
+    }
+
+    /// Mamba-2 SSD scan; see [`Op::Mamba2Scan`] for the operand layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_scan(
+        &mut self,
+        x: TensorId,
+        dt: TensorId,
+        a_log: TensorId,
+        b: TensorId,
+        c: TensorId,
+        d: TensorId,
+        dt_bias: TensorId,
+        op: Op,
+    ) -> TensorId {
+        assert!(matches!(op, Op::Mamba2Scan { .. }));
+        self.emit(op, vec![x, dt, a_log, b, c, d, dt_bias])
     }
 
     /// Kimi-K3's `situ` GLU: `situ_a(gate) * softclip(up)`.

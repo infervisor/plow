@@ -2,7 +2,7 @@
 //! leaves inlined as `(Input "name")` / `(Weight "name")`. Returns the body and
 //! the root variable to extract.
 
-use nn_graph::op::{ActKind, EwKind, PadMode, ReduceKind};
+use nn_graph::op::{ActKind, EwKind, MoeExpertAct, PadMode, ReduceKind};
 use nn_graph::{Graph, Op, Origin, TensorId};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -283,7 +283,32 @@ fn term_for(
             top_k,
             intermediate_size,
             block_fp8,
+            post_expert_norm: None,
+            act: MoeExpertAct::Relu2,
+        } => format!(
+            "(MoeExpertsRelu2 {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            num_experts,
+            top_k,
+            intermediate_size,
+            i64::from(*block_fp8),
+        ),
+        Op::MoeExperts {
+            act: MoeExpertAct::Relu2,
+            ..
+        } => {
+            return Err(LowerError::Unsupported {
+                op: "moe_experts(relu2, post_expert_norm)",
+            })
+        }
+        Op::MoeExperts {
+            num_experts,
+            top_k,
+            intermediate_size,
+            block_fp8,
             post_expert_norm: Some(eps),
+            act: MoeExpertAct::SwiGlu,
         } => format!(
             "(MoeExpertsPostNorm {} {} {} {} {} {} {} {})",
             e(0)?,
@@ -344,6 +369,7 @@ fn term_for(
             intermediate_size,
             block_fp8,
             post_expert_norm: None,
+            act: MoeExpertAct::SwiGlu,
         } => format!(
             "(MoeExperts {} {} {} {} {} {})",
             e(0)?,
@@ -420,9 +446,40 @@ fn term_for(
             conv1d(e(0)?, e(1)?, inputs.get(2).map(|_| e(2)).transpose()?, &cfg)
         }
         // --- Kimi-K3 ---
+        Op::Conv1dDepthwise { kernel } if inputs.len() == 3 => {
+            format!(
+                "(Conv1dDepthwiseBias {} {} {} {})",
+                e(0)?,
+                e(1)?,
+                e(2)?,
+                kernel
+            )
+        }
         Op::Conv1dDepthwise { kernel } => {
             format!("(Conv1dDepthwise {} {} {})", e(0)?, e(1)?, kernel)
         }
+        Op::Mamba2Scan {
+            num_heads,
+            head_dim,
+            n_groups,
+            state_size,
+            chunk_size,
+            dt_limit,
+        } => format!(
+            "(Mamba2Scan {} {} {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            e(3)?,
+            e(4)?,
+            e(5)?,
+            e(6)?,
+            quote(&format!(
+                "heads={num_heads};hd={head_dim};groups={n_groups};state={state_size};\
+                 chunk={chunk_size};dt={},{}",
+                dt_limit.0, dt_limit.1
+            ))
+        ),
         Op::SituGlu { beta, linear_beta } => format!(
             "(SituGlu {} {} {} {})",
             e(0)?,

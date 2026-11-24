@@ -892,7 +892,7 @@ impl LiveKvLayout {
         let mut full_shape = None;
         for c in &m.caches {
             cache_tensors.extend(c.pair.map(usize::from));
-            let elem = if c.scales.is_some() { 1 } else { 2 };
+            let elem = c.elem_bytes();
             // A row-interleaved cache is one `heads * hd` head window per slot: a row maps as one
             // unit, so the allocator charges whole rows instead of a block per head.
             let (heads, hd) = match c.layout {

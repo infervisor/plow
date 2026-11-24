@@ -158,6 +158,7 @@ fn build(layers: &[Layer], stride: u32, layout: u32) -> Model {
             window: ly.window,
             mask: if ly.window == 0 { u32::MAX } else { stride - 1 },
             layout,
+            e4m3: false,
         });
     }
     m

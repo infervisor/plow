@@ -129,11 +129,25 @@ pub fn disasm<'a>(idx: usize, w: &DevInst64, names: &[&'a str]) -> Inst<'a> {
         if known && name.is_none() {
             continue;
         }
-        ints.push(IntOperand {
-            slot: k,
-            name,
-            value: w.i[k],
-        });
+        match packed_fields(op, k) {
+            Some(fields) => {
+                for &(field, shift, bits) in fields {
+                    let value = (w.i[k] >> shift) & (u32::MAX >> (32 - bits));
+                    if shift == 0 || value != 0 {
+                        ints.push(IntOperand {
+                            slot: k,
+                            name: Some(field),
+                            value,
+                        });
+                    }
+                }
+            }
+            None => ints.push(IntOperand {
+                slot: k,
+                name,
+                value: w.i[k],
+            }),
+        }
     }
 
     let mut floats = Vec::new();
@@ -233,6 +247,23 @@ pub fn op_label(op: u16) -> String {
 }
 
 /// Label for an int slot: `i0..i7`, then the two overlay words.
+/// Immediates that carry more than one field: span verify (devgen `spec/span_verify.rs`) ORs its
+/// operands into the high bits of the Mamba-2 immediates. `(name, shift, bits)`, the low field
+/// under the slot's own name; a high field is reported only when set.
+fn packed_fields(op: Option<DevOp>, slot: usize) -> Option<&'static [(&'static str, u32, u32)]> {
+    match (op?, slot) {
+        (DevOp::Mamba2Conv, 5) => Some(&[("depth", 0, 16), ("replay_table", 16, 16)]),
+        (DevOp::Mamba2Step, 5) => Some(&[
+            ("state_bytes", 0, 8),
+            ("depth", 8, 8),
+            ("replay_table", 16, 16),
+        ]),
+        (DevOp::Mamba2Step, 6) => Some(&[("seed_word", 0, 16), ("rowslot", 16, 16)]),
+        (DevOp::Mamba2Step, 7) => Some(&[("layer", 0, 16), ("record", 16, 16)]),
+        _ => None,
+    }
+}
+
 pub fn int_slot_label(slot: usize) -> &'static str {
     const L: [&str; 10] = ["i0", "i1", "i2", "i3", "i4", "i5", "i6", "i7", "j0", "j1"];
     L.get(slot).copied().unwrap_or("i?")
@@ -386,6 +417,26 @@ mod tests {
             assert_eq!(out.raw.i, w.i, "{op:?}");
             assert_eq!(out.raw.fj, w.fj, "{op:?}");
         }
+    }
+
+    #[test]
+    fn splits_span_verify_fields_of_mamba2_step() {
+        let mut d = inst(DevOp::Mamba2Step);
+        d.i = [128, 64, 128, 8, 4, 2 | 3 << 8 | 41 << 16, 32 | 17 << 16, 5 | 40 << 16];
+        let out = disasm(0, &d.pack(), &[]);
+        let get = |n: &str| out.ints.iter().find(|o| o.name == Some(n)).map(|o| o.value);
+        assert_eq!(get("state_bytes"), Some(2));
+        assert_eq!(get("depth"), Some(3));
+        assert_eq!(get("replay_table"), Some(41));
+        assert_eq!(get("seed_word"), Some(32));
+        assert_eq!(get("rowslot"), Some(17));
+        assert_eq!(get("layer"), Some(5));
+        assert_eq!(get("record"), Some(40));
+        d.i[5] = 2;
+        d.i[6] = 32;
+        d.i[7] = 5;
+        let plain = disasm(0, &d.pack(), &[]);
+        assert!(plain.ints.iter().all(|o| !matches!(o.name, Some("depth" | "rowslot" | "record"))));
     }
 
     #[test]

@@ -317,7 +317,7 @@ static __device__ void d_gemv(__nv_bfloat16* __restrict__ C, const __nv_bfloat16
     });
 }
 
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X
 static __device__ void d_gemv_tp_f32(float* C, const __nv_bfloat16* x, const __nv_bfloat16* W,
                                      unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk) {
     const bool single_tile = M <= GV_MM_MAX;
@@ -2362,8 +2362,8 @@ static __device__ void d_gemm_w8a8(__nv_bfloat16* __restrict__ C, const uint8_t*
                     int rr = tm + gr + (e / 2) * 8;
                     int cc = tn + gc + (e % 2);
                     if (rr < (int)m && cc < (int)n)
-                        C[(size_t)rr * n + cc] =
-                            __float2bfloat16(acc[mi][nj][e] * ascale[rr] * wscale[cc]);
+                        C[(size_t)rr * n + cc] = __float2bfloat16(
+                            ascale ? acc[mi][nj][e] * ascale[rr] * wscale[cc] : acc[mi][nj][e]);
                 }
             }
         __syncthreads();
@@ -2880,6 +2880,26 @@ static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __re
                 xq[row + kk] = *(const uint8_t*)&q;
             }
         }
+    }
+}
+
+/* Per-tensor static e4m3 quant (QUANT_FP8 i5 = PLOW_FP8_TENSOR_SCALE): xq = e4m3(clamp(x * (1/s),
+ * +-448)), s = scale[0] (the checkpoint's input_scale, read only); vLLM's static fp8 quant. */
+static __device__ void d_quant_fp8_tensor(uint8_t* __restrict__ xq, const __nv_bfloat16* __restrict__ x,
+                                          const float* __restrict__ scale, unsigned M, unsigned K,
+                                          unsigned slice, unsigned nblk) {
+    if (K & 7u) { __trap(); return; }
+    const float inv = 1.0f / scale[0];
+    const size_t total = (size_t)M * K / 8u;
+    for (size_t v = (size_t)slice * blockDim.x + threadIdx.x; v < total; v += (size_t)nblk * blockDim.x) {
+        const bf16v8 in = ld_glob8(x + v * 8u);
+        uint2 q8;
+        unsigned short* q2 = (unsigned short*)&q8;
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            q2[j] = pack_fp8_e4m3(fmaxf(-448.0f, fminf(__bfloat162float(in.x[2 * j]) * inv, 448.0f)),
+                                  fmaxf(-448.0f, fminf(__bfloat162float(in.x[2 * j + 1]) * inv, 448.0f)));
+        *(uint2*)(xq + v * 8u) = q8;
     }
 }
 
@@ -3501,9 +3521,15 @@ __device__ __forceinline__ void gemv_rows_fp8(__nv_bfloat16* __restrict__ C,
 #ifndef PLOW_NV_FP8_DECODE_TC
 #define PLOW_NV_FP8_DECODE_TC 1
 #endif
-/* Gemma-only: other models' decode objects lack the arena it needs (EMBED_SMEM, Qwen3.5 W8A8). */
-#if PLOW_NV_FP8_DECODE_TC && defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER && \
-    !PLOW_NV_PREFILL
+/* Gemma-only on Hopper: other models' decode objects lack the arena it needs (EMBED_SMEM, Qwen3.5
+ * W8A8). PLOW_NV_FP8_DECODE_TC_ON: a non-Hopper decode object whose packet asks for it (tuning
+ * `fp8_decode_tc`, PLOW_FP8_DECODE_TC); the arena claim below grows to cover it. */
+#ifndef PLOW_NV_FP8_DECODE_TC_ON
+#define PLOW_NV_FP8_DECODE_TC_ON 0
+#endif
+#if PLOW_NV_FP8_DECODE_TC && !PLOW_NV_PREFILL &&                                                   \
+    ((defined(PLOW_NV_GEMMA) && PLOW_NV_GEMMA && defined(PLOW_NV_HOPPER) && PLOW_NV_HOPPER) ||    \
+     (PLOW_NV_FP8_DECODE_TC_ON && !defined(PLOW_NV_HOPPER)))
 #define PLOW_NV_FP8_DECODE_TC_ACTIVE 1
 #include "op_gemv_fp8_tc.cuh"
 __device__ __forceinline__ bool gemv_fp8_tc_supported(unsigned M, unsigned K) {
@@ -3547,6 +3573,20 @@ static __device__ void d_gemv_fp8(__nv_bfloat16* __restrict__ C, const __nv_bflo
                            __nv_bfloat16* __restrict__ arena) {
 #if PLOW_NV_FP8_DECODE_TC_ACTIVE && !PLOW_NV_FP8_DECODE_WGMMA_ACTIVE
     if (gemv_fp8_tc_supported(M, K)) {
+#if !defined(PLOW_NV_HOPPER)
+        /* sm_12x: stream-K tiles (op_gemv_fp8_tc.cuh d_gemv_fp8_tc_sk) on the decode rungs where the
+         * four-arm block A/B measured a win (GB10, 48 CTAs, Nemotron-H L0..1 / L6..7): rows 5..32
+         * on every shape (rows 9..16: the tile walk's last round left 22-25% of the warps idle on
+         * in_proj's 25 / out_proj's 6 tiles per CTA); rows <= 4 only on many-tile or K >= 8192
+         * shapes (in_proj, out_proj; q/k/v keep the tile walk). Hopper not measured. */
+        const unsigned sk_tiles = ((N + nblk - 1u) / nblk + 15u) / 16u;
+        if (M > 4u || sk_tiles >= (blockDim.x >> 5) || K >= 8192u) {
+            if (M <= 8) d_gemv_fp8_tc_sk<1>(C, x, W, scale, M, N, K, slice, nblk, (float*)arena);
+            else if (M <= 16) d_gemv_fp8_tc_sk_wide<2>(C, x, W, scale, M, N, K, slice, nblk, (float*)arena);
+            else if (M <= 32) d_gemv_fp8_tc_sk_wide<4>(C, x, W, scale, M, N, K, slice, nblk, (float*)arena);
+            if (M <= 32) return;
+        }
+#endif
         if (M <= 8) d_gemv_fp8_tc<1, false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, (float*)arena);
         else if (M <= 16) d_gemv_fp8_tc2<false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, (float*)arena);
         else if (M <= 32) d_gemv_fp8_tc4<false>(C, x, W, nullptr, scale, nullptr, M, N, K, slice, nblk, (float*)arena);

@@ -112,6 +112,19 @@ class RooflineTests(unittest.TestCase):
             p.write_text(json.dumps({"bw_gbps": 1000.0, "bf16_tflops": 100.0, "fp8_tflops": 200.0}))
             c = gen_bench.load_ceilings(str(p))
         self.assertEqual((c["bw"], c["peak"]["bf16"], c["peak"]["fp8"]), (1000e9, 100e12, 200e12))
+        self.assertNotIn("fp4", c["peak"])
+        # GB10's measured ceilings: the roofline registry entry crates/hwspec pins.
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "campaign"))
+        from roofline import lookup_gpu
+        gb10 = lookup_gpu("gb10")
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "ceilings.json"
+            p.write_text(json.dumps({"bw_gbps": gb10.bandwidth_for_bound_gbps,
+                                     "bf16_tflops": gb10.bf16_tflops_dense,
+                                     "fp8_tflops": gb10.fp8_tflops_dense, "fp4_tflops": 497.0}))
+            c = gen_bench.load_ceilings(str(p))
+            self.assertEqual((c["bw"], c["peak"]["fp4"]), (238e9, 497e12))
 
     def test_cold_sets_exceed_l2(self):
         self.assertEqual(gen_bench.cold_sets(53e6), 4)

@@ -174,12 +174,7 @@ impl KernelMeasurement {
         let latency_secs = self.stats.median_ns * 1e-9;
         let efficiency = contract.empirical_efficiency(gpu, latency_secs);
         if !contract.satisfies_certification(gpu, latency_secs) {
-            let threshold = match contract.bound_category {
-                kernelcaps::BoundCategory::MemoryBoundHbm
-                | kernelcaps::BoundCategory::MemoryBoundL2 => 0.80,
-                kernelcaps::BoundCategory::ComputeBoundTensorCore
-                | kernelcaps::BoundCategory::ComputeBoundVectorAlu => 0.75,
-            };
+            let threshold = contract.bound_category.certification_threshold();
             blockers.push(format!(
                 "attained roofline efficiency {:.2}% is below the required {:.2}% certification threshold",
                 efficiency * 100.0,

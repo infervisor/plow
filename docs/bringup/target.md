@@ -10,7 +10,7 @@ default.
 | parameter | meaning | how to derive it |
 |---|---|---|
 | `$VENDOR` | `nvidia`, `amd`, `apple` or `intel` | `IsaLevel::vendor()` (`crates/hwspec/src/isa.rs`; `Vendor` in `spec.rs`) |
-| `$ISA` | the `--arch` value | `IsaLevel::arch_flag()`: `sm_89`, `sm_90a`, `sm_100a`, `sm_120a`, `gfx942`, `gfx950`, `gfx1201`, `metal3`, `avx512`, `amx`, `cpu` |
+| `$ISA` | the `--arch` value | `IsaLevel::arch_flag()`: `sm_89`, `sm_90a`, `sm_100a`, `sm_120a`, `sm_121a`, `gfx942`, `gfx950`, `gfx1201`, `metal3`, `avx512`, `amx`, `cpu` |
 | `$GPU` | part name/alias passed to `--gpu` | `plowc --list-gpus`. Do not guess one. |
 | `$NCU` | executor (CU/SM/core) count the blob is compiled for | leave `--n-cu` at `0` (takes the spec's count); set it only to under-subscribe deliberately |
 | `$NGPU` / `$PARALLEL` | `--num-gpus` (default `1`), `--parallel` (default `tp`) | TP is the only emit-time mode; DP and PD are serve-time (`plowrt serve --dp`, `--pd`, see [06-runtime-opt.md](06-runtime-opt.md)) |
@@ -31,6 +31,7 @@ default.
 | `gfx950` | `scripts/build_gfx950.sh` |
 | `sm_90a` | `scripts/build_sm90a_cubin.sh` |
 | `sm_120a` | `scripts/build_sm120_cubin.sh` |
+| `sm_121a` | `plowc --emit devblob+cubin --gpu gb10` (the sm120 objects built `-arch=sm_121a`) |
 | `sm_89` | `plowc --emit devblob+cubin --arch sm_89` (the recipe's `[emit] emit`) |
 | `metal3` | none: shaders compile at load from the packet |
 | `amx` / `avx512` | none: CPU kernels build with `plowrt --features cpu` (`runtime/cpu/`, `docs/runtime/cpu.md`) |

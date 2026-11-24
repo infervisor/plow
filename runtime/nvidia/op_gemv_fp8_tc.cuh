@@ -261,6 +261,98 @@ static __device__ void d_gemv_fp8_tc(__nv_bfloat16* C, const __nv_bfloat16* x, c
     }
 }
 
+/* Single-matrix C = scale * W x with the CTA's (16-row tile, 64-wide K chunk) units split evenly
+ * over its warps in tile-major order (stream-K). The tile-per-warp walk above leaves warps idle on
+ * the last round (in_proj: 25 tiles per CTA over 8 warps = 78%, out_proj: 6 tiles = 75%). A warp's
+ * whole tiles store directly; a tile cut between warps sums its partials after one block barrier
+ * in warp order (the warp holding chunk 0 adds the later ones): deterministic per shape. */
+template <int NG>
+static __device__ void d_gemv_fp8_tc_sk(__nv_bfloat16* C, const __nv_bfloat16* x, const uint8_t* W,
+                                        const float* sg, unsigned M, unsigned N, unsigned K,
+                                        unsigned slice, unsigned nblk, float* red) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const unsigned g = lane >> 2, t = lane & 3u;
+    const unsigned per = (N + nblk - 1u) / nblk;
+    const unsigned n0 = slice * per, n1 = min(n0 + per, N);
+    const unsigned ntile = n1 > n0 ? (n1 - n0 + 15u) / 16u : 0u;
+    const unsigned nchunk = K / 64u, total = ntile * nchunk;
+    auto start = [&](unsigned w) { return (unsigned)((unsigned long long)w * total / nw); };
+    const unsigned u0 = start(warp), u1 = start(warp + 1u);
+    constexpr int U = NG == 1 ? PLOW_FP8TC_U1 : NG == 2 ? PLOW_FP8TC_U2 : PLOW_FP8TC_U4;
+    const __nv_bfloat16* xr[NG];
+    bool vx[NG];
+#pragma unroll
+    for (int q = 0; q < NG; q++) {
+        const unsigned m = q * 8u + g;
+        vx[q] = m < M;
+        xr[q] = x + (size_t)(vx[q] ? m : 0u) * K + t * 16u;
+    }
+    /* Partial slots per warp: 0 = a tile it entered after chunk 0, 1 = a tile it left before the end.
+     * The slots are read after the one barrier below; the interpreter's retire barrier orders them
+     * before the next op's arena use. */
+    static_assert(2u * PLOW_NV_WARPS * 32u * NG * 4u * 4u <= PLOW_FP8TC_ARENA_BYTES, "stream-K slots");
+    auto slot = [&](unsigned w, unsigned s) { return red + ((w * 2u + s) * 32u + lane) * (NG * 4u); };
+    auto store = [&](unsigned tile, const float (&c)[NG][4]) {
+#pragma unroll
+        for (int q = 0; q < NG; q++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned n = n0 + tile * 16u + g + (i >= 2 ? 8u : 0u);
+                const unsigned m = q * 8u + t * 2u + (i & 1u);
+                if (n < n1 && m < M) C[(size_t)m * N + n] = __float2bfloat16(c[q][i] * sg[n]);
+            }
+    };
+    float cu[NG][4] = {};
+    unsigned own = ~0u; /* the tile this warp left unfinished from chunk 0 */
+    for (unsigned u = u0; u < u1;) {
+        const unsigned tile = u / nchunk, lo = u % nchunk, hi = min(nchunk, lo + (u1 - u));
+        const unsigned ra = n0 + tile * 16u + g, rb = ra + 8u;
+        const bool va = ra < n1, vb = rb < n1;
+        const uint8_t* wa = W + (size_t)(va ? ra : n0) * K + t * 16u;
+        const uint8_t* wb = W + (size_t)(vb ? rb : n0) * K + t * 16u;
+        float cg[NG][4] = {};
+        fp8tc_tile<NG, false, U, true>(cg, cu, wa, wb, nullptr, nullptr, va, vb, xr, vx, hi, lo, 1u);
+        if (lo == 0u && hi == nchunk) {
+            store(tile, cg);
+        } else {
+            float* s = slot(warp, lo == 0u ? 1u : 0u);
+#pragma unroll
+            for (int q = 0; q < NG; q++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) s[q * 4 + i] = cg[q][i];
+            if (lo == 0u) own = tile;
+        }
+        u += hi - lo;
+    }
+    __syncthreads();
+    if (own != ~0u) {
+        float c[NG][4];
+        const float* s = slot(warp, 1u);
+#pragma unroll
+        for (int q = 0; q < NG; q++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) c[q][i] = s[q * 4 + i];
+        for (unsigned w = warp + 1u; w < nw && start(w) < (own + 1u) * nchunk; w++) {
+            if (start(w + 1u) == start(w)) continue; /* an empty range wrote nothing */
+            const float* p = slot(w, 0u);
+#pragma unroll
+            for (int q = 0; q < NG; q++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) c[q][i] += p[q * 4 + i];
+        }
+        store(own, c);
+    }
+}
+
+/* M > 8 stream-K tiles out of line, as d_gemv_fp8_tc2 / tc4 below. */
+template <int NG>
+static __device__ __noinline__
+void d_gemv_fp8_tc_sk_wide(__nv_bfloat16* C, const __nv_bfloat16* x, const uint8_t* W,
+                           const float* sg, unsigned M, unsigned N, unsigned K, unsigned slice,
+                           unsigned nblk, float* red) {
+    d_gemv_fp8_tc_sk<NG>(C, x, W, sg, M, N, K, slice, nblk, red);
+}
+
 /* Claim-ahead L2 prefetch (the FP8 twin of PLOW_GEMV_PREFETCH): issued between claim and gate, it
  * asks L2 for the head of every row the first round of the walk above starts on, so HBM works
  * while the block waits on the previous op's tail. Bytes per CTA; 0 = off. Hints only. */

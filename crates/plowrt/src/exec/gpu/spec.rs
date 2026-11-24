@@ -6,6 +6,15 @@
 //! sequence (the pending token, then `k` drafts) at consecutive positions; flash waits on every
 //! row's K/V store, so row `j` sees rows `0..j` of its own span. Plain launches keep the identity
 //! map, which addresses exactly the cells the `n_batch_kv` formula does.
+//!
+//! Recurrent packets verify only with `recurrent_state.verify` declared: the span chains its
+//! rows through every state buffer, keeps the state after each non-final row in the buffer's
+//! snapshot and the final state in the buffer; [`GpuEngine::spec_commit`] copies the snapshot of
+//! the last committed row back when the span is cut short. With replay rollback
+//! (`verify.replay`) the span leaves the buffers alone and records its rows' step inputs; a
+//! commit defers replaying the committed records, which the next verify does first, or the
+//! packet's replay program before any other reader of the state
+//! ([`GpuEngine::recurrent_replay_flush`]).
 
 use std::path::Path;
 
@@ -17,7 +26,7 @@ use crate::orch::speculative::{
 use crate::{Result, RuntimeError};
 
 use super::decode_rung::decode_selection;
-use super::{DevSample, GpuEngine};
+use super::{DevProgram, DevSample, GpuEngine};
 use packet::dev::{DevOp, TENSOR_NONE16};
 
 /// One sequence's verify span: `tokens[0]` is the slot's pending token (position `pos[slot]`),
@@ -84,10 +93,65 @@ pub(super) struct SpecRt {
     /// The span map is (or may be) on the device: a failed restore leaves it there, and no
     /// plain launch may run against it.
     map_dirty: bool,
+    /// Armed on a recurrent packet with verify rollback: spans must be committed.
+    recurrent_rollback: bool,
+    /// Replay rollback (`recurrent_state.verify.replay`), loaded by `spec_enable`.
+    replay: Option<ReplayRt>,
+}
+
+/// The replay program and table of replay rollback, and every slot's deferred commit.
+struct ReplayRt {
+    t_table: usize,
+    arg: DevProgram,
+    counter_bytes: usize,
+    _tables: Vec<DeviceMem>,
+    /// The verify's table staging (`[0]` = the record parity it writes).
+    stage: PinnedHost,
+    /// The record parity the next verify writes.
+    parity: u32,
+    deferred: parking_lot::Mutex<Deferred>,
+}
+
+struct Deferred {
+    /// Per slot: `(rows, row0, parity)` of the commit its next row-slot launch replays.
+    slots: Vec<Option<(u32, u32, u32)>>,
+    /// The replay program's table staging. Rewritten only once a verify ran after the flush
+    /// that read it (a verify synchronizes the stream).
+    stage: PinnedHost,
+}
+
+impl ReplayRt {
+    /// The replay table: `parity`, the slot count, then each slot's entry (`here`: it runs a
+    /// span in this launch). Takes the deferred commits.
+    fn fill(
+        deferred: &mut [Option<(u32, u32, u32)>],
+        table: &mut [u32],
+        parity: u32,
+        here: impl Fn(usize) -> bool,
+    ) -> Result<()> {
+        table[0] = parity;
+        table[1] = deferred.len() as u32;
+        for (s, d) in deferred.iter_mut().enumerate() {
+            table[2 + s] = match d.take() {
+                Some((rows, row0, par)) => plow_asset::recurrent_state::Replay::entry(
+                    rows,
+                    row0,
+                    par,
+                    here(s),
+                )
+                .map_err(RuntimeError::Rejected)?,
+                None => 0,
+            };
+        }
+        Ok(())
+    }
 }
 
 struct Pending {
     slot: usize,
+    /// The span's first launch row and the record parity of its launch (replay rollback).
+    row0: u32,
+    parity: u32,
     generation: u32,
     pos: u32,
     tokens: Vec<u32>,
@@ -101,12 +165,20 @@ impl SpecRt {
         self.object
     }
 
-    /// Any launch or rewind other than the verify itself ends the verify's transaction.
+    /// Any launch or rewind other than the verify itself ends the verify's transaction. On a
+    /// recurrent packet every verified span must be committed first: its state buffers already
+    /// hold the whole span.
     pub(super) fn end_pending(&mut self) -> Result<()> {
         if self.map_dirty {
             return Err(RuntimeError::Device(
                 "span row map was not restored after a failed verify; engine unusable".into(),
             ));
+        }
+        if self.recurrent_rollback && !self.pending.is_empty() {
+            let slots: Vec<usize> = self.pending.iter().map(|p| p.slot).collect();
+            return Err(RuntimeError::Device(format!(
+                "recurrent state of slots {slots:?} advanced past an uncommitted verify; engine unusable"
+            )));
         }
         self.pending.clear();
         Ok(())
@@ -166,6 +238,8 @@ impl SpecRt {
             sites,
             pending: Vec::new(),
             map_dirty: false,
+            recurrent_rollback: false,
+            replay: None,
         }))
     }
 }
@@ -188,11 +262,13 @@ impl GpuEngine {
     }
 
     /// Arm span-mode verify: needs the packet's `in.rowslot`, decode objects carrying
-    /// `plow_row_slot_1`, no recurrent state, no context-band rungs, and the accept kernel from
-    /// the sampler cubin. Returns the largest `k` the sliding rings allow.
+    /// `plow_row_slot_1`, recurrent state only with declared verify rollback, no context-band
+    /// rungs, and the accept kernel from the sampler cubin. Returns the largest `k` the sliding
+    /// rings and the rollback depth allow.
     pub fn spec_enable(&mut self, assets: &Path) -> Result<usize> {
-        let reason = if self.recurrent.is_some() {
-            Some("recurrent state cannot rewind")
+        let rollback = self.recurrent.as_ref().map(|r| r.verify.is_some());
+        let reason = if rollback == Some(false) {
+            Some("recurrent state without verify rollback cannot rewind")
         } else if self.decode_contexts.is_some() {
             Some("context-band decode rungs are not span-capable")
         } else {
@@ -223,11 +299,187 @@ impl GpuEngine {
                     cubin.display()
                 ))
             })?;
-        self.spec.as_mut().expect("checked").accept = Some((f, module));
+        let replay = self.replay_load(assets)?;
+        let s = self.spec.as_mut().expect("checked");
+        s.accept = Some((f, module));
+        s.recurrent_rollback = rollback == Some(true);
+        s.replay = replay;
+        Ok(self.spec_k_cap())
+    }
+
+    /// The replay program and table of a packet with replay rollback, on the row-slot twin.
+    fn replay_load(&self, assets: &Path) -> Result<Option<ReplayRt>> {
+        let reject = |m: &str| RuntimeError::Rejected(format!("recurrent replay: {m}"));
+        let Some(replay) = self
+            .recurrent
+            .as_ref()
+            .and_then(|r| r.verify.as_ref())
+            .and_then(|(v, _)| v.replay.as_ref())
+        else {
+            return Ok(None);
+        };
+        if self.row_slot_twin.is_none() {
+            return Err(reject("needs the row-slot twin object"));
+        }
+        let pkt = crate::asset::devblob::DevBlob::find_in_dir(assets)?
+            .ok_or_else(|| reject("no packet"))?;
+        let image = crate::asset::packet_image::PacketImage::open(&pkt)?;
+        let bytes = image
+            .blob
+            .reserved_metadata(&image.raw, plow_asset::recurrent_state::REPLAY_SECTION)?
+            .ok_or_else(|| reject("replay program section missing"))?;
+        let section = plow_asset::aux_program::parse(bytes, self.grid, self.devp.len())
+            .map_err(|e| reject(&e))?;
+        let [program] = section.programs.as_slice() else {
+            return Err(reject("expected one program"));
+        };
+        // Only the recurrent sites, every one in replay mode (no span rows), on this packet's
+        // replay table.
+        let sites_ok = program.insts.iter().all(|d| match DevOp::from_u16(d.op) {
+            Some(DevOp::Mamba2Conv) => d.i[2] == 0 && d.i[5] >> 16 == u32::from(replay.table),
+            Some(DevOp::Mamba2Step) => d.i[4] == 0 && d.i[5] >> 16 == u32::from(replay.table),
+            _ => false,
+        });
+        if !sites_ok {
+            return Err(reject("program is not replay-only recurrent sites"));
+        }
+        let (arg, _, counter_bytes, tables) =
+            super::mixed_step::upload_program(&self.be, program, self.d_tens.base, 0, 0)?;
+        let words = (self.batch + 2) * 4;
+        Ok(Some(ReplayRt {
+            t_table: usize::from(replay.table),
+            arg,
+            counter_bytes,
+            _tables: tables,
+            stage: self.be.host_alloc_pinned(words)?,
+            parity: 0,
+            deferred: parking_lot::Mutex::new(Deferred {
+                slots: vec![None; self.batch],
+                stage: self.be.host_alloc_pinned(words)?,
+            }),
+        }))
+    }
+
+    /// Replay every deferred commit onto its slot's state (the replay program on the row-slot
+    /// twin): any reader of the recurrent state other than a verify runs this first.
+    pub(crate) fn recurrent_replay_flush(&self) -> Result<()> {
+        let Some(r) = self.spec.as_ref().and_then(|s| s.replay.as_ref()) else {
+            return Ok(());
+        };
+        let mut deferred = r.deferred.lock();
+        if deferred.slots.iter().all(Option::is_none) {
+            return Ok(());
+        }
+        let (full, _) = self.row_slot_twin.as_ref().expect("checked at load");
+        let Deferred { slots, stage } = &mut *deferred;
+        ReplayRt::fill(slots, bytemuck::cast_slice_mut(stage.as_mut_slice()), r.parity, |_| false)?;
+        // SAFETY: the pinned stage lives as long as the engine (see `Deferred::stage`).
+        unsafe {
+            self.be
+                .memcpy_htod_async(self.devp[r.t_table].base, stage.as_slice(), &self.stream)?;
+        }
+        self.be
+            .memset_d8_async(r.arg.counters, 0, r.counter_bytes, &self.stream)?;
+        let mut arg = r.arg;
+        let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        self.be.launch_cooperative(
+            full.function,
+            self.grid,
+            full.block,
+            full.smem,
+            &mut params,
+            Some(&self.stream),
+        )
+    }
+
+    /// Stage the replay table for a launch whose span riders run `here`'s slots
+    /// (`span_riders.rs`): it replays every deferred commit, as a verify launch does. Returns
+    /// the record parity it writes and the commits it took (`None`: no replay rollback).
+    pub(super) fn span_rider_replay(
+        &mut self,
+        here: &[usize],
+    ) -> Result<Option<(u32, Vec<Option<(u32, u32, u32)>>)>> {
+        let Some(r) = self.spec.as_mut().and_then(|s| s.replay.as_mut()) else {
+            return Ok(None);
+        };
+        let taken = {
+            let mut deferred = r.deferred.lock();
+            let taken = deferred.slots.clone();
+            let table: &mut [u32] = bytemuck::cast_slice_mut(r.stage.as_mut_slice());
+            ReplayRt::fill(&mut deferred.slots, table, r.parity, |b| here.contains(&b))?;
+            taken
+        };
+        // SAFETY: the pinned stage lives as long as the engine; the token batch synchronizes
+        // before the next writer (a verify or another rider launch) rewrites it.
+        unsafe {
+            self.be
+                .memcpy_htod_async(self.devp[r.t_table].base, r.stage.as_slice(), &self.stream)?;
+        }
+        Ok(Some((r.parity, taken)))
+    }
+
+    /// A rider launch refused before it launched: its replay table never ran.
+    pub(super) fn span_rider_restore(&self, taken: Vec<Option<(u32, u32, u32)>>) {
+        if let Some(r) = self.spec.as_ref().and_then(|s| s.replay.as_ref()) {
+            let mut deferred = r.deferred.lock();
+            for (d, t) in deferred.slots.iter_mut().zip(taken) {
+                if d.is_none() {
+                    *d = t;
+                }
+            }
+        }
+    }
+
+    /// Commit the span riders of a launch that wrote records at `parity`: `(slot, span rows,
+    /// emitted, first rider row)` each, deferred like [`Self::spec_commit`]'s.
+    pub(super) fn span_rider_commit(
+        &mut self,
+        parity: u32,
+        commits: &[(usize, u32, u32, u32)],
+    ) -> Result<()> {
+        if let Some((rollback, buffers)) = self.recurrent.as_ref().and_then(|r| r.verify.as_ref()) {
+            for &(b, rows, n, _) in commits {
+                let copies = rollback
+                    .commit(buffers, b as u32, rows, n)
+                    .map_err(RuntimeError::Rejected)?;
+                if !copies.is_empty() {
+                    return Err(RuntimeError::Rejected(
+                        "span riders need replay rollback, not snapshots".into(),
+                    ));
+                }
+            }
+        }
+        let r = self
+            .spec
+            .as_mut()
+            .and_then(|s| s.replay.as_mut())
+            .ok_or_else(|| RuntimeError::Rejected("span riders without replay rollback".into()))?;
+        r.parity = parity ^ 1;
+        let mut deferred = r.deferred.lock();
+        for &(b, _, n, row0) in commits {
+            deferred.slots[b] = Some((n, row0, parity));
+        }
+        Ok(())
+    }
+
+    /// Slot `b`'s state was replaced (admission, rewind): its deferred commit no longer applies.
+    pub(super) fn recurrent_replay_drop(&self, b: usize) {
+        if let Some(r) = self.spec.as_ref().and_then(|s| s.replay.as_ref()) {
+            r.deferred.lock().slots[b] = None;
+        }
+    }
+
+    /// The deepest span the sliding rings and the recurrent rollback depth allow.
+    fn spec_k_cap(&self) -> usize {
         let ring_k = self
             .resume_ring_slack
             .map_or(SPEC_KMAX, |s| (s as usize).saturating_sub(1));
-        Ok(SPEC_KMAX.min(ring_k))
+        let depth = self
+            .recurrent
+            .as_ref()
+            .and_then(|r| r.verify.as_ref())
+            .map_or(SPEC_KMAX, |(v, _)| v.depth as usize);
+        SPEC_KMAX.min(ring_k).min(depth)
     }
 
     /// Slot `b`'s committed position: the pending token's row.
@@ -265,10 +517,7 @@ impl GpuEngine {
         if spans.is_empty() || spans.len() > bsz || stop.len() > STOP_MAX {
             return reject(format!("{} spans, {} stop ids", spans.len(), stop.len()));
         }
-        let max_k = SPEC_KMAX.min(
-            self.resume_ring_slack
-                .map_or(SPEC_KMAX, |s| (s as usize).saturating_sub(1)),
-        );
+        let max_k = self.spec_k_cap();
         let mut seen = vec![false; bsz];
         let mut rows = 0usize;
         for sp in spans {
@@ -317,12 +566,24 @@ impl GpuEngine {
                 v.ensure_rows(sp.slot, self.pos[sp.slot] + sp.tokens.len() as u32)?;
             }
         }
+        // A verify row reads its slot's state there, never from an attached block.
+        if self.recurrent.is_some() {
+            for sp in spans {
+                self.state_materialize_attached(sp.slot, None)?;
+            }
+        }
         let max_kvlen = spans
             .iter()
             .map(|sp| self.pos[sp.slot] + sp.tokens.len() as u32)
             .max()
             .expect("nonempty");
         self.patch_nv_nsplit(max_kvlen)?;
+        let lens: smallvec::SmallVec<[u32; 16]> = if spans.iter().all(|sp| sp.tokens.len() == 1) {
+            smallvec::SmallVec::new()
+        } else {
+            spans.iter().map(|sp| sp.tokens.len() as u32).collect()
+        };
+        self.stage_mtp_dshift(&lens)?;
         // Rows up to the span ends are about to be written, whatever happens after submission.
         for sp in spans {
             let hw = self.pos[sp.slot] + sp.tokens.len() as u32;
@@ -363,6 +624,13 @@ impl GpuEngine {
             }
             let stop_h: &mut [u32] = bytemuck::cast_slice_mut(s.stop.as_mut_slice());
             stop_h[..stop.len()].copy_from_slice(stop);
+            // This launch replays every deferred commit: a slot's span first, else its own item.
+            if let Some(r) = s.replay.as_mut() {
+                let table: &mut [u32] = bytemuck::cast_slice_mut(r.stage.as_mut_slice());
+                ReplayRt::fill(&mut r.deferred.lock().slots, table, r.parity, |b| {
+                    spans.iter().any(|sp| sp.slot == b)
+                })?;
+            }
         }
         // Every verify row's plain-decode draw when a span samples on the device; argmax and
         // host rows take the greedy argmax (identical to the verify's own).
@@ -397,9 +665,12 @@ impl GpuEngine {
             &dev_slots,
         ) {
             // Plain launches must not see the span map, and staging may still be in flight: only
-            // a restore that drains cleanly clears the dirty flag.
-            self.spec.as_mut().expect("checked").map_dirty = true;
-            if self.spec_upload_identity().is_ok()
+            // a restore that drains cleanly clears the dirty flag. The deferred commits of replay
+            // rollback went with the launch: never recoverable.
+            let s = self.spec.as_mut().expect("checked");
+            s.map_dirty = true;
+            if s.replay.is_none()
+                && self.spec_upload_identity().is_ok()
                 && self.be.stream_synchronize(&self.stream).is_ok()
             {
                 self.spec.as_mut().expect("checked").map_dirty = false;
@@ -445,15 +716,29 @@ impl GpuEngine {
             verdicts.push(verdict);
             r += n;
         }
+        let parity = match self.spec.as_mut().and_then(|s| s.replay.as_mut()) {
+            Some(r) => {
+                r.parity ^= 1;
+                r.parity ^ 1
+            }
+            None => 0,
+        };
+        let mut row0 = 0u32;
         let pending: Vec<Pending> = spans
             .iter()
             .zip(verdicts.iter())
-            .map(|(sp, v)| Pending {
-                slot: sp.slot,
-                generation: self.slot_generations[sp.slot],
-                pos: self.pos[sp.slot],
-                tokens: sp.tokens.to_vec(),
-                verdict: *v,
+            .map(|(sp, v)| {
+                let p = Pending {
+                    slot: sp.slot,
+                    row0,
+                    parity,
+                    generation: self.slot_generations[sp.slot],
+                    pos: self.pos[sp.slot],
+                    tokens: sp.tokens.to_vec(),
+                    verdict: *v,
+                };
+                row0 += sp.tokens.len() as u32;
+                p
             })
             .collect();
         self.spec.as_mut().expect("checked").pending = pending;
@@ -505,7 +790,13 @@ impl GpuEngine {
                     &self.stream,
                 )?;
             }
+            if let Some(r) = &s.replay {
+                self.be
+                    .memcpy_htod_async(self.devp[r.t_table].base, r.stage.as_slice(), &self.stream)?;
+            }
         }
+        // Recurrent sites take part per launch row: the span rows, never the padding.
+        self.upload_active_slots(0..rows)?;
         self.reset_selected_decode_counters(selection)?;
         self.span_launch = true;
         let launched = self.launch_decode_program(selection);
@@ -594,6 +885,22 @@ impl GpuEngine {
             || n > span.tokens.len()
         {
             return Err(stale());
+        }
+        if let Some((rollback, buffers)) = self.recurrent.as_ref().and_then(|r| r.verify.as_ref()) {
+            let copies = rollback
+                .commit(buffers, b as u32, span.tokens.len() as u32, n as u32)
+                .map_err(RuntimeError::Rejected)?;
+            if let Some(r) = self.spec.as_ref().and_then(|s| s.replay.as_ref()) {
+                r.deferred.lock().slots[b] = Some((n as u32, p.row0, p.parity));
+            }
+            for c in copies {
+                self.be.memcpy_dtod_async(
+                    self.devp[usize::from(c.buffer)].base + c.dst,
+                    self.devp[usize::from(c.snapshot)].base + c.src,
+                    c.bytes,
+                    &self.stream,
+                )?;
+            }
         }
         self.pos[b] += n as u32;
         if self.vmm_prefix_enabled() {

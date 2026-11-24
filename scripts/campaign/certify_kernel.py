@@ -4,6 +4,8 @@
 Enforces the hard empirical roofline qualification thresholds before promotion:
   - Memory-bound ops (Decode GEMV, linear recurrent scan): >= 80% empirical roofline
   - Compute-bound ops (Prefill GEMM, MoE dense): >= 75% empirical roofline
+The thresholds are costmodel's (`CERTIFY_MEMORY_BOUND` / `CERTIFY_COMPUTE_BOUND`, the gate tunedb
+records pass), read from crates/costmodel/data/op_floor_cases.json, which costmodel's test pins.
 
 Usage:
     certify_kernel.py --input <block_roofline.json | measurement.json> [--out-record <record.json>]
@@ -13,8 +15,12 @@ import json
 import sys
 from pathlib import Path
 
+FLOOR_TABLE = Path(__file__).resolve().parents[2] / "crates/costmodel/data/op_floor_cases.json"
+_GATE = json.loads(FLOOR_TABLE.read_text())["certification"]
+MIN_MEMORY, MIN_COMPUTE = _GATE["memory_bound"], _GATE["compute_bound"]
 
-def evaluate_efficiency(row, min_memory_eff=0.80, min_compute_eff=0.75):
+
+def evaluate_efficiency(row, min_memory_eff=MIN_MEMORY, min_compute_eff=MIN_COMPUTE):
     """Evaluate whether a single row meets the certification gate."""
     phase = row.get("phase", "decode")
     pct_str = row.get("pct_of_floor") or row.get("pct_floor")
@@ -40,7 +46,7 @@ def evaluate_efficiency(row, min_memory_eff=0.80, min_compute_eff=0.75):
     }
 
 
-def certify_data(data, min_memory_eff=0.80, min_compute_eff=0.75):
+def certify_data(data, min_memory_eff=MIN_MEMORY, min_compute_eff=MIN_COMPUTE):
     rows = data.get("rows", [])
     if not rows and "efficiency" in data:
         rows = [data]
@@ -59,8 +65,10 @@ def certify_data(data, min_memory_eff=0.80, min_compute_eff=0.75):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True, help="Input JSON report from block_roofline or micro-harness")
-    ap.add_argument("--min-memory", type=float, default=0.80, help="Min memory-bound efficiency [default: 0.80]")
-    ap.add_argument("--min-compute", type=float, default=0.75, help="Min compute-bound efficiency [default: 0.75]")
+    ap.add_argument("--min-memory", type=float, default=MIN_MEMORY,
+                    help=f"Min memory-bound efficiency [default: {MIN_MEMORY}]")
+    ap.add_argument("--min-compute", type=float, default=MIN_COMPUTE,
+                    help=f"Min compute-bound efficiency [default: {MIN_COMPUTE}]")
     ap.add_argument("--out-record", help="Optional output tunedb record JSON if qualified")
     args = ap.parse_args()
 

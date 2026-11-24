@@ -371,50 +371,8 @@ impl<'a> RooflineModel<'a> {
     }
 }
 
-/// Compute peak theoretical dense TFLOP/s for a known GPU and precision.
-pub fn peak_compute_tflops(gpu: &GpuSpec, dtype: MmaDtype) -> f64 {
-    let name = gpu.name.to_uppercase();
-    // Calibrated datasheet peak TFLOP/s (dense tensor core / matrix engine):
-    if name.contains("H100") || name.contains("H200") {
-        match dtype {
-            MmaDtype::Fp16 | MmaDtype::Bf16 => 989.0,
-            MmaDtype::Fp8 | MmaDtype::Int8 => 1979.0,
-            MmaDtype::Fp4 => 1979.0,
-        }
-    } else if name.contains("MI300") {
-        match dtype {
-            MmaDtype::Fp16 | MmaDtype::Bf16 => 1307.0,
-            MmaDtype::Fp8 | MmaDtype::Int8 => 2614.0,
-            MmaDtype::Fp4 => 2614.0,
-        }
-    } else if name.contains("MI350") {
-        match dtype {
-            MmaDtype::Fp16 | MmaDtype::Bf16 => 2300.0,
-            MmaDtype::Fp8 | MmaDtype::Int8 => 4600.0,
-            MmaDtype::Fp4 => 9200.0,
-        }
-    } else if name.contains("5090") {
-        match dtype {
-            // Measured, fp32 accumulate (GeForce runs it at half the fp16-accumulate rate).
-            MmaDtype::Fp16 | MmaDtype::Bf16 => 235.0,
-            MmaDtype::Fp8 | MmaDtype::Int8 => 1670.0,
-            MmaDtype::Fp4 => 3340.0,
-        }
-    } else if name.contains("4090") {
-        match dtype {
-            MmaDtype::Fp16 | MmaDtype::Bf16 => 330.0,
-            MmaDtype::Fp8 | MmaDtype::Int8 => 660.0,
-            MmaDtype::Fp4 => 660.0,
-        }
-    } else {
-        // Analytical fallback from hardware spec
-        let cores = gpu.sm_count as f64 * gpu.sm.tensor_cores as f64;
-        let macs_core = gpu.sm.mma.of(dtype).unwrap_or(256) as f64;
-        let clock_hz = gpu.clock_boost.0 as f64;
-        // 2 FLOPs per MAC
-        (cores * macs_core * 2.0 * clock_hz) / 1e12
-    }
-}
+/// Peak dense TFLOP/s: the one table in `hwspec`.
+pub use hwspec::peak_compute_tflops;
 
 #[cfg(test)]
 mod tests {

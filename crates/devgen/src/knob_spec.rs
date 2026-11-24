@@ -15,6 +15,7 @@ use plow_asset::knob::{
     Allow, Check, Cmp, Constraint, Default, DefaultCase, Domain, Formula as F, KnobSpec, Layer,
     OpSel, ScopeField, Source, Status, Target, TargetAtom as T, TargetSpec, Val, U32,
 };
+use hwspec::isa::SM12X;
 use serde_json::{json, Value};
 
 const TRUE: Val = Val::Bool(true);
@@ -327,7 +328,7 @@ const DECODE_LADDER_DEFAULT: Default = Default::Production {
         },
         DefaultCase {
             when: F::And(&[
-                F::Target(T::Arch("sm_120a")),
+                F::Target(T::Family(SM12X)),
                 F::Target(T::Cap("decode_ladder")),
                 F::Target(T::Tp(1)),
                 F::Atom("emit.decode_batch", Cmp::Eq, Val::Nat(1)),
@@ -545,7 +546,7 @@ const PACKED_PREFILL_DEFAULT: Default = Default::Production {
         // lib.rs apply_production_defaults: segmented FP8-KV prefill needs the packed contract.
         DefaultCase {
             when: F::And(&[
-                F::Or(&[F::Target(T::Arch("sm_90a")), F::Target(T::Arch("sm_120a"))]),
+                F::Or(&[F::Target(T::Arch("sm_90a")), F::Target(T::Family(SM12X))]),
                 F::Target(T::Tp(1)),
                 F::Target(T::Cap("dense_packet_contracts")),
                 F::Atom("emit.fp8_kv", Cmp::Eq, TRUE),
@@ -566,7 +567,7 @@ const UNISEG_DEFAULT: Default = Default::Production {
         },
         DefaultCase {
             when: F::Or(&[
-                F::Target(T::Arch("sm_120a")),
+                F::Target(T::Family(SM12X)),
                 F::Target(T::Arch("sm_120")),
                 F::Target(T::Arch("metal3")),
                 F::Target(T::Arch("amx")),
@@ -1513,6 +1514,7 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.moe_pf_lt_route", Some("PLOW_EMIT_MOE_PF_LT_ROUTE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.moe_dec_lt", Some("PLOW_EMIT_MOE_DEC_LT"), Layer::Emit, Domain::Bool, GEMMA4_MOE_DEC_LT_DEFAULT, MOE_LT_EMIT_QUALIFIED),
     KnobSpec::new("emit.gemma_gemm_lt", Some("PLOW_GEMMA_GEMM_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.fp8_decode_tc", Some("PLOW_FP8_DECODE_TC"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.decode_native_tc", Some("PLOW_EMIT_DECODE_NATIVE_TC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fuse_ab", Some("PLOW_QWEN_FUSE_AB"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.qwen_fuse_mlp", Some("PLOW_QWEN_FUSE_MLP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1566,6 +1568,7 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_KDA_GNORM_ILP", Some("PLOW_KDA_GNORM_ILP"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("env.PLOW_KDA_CARRY_XCD", Some("PLOW_KDA_CARRY_XCD"), Layer::RawEnv, Domain::Bool, ON, OPT_IN),
     KnobSpec::new("env.PLOW_QKVA_WAVE1", Some("PLOW_QKVA_WAVE1"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("env.PLOW_NVFP4_SHARED_RADD", Some("PLOW_NVFP4_SHARED_RADD"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_PF_A4W4_BK", Some("PLOW_MOE_PF_A4W4_BK"), Layer::RawEnv, U32, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_PF_DOWN_SWEEP", Some("PLOW_MOE_PF_DOWN_SWEEP"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_DOWN_SWEEP_LINE", Some("PLOW_MOE_DOWN_SWEEP_LINE"), Layer::RawEnv, Domain::Bool, OFF, OPT_IN),
@@ -1666,7 +1669,10 @@ pub const RAW_ENV: &[KnobSpec] = &[
     KnobSpec::new("env.PLOW_MLA_PF_AITER", Some("PLOW_MLA_PF_AITER"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MLA_PF_V2", Some("PLOW_MLA_PF_V2"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_MOE_DECODE_STANDALONE", Some("PLOW_MOE_DECODE_STANDALONE"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
-    KnobSpec::new("env.PLOW_NV_ABLATE_HI", Some("PLOW_NV_ABLATE_HI"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
+    // flake.nix CUDA-only dev shell marker (no ROCm on the platform): the tools accept it in place
+    // of ROCM_PATH as "inside nix develop".
+    KnobSpec::new("env.PLOW_NIX_GPU", Some("PLOW_NIX_GPU"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_NV_ABLATE_HI",Some("PLOW_NV_ABLATE_HI"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_NV_ABLATE_LO", Some("PLOW_NV_ABLATE_LO"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_NV_FA512_BKV", Some("PLOW_NV_FA512_BKV"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     // plowc `--emit devblob+cubin`: the toolkit nvcc (the dev shell exports it); toolchain, not a
@@ -1956,6 +1962,15 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_HAS_MOE_COMBINE_RESID_NORM_GEMMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_DOWN_MX", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_DOWN_MX_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_ALIGN_NVFP4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_DOWN_NVFP4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_DOWN_NVFP4_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_QUANT_NVFP4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MAMBA2_CHUNK_OUT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_ROUTER_LOGITS_F32", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_ROUTER_SIGMOID_TOPK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_UP_NVFP4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_HAS_MOE_UP_NVFP4_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_EXPERT_DOWN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_EXPERT_DOWN_FP8_BLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_HAS_MOE_EXPERT_DOWN_GEMMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2282,6 +2297,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_GEMMA4_GLU_FP8_PROMOTE_STAGES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FP8_DECODE_TC64", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_FP8_DECODE_TC_ACTIVE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_FP8_DECODE_TC_ON", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_FP8TC_U", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_FP8TC_U1", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_MOE_FP8_TC_ACTIVE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2308,6 +2324,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_FUTURE_OP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GATE_SLEEP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_KV_ILV", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_KV_E4M3", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMMA3", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMMA_HNR_BF16", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2333,12 +2350,28 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_LANE_MASK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_LEAN_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MAMBA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_MAMBA_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_MAMBA_SCAN_FUSE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_FA2_PF128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_BM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_STAGES64", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2_NMAJOR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2_PFD", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2_BULK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2_MIN_T", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2_NST", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2_PF_MAXT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2_PP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_W4A4_V2_PP_MAXT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MASKED_PADDING", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MINBLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MLA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MOE_COMMON", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MXFP4_MOE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MXFP4_PROJ", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_NVFP4_MOE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_OP_MOE_NVFP4_CUH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_ENTRY_TRACE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_OP_MOE_CUH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_OP_MOE_SM90_CUH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2349,6 +2382,8 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_PACKET_REQUIRES_RESIDUAL_F32", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_REQUIRES_XR_PARTIAL_F32", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_REQUIRES_PF_GEMV_HEAD", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_PF_GEMV_FP8_HEAD", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_PACKET_REQUIRES_PF_GEMV_FP8_HEAD", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_PTXSYNC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_QUANT_FP8_VLLM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2423,6 +2458,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_PACKET_HAS_XREDUCE2", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_MOE_ROUTER_GEMMA_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_GLU_PITCHED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_PACKET_HAS_ROW_COL_SCALE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_HAS_PACKED_PREFILL_TOPOLOGY", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_PACKET_LINEAR_BIAS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_QKV_DOT4", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2444,6 +2480,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_SM120_CUBIN_FP8KV", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SM120_CUBIN_SEG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SM120_SMS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_SM12X", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SM89_CUBIN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SM90A_CUBIN", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SM90_WGMMA_CUH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

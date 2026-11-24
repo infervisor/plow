@@ -59,6 +59,9 @@ pub enum Cmp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetAtom {
     Arch(&'static str),
+    /// Every arch of an ISA family (`hwspec::IsaLevel::family`, e.g. `sm12x`). Rendered for the
+    /// verifier as the `Or` of its `Arch` atoms.
+    Family(&'static str),
     Tp(u32),
     NCu(u32),
     Model(&'static str),
@@ -366,6 +369,9 @@ impl TargetAtom {
     pub fn eval(&self, t: &Target) -> bool {
         match *self {
             TargetAtom::Arch(s) => t.arch == s,
+            TargetAtom::Family(f) => {
+                hwspec::IsaLevel::from_arch_flag(&t.arch).is_some_and(|l| l.family() == Some(f))
+            }
             TargetAtom::Tp(n) => t.tp == n,
             TargetAtom::NCu(n) => t.n_cu == n,
             TargetAtom::Model(s) => t.model == s,
@@ -522,6 +528,14 @@ impl Formula {
             Formula::True => json!(["true"]),
             Formula::Atom(k, c, v) => json!(["atom", k, cmp(c), v.to_json()]),
             Formula::Target(TargetAtom::Arch(s)) => json!(["arch", s]),
+            Formula::Target(TargetAtom::Family(f)) => json!([
+                "or",
+                hwspec::IsaLevel::ALL
+                    .into_iter()
+                    .filter(|l| l.family() == Some(*f))
+                    .map(|l| json!(["arch", l.arch_flag()]))
+                    .collect::<Vec<_>>()
+            ]),
             Formula::Target(TargetAtom::Tp(n)) => json!(["tp", n]),
             Formula::Target(TargetAtom::NCu(n)) => json!(["n_cu", n]),
             Formula::Target(TargetAtom::Model(s)) => json!(["model", s]),

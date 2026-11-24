@@ -11,6 +11,7 @@ pub mod cost;
 pub mod dominance;
 pub mod dtype_cost;
 pub mod mma;
+pub mod op_floor;
 pub mod optile;
 pub mod roofline;
 pub mod sram;

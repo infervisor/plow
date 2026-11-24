@@ -52,7 +52,8 @@ SPEC_FIELDS = {
     "dtype": (True, "arithmetic as served, free text"),
     "classes": (True, "{class name: shape dict}; optional 'step': {'us', 'calls'} per class "
                       "(full step time and this block's calls in it) for the in-model verdict"),
-    "cost": (True, "cost(cls) -> {'bytes', 'flops', 'peak': bf16|fp8|tf32|fp32, 'passes'=1}"),
+    "cost": (True, "cost(cls) -> {'bytes', 'flops', 'peak': bf16|fp8|tf32|fp32|fp4 (fp4 needs "
+                   "the ceilings JSON's fp4_tflops), 'passes'=1}"),
     "inputs": (True, "inputs(cls, seed) -> {name: cuda tensor}"),
     "rotate": (True, "input names regenerated per cold set (the streamed operands)"),
     "out": (True, "out(cls) -> (shape, torch dtype name)"),

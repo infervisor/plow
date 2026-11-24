@@ -328,7 +328,11 @@ fn moe(nn: &mut Nn, cfg: &GlmConfig, layer: u32, p: &str, x: TensorId) -> Tensor
             cfg.hidden_size,
             cfg.moe_intermediate_size,
         );
-        routed_experts.push(RoutedExpertBinding { gate, up, down });
+        routed_experts.push(RoutedExpertBinding {
+            gate: Some(gate),
+            up,
+            down,
+        });
     }
     nn.expert_binding(ExpertLayerBinding {
         block: layer,
@@ -447,5 +451,7 @@ fn expert_projection(
     ExpertProjectionBinding {
         weight: weight.to_string(),
         scale: Some(scale),
+        scale_2: None,
+        input_scale: None,
     }
 }

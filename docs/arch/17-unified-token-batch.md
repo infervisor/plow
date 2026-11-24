@@ -1422,7 +1422,8 @@ Fixed (commits `eec6b69e6`, `2487263dd`):
    token). The arm now yields while a live request wants logprobs, unless the engine declares
    `token_batch_logprobs` (CPU does).
 6. **Verify spans on a recurrent chain** would commit a shortened frontier over a fully advanced
-   scan state; refused in the engine (`spec_enable` already refuses such packets).
+   scan state; refused in the token batch, which keeps no per-row snapshots (decode-rung verify
+   commits through `recurrent_state.verify`, docs/arch/29 §3).
 
 Measured, not bugs:
 

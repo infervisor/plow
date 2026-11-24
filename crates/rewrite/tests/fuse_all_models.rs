@@ -46,9 +46,16 @@ fn assert_expert_bindings_in_checkpoint(g: &nn_graph::Graph) {
     for layer in &g.expert_bindings {
         assert_eq!(layer.routed_experts.len(), layer.num_experts as usize);
         for expert in &layer.routed_experts {
-            for projection in [&expert.gate, &expert.up, &expert.down] {
+            for projection in expert.gate.iter().chain([&expert.up, &expert.down]) {
                 assert!(bound.insert(projection.weight.clone()));
-                if let Some(scale) = &projection.scale {
+                for scale in [
+                    &projection.scale,
+                    &projection.scale_2,
+                    &projection.input_scale,
+                ]
+                .into_iter()
+                .flatten()
+                {
                     assert!(bound.insert(scale.clone()));
                 }
             }
@@ -60,7 +67,10 @@ fn assert_expert_bindings_in_checkpoint(g: &nn_graph::Graph) {
     let checkpoint_experts = g
         .checkpoint_manifest()
         .into_iter()
-        .filter(|weight| weight.name.contains(".mlp.experts.") && !dag.contains(&*weight.name))
+        .filter(|weight| {
+            (weight.name.contains(".mlp.experts.") || weight.name.contains(".mixer.experts."))
+                && !dag.contains(&*weight.name)
+        })
         .map(|weight| weight.name.to_string())
         .collect();
     assert_eq!(bound, checkpoint_experts, "expert manifest is incomplete");
@@ -951,4 +961,122 @@ fn fuse_muse_spark() {
         "Muse Spark fusion dropped or duplicated weight leaves"
     );
     assert_expert_bindings_in_checkpoint(&g);
+}
+
+// --- Nemotron-H: Mamba-2 / NoPE GQA / latent relu² MoE, ModelOpt FP8 + NVFP4 ---
+
+/// Scaled nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 `llm_config`.
+const NEMOTRON_H: &str = r#"{
+    "model_type": "nemotron_h_omni",
+    "dtype": "bfloat16",
+    "vision_config": {"model_type": "radio"},
+    "quantization_config": {
+        "quant_method": "modelopt_mixed",
+        "quant_algo": "MIXED_PRECISION",
+        "kv_cache_scheme": {"dynamic": false, "num_bits": 8, "type": "float"},
+        "quantized_layers": {
+            "language_model.backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+            "language_model.backbone.layers.0.mixer.out_proj": {"quant_algo": "FP8"},
+            "language_model.backbone.layers.2.mixer.q_proj": {"quant_algo": "FP8"},
+            "language_model.backbone.layers.2.mixer.k_proj": {"quant_algo": "FP8"},
+            "language_model.backbone.layers.2.mixer.v_proj": {"quant_algo": "FP8"},
+            "language_model.backbone.layers.2.mixer.o_proj": {"quant_algo": "FP8"},
+            "language_model.backbone.layers.1.mixer.shared_experts.up_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.shared_experts.down_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.experts.0.up_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.experts.0.down_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.experts.1.up_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.experts.1.down_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.experts.2.up_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.experts.2.down_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.experts.3.up_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.backbone.layers.1.mixer.experts.3.down_proj": {"quant_algo": "NVFP4", "group_size": 16},
+            "language_model.lm_head": {"quant_algo": "FP8"}
+        }
+    },
+    "llm_config": {
+        "model_type": "nemotron_h",
+        "vocab_size": 256, "hidden_size": 128, "layer_norm_epsilon": 1e-5,
+        "layers_block_type": ["mamba", "moe", "attention", "moe"],
+        "tie_word_embeddings": false, "num_nextn_predict_layers": 1,
+        "mamba_num_heads": 8, "mamba_head_dim": 16, "ssm_state_size": 16,
+        "n_groups": 2, "conv_kernel": 4, "chunk_size": 16,
+        "mamba_hidden_act": "silu", "use_conv_bias": true, "use_bias": false,
+        "time_step_limit": [0.0, {"__float__": "Infinity"}],
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 32,
+        "attention_bias": false, "sliding_window": null,
+        "n_routed_experts": 4, "num_experts_per_tok": 2,
+        "moe_intermediate_size": 64, "moe_latent_size": 32,
+        "moe_shared_expert_intermediate_size": 128, "n_shared_experts": 1,
+        "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        "routed_scaling_factor": 5.0, "mlp_hidden_act": "relu2", "mlp_bias": false,
+        "dtype": "bfloat16"
+    }
+}"#;
+
+#[test]
+fn fuse_nemotron_h() {
+    let g = build_from_config_json(NEMOTRON_H).expect("build nemotron_h");
+    let (fused, stats) = rewrite::rewrite_graph(&g).expect("rewrite nemotron_h");
+
+    for op in ["FusedNormLinear", "FusedResidualNorm"] {
+        assert!(fused.contains(op), "{op} did not fire in Nemotron-H");
+    }
+    for op in [
+        "Mamba2Scan",
+        "Conv1dDepthwiseBias",
+        "MoeRouterNoAux",
+        "MoeExpertsRelu2",
+        "UnitRmsNorm",
+    ] {
+        assert!(fused.contains(op), "{op} missing from the Nemotron-H graph");
+    }
+    assert!(
+        stats.ops_after < stats.ops_before,
+        "fusion did not reduce Nemotron-H ops: {} -> {}",
+        stats.ops_before,
+        stats.ops_after
+    );
+    assert_eq!(
+        fused_weights(&fused),
+        graph_dag_weights(&g),
+        "Nemotron-H fusion dropped or duplicated weight leaves"
+    );
+    assert_expert_bindings_in_checkpoint(&g);
+
+    // Every declared tensor is a DAG leaf, a routed-expert binding, or a
+    // dense-linear quant scale.
+    let mut accounted = graph_dag_weights(&g);
+    for layer in &g.expert_bindings {
+        for e in &layer.routed_experts {
+            for p in [&e.up, &e.down] {
+                accounted.insert(p.weight.clone());
+                accounted.extend(
+                    [&p.scale, &p.scale_2, &p.input_scale]
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
+        }
+    }
+    for q in &g.quant_linear_bindings {
+        assert!(
+            accounted.contains(&q.weight),
+            "{} is not a DAG leaf",
+            q.weight
+        );
+        accounted.insert(q.weight_scale.clone());
+        accounted.extend(
+            [&q.weight_scale_2, &q.input_scale]
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+    }
+    assert_eq!(
+        accounted,
+        graph_weights(&g),
+        "unbound Nemotron-H checkpoint tensors"
+    );
 }

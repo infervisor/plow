@@ -431,6 +431,15 @@ Packet ABI: the `recurrent_state` section (`crates/plow-asset/src/recurrent_stat
 - `prefill_initstate`: an optional gathered init-state scratch for a packed prompt scan
   (`act.gdn.initstate`).
 - `prefill_updates_state`: true when every prefill program advances every buffer.
+- `step_seed` (optional): `active` is `i32[slots + 1]`; the last word is a fresh u32 the runtime
+  writes with the mask before every launch (SplitMix64 from a fixed start). Mamba-2 decode keys
+  its stochastic rounding of the fp16 state with it (Philox-4x32, per-layer key).
+- `verify` (optional): speculative-verify rollback. `depth` and one snapshot tensor per buffer
+  (`[slots][depth][slot_bytes]`, `state.` class, never zeroed). A span-verify decode launch over
+  `n <= depth + 1` rows of one slot writes each buffer's state after span row `j < n - 1` to
+  snapshot `[slot][j]` and the final state to the buffer; committing `c < n` rows copies
+  snapshot `[slot][c - 1]` back (`VerifyRollback::commit`). Without it plowrt refuses verify on
+  recurrent packets.
 
 Every `state.` class tensor must be one of the declared buffers; otherwise the packet is refused
 at load. The CUDA engine validates the manifest at load (`exec/gpu.rs` `RecurrentState`) and zeroes
@@ -577,6 +586,20 @@ KV / state class: recurrent buffers, not integrated with serving, the prefix cac
 store.
 
 Status: block-level experiment, sm_120.
+
+Packed prefill (chunked scan, ops 240-245): several requests share one prefill launch without a
+state gather. The packed-request table (`[n, {row0, len, slot, end}]`) is bound into the conv and
+the three chunk phases (`t7`), and each request's rows form their own 128-row chunks at the same
+offsets from its first row as in a launch of its own. No chunk crosses a request, so the
+per-request arithmetic and rounding points are those of the single-request launch. The conv
+reads and rewrites the request slot's history, the inter-chunk pass carries from and writes back
+that slot's SSM state, and pad rows after the last request are zero. The chunk scratch holds
+`T/128 + slots` chunks. A one-row request is a valid one-row chunk, but its state write would be
+the prefill's round-to-nearest, not the decode step's stochastic rounding, so decode rows do not
+ride a Mamba-2 packed launch. The launch's fixed cost (every expert's weights stream at any row
+count) dominates, so scheduling follows it: with more than one request waiting, each joins with
+its whole remainder instead of a lone launch's first rung, and with decoders live further packs
+run in the same tick while it stays within one widest launch's measured time, as serial chunks do.
 
 
 ## 4. Mixture of experts
@@ -741,6 +764,9 @@ Kernels and objects: interpreter `op_gemm_sm90.cuh` in `interp_sm90a.cubin`; fus
 `interp_sm90a_pfgemm_glu_w8a8_gemma4.cubin` (rows 4096-8192, N 15360, K 3840; globals checked by
 `crates/devgen/src/gemma4_w8a8_gemm_glu_role.rs`); cuBLASLt with the outer-vector scale mode (`crates/plowrt/src/device/cuda/lt.rs`,
 eligibility `segment_roles::cublaslt_prefill_fp8`, needs cuBLASLt >= 12.9 = `CUBLASLT_FP8_MIN`);
+on sm_12x, which has no vector-scale FP8 algorithm, the unit-scale route: `GemmFp8` `i5 = 1`
+(`FP8_UNIT_SCALE`, no scale operands) as one scalar-scale cuBLASLt matmul, then `RowColScale` (231,
+`out *= a_scale[m] * w_scale[n]` on the interpreter; eligibility `cublaslt_prefill_fp8_unit`);
 grouped MoE matmuls in cuBLASLt (`crates/devgen/src/dense_cublaslt.rs`, glue
 `runtime/nvidia/moe_lt_sm90.cu`, >= 13.4 = `CUBLASLT_GROUPED_MIN`). AMD gfx950 wide-K MFMA
 (`d_gemm_fp8_t`, `runtime/amd/op_gemm.h`).
@@ -858,6 +884,27 @@ Emitter: `crates/devgen/src/mtp.rs`.
 KV / state class: none of its own; reads the target's last sliding and last full caches.
 Status: CUDA (serve `PLOW_SPEC=1`, opt-in).
 
+### Chain drafter with its own attention layer (Qwen3.5 MTP)
+
+What it computes: the checkpoint's MTP layer drafts as a chain. Step `j` embeds `tokens[j]`
+(target table), joins it with the carried hidden (the target's final-norm row at step 0, then
+the previous step's `mtp.norm` output) through `fc(cat(norm_e(e), norm_h(h)))`, runs one
+full-attention decoder layer that stores its K/V in its own cache at position
+`committed - 1 + j`, and emits the greedy draft through the target head. Every prefill program
+fills that cache for the prompt rows (row `i` from `(h_i, embed(x_{i+1}))`).
+Examples: Qwen3.8-27B (`qwen3_5_mtp`, `mtp_num_hidden_layers = 1`).
+Packet ABI: `spec.json` chain drafter plus `step_position`/`step_kv_len` (per later step) and
+`own_kv` (the drafter cache, zeroed when the runtime loads the drafter); `fc` binds the two
+column blocks of `mtp.fc.weight` (`derived_weights.json` `cols`). The target's decode rungs
+verify with recurrent rollback (`recurrent_state.verify`, Recurrent state above).
+Kernels and objects: decode interpreter (row-slot twin); the GDN conv and step take span arms
+(`op_qwen_gdn.cuh` `_span`), the BF16 flash decode reads the row-slot map in `t6`.
+Emitter: `crates/devgen/src/qwen35_mtp.rs`, `qwen35.rs` (span operands, snapshots).
+KV / state class: the drafter cache `kv.mtp.{k,v}` is flat, outside live KV and the block store
+(a prefix hit leaves those rows stale: draft quality only); snapshots are `state.` buffers that
+the block store does not capture.
+Status: emitted (`PLOW_SPEC_KIND=qwen3_5_mtp`); GPU validation open.
+
 ### Block drafter (DSpark)
 
 What it computes: a drafter that keeps its own KV: for each committed row, K/V of its
@@ -890,6 +937,9 @@ Packet ABI: the packet's draft programs plus its decode rungs; no verify-specifi
 Kernels and objects: runtime-side (`crates/plowrt/src/serve/mux.rs`, `exec/gpu/spec_draft.rs`).
 KV / state class: rejected drafts' KV rows past the accepted length are overwritten by later
 writes (not verified beyond the mux code path).
+Recurrent packets verify only with declared rollback: `spec_verify` fills `in.active` per launch
+row (padding rows inactive) and `spec_commit` applies the snapshot copies before advancing the
+frontier; an uncommitted recurrent span leaves the engine refused.
 Status: CUDA; `PLOW_SPEC` opt-in, `PLOW_SPEC_SAMPLED` on, `PLOW_SPEC_SAMPLED_KMAX` 3.
 Deeper: docs/flags-reference.md (`PLOW_SPEC*` rows).
 
@@ -1007,6 +1057,7 @@ fastconformer RNNT, fish-s2.
 | MXFP4 dense projections (ops 91-93 family) | emitted-not-served (decode GEMV only) | same | served (Kimi-K3 recipe) | dispatch only (no recipe) |
 | FP8 KV cache | served | served (sm_89 recipes) | served | dispatch only (no recipe) |
 | Library GEMM routes (cuBLASLt / hipBLASLt) | served (segment roles) | served, no recipe (Lt is CUDA-generic) | served (`amd_gemm_lt.rs`) | n/a |
+| Unit-scale FP8 projections + `RowColScale` (op 231) | n/a (vector scales) | served (GB10 trial recipe) | missing | missing |
 | N-concatenated projections (derived weights, contract 4) | served (block-FP8 Lt, trial recipe) | missing (no FP8 block Lt emit) | missing (refused at load) | missing |
 | MTP chain drafter + verify | served (`exec/gpu/spec*.rs`) | served, no recipe | missing | missing |
 | DSpark block drafter | emitted-not-served (refused) | emitted-not-served | missing | missing |
@@ -1017,6 +1068,8 @@ fastconformer RNNT, fish-s2.
 ### What each missing cell needs
 
 - **N-concatenated projections on gfx942**: the HSA loader needs the `derived_weights.json` assembly (`Checkpoint::concatenated`), `GluPitched` and the two pitched sources in `runtime/amd/interp.hip` (`d_qwen_q_gate_split` / `d_qwen_headnorm_rope` addressing), and the hipBLASLt route over the concatenated shape; until then `asset::serve::refuse_concat_features` rejects such a packet.
+
+- **Unit-scale FP8 projections on gfx942 / CPU**: a `RowColScale` arm (`runtime/amd/interp.hip`, the CPU op table) and the hipBLASLt scalar-scale FP8 matmul; gfx942 has no FP8 recipe today, so nothing emits it there.
 
 - **KV-shared tail on gfx942**: needs a port of the runtime gather (`crates/plowrt/src/exec/gpu/shared_tail.rs` `shared_tail_enqueue`/`shared_tail_rows`) into `exec/amd.rs`, reading the same `kv_shared_tail` section (`crates/plow-asset/src/kv_shared_tail.rs`). No new device op: it reuses the flash ops over the source layer's cache.
 - **KV-shared tail on CPU**: the same gather in `serve/cpu_serve.rs`'s prefill path. Not verified whether any CPU emit carries the section.
@@ -1117,7 +1170,9 @@ fastconformer RNNT, fish-s2.
 - **FP8 KV on CPU**: `FLASH_*_FP8` tables exist; needs a CPU FP8-KV recipe and gate.
 - **MTP + verify on AMD/CPU**: the speculative serve path is `exec/gpu/spec.rs`, `spec_serve.rs`,
   `spec_draft.rs` only; AMD needs a draft-program launch, verify rows in the packed launch and
-  KV rollback in `exec/amd.rs`; CPU the same in `exec/cpu/engine.rs`.
+  KV rollback in `exec/amd.rs`; CPU the same in `exec/cpu/engine.rs`. Recurrent rollback
+  (`recurrent_state.verify`) additionally needs the span arms in `runtime/amd/op_qwen_gdn.h` and
+  the snapshot commit in the AMD engine.
 - **DSpark on every backend**: `spec_serve.rs:65` rejects block drafters; needs the block-draft
   verify loop and the drafter-context tail consumer (`spec.context.json`) in the serve path.
 - **Multimodal on AMD/CPU**: ops 206-210 arms (`RMSNORM_F32`, `ROPE_AXIAL_F32`, `CHUNK_ATTENTION_F32`,

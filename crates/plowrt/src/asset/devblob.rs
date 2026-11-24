@@ -1606,7 +1606,11 @@ impl DevProg {
         const BF16_OPS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed];
         // Compiled out of the lean GEMM object (interp_sm120.cu `!PLOW_NV_SEG_GEMM`): a segment
         // carrying the native grouped-MoE prefill must run on the fat object, or it traps.
-        const LEAN_GEMM_EXCLUDED: [DevOp; 7] = [
+        // The NVFP4 MoE prefill GEMMs (~168 registers) spill under the lean object's 128-register
+        // cap and its 67.6 KB W4A4 ring rules out its second block per SM anyway.
+        const LEAN_GEMM_EXCLUDED: [DevOp; 9] = [
+            DevOp::MoeUpNvfp4Pf,
+            DevOp::MoeDownNvfp4Pf,
             DevOp::MoeRouterGemmaPf,
             DevOp::MoeAlignGemmaPf,
             DevOp::MoeGroupGluGemmaPf,

@@ -280,6 +280,9 @@ nix develop --command <script> <args>
 ```
 
 `ROCM_PATH` being unset is the signal you are outside it; every tool below refuses in that case.
+On a CUDA-only platform (aarch64 DGX Spark / GB10: the flake carries no ROCm there) the shell sets
+`PLOW_NIX_GPU=cuda` instead, and `gpuq.py` and `plowbench.sh` accept either marker. Never set it by
+hand outside the shell.
 
 **What does NOT come from nix**, and must be pointed at explicitly:
 
