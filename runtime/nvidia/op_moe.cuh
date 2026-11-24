@@ -5031,14 +5031,28 @@ static __device__ void d_nvfp4_grouped_down_hopper(
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const unsigned warps = blockDim.x >> 5;
     WarpTiles& stage = tiles[warp];
-    const unsigned work_items = E * ((H + N - 1u) / N);
-    for (unsigned work = slice * warps + warp; work < work_items; work += nblk * warps) {
-        const unsigned expert = work % E;
-        const unsigned col0 = work / E * N;
+    constexpr unsigned ROUTING_TILE = 64;
+    const int* tile_prefix = meta + 2u * E;
+    const unsigned routing_tiles = tile_prefix[E];
+    if (routing_tiles == 0 || routing_tiles > aligned_rows / ROUTING_TILE) return;
+    const size_t work_items = (size_t)routing_tiles * ((H + N - 1u) / N);
+    for (size_t work = slice * warps + warp; work < work_items; work += nblk * warps) {
+        const unsigned tile = work % routing_tiles;
+        const unsigned col0 = work / routing_tiles * N;
+        unsigned lo = 0, hi = E;
+        while (hi - lo > 1) {
+            const unsigned mid = lo + (hi - lo) / 2;
+            if ((unsigned)tile_prefix[mid] <= tile) lo = mid;
+            else hi = mid;
+        }
+        const unsigned expert = lo;
         const unsigned begin = meta[expert], count = meta[E + expert];
-        if (count == 0 || begin >= aligned_rows || count > aligned_rows - begin) continue;
+        const unsigned expert_tile = tile_prefix[expert];
+        if (begin >= aligned_rows || count > aligned_rows - begin || expert_tile > tile) continue;
+        const unsigned first = (tile - expert_tile) * ROUTING_TILE;
+        const unsigned end = min(first + ROUTING_TILE, count);
         const float outer = amax[expert] / *denominator;
-        for (unsigned row0 = 0; row0 < count; row0 += M) {
+        for (unsigned row0 = first; row0 < end; row0 += M) {
             wmma::fragment<wmma::accumulator, M, N, K, float> acc;
             wmma::fill_fragment(acc, 0.0f);
             for (unsigned k0 = 0; k0 < I; k0 += K) {
