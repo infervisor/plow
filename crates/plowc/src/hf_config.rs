@@ -307,8 +307,10 @@ fn parse_weight_dtype(v: &Value) -> nn_graph::DType {
             "fp8" => return nn_graph::DType::F8E4M3,
             // OCP MX microscaling FP4 (e2m1 + one E8M0 scale per 32). Transformers
             // spells the gpt-oss / MX-quantized checkpoints `quant_method: "mxfp4"`.
-            // ModelOpt NVFP4 is also FP4 weight dtype.
-            "modelopt" | "mxfp4" | "fp4" => return nn_graph::DType::F4,
+            "mxfp4" | "fp4" => return nn_graph::DType::F4,
+            "modelopt" if v["quantization_config"]["quant_algo"].as_str() == Some("NVFP4") => {
+                return nn_graph::DType::F4;
+            }
             _ => {}
         }
     }

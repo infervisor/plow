@@ -30,6 +30,7 @@ pub(crate) struct InklingCfg {
     pub n_exp: u32,
     pub top_k: u32,
     pub vocab: u32,
+    pub logit_softcap: f32,
     pub window: u32,
     pub swiglu_alpha: f32,
     pub swiglu_limit: f32,
@@ -110,6 +111,7 @@ fn cfg_inkling(v: &Value) -> InklingCfg {
         n_exp,
         top_k,
         vocab,
+        logit_softcap: t["final_logit_softcapping"].as_f64().unwrap_or(0.0) as f32,
         window,
         swiglu_alpha,
         swiglu_limit,
@@ -696,15 +698,24 @@ fn phase_range(
     let head = format!("{}unembed.weight", c.prefix);
     let lm = em.w(&head, c.vocab as u64 * h as u64 * BF16);
     let (vocab, all) = (c.vocab, em.b.all());
+    let logit_rows = if prefill { 1 } else { t };
     dep = em.b.emit(DevOp::Gemv, all, &[dep], |d| {
         d.t[0] = logits;
         d.t[1] = hn;
         d.t[2] = lm;
-        d.i[0] = if prefill { 1 } else { t };
+        d.i[0] = logit_rows;
         d.i[1] = vocab;
         d.i[2] = h;
         d.i[4] = if prefill { t - 1 } else { 0 };
     });
+    if c.logit_softcap > 0.0 {
+        dep = em.b.emit(DevOp::SoftCap, em.b.all(), &[dep], |d| {
+            d.t[0] = logits;
+            d.t[1] = logits;
+            d.i[0] = logit_rows * vocab;
+            d.f[0] = c.logit_softcap;
+        });
+    }
     let nb = if !prefill && (t > 1 || ladder) { t } else { 0 };
     dep = em
         .b
