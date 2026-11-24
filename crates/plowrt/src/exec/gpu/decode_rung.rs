@@ -522,9 +522,11 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
             continue;
         }
         let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
+        let relative = !fp8 && d.fj[2] == packet::dev::FLASH_DECODE_RELATIVE;
         if !matches!(d.i[6], 64 | 128 | 256 | 512)
             || (fp8 && d.i[6] == 64)
-            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) && !hnr_fold(d))
+            || (!fp8 && d.t[6] != TENSOR_NONE16)
+            || (!fp8 && d.t[7] != TENSOR_NONE16 && !relative && !hnr_fold(d))
         {
             if crate::config::RuntimeConfig::get().nv.ladder_debug {
                 eprintln!("ladder: unsupported FlashDecode geometry or bound slot/fold operands");
