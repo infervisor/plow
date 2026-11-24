@@ -1,8 +1,13 @@
 # Inkling-2-Mini Bringup & Serving Concurrency Comparison (1x NVIDIA H100 SXM5 80GB)
 
-This document records the bringup, architecture verification, and production serving benchmark of `/opt/dlami/nvme/models/Inkling-2-Mini` (model type `inkling2_loop`) on an NVIDIA H100 80GB SXM5 (`sm_90a`), comparing Infervisor (`plowrt`) against vLLM 0.28.0.
+> **Historical backup.** These measurements predate the current qualification.
+> The recovered emitter omits attention and recurrent operations used by the
+> reference model. The local checkpoint routes eight experts per token.
+> This report and its CSV cannot establish output equivalence or production readiness.
 
-All matched metrics are archived in [comparison.csv](file:///home/lava/plow/docs/bringup/results/inkling-2-mini/comparison.csv).
+This document records the bringup, architecture verification, and production serving benchmark of `Inkling-2-Mini` (model type `inkling2_loop`) on an NVIDIA H100 80GB SXM5 (`sm_90a`), comparing Infervisor (`plowrt`) against vLLM 0.28.0.
+
+All matched metrics are archived in [comparison.csv](comparison.csv).
 
 ## Executive Summary
 
@@ -171,7 +176,7 @@ Scaling from $B=1$ to $B=16$ delivers a **+126.1% aggregate throughput gain** ($
 
 ## Formal Verification (Lean 4)
 
-Formal machine-checked proofs were added to [lean-plow/Plow/MoePerf.lean](file:///home/lava/plow/lean-plow/Plow/MoePerf.lean) to verify memory isolation, bounding, scale index validity, and LUT optimization bounds for Inkling's hybrid MoE and recurrent loop layout:
+Formal machine-checked proofs were added to [lean-plow/Plow/MoePerf.lean](../../../../lean-plow/Plow/MoePerf.lean) to verify memory isolation, bounding, scale index validity, and LUT optimization bounds for Inkling's hybrid MoE and recurrent loop layout:
 
 - **§D9: NVFP4 Block-16 Layout and Scale Index Safety**
   - `nvfp4_weight_offset_in_bounds`: Proves that for all valid expert IDs ($e < 128$) and parameter coordinates, byte offsets never exceed the expert's allocated weight buffer.
@@ -191,4 +196,4 @@ Formal machine-checked proofs were added to [lean-plow/Plow/MoePerf.lean](file:/
 
 Verification status:
 - `lake build plow_verify`: **PASS (0 errors)**.
-- `cargo test -p lean_verify`: **PASS (100% tests passing)**, with updated verifier hashes registered in [lean-plow/approved-verifiers.json](file:///home/lava/plow/lean-plow/approved-verifiers.json) and [crates/plow-asset/approved-verifiers.json](file:///home/lava/plow/crates/plow-asset/approved-verifiers.json).
+- `cargo test -p lean_verify`: **PASS (100% tests passing)**, with updated verifier hashes registered in [lean-plow/approved-verifiers.json](../../../../lean-plow/approved-verifiers.json) and [crates/plow-asset/approved-verifiers.json](../../../../crates/plow-asset/approved-verifiers.json).
