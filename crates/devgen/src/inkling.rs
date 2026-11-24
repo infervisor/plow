@@ -1182,20 +1182,18 @@ pub(super) fn run(
         gen,
     };
 
+    let block_only_omissions: &[&str] = if block.is_some() {
+        &[".attn_sconv.", ".mlp_sconv.", "attn_res.", "controllers.",
+            "middle_cycle_cross_pass_", "k_input_norm.", "v_input_norm."]
+    } else {
+        &[]
+    };
     validate_coverage(
         dir,
         &c.prefix,
         &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
         block.map(|_| layers.clone()),
-        &[
-            ".attn_sconv.",
-            ".mlp_sconv.",
-            "attn_res.",
-            "controllers.",
-            "middle_cycle_cross_pass_",
-            "k_input_norm.",
-            "v_input_norm.",
-        ],
+        block_only_omissions,
         &[],
         &[],
     )
