@@ -1,0 +1,61 @@
+# Inkling-2-Mini NVFP4 weights + MXFP8 hybrid MoE, BF16 KV, 16384 context, one H100 SXM5.
+# Production recipe for this model/GPU/precision.
+#
+# Checkpoint: thinkingmachines/Inkling-2-Mini @ ed40e7da625f594fc9c4990f5f66be24873c22d7.
+# 24 physical layers (layers 6..17 executed in 3 recurrent loop passes -> 48 effective layer applications).
+# Hybrid MoE: layers 0..19 are NVFP4 block-16 (E2M1, FP8 scale), layers 20..23 are MXFP8 block-32 (E4M3, E8M0 scale).
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "inkling-2-mini"
+label = "sm90a-h100-tp1-nvfp4"
+status = "emits"
+plow_git = "e301beaab35cb77552a0cb847e5f38d4d07cf54b"
+network = "inkling2_loop"
+
+[target]
+vendor = "nvidia"
+isa = "sm_90a"
+sku = "H100 SXM5"
+units = 132
+num_gpus = 1
+parallel = "tp"
+max_ctx = 16384
+toolchain = "cuda-12.9"
+
+[checkpoint]
+source = "hf:thinkingmachines/Inkling-2-Mini"
+revision = "ed40e7da625f594fc9c4990f5f66be24873c22d7"
+layout = "hf"
+
+[cell]
+name = "inkling-2-mini.h100.nvfp4"
+model = "thinkingmachines/Inkling-2-Mini"
+revision = "ed40e7da625f594fc9c4990f5f66be24873c22d7"
+hf_dir = "{env:INKLING_CHECKPOINT}"
+gpu = "H100 SXM5"
+arch = "sm_90a"
+n_cu = 132
+max_ctx = 16384
+precision = "nvfp4"
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "inkling-2-mini"]
+[emit.env]
+PLOW_UNISEG = "0"
+
+[serve.env]
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 8192"
+concs = "1 8 16"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:INKLING_CHECKPOINT}"
+model_id = "inkling-2-mini"
+gate_prompt = "The capital of France is"
