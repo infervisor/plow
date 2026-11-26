@@ -15,7 +15,7 @@ schema = "plow.recipe.v1"
 namespace = "infervisor"
 name = "maya2-native"
 label = "sm90a-h100-tp1"
-plow_git = "d5c89b2f63e380343d0ff47ce14080b92fc1e9d9"
+plow_git = "57c178acb0c90ebc4b8fc7b7b1e683d9411b1ce9"
 network = "qwen3"
 doc = "docs/runtime/tts.md"
 
@@ -85,10 +85,6 @@ PLOW_EMIT_PACKED_PREFILL_SMALL_HD = "1"
 PLOW_NV_DENSE_TUNE = "1"
 PLOW_NV_FA_FOLD = "1"
 PLOW_EMIT_PREFILL_CUBLASLT = "1"
-PLOW_EMIT_SNAC_SPLIT_BF16 = "1"
-PLOW_EMIT_CODEC_CONV_OBJECT = "20"
-PLOW_DEPTH_ROWS = "6,12,20,24,36"
-
 [capabilities]
 masked_padding = "structural: request chunk limits (masked padding) are Gemma 4 only (crates/devgen/src/lib.rs:9382), and the packed contract needs the plow_pf_masked_padding_abi object capability (crates/plow-asset/src/packed_prefill.rs:87), which only the hd256/hd512 attention and Gemma 4 GLU objects declare; Maya2 is hd128 GQA2 on interp_sm90a*. Unmasked pad rows fit: prompts < 512 rows, max_ctx 2048"
 generated_kernels = "structural: no generated role for hd128 GQA2 attention (16 q / 8 kv heads); the sm_90a catalog tuning/nvidia/sm_90a/h100-sxm5/gen_kernels.json has hd256/hd512 entries only, matched on head width (crates/devgen/src/gen_kernels.rs:406,414)"
@@ -105,5 +101,5 @@ arms = ["--conc 1 --stream --wav --n 16 --prompt-set chatterbox", "--conc 8 --st
 cer_median_max = 0.05
 
 [serve]
-extra_args = "--decode-pipeline --max-hold-ms 0"
-env = { PLOW_VMM_LIVE = "1", PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1", PLOW_MAX_HOLD_MS = "0", PLOW_TTS_REALTIME = "0", PLOW_TTS_DEVICE_CONTROL = "1", PLOW_TTS_STREAM_FIRST_FRAMES = "1", PLOW_TTS_STREAM_STEP_FRAMES = "1", PLOW_PF_SEG_GRAPH = "0", PLOW_PF_INTERLEAVE = "128", PLOW_TICK_DELIVERY = "1", PLOW_TTS_CODEC_SCHED = "1", PLOW_MAX_QUEUED_REQUESTS = "4096" }
+extra_args = "--decode-pipeline"
+env = { PLOW_VMM_LIVE = "1", PLOW_VMM_PREFIX = "1", PLOW_LT_RUNG_ALGOS = "true", PLOW_DECODE_PIPELINE = "1", PLOW_TTS_REALTIME = "0", PLOW_PF_SEG_GRAPH = "0", PLOW_PF_INTERLEAVE = "0" }

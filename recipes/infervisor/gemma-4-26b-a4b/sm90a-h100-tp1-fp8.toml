@@ -124,9 +124,6 @@ PLOW_PF_ADMIT_OVERLAP = "1"
 PLOW_PF_ITL_FORCE = "0"
 PLOW_VMM_STRICT_PUBLISH = "1"
 PLOW_KV_POOL_MIB = "2048"
-PLOW_MAX_QUEUED_REQUESTS = "4096"
-PLOW_DECODE_CUBLASLT_MIN_ROWS = "64"
-PLOW_SPEC_RIDE = "2"
 
 # Speculative decoding drafter (Gemma-4 assistant MTP, 4 layers over target layers 28/29 KV).
 [spec]
