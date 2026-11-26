@@ -1520,6 +1520,37 @@ static __device__ void d_glu_pitched(__nv_bfloat16* __restrict__ out, const __nv
 }
 #endif /* GLU_PITCHED_ARMS */
 
+/* Op 231: the outer scaling of an unscaled GEMM_FP8 output (the cuBLASLt unit-scale route),
+ * out[m*N + n] = bf16(f32(x[m*N + n]) * row[m] * col[n]) in the native epilogue's order.
+ * Packet-gated like GluPitched. */
+#ifndef ROW_COL_SCALE_ARMS
+#if defined(PLOW_PACKET_HAS_ROW_COL_SCALE) && !PLOW_PACKET_HAS_ROW_COL_SCALE
+#define ROW_COL_SCALE_ARMS 0
+#else
+#define ROW_COL_SCALE_ARMS 1
+#endif
+#endif
+#if ROW_COL_SCALE_ARMS
+static __device__ void d_row_col_scale(__nv_bfloat16* out, const __nv_bfloat16* x,
+                                       const float* __restrict__ row, const float* __restrict__ col,
+                                       unsigned m, unsigned n, unsigned slice, unsigned nblk) {
+    if (n & 7u) __trap();
+    const unsigned n8 = n >> 3, total = m * n8, step = nblk * PLOW_NV_THREADS;
+    for (unsigned v = slice * PLOW_NV_THREADS + threadIdx.x; v < total; v += step) {
+        const unsigned r = v / n8, c = (v - r * n8) * 8;
+        const bf16v8 in = ld_glob8(x + (size_t)v * 8);
+        const float4 c0 = *reinterpret_cast<const float4*>(col + c);
+        const float4 c1 = *reinterpret_cast<const float4*>(col + c + 4);
+        const float cs[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+        const float rs = row[r];
+        bf16v8 o;
+#pragma unroll
+        for (int j = 0; j < 8; j++) o.x[j] = __float2bfloat16(__bfloat162float(in.x[j]) * rs * cs[j]);
+        st_glob8(out + (size_t)v * 8, o);
+    }
+}
+#endif /* ROW_COL_SCALE_ARMS */
+
 /* Greedy argmax, per-block partial. See amax_pack() in sm120_common.cuh for the packed-key
  * contract — it is reproduced BIT-EXACTLY from AMD, so ties break identically.
  * `part` needs no zeroing: every block writes its own slot unconditionally.

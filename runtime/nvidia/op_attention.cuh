@@ -832,6 +832,23 @@ __device__ __noinline__ void fa_fold_tail(__nv_bfloat16* __restrict__ out,
 #if PLOW_NV_KV_ILV && (PLOW_NV_FA_RGT || PLOW_NV_FA_RGM)
 #error "PLOW_NV_KV_ILV: the RGT / RGM bulk copies assume head-major rows"
 #endif
+/* PLOW_NV_KV_E4M3 (manifest `kv_e4m3`): every cache holds E4M3 bytes at unit scale (vLLM's
+ * default k/v scale), head-major. Only the GQA-16 mma item reads them (fa_decode_mma16,
+ * PLOW_NV_FA_GF 16); every other decode body traps. */
+#ifndef PLOW_NV_KV_E4M3
+#define PLOW_NV_KV_E4M3 0
+#endif
+/* fa_decode_mma16 (bitwise equal in every mode): 1 = next key block loaded into registers under the
+ * current one, 2 = next block requested into L2 (no registers held), both with the rescale skipped
+ * at c = 1; 0 = the plain loop (A/B control). Full model, GB10, ms 0 / 1 / 2: plain B=1 1K 47.37 /
+ * 48.65 / 47.43 (1's 32 registers spill elsewhere in the interpreter: LDL 600 -> 887), spec mtp k=3
+ * B=8 32K tick 188.8 / 189.1 / 187.3. */
+#ifndef PLOW_NV_FA16_PIPE
+#define PLOW_NV_FA16_PIPE 2
+#endif
+#if PLOW_NV_KV_E4M3 && (PLOW_NV_FA_RGT || PLOW_NV_FA_RGM || PLOW_NV_KV_ILV || PLOW_NV_HNR_FOLD)
+#error "PLOW_NV_KV_E4M3: the bulk-copy rings, KV interleave and the HeadNormRope fold move bf16 rows"
+#endif
 #ifndef PLOW_NV_HNR_FOLD
 #define PLOW_NV_HNR_FOLD 0
 #endif
@@ -1273,7 +1290,7 @@ __device__ __forceinline__ void fa_decode_rg8_item(
  * Needs nsplit 1, no window, no ring wrap, and a merge-folded output. Block = FA_ST_THREADS. */
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 #ifndef PLOW_NV_FA_ST_STAGES
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+#if PLOW_SM12X
 #define PLOW_NV_FA_ST_STAGES 2 /* 4 stages at hd 128 = 140 KiB > GB202's 99 KiB opt-in */
 #else
 #define PLOW_NV_FA_ST_STAGES 4
@@ -2400,6 +2417,7 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
     static_assert(!RG || PLOW_NV_WARPS * (32u / (D / (8u * (D > 256 ? D / 256 : 1)))) * (D + 2u) <=
                              (unsigned)FA_DEC_SMEM_FLOATS(D, GF),
                   "row-group fold scratch exceeds the flash-decode arena claim for this (D, GF)");
+    if (PLOW_NV_KV_E4M3) __trap(); /* E4M3 KV: the GQA-16 item only */
     if constexpr (!RG) {
         if (out) __trap(); /* a merge-folded packet needs the row-group body */
         if constexpr (NRF) __trap();
@@ -3207,6 +3225,257 @@ __device__ __forceinline__ void d_flash_decode_body(float* __restrict__ Opart, f
     }
 }
 
+/* hd128 GQA-16 decode on mma.sync over E4M3 KV (PLOW_NV_FA_GF 16 objects, PLOW_NV_KV_E4M3): an
+ * item is (b, kv head, split) and its 16 query heads are the m16 rows, so every KV byte is read
+ * once per item. Each warp walks 16-key blocks of the split (block w, w + 8, ...) with its own
+ * online softmax; the 8 warp states fold through smem into the split's partial (FlashMerge
+ * contract, log2 domain). QK^T: the head dim is permuted identically in Q and K (lane t4 owns
+ * dims [32 t4, 32 t4 + 32): k step kf = dims 32 t4 + 4 kf + {0, 1} / {2, 3}), so a lane reads 32
+ * contiguous K bytes per key. P.V: n tile j column n is dim 16 n + j, so a lane reads 16
+ * contiguous V bytes of each of its 4 keys. K / V dequantize exactly to bf16 (vLLM XQA's bf16
+ * MMA on unit-scale e4m3), P rounds to bf16, f32 accumulation. `kvs` (FlashDecode t7, drafter
+ * caches): per-tensor {k_scale, v_scale} as XQA's bmm1 / bmm2 scales, k_scale on the logit scale
+ * and v_scale on the partial output. */
+__device__ __forceinline__ unsigned fa_e4m3x2_to_bf16x2(unsigned two) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(two & 0xffffu), __NV_E4M3);
+    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+    const __nv_bfloat162 r = __floats2bfloat162_rn(f.x, f.y);
+    return *reinterpret_cast<const unsigned*>(&r);
+}
+__device__ __forceinline__ void fa_m16_mma(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ unsigned fa_u4w(const uint4& v, int i) {
+    return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+template <bool SLOTMAP>
+__device__ void fa_decode_mma16(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                const __nv_bfloat16* __restrict__ Q, const unsigned char* __restrict__ K,
+                                const unsigned char* __restrict__ V, const int* __restrict__ kv_len,
+                                unsigned n_batch, unsigned n_head, unsigned n_kv_head, unsigned kv_stride,
+                                float scale, unsigned nsplit, unsigned kv_mask, unsigned slice,
+                                unsigned nblk, float* lds, const int* __restrict__ decode_slot,
+                                const float* __restrict__ kvs) {
+    constexpr unsigned D = 128, G = 16;
+    if (n_head != n_kv_head * G) { __trap(); return; }
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const unsigned g = lane >> 2, t4 = lane & 3u;
+    const float vs = kvs ? kvs[1] : 1.f;
+    const float ls = FA_SCALE(kvs ? scale * kvs[0] : scale);
+    /* Fold scratch [16][FS]: (head h, dim d) at h * FS + d + d / 32, so the fold's lanes (h = g,
+     * d = 32 t4 + j) hit banks 4 g + t4 + j, all distinct. */
+    constexpr unsigned FS = D + 4;
+    float* go = lds;           /* [16][FS] */
+    float* gm = lds + G * FS;  /* [16] */
+    float* gl = gm + G;        /* [16] */
+    const unsigned n_work = n_batch * n_kv_head * nsplit;
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned sp = w % nsplit, hkv = (w / nsplit) % n_kv_head, b = w / (nsplit * n_kv_head);
+        unsigned slot = b;
+        if constexpr (SLOTMAP) {
+            const int physical = decode_slot[b];
+            if (physical < 0) __trap();
+            slot = (unsigned)physical;
+        }
+#if PLOW_NV_ROW_SLOT
+        else if (decode_slot) {
+            slot = (unsigned)decode_slot[b] & 0x7FFFFFFFu;
+        }
+#endif
+        const unsigned len = (unsigned)kv_len[b];
+        const unsigned per = (len + nsplit - 1) / nsplit;
+        const unsigned lo = sp * per, hi = lo + per < len ? lo + per : len;
+        const unsigned h0 = hkv * G;
+        const size_t base = ((size_t)slot * n_kv_head + hkv) * (size_t)kv_stride * D;
+        const unsigned char* kb = K + base;
+        const unsigned char* vb = V + base;
+        unsigned qa[8][4];
+        {
+            const uint4* qr = reinterpret_cast<const uint4*>(Q + ((size_t)b * n_head + h0 + g) * D + 32u * t4);
+            const uint4* qr8 = reinterpret_cast<const uint4*>(Q + ((size_t)b * n_head + h0 + g + 8u) * D + 32u * t4);
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const uint4 x = qr[c], y = qr8[c];
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    qa[2 * c + e][0] = fa_u4w(x, 2 * e);
+                    qa[2 * c + e][1] = fa_u4w(y, 2 * e);
+                    qa[2 * c + e][2] = fa_u4w(x, 2 * e + 1);
+                    qa[2 * c + e][3] = fa_u4w(y, 2 * e + 1);
+                }
+            }
+        }
+        float o[16][4];
+#pragma unroll
+        for (int j = 0; j < 16; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
+        float m0 = FA_NEG_INF, m1 = FA_NEG_INF, l0 = 0.f, l1 = 0.f;
+        auto ld_kv = [&](unsigned k0, uint4 (&kr)[2][2], uint4 (&vr)[4]) {
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const unsigned key = min(k0 + 8u * i + g, hi - 1u);
+                const uint4* p = reinterpret_cast<const uint4*>(kb + (size_t)(key & kv_mask) * D + 32u * t4);
+                kr[i][0] = __ldcs(p);
+                kr[i][1] = __ldcs(p + 1);
+            }
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const unsigned key = min(k0 + 2u * t4 + (q & 1) + 8u * (q >> 1), hi - 1u);
+                vr[q] = __ldcs(reinterpret_cast<const uint4*>(vb + (size_t)(key & kv_mask) * D + 16u * g));
+            }
+        };
+#if PLOW_NV_FA16_PIPE == 1
+        /* The warp's next 16-key block is loaded before this one is consumed: one DRAM round trip
+         * per block hides behind the previous block's MMAs instead of preceding them. */
+        uint4 nk[2][2], nv[4];
+        if (lo + 16u * warp < hi) ld_kv(lo + 16u * warp, nk, nv);
+#endif
+        for (unsigned k0 = lo + 16u * warp; k0 < hi; k0 += 16u * PLOW_NV_WARPS) {
+            uint4 kr[2][2], vr[4];
+#if PLOW_NV_FA16_PIPE == 1
+#pragma unroll
+            for (int i = 0; i < 2; i++) kr[i][0] = nk[i][0], kr[i][1] = nk[i][1];
+#pragma unroll
+            for (int q = 0; q < 4; q++) vr[q] = nv[q];
+            if (k0 + 16u * PLOW_NV_WARPS < hi) ld_kv(k0 + 16u * PLOW_NV_WARPS, nk, nv);
+#else
+#if PLOW_NV_FA16_PIPE == 2
+            /* The next block's 16 K rows and 16 V rows (one line each) requested into L2, no
+             * registers held: lane l < 16 takes K row l, lane l >= 16 V row l - 16. */
+            if (k0 + 16u * PLOW_NV_WARPS < hi) {
+                const unsigned lane = threadIdx.x & 31u;
+                const unsigned key = min(k0 + 16u * PLOW_NV_WARPS + (lane & 15u), hi - 1u);
+                const unsigned char* p = (lane < 16u ? kb : vb) + (size_t)(key & kv_mask) * D;
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+            }
+#endif
+            ld_kv(k0, kr, vr);
+#endif
+            float s[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.f;
+#pragma unroll
+                for (int kf = 0; kf < 8; kf++) {
+                    const unsigned wd = fa_u4w(kr[i][kf >> 2], kf & 3);
+                    fa_m16_mma(s[i], qa[kf], fa_e4m3x2_to_bf16x2(wd), fa_e4m3x2_to_bf16x2(wd >> 16));
+                }
+                const unsigned key = k0 + 8u * i + 2u * t4;
+                if (key >= hi) s[i][0] = s[i][2] = -INFINITY;
+                if (key + 1u >= hi) s[i][1] = s[i][3] = -INFINITY;
+            }
+            float x0 = fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1]));
+            float x1 = fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3]));
+            x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 1));
+            x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 2));
+            x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 1));
+            x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 2));
+            /* key k0 < hi is live, so x is finite */
+            const float n0 = fmaxf(m0, x0 * ls), n1 = fmaxf(m1, x1 * ls);
+            const float c0 = FA_EXP(m0 - n0), c1 = FA_EXP(m1 - n1);
+            m0 = n0;
+            m1 = n1;
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                s[i][0] = FA_EXP(fmaf(s[i][0], ls, -n0));
+                s[i][1] = FA_EXP(fmaf(s[i][1], ls, -n0));
+                s[i][2] = FA_EXP(fmaf(s[i][2], ls, -n1));
+                s[i][3] = FA_EXP(fmaf(s[i][3], ls, -n1));
+            }
+            l0 = l0 * c0 + (s[0][0] + s[0][1] + s[1][0] + s[1][1]);
+            l1 = l1 * c1 + (s[0][2] + s[0][3] + s[1][2] + s[1][3]);
+            unsigned pa[4];
+            {
+                __nv_bfloat162 t;
+                t = __floats2bfloat162_rn(s[0][0], s[0][1]);
+                pa[0] = *reinterpret_cast<unsigned*>(&t);
+                t = __floats2bfloat162_rn(s[0][2], s[0][3]);
+                pa[1] = *reinterpret_cast<unsigned*>(&t);
+                t = __floats2bfloat162_rn(s[1][0], s[1][1]);
+                pa[2] = *reinterpret_cast<unsigned*>(&t);
+                t = __floats2bfloat162_rn(s[1][2], s[1][3]);
+                pa[3] = *reinterpret_cast<unsigned*>(&t);
+            }
+#if PLOW_NV_FA16_PIPE
+            /* Once the running max settles, c0 = c1 = 1 exactly (ex2(0)) and the rescale is the
+             * identity: skip its 64 multiplies when the whole warp is there. */
+            if (__any_sync(0xffffffffu, c0 != 1.f || c1 != 1.f)) {
+#pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    o[j][0] *= c0;
+                    o[j][1] *= c0;
+                    o[j][2] *= c1;
+                    o[j][3] *= c1;
+                }
+            }
+#endif
+#pragma unroll
+            for (int jw = 0; jw < 4; jw++) {
+                const unsigned a0 = fa_u4w(vr[0], jw), a1 = fa_u4w(vr[1], jw);
+                const unsigned a2 = fa_u4w(vr[2], jw), a3 = fa_u4w(vr[3], jw);
+                const unsigned lo01 = __byte_perm(a0, a1, 0x5140), hi01 = __byte_perm(a0, a1, 0x7362);
+                const unsigned lo23 = __byte_perm(a2, a3, 0x5140), hi23 = __byte_perm(a2, a3, 0x7362);
+                const unsigned b0[4] = {lo01, lo01 >> 16, hi01, hi01 >> 16};
+                const unsigned b1[4] = {lo23, lo23 >> 16, hi23, hi23 >> 16};
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    float(&acc)[4] = o[4 * jw + e];
+#if !PLOW_NV_FA16_PIPE
+                    acc[0] *= c0;
+                    acc[1] *= c0;
+                    acc[2] *= c1;
+                    acc[3] *= c1;
+#endif
+                    fa_m16_mma(acc, pa, fa_e4m3x2_to_bf16x2(b0[e]), fa_e4m3x2_to_bf16x2(b1[e]));
+                }
+            }
+        }
+        l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
+        l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+        /* Fold the warp states into smem, one warp at a time (only warps that saw a key; warp 0
+         * always, so an empty split publishes (NEG_INF, 0)). Lane (g, t4) owns heads g / g + 8 at
+         * dims 32 t4 + j (o[j][0] / [2]) and 32 t4 + 16 + j (o[j][1] / [3]). */
+        const unsigned nfw = hi > lo ? min((hi - lo + 15u) / 16u, PLOW_NV_WARPS) : 1u;
+        for (unsigned fw = 0; fw < nfw; fw++) {
+            __syncthreads();
+            if (warp != fw) continue;
+            const float pm0 = fw ? gm[g] : FA_NEG_INF, pm1 = fw ? gm[g + 8] : FA_NEG_INF;
+            const float M0 = fmaxf(pm0, m0), M1 = fmaxf(pm1, m1);
+            const float a0 = FA_EXP(pm0 - M0), a1 = FA_EXP(pm1 - M1);
+            const float e0 = FA_EXP(m0 - M0), e1 = FA_EXP(m1 - M1);
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                float* r0 = go + g * FS + 33u * t4 + j;
+                float* r1 = go + (g + 8u) * FS + 33u * t4 + j;
+                r0[0] = (fw ? r0[0] * a0 : 0.f) + o[j][0] * e0;
+                r0[16] = (fw ? r0[16] * a0 : 0.f) + o[j][1] * e0;
+                r1[0] = (fw ? r1[0] * a1 : 0.f) + o[j][2] * e1;
+                r1[16] = (fw ? r1[16] * a1 : 0.f) + o[j][3] * e1;
+            }
+            __syncwarp();
+            if (t4 == 0) {
+                gl[g] = (fw ? gl[g] * a0 : 0.f) + l0 * e0;
+                gl[g + 8] = (fw ? gl[g + 8] * a1 : 0.f) + l1 * e1;
+                gm[g] = M0;
+                gm[g + 8] = M1;
+            }
+        }
+        __syncthreads();
+        for (unsigned i = tid; i < G * D; i += PLOW_NV_THREADS) {
+            const size_t row = (size_t)b * n_head + h0 + i / D;
+            Opart[(row * nsplit + sp) * D + i % D] = go[i / D * FS + i % D + i % D / 32u] * vs;
+            if (i % D == 0) {
+                mlpart[(row * nsplit + sp) * 2] = gm[i / D];
+                mlpart[(row * nsplit + sp) * 2 + 1] = gl[i / D];
+            }
+        }
+    }
+}
+
 template <int D, int GF, bool FP8KV = false, bool SZKV = false, bool SLOTMAP = false, int CLONE = 0,
           bool NRF = false>
 __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
@@ -3229,6 +3498,19 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #else
                                                const FaNrf* __restrict__ nrf = nullptr) {
 #endif
+    if constexpr (D == 128 && GF == 16) {
+        static_assert(!FP8KV && !SZKV && !NRF && CLONE == 0, "the GQA-16 item reads unit-scale E4M3 KV only");
+        static_assert(16u * 134u <= (unsigned)FA_DEC_SMEM_FLOATS(128, 16), "GQA-16 fold scratch");
+        if (!PLOW_NV_KV_E4M3 || out || window) __trap(); /* no merge fold, full attention */
+#if PLOW_NV_TOKEN_BATCH_BF16
+        if (row_batch) __trap();
+#endif
+        /* k_scale: the per-tensor {k, v} pair (FlashDecode t7), not FP8KV's per-row scales. */
+        fa_decode_mma16<SLOTMAP>(Opart, mlpart, Q, (const unsigned char*)K, (const unsigned char*)V, kv_len,
+                                 n_batch, n_head, n_kv_head, kv_stride, scale, nsplit, kv_mask, slice, nblk,
+                                 lds, decode_slot, k_scale);
+        return;
+    } else
 #if PLOW_NV_FA_TC16
     if constexpr (FA_TC16_TAKES(D, GF, FP8KV, SZKV)) {
         static_assert(FA_TC16_SMEM_FLOATS <= (unsigned)FA_DEC_SMEM_FLOATS(512, 16),
@@ -3261,16 +3543,17 @@ __device__ __noinline__ void d_flash_decode_slots(
     unsigned kv_mask, unsigned slice, unsigned nblk, float* lds, unsigned kv_cap,
 #if PLOW_NV_TOKEN_BATCH_BF16
     const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr,
-    const PlowTokenBatch* row_batch = nullptr) {
+    const PlowTokenBatch* row_batch = nullptr, const float* kvs = nullptr) {
 #else
-    const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr) {
+    const int* decode_slot, __nv_bfloat16* out = nullptr, unsigned* merge_ctr = nullptr,
+    const float* kvs = nullptr) {
 #endif
     d_flash_decode<D, GF, false, false, true, CLONE>(
         Opart, mlpart, Q, K, V, kv_len, n_batch, n_head, n_kv_head, kv_stride, window, scale,
 #if PLOW_NV_TOKEN_BATCH_BF16
-        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr, nullptr, row_batch);
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, kvs, nullptr, decode_slot, out, merge_ctr, nullptr, row_batch);
 #else
-        nsplit, kv_mask, slice, nblk, lds, kv_cap, nullptr, nullptr, decode_slot, out, merge_ctr);
+        nsplit, kv_mask, slice, nblk, lds, kv_cap, kvs, nullptr, decode_slot, out, merge_ctr);
 #endif
 }
 
@@ -3291,11 +3574,15 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
      * FA_EXP now a single MUFU.EX2, the recompute is cheaper than any spill-prone weight array.
      * (m,l) is read as one 8-byte float2 — mlpart is [split][2] f32, 8-aligned. */
     const unsigned n_work = n_batch * n_head;
-    for (unsigned w = slice; w < n_work; w += nblk) {
+    /* D < block width: G thread groups take G of the block's items at once (same block per item). */
+    constexpr unsigned G = D < PLOW_NV_THREADS && PLOW_NV_THREADS % D == 0 ? PLOW_NV_THREADS / D : 1u;
+    constexpr unsigned DS = G > 1u ? (unsigned)D : PLOW_NV_THREADS;
+    const unsigned d0 = G > 1u ? threadIdx.x % D : threadIdx.x;
+    for (unsigned w = slice + (G > 1u ? threadIdx.x / D : 0u) * nblk; w < n_work; w += G * nblk) {
         const unsigned h = w % n_head, b = w / n_head;
 #if PLOW_NV_PACKED_REQUEST
         if (req && b >= (unsigned)(req[1 + 4 * (req[0]-1)] + req[2 + 4 * (req[0]-1)])) {
-            for (unsigned d=threadIdx.x; d<D; d+=PLOW_NV_THREADS)
+            for (unsigned d = d0; d < D; d += DS)
                 O[((size_t)b*n_head+h)*D+d]=__float2bfloat16(0.0f);
             continue;
         }
@@ -3319,7 +3606,7 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
         if constexpr (SINKS) gl += FA_EXP(sink - gm);
         const float inv = (gl > 0.0f) ? (1.0f / gl) : 0.0f;
 
-        for (unsigned d = threadIdx.x; d < D; d += PLOW_NV_THREADS) {
+        for (unsigned d = d0; d < D; d += DS) {
             float acc = 0.0f;
             for (unsigned s = 0; s < nsplit; s++)
                 acc += Opart[((size_t)(b * n_head + h) * nsplit + s) * D + d] * FA_EXP(ml2[s].x - gm);

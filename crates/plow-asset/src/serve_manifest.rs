@@ -510,15 +510,22 @@ impl KvGeometry {
     /// sliding layers and then `sliding_window` is required; without it every
     /// `num_hidden_layers` layer is full attention. The trailing `num_kv_shared_layers` read an
     /// earlier layer's cache and own none. `linear_attention` layers (Qwen3-Next style gated
-    /// DeltaNet) carry recurrent state instead of KV rows and own no cache rows here. `None` when
-    /// the shape is not there.
+    /// DeltaNet) carry recurrent state instead of KV rows and own no cache rows here. Nemotron-H
+    /// (`llm_config.layers_block_type`): only `attention` layers own cache rows. `None` when the
+    /// shape is not there.
     pub fn from_config(checkpoint_dir: &Path) -> Option<Self> {
         let v = read_json(&checkpoint_dir.join("config.json"))?;
-        let t = v.get("text_config").unwrap_or(&v);
+        let t = v
+            .get("text_config")
+            .or_else(|| v.get("llm_config"))
+            .unwrap_or(&v);
         let mut full_layers = Vec::new();
         let mut slide_layers = Vec::new();
-        match t.get("layer_types").and_then(|x| x.as_array()) {
-            Some(layer_types) => {
+        match (
+            t.get("layer_types").and_then(|x| x.as_array()),
+            t.get("layers_block_type").and_then(|x| x.as_array()),
+        ) {
+            (Some(layer_types), _) => {
                 for (l, ty) in layer_types.iter().enumerate() {
                     match ty.as_str()? {
                         "full_attention" => full_layers.push(l as u32),
@@ -528,7 +535,16 @@ impl KvGeometry {
                     }
                 }
             }
-            None => {
+            (None, Some(blocks)) => {
+                for (l, ty) in blocks.iter().enumerate() {
+                    match ty.as_str()? {
+                        "attention" => full_layers.push(l as u32),
+                        "mamba" | "moe" | "mlp" => {}
+                        _ => return None,
+                    }
+                }
+            }
+            (None, None) => {
                 let n = t.get("num_hidden_layers")?.as_u64()? as u32;
                 full_layers = (0..n).collect();
             }
@@ -1051,6 +1067,25 @@ mod tests {
         )
         .unwrap();
         assert!(KvGeometry::from_config(&d).is_none());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn nemotron_h_attention_blocks_own_the_kv_rows() {
+        let d = tmp("nemotron-h");
+        std::fs::write(
+            d.join("config.json"),
+            r#"{"llm_config":{"layers_block_type":["mamba","moe","mamba","attention","moe"],
+                "num_hidden_layers":5,"num_key_value_heads":2,"head_dim":128,"sliding_window":null,
+                "mtp_layers_block_type":["attention","moe"]}}"#,
+        )
+        .unwrap();
+        let kv = KvGeometry::from_config(&d).unwrap();
+        assert_eq!(
+            (kv.full_layers, kv.slide_layers, kv.window),
+            (vec![3], vec![], 0)
+        );
+        assert_eq!((kv.kv_heads_full, kv.head_dim_full), (2, 128));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

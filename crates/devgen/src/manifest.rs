@@ -38,6 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hwspec::IsaLevel;
 use packet::dev::{DevOp, GEMM_WIDE_C8_TAG};
 use packet::devbuild::{Model, Program};
 use serde_json::{json, Map, Value};
@@ -123,6 +124,8 @@ pub fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
         DevOp::GemmWide if i[7] == GEMM_WIDE_C8_TAG => Some("tile128x384x64".into()),
         // A bf16 prefill carrying a span table (encoder bidirectional rows): the PIPE=0 body.
         DevOp::FlashPrefill if i[7] >> 16 != 0 => Some("span".into()),
+        // An E4M3 cache writer: every flash arm of the object reads E4M3 rows.
+        DevOp::QwenHeadNormRope if i[7] & plow_asset::live_kv::KV_E4M3 != 0 => Some("e4m3".into()),
         _ => None,
     };
     Arm {
@@ -347,7 +350,8 @@ struct Shapes {
     /// `K` (`i[2]`) of every dense decode GEMV site: the row kernels the decode object needs.
     decode_gemv_k: BTreeSet<u32>,
     decode_fp8_gemv_rows: BTreeSet<u32>,
-    /// hd → "bf16" | "e4m3", from which flash opcode reads that hd.
+    /// hd → "bf16" | "e4m3", from which flash opcode reads that hd, or "e4m3" for every hd when
+    /// the object-wide E4M3 cache writer (`QwenHeadNormRope` KV_E4M3) is present.
     kv_dtype: BTreeMap<u32, &'static str>,
     /// Largest prefill bucket = the largest chunk the runtime can submit.
     max_chunk: u32,
@@ -491,6 +495,12 @@ struct Shapes {
     ops_present: BTreeSet<String>,
     /// Slots of the v3 prefill split-KV workspace a fused flash prefill carries in t1 (0 = none).
     fa_ws_slots: u32,
+    /// A prefill `FlashPrefill` in the FA2 hd128 body's contract (op_flash_pf128.cuh): hd 128,
+    /// window 0, nsplit 1, fused epilogue (t5).
+    pf_flash_fa2: bool,
+    /// A prefill `FlashPrefill` in the FA2 hd256 body's contract (op_flash_pf256.cuh): hd 256,
+    /// single request (no packed table in t6, no encoder span in i7).
+    pf_flash_fa2_hd256: bool,
 }
 
 /// Was this opcode emitted anywhere in the packet?
@@ -500,6 +510,8 @@ fn union_has(s: &Shapes, name: &str) -> bool {
 
 fn shapes(m: &Model) -> Shapes {
     let mut s = Shapes::default();
+    let mut gemv_batch = 0;
+    let mut kv_e4m3 = false;
     // Every program from `dec_lo` on is a DECODE RUNG, not a prefill bucket. Without a
     // ladder that is the last program alone, i.e. exactly the `pi == last` this replaced.
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
@@ -529,6 +541,15 @@ fn shapes(m: &Model) -> Shapes {
             }
             if decode && matches!(op, DevOp::GemvFp8 | DevOp::GemvQkvFp8 | DevOp::GemvGluFp8) {
                 s.decode_fp8_gemv_rows.insert(inst.i[0]);
+            }
+            if decode
+                && matches!(
+                    op,
+                    DevOp::Gemv | DevOp::GemvQkv | DevOp::GemvGlu | DevOp::GemvFp8 | DevOp::GemvQkvFp8
+                        | DevOp::GemvGluFp8
+                )
+            {
+                gemv_batch = gemv_batch.max(inst.i[0]);
             }
             match op {
                 DevOp::XReduce if inst.i[7] != 0 => s.xr_combine_fold = true,
@@ -579,6 +600,15 @@ fn shapes(m: &Model) -> Shapes {
                     {
                         s.fa_ws_slots = m.n_cu;
                     }
+                    s.pf_flash_fa2 |= op == DevOp::FlashPrefill
+                        && !decode
+                        && inst.i[5..8] == [0, 128, 1]
+                        && inst.t[5] != packet::TENSOR_NONE;
+                    s.pf_flash_fa2_hd256 |= op == DevOp::FlashPrefill
+                        && !decode
+                        && inst.i[6] == 256
+                        && inst.i[7] >> 16 == 0
+                        && inst.t[6] == packet::TENSOR_NONE;
                     s.hd.insert(inst.i[6]);
                     s.kv_heads.insert(inst.i[3]);
                     s.kv_dtype
@@ -782,9 +812,23 @@ fn shapes(m: &Model) -> Shapes {
                     s.mxfp4_proj = true;
                 }
                 DevOp::GemmFp8 if !decode => s.prefill_fp8_gemm = true,
+                DevOp::QwenHeadNormRope if inst.i[7] & plow_asset::live_kv::KV_E4M3 != 0 => {
+                    kv_e4m3 = true;
+                }
                 _ => {}
             }
         }
+    }
+    // The E4M3 writer marks the object, not one site: plain FlashDecode/FlashPrefill read E4M3
+    // rows under PLOW_NV_KV_E4M3 (`arm_of`).
+    if kv_e4m3 {
+        s.kv_dtype.values_mut().for_each(|d| *d = "e4m3");
+    }
+    // A program with no decode attention (a MoE- or Mamba-only block) sizes the decode batch from
+    // its decode GEMVs' rows: without it GV_MM_MAX, the GEMV MMA arm and PLOW_PACKET_DECODE_BATCH
+    // fall to the 1-row object and every rung runs the widest program.
+    if s.decode_batch == 0 {
+        s.decode_batch = gemv_batch;
     }
     s.max_chunk = s.prefill_buckets.iter().copied().max().unwrap_or(0);
     s
@@ -842,6 +886,12 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
             .any(|a| a.op == "FlashPrefill" && a.variant.as_deref() == Some("span"))),
     );
     f.insert(
+        "kv_e4m3".into(),
+        json!(union
+            .iter()
+            .any(|a| a.op == "QwenHeadNormRope" && a.variant.as_deref() == Some("e4m3"))),
+    );
+    f.insert(
         "fp8_kv".into(),
         json!(
             has("FlashDecodeFp8")
@@ -875,10 +925,14 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
         json!(has("GemvFp8") || has("GemvGluFp8")),
     );
     f.insert("w8a8_block128".into(), json!(has("QuantFp8Block128")));
-    f.insert(
-        "qwen_gdn".into(),
-        json!(union.iter().any(|a| a.op.starts_with("Qwen"))),
-    );
+    // The Qwen3.5 Gated DeltaNet family. Its head-norm/RoPE KV writer (and RMSNorm) also serve
+    // other hybrids (Nemotron-H): `qwen_kv_writer`, written only when it is the sole reason the
+    // objects need the Qwen arms.
+    let qwen_gdn = union.iter().any(|a| a.op.starts_with("QwenGdn") || a.op == "QwenGatedNorm");
+    f.insert("qwen_gdn".into(), json!(qwen_gdn));
+    if !qwen_gdn && union.iter().any(|a| a.op.starts_with("Qwen")) {
+        f.insert("qwen_kv_writer".into(), json!(true));
+    }
     f.insert(
         "moe".into(),
         json!(union.iter().any(|a| a.op.starts_with("Moe"))),
@@ -893,7 +947,10 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
                 || has("MlaMergeFold")
         ),
     );
-    f.insert("mamba".into(), json!(has("Mamba2Scan")));
+    f.insert(
+        "mamba".into(),
+        json!(union.iter().any(|a| a.op.starts_with("Mamba2"))),
+    );
     f.insert(
         "tensor_parallel".into(),
         json!(union.iter().any(|a| a.op.starts_with('X'))),
@@ -993,8 +1050,13 @@ fn precision_axes(
     } else {
         "fp8"
     };
-    // KV.
-    let kv = if on("fp8_kv") { "fp8" } else { "bf16" };
+    // KV. `kv_e4m3` is the unit-scale E4M3 cache: fp8 on this axis, but not the `fp8_kv` arm
+    // set (`PLOW_FP8_KV` objects), so the boolean stays false.
+    let kv = if on("fp8_kv") || on("kv_e4m3") {
+        "fp8"
+    } else {
+        "bf16"
+    };
     // EXPERTS. `moe_enc` is the runtime encoding field; absent means there are no expert ops.
     let expert = match (s.moe_enc.len(), s.moe_enc.iter().next()) {
         (0, _) => "none",
@@ -1137,12 +1199,30 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         gv_mm_max.min(32)
     };
     t.insert("gv_mm_max".into(), json!(gv_mm_max));
+    // * `fp8_decode_tc` (PLOW_FP8_DECODE_TC opt-in) = the narrowest rung whose decode FP8 GEMVs
+    //   take op_gemv_fp8_tc.cuh on an mma.sync object; narrower rungs keep the FFMA walk. A recipe
+    //   value, measured per model: Nemotron-3.5-Super full model, GB10, ctx 1024, ms/step FFMA ->
+    //   TC: B=1 50.81 -> 52.81, B=2 61.00 -> 62.82, B=4 78.67 -> 69.12 (its recipe sets 4; the
+    //   single-block bench favours TC at M=1/2 only through L2 residency of the Mamba state).
+    if let Some(rung) = crate::emit_config::active().fp8_decode_tc {
+        assert!(
+            IsaLevel::arch_is_sm12x(arch),
+            "PLOW_FP8_DECODE_TC: sm_12x decode objects only"
+        );
+        if !s.decode_fp8_gemv_rows.is_empty() && s.decode_batch >= rung {
+            t.insert("fp8_decode_tc".into(), json!(rung));
+        }
+    }
     // * `fa_rg`: hd128 decode on the row-group flash body, which the merge fold requires
     //   (nv_decode_merge_fold; PLOW_NV_FA_FOLD opt-in).
+    //   A wide GQA group (>= 16 query heads per KV head) on sm_12x takes it too: one item streams
+    //   its kv head's rows for 4 query heads from registers (Nemotron-H GQA 16, GB10 block L6
+    //   B=16 ctx 32K 5.20 -> 3.52 ms, B=8 128K 9.15 -> 5.71).
     if arch.starts_with("sm_")
         && s.hd.contains(&128)
         && s.hd.iter().all(|&h| h <= 128)
-        && crate::emit_config::active().nv_fa_fold
+        && (crate::emit_config::active().nv_fa_fold
+            || (IsaLevel::arch_is_sm12x(arch) && s.gqa >= crate::WIDE_GQA))
     {
         t.insert("fa_rg".into(), json!(1));
     }
@@ -1161,6 +1241,24 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     // * `fa_v3_splitkv`: the fused v3 flash prefill carries the split-KV workspace (`fa_ws`).
     if s.fa_ws_slots > 0 {
         t.insert("fa_v3_splitkv".into(), json!(s.fa_ws_slots));
+    }
+    // * `fa2_pf128`: the sm_12x prefill object carries the FA2 hd128 body (op_flash_pf128.cuh) for
+    //   the FlashPrefill sites in its contract (hd128, window 0, nsplit 1, fused epilogue); other
+    //   sites keep d_flash_prefill. Measured on 1K-8K-row chunks (Nemotron-H GB10, 256K TTFT 248
+    //   -> 141 s); packets whose chunks stay below 1024 rows keep d_flash_prefill until measured.
+    //   An E4M3 hd128 cache is read by this body only.
+    if IsaLevel::arch_is_sm12x(arch)
+        && s.pf_flash_fa2
+        && (s.max_chunk >= 1024 || s.kv_dtype.get(&128) == Some(&"e4m3"))
+    {
+        t.insert("fa2_pf128".into(), json!(1));
+    }
+    // * `fa2_pf256`: the same for the hd256 sites (op_flash_pf256.cuh: split-D warp pairs, causal or
+    //   window, any nsplit; packed requests keep d_flash_prefill). Measured on the Qwen3.8-27B GB10
+    //   8192-row chunk (nemotron-3.5-super-gb10/comparison.md "Single-SM inner loops: hd256
+    //   attention").
+    if IsaLevel::arch_is_sm12x(arch) && s.pf_flash_fa2_hd256 && s.max_chunk >= 1024 {
+        t.insert("fa2_pf256".into(), json!(1));
     }
     // TILE PROVENANCE. Written because its absence made a real regression unauditable: for
     // several days every AMD compile selected GEMM tiles from the ANALYTICAL MODEL (both tuning
@@ -1343,12 +1441,6 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
             //   E4B: B=1 +0.25 ms and B>=64 +0.2 ms, so hd <= 128 only.
             t.insert("gemv_l2pf".into(), json!(65536));
         }
-        // * `row_slot_twin`: a span-verify packet (PLOW_EMIT_SPAN_VERIFY) gets `_rs` twins of its
-        //   decode objects built with PLOW_NV_ROW_SLOT; plain launches keep the objects without the
-        //   slot map (it measured +0.6..1.5% on every plain rung).
-        if crate::emit_config::active().span_verify {
-            t.insert("row_slot_twin".into(), json!(1));
-        }
         // * `gemv_wide`: rungs past GV_MM_MAX stream the weights once on wgmma
         //   (op_gemv_wide_sm90.cuh) instead of ceil(B / 32) mma.sync passes. Its split-K tiles are
         //   written by other blocks than their owner, so only dense packets (coarse gates) take it.
@@ -1366,6 +1458,13 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
                 t.insert("gw_min_rows".into(), json!(32));
             }
         }
+    }
+    // * `row_slot_twin`: a span-verify packet (PLOW_EMIT_SPAN_VERIFY) gets `_rs` twins of its
+    //   decode objects built with PLOW_NV_ROW_SLOT; plain launches keep the objects without the
+    //   slot map (it measured +0.6..1.5% on every plain rung). Every NVIDIA target: the sm_120
+    //   interpreter's span arms (Qwen GDN, BF16 flash) live in the same twin.
+    if arch.starts_with("sm_") && crate::emit_config::active().span_verify {
+        t.insert("row_slot_twin".into(), json!(1));
     }
     // A packet without a decode GEMV (a W8A8 block, no lm_head) still writes interleaved KV, so
     // its objects need the same layout and row-group body.
@@ -1387,7 +1486,7 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     // Qwen3-ASR rtx-5090 step_bench ctx 512 B=1/8/16/32, PLOW_GEMV_PREFETCH on, token digests
     // unchanged: 1.7B 2.722/3.091/3.469/4.270 -> 2.630/3.091/3.470/4.268 ms; 0.6B
     // 1.433/1.662/2.038/2.917 -> 1.301/1.660/2.033/2.907.
-    if arch == "sm_120a"
+    if IsaLevel::arch_is_sm12x(arch)
         && s.moe_down_inter == 0
         && s.decode_batch >= 2
         && !s.decode_gemv_k.is_empty()
@@ -1403,7 +1502,7 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     //   where gvmma_partition leaves 42 blocks idle. Qwen3-ASR 1.7B rtx-5090 ctx 1024 B=1/4/16/32,
     //   Gemv + GemvQkv (5): 2.707/3.022/4.026/5.394 -> 2.733/2.893/3.819/5.399 ms, token digests
     //   unchanged; the 0.6B loses (B=16 +2.3%: N=1024 is 7 rows a block, the mma half empty).
-    if arch == "sm_120a"
+    if IsaLevel::arch_is_sm12x(arch)
         && s.moe_down_inter == 0
         && s.decode_batch >= 2
         && s.decode_gemv_k.iter().all(|k| k % 32 == 0)
@@ -1415,8 +1514,8 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     // * `norm_fold` (PLOW_DECODE_NORM_FOLD opt-in): the decode object carries the AddNorm fold
     //   arms the packet's o_proj / down / GemvGlu / GemvQkv use.
     if arch.starts_with("sm_") && crate::emit_config::active().decode_norm_fold {
-        assert_eq!(
-            arch, "sm_120a",
+        assert!(
+            IsaLevel::arch_is_sm12x(arch),
             "PLOW_DECODE_NORM_FOLD: sm_120a decode objects only"
         );
         t.insert("norm_fold".into(), json!(1));
@@ -1426,8 +1525,8 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     //   programs' FlashDecode uses it (any sm_ object; the backbone's flash packets stay unfolded).
     let ec = crate::emit_config::active();
     if arch.starts_with("sm_") && ec.decode_hnr_fold.unwrap_or(0) > 0 {
-        assert_eq!(
-            arch, "sm_120a",
+        assert!(
+            IsaLevel::arch_is_sm12x(arch),
             "PLOW_DECODE_HNR_FOLD: sm_120a decode objects only"
         );
         t.insert("hnr_fold".into(), json!(1));
@@ -1449,8 +1548,8 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
         .filter(|&r| r > 0)
     {
         if arch.starts_with("sm_") {
-            assert_eq!(
-                arch, "sm_120a",
+            assert!(
+                IsaLevel::arch_is_sm12x(arch),
                 "PLOW_DECODE_GEMV_XK: sm_120a decode objects only"
             );
             t.insert("gemv_xk".into(), json!(rows));
@@ -1461,8 +1560,8 @@ fn tuning(s: &Shapes, arch: &str) -> Map<String, Value> {
     }
     // * `gemv_w_cs` (PLOW_DECODE_GEMV_W_CS opt-in): the GEMV walks load weights evict-first.
     if arch.starts_with("sm_") && crate::emit_config::active().decode_gemv_w_cs {
-        assert_eq!(
-            arch, "sm_120a",
+        assert!(
+            IsaLevel::arch_is_sm12x(arch),
             "PLOW_DECODE_GEMV_W_CS: sm_120a decode objects only"
         );
         t.insert("gemv_w_cs".into(), json!(1));
@@ -1680,9 +1779,13 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     } else if on("fp8_gemv") {
         req.push("PLOW_NV_W8A16=1".to_string());
     }
-    if on("qwen_gdn") {
+    let qwen_arms = on("qwen_gdn") || on("qwen_kv_writer");
+    if qwen_arms {
         req.push("PLOW_NV_QWEN_GDN=1".into());
-        req.push("PLOW_NV_FA_GF=2".into());
+        // The Qwen KV writer's decode nsplit is balanced for this GF (`hybrid_decode_gf`).
+        let hd = s.hd.iter().copied().max().unwrap_or(0);
+        let gf = crate::hybrid_decode_gf(s.gqa, hd, on("kv_e4m3"));
+        req.push(format!("PLOW_NV_FA_GF={gf}"));
     } else if s.hd.iter().all(|&h| h <= 128) && s.gqa > 1 && s.gqa % 4 != 0 {
         // The hd128 flash-decode arm defaults to GF 4 and traps unless GF | gqa.
         let gf = if s.gqa % 2 == 0 {
@@ -1694,7 +1797,7 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("w8a8") {
         req.push("PLOW_NV_W8A8=1".into());
-        if on("qwen_gdn") {
+        if qwen_arms {
             req.push("PLOW_NV_FP8_M1=1".into());
             req.push("PLOW_NV_QUANT_FP8_VLLM=1".into());
             // `plow_w8a8_vllm_prefill_abi` is 1 only for the qualified prefill epilogue.
@@ -1714,6 +1817,9 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("fp8_kv") {
         req.push("PLOW_FP8_KV=1".into());
+    }
+    if on("kv_e4m3") {
+        req.push("PLOW_NV_KV_E4M3=1".into());
     }
     if on("prefill_span") {
         req.push("PLOW_NV_FA_PIPE=0".into());
@@ -2719,7 +2825,7 @@ fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
 /// Opcodes whose interpreter arms compile only under their `PLOW_PACKET_HAS_*` define
 /// (`runtime/nvidia/op_elementwise.cuh` GLU_PITCHED_ARMS): derived from the arm union, so a
 /// program instruction the union misses would build objects without its case.
-const PACKET_GATED_OPS: [DevOp; 1] = [DevOp::GluPitched];
+const PACKET_GATED_OPS: [DevOp; 2] = [DevOp::GluPitched, DevOp::RowColScale];
 
 /// The packet-gated opcodes some program instruction uses that `union` (which sets their
 /// `PLOW_PACKET_HAS_*` defines) does not hold.
@@ -3519,6 +3625,13 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_PF_GEMV_HEAD {0}\n#ifndef PLOW_NV_PF_GEMV_HEAD\n#define PLOW_NV_PF_GEMV_HEAD {0}\n#endif\n",
         if prefill_gemv_head { 1 } else { 0 }
     ));
+    // The FP8 twin of that arm (Nemotron-H's per-tensor FP8 lm_head): without it the prefill
+    // object has no GemvFp8 case and traps at the head.
+    let prefill_gemv_fp8_head = prefill_ops.contains("GemvFp8");
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_PF_GEMV_FP8_HEAD {0}\n#ifndef PLOW_NV_PF_GEMV_FP8_HEAD\n#define PLOW_NV_PF_GEMV_FP8_HEAD {0}\n#endif\n",
+        if prefill_gemv_fp8_head { 1 } else { 0 }
+    ));
     for (key, macro_name) in [
         ("moe_stage1_body", "PLOW_OBJECT_MOE_STAGE1_BODY"),
         ("moe_stage2_body", "PLOW_OBJECT_MOE_STAGE2_BODY"),
@@ -3701,11 +3814,27 @@ pub fn config_header(manifest: &Value) -> String {
             let arch = manifest.get("arch").and_then(Value::as_str);
             if v >= 2 && arch == Some("sm_90a") {
                 out.push_str("#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n");
-            } else if v >= 2 && matches!(arch, Some("sm_89" | "sm_120a")) {
+            } else if v >= 2 && arch.is_some_and(|a| a == "sm_89" || IsaLevel::arch_is_sm12x(a)) {
                 out.push_str(
                     "#if !PLOW_NV_SPEECH\n#ifndef PLOW_NV_GEMV_MMA\n#define PLOW_NV_GEMV_MMA 1\n#endif\n#endif\n",
                 );
             }
+        }
+        if let Some(v) = t.get("fp8_decode_tc").and_then(Value::as_u64) {
+            out.push_str(&format!(
+                "#ifndef PLOW_NV_FP8_DECODE_TC_ON\n#define PLOW_NV_FP8_DECODE_TC_ON 1\n#endif\n\
+                 #ifndef PLOW_NV_FP8_DECODE_TC\n#define PLOW_NV_FP8_DECODE_TC {v}\n#endif\n"
+            ));
+        }
+        if t.get("fa2_pf128").is_some() {
+            out.push_str(
+                "#if PLOW_NV_PREFILL && !PLOW_NV_SPEECH\n#ifndef PLOW_NV_FA2_PF128\n#define PLOW_NV_FA2_PF128 1\n#endif\n#endif\n",
+            );
+        }
+        if t.get("fa2_pf256").is_some() {
+            out.push_str(
+                "#if PLOW_NV_PREFILL && !PLOW_NV_SPEECH\n#ifndef PLOW_NV_FA2_PF256\n#define PLOW_NV_FA2_PF256 1\n#endif\n#endif\n",
+            );
         }
         if let Some(v) = t.get("gf256").and_then(Value::as_u64) {
             out.push_str(&format!(
@@ -3725,7 +3854,10 @@ pub fn config_header(manifest: &Value) -> String {
         }
         // A 16-head full-attention group needs the wide softmax reductions (op_attention.cuh);
         // sm_90a writes it in its own block below, other qualified targets keep their headers.
-        if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a")
+        if manifest
+            .get("arch")
+            .and_then(Value::as_str)
+            .is_some_and(IsaLevel::arch_is_sm12x)
             && (t.get("gf_full").and_then(Value::as_u64) == Some(16)
                 || t.get("gf_light512").and_then(Value::as_u64) == Some(16))
         {
@@ -3763,7 +3895,10 @@ pub fn config_header(manifest: &Value) -> String {
             out.push_str("#ifndef PLOW_NV_KV_ILV\n#define PLOW_NV_KV_ILV 1\n#endif\n");
         }
         // Measured in the decode object only; the speech and prefill objects keep their walks.
-        if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a")
+        if manifest
+            .get("arch")
+            .and_then(Value::as_str)
+            .is_some_and(IsaLevel::arch_is_sm12x)
             && t.get("gemv_mma_b1").is_some()
         {
             out.push_str(
@@ -3781,7 +3916,11 @@ pub fn config_header(manifest: &Value) -> String {
                 "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_HNR_FOLD\n#define PLOW_NV_HNR_FOLD 1\n#endif\n#endif\n",
             );
         }
-        if manifest.get("arch").and_then(Value::as_str) == Some("sm_120a") {
+        if manifest
+            .get("arch")
+            .and_then(Value::as_str)
+            .is_some_and(IsaLevel::arch_is_sm12x)
+        {
             if let Some(v) = t.get("gemv_k8_ops").and_then(Value::as_u64) {
                 out.push_str(&format!(
                     "#if !PLOW_NV_SPEECH && !PLOW_NV_PREFILL\n#ifndef PLOW_NV_GEMV_K8\n#define PLOW_NV_GEMV_K8 1\n#endif\n\
@@ -3993,6 +4132,60 @@ mod tests {
     use super::*;
     use packet::dev::DevInst;
     use packet::devbuild::Program;
+
+    /// PLOW_FP8_DECODE_TC is the recipe's measured rung: the tuning carries it when the decode
+    /// ladder reaches it and the packet has decode FP8 GEMVs, whatever the model.
+    #[test]
+    fn fp8_decode_tc_is_the_recipe_rung_on_sm12x() {
+        let _guard = held_env();
+        let mut shapes = Shapes::default();
+        shapes.decode_batch = 16;
+        shapes.decode_fp8_gemv_rows.insert(16);
+        assert!(!tuning(&shapes, "sm_121a").contains_key("fp8_decode_tc"));
+        let _on = crate::test_env::EnvScope::set(&[("PLOW_FP8_DECODE_TC", "4")]);
+        assert!(std::panic::catch_unwind(|| tuning(&shapes, "sm_90a")).is_err());
+        let tune = tuning(&shapes, "sm_121a");
+        assert_eq!(tune["fp8_decode_tc"], 4);
+        let header = config_header(&json!({"arch": "sm_121a", "tuning": tune}));
+        assert!(header.contains("#define PLOW_NV_FP8_DECODE_TC_ON 1\n"));
+        assert!(header.contains("#ifndef PLOW_NV_FP8_DECODE_TC\n#define PLOW_NV_FP8_DECODE_TC 4\n#endif\n"));
+        shapes.decode_batch = 2;
+        assert!(!tuning(&shapes, "sm_121a").contains_key("fp8_decode_tc"));
+    }
+
+    /// The sm_12x shape gates: a wide hd128 GQA group takes the row-group decode body, and a
+    /// FlashPrefill in the FA2 contract at >= 1024-row chunks takes the FA2 prefill body.
+    #[test]
+    fn sm12x_attention_bodies_follow_the_shapes() {
+        let _guard = held_env();
+        let mut shapes = Shapes::default();
+        shapes.hd.insert(128);
+        shapes.gqa = 16;
+        shapes.max_chunk = 8192;
+        shapes.pf_flash_fa2 = true;
+        let tune = tuning(&shapes, "sm_121a");
+        assert_eq!((tune.get("fa_rg"), tune.get("fa2_pf128")), (Some(&json!(1)), Some(&json!(1))));
+        let header = config_header(&json!({"arch": "sm_121a", "tuning": tune}));
+        assert!(header.contains("#if PLOW_NV_PREFILL && !PLOW_NV_SPEECH\n#ifndef PLOW_NV_FA2_PF128\n"));
+        for arch in ["sm_90a", "sm_89"] {
+            assert!(!tuning(&shapes, arch).contains_key("fa2_pf128"));
+        }
+        assert!(!tune.contains_key("fa2_pf256"));
+        shapes.pf_flash_fa2_hd256 = true;
+        let tune = tuning(&shapes, "sm_121a");
+        assert_eq!(tune.get("fa2_pf256"), Some(&json!(1)));
+        let header = config_header(&json!({"arch": "sm_121a", "tuning": tune}));
+        assert!(header.contains("#if PLOW_NV_PREFILL && !PLOW_NV_SPEECH\n#ifndef PLOW_NV_FA2_PF256\n"));
+        assert!(!tuning(&shapes, "sm_90a").contains_key("fa2_pf256"));
+        shapes.gqa = 2;
+        shapes.max_chunk = 512;
+        let tune = tuning(&shapes, "sm_120a");
+        assert!(!tune.contains_key("fa_rg") && !tune.contains_key("fa2_pf128"));
+        assert!(!tune.contains_key("fa2_pf256"));
+        assert_eq!(crate::hybrid_decode_gf(16, 128, false), 4);
+        assert_eq!(crate::hybrid_decode_gf(16, 128, true), 16);
+        assert_eq!(crate::hybrid_decode_gf(6, 256, false), 2);
+    }
 
     #[test]
     fn fp8_tc64_is_an_explicit_wide_object_request() {
@@ -4852,6 +5045,57 @@ mod tests {
             "the KV axis is INDEPENDENT of the weight axis"
         );
         assert_eq!(p["expert_enc"], "none");
+    }
+
+    /// An E4M3 cache marked by the `QwenHeadNormRope` writer (Nemotron-H / Qwen3.5) is read by the
+    /// plain flash opcodes, so the KV axis and `kv_dtype` must follow the writer, while `fp8_kv`
+    /// (the `PLOW_FP8_KV` arm set) stays off. A short-chunk E4M3 packet still needs the FA2 body:
+    /// the hd128 `d_flash_prefill` arm traps on an E4M3 cache.
+    #[test]
+    fn e4m3_writer_sets_the_kv_axis_without_the_fp8_kv_arms() {
+        let m = |writer_i7: u32| Model {
+            n_cu: 48,
+            target: 0,
+            tensors: vec![],
+            progs: vec![
+                prog(vec![
+                    inst(DevOp::QwenHeadNormRope, [2, 128, 0, 128, 0, 0, 1, writer_i7]),
+                    inst(DevOp::FlashPrefill, [0, 0, 32, 2, 0, 0, 128, 1]),
+                ]),
+                prog(vec![
+                    inst(DevOp::QwenHeadNormRope, [2, 128, 0, 128, 0, 0, 1, writer_i7]),
+                    inst(DevOp::FlashDecode, [8, 32, 2, 0, 0, 0, 128, 0]),
+                ]),
+            ],
+            kv_row_insts: vec![],
+            prog_t: vec![512, 8],
+            gen: vec![],
+        };
+        let requires = |man: &Value| -> Vec<String> {
+            man["backends"]
+                .as_object()
+                .into_iter()
+                .flat_map(|b| b.values())
+                .filter_map(|v| v["requires"].as_array())
+                .flatten()
+                .filter_map(|r| r.as_str().map(str::to_string))
+                .collect()
+        };
+        let e4m3 = build(&m(plow_asset::live_kv::KV_E4M3), "sm_121a");
+        assert_eq!(e4m3["features"]["kv_e4m3"], true);
+        assert_eq!(e4m3["features"]["fp8_kv"], false);
+        assert_eq!(e4m3["precision"]["kv_enc"], "fp8");
+        assert_eq!(e4m3["shapes"]["kv_dtype"]["hd128"], "e4m3");
+        assert_eq!(e4m3["tuning"]["fa2_pf128"], 1);
+        let req = requires(&e4m3);
+        assert!(req.iter().any(|r| r == "PLOW_NV_KV_E4M3=1"), "{req:?}");
+        assert!(!req.iter().any(|r| r == "PLOW_FP8_KV=1"), "{req:?}");
+
+        let bf16 = build(&m(0), "sm_121a");
+        assert_eq!(bf16["features"]["kv_e4m3"], false);
+        assert_eq!(bf16["precision"]["kv_enc"], "bf16");
+        assert_eq!(bf16["shapes"]["kv_dtype"]["hd128"], "bf16");
+        assert!(bf16["tuning"].get("fa2_pf128").is_none());
     }
 
     /// The activation axis is `QuantFp8`'s presence — the op that IS the activation quant — and

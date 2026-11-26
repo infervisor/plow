@@ -47,6 +47,8 @@ use packet::rope::{GenTensor, RopeScale};
 use serde_json::Value;
 
 mod checkpoint;
+mod components;
+mod derived;
 pub mod consolidated;
 pub mod cost_inputs;
 pub mod gemm_policy;
@@ -73,6 +75,9 @@ mod ladder;
 mod mla;
 mod muse;
 mod qwen35;
+mod recurrent;
+mod spec;
+mod nemotron_h;
 #[cfg(test)]
 mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
@@ -259,6 +264,23 @@ pub(crate) fn attention_decode_ns(
         return fallback;
     };
     balanced_attention_ns(batch, heads, kv_heads, n_cu, gf)
+}
+
+/// Query heads per KV head from which an hd128 GQA group counts as wide ([`hybrid_decode_gf`]).
+pub(crate) const WIDE_GQA: u32 = 16;
+
+/// Query heads per decode attention work item for the Qwen-KV-writer hybrids (Qwen3.5,
+/// Nemotron-H). A wide hd128 group runs the row-group flash body at GF 4 with the split count
+/// balanced over the SMs; under E4M3 KV one mma.sync item per KV head (16 query heads), so each
+/// KV byte is read once per step (op_attention.cuh `fa_decode_mma16`). Other shapes keep 2. The
+/// decode object's `PLOW_NV_FA_GF` (manifest.rs) and the packet's FlashDecode `nsplit` both
+/// derive from it.
+pub(crate) fn hybrid_decode_gf(gqa: u32, hd: u32, kv_e4m3: bool) -> u32 {
+    match (hd <= 128 && gqa >= WIDE_GQA, kv_e4m3) {
+        (true, true) => 16,
+        (true, false) => 4,
+        (false, _) => 2,
+    }
 }
 
 fn balanced_attention_ns(batch: u32, heads: u32, kv_heads: u32, n_cu: u32, gf: u32) -> u32 {
@@ -9172,7 +9194,7 @@ fn apply_production_defaults(
     // `PLOW_DECODE_TIERS` (a per-rung object) is what makes the 16 rung payable; until a
     // tiered gfx942 recipe ships and is measured, the ladder stops at 8.
     let ladder = match arch {
-        "sm_90a" | "sm_120a" => Some("1,2,4,8,16"),
+        a if a == "sm_90a" || hwspec::IsaLevel::arch_is_sm12x(a) => Some("1,2,4,8,16"),
         "gfx942" => Some("1,2,4,8"),
         _ => None,
     };
@@ -9199,7 +9221,7 @@ fn apply_production_defaults(
         && !cfg.uniseg
         && tp == 1
         && capabilities.dense_packet_contracts
-        && arch == "sm_120a"
+        && hwspec::IsaLevel::arch_is_sm12x(arch)
         && cfg.emit_packed_prefill.is_none()
     {
         cfg.emit_packed_prefill = Some(true);
@@ -9374,13 +9396,13 @@ fn apply_production_defaults(
 
 /// CUDA targets where cuBLASLt has OUTER_VEC (per-row/per-column) FP8 scaling algorithms.
 fn cublaslt_fp8_vector_scale_arch(arch: &str) -> bool {
-    arch == "sm_90a"
+    plow_asset::segment_roles::lt_fp8_scale(arch, hwspec::LtFp8Scale::Vector)
 }
 
 /// CUDA targets whose prefill objects carry the packed-request ABI (`PLOW_NV_PACKED_REQUEST`):
 /// the interpreter's non-wgmma packed arms compile for GB202 as well as Hopper.
 fn nv_packed_request_arch(arch: &str) -> bool {
-    matches!(arch, "sm_90a" | "sm_120a")
+    arch == "sm_90a" || hwspec::IsaLevel::arch_is_sm12x(arch)
 }
 
 fn cublaslt_emit_supported(
@@ -9390,7 +9412,7 @@ fn cublaslt_emit_supported(
     has_decode_objects: bool,
 ) -> bool {
     capabilities.cublaslt_decode
-        && matches!(arch, "sm_90a" | "sm_89" | "sm_120a")
+        && (matches!(arch, "sm_90a" | "sm_89") || hwspec::IsaLevel::arch_is_sm12x(arch))
         && tp == 1
         && !has_decode_objects
 }
@@ -9508,7 +9530,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                 && (!emit_config::active().any_fp8_weights() || emit_config::active().w8a8)
                 && !emit_config::active().mxfp4
                 && emit_config::active().packed_prefill_metadata_on(),
-            "request chunk limits require packed Gemma 4 BF16 or W8A8 weights on a packed-request CUDA target (sm_90a, sm_120a) at TP1"
+            "request chunk limits require packed Gemma 4 BF16 or W8A8 weights on a packed-request CUDA target (sm_90a, sm_120a, sm_121a) at TP1"
         );
     }
 
@@ -9568,13 +9590,17 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                 || model_type == "qwen3_5")
                 && arch == "sm_90a"
                 || (model_type == "qwen3_asr" || model_type == "qwen3" || model_type == "llama" || model_type.starts_with("gemma4"))
-                    && matches!(arch.as_str(), "sm_89" | "sm_120a"))
+                    && (arch == "sm_89" || hwspec::IsaLevel::arch_is_sm12x(&arch))
+                // Qwen3.5 W8A8 on sm_12x: the unit-scale FP8 route (segment_roles::cublaslt_prefill_fp8_unit).
+                || model_type == "qwen3_5"
+                    && hwspec::IsaLevel::arch_is_sm12x(&arch)
+                    && emit_config::active().w8a8)
                 && tp == 1
                 && (!emit_config::active().any_fp8_weights()
                     || ((model_type.starts_with("gemma4") || model_type == "qwen3_5")
                         && emit_config::active().w8a8))
                 && !emit_config::active().mxfp4,
-            "cuBLASLt prefill emission requires Gemma 4 / Qwen3.5 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR, Qwen3, Llama and Gemma 4 BF16 also on SM89 and SM120)"
+            "cuBLASLt prefill emission requires Gemma 4 / Qwen3.5 W8A8 or supported BF16 on single-GPU SM90 (Qwen3-ASR, Qwen3, Llama and Gemma 4 BF16 also on SM89 and SM120; Qwen3.5 W8A8 on SM120/SM121 via unit-scale FP8)"
         );
     }
     if emit_config::active().gemma4_sm90_gemm_glu_role {
@@ -9617,7 +9643,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // assertion is why it could never be given one; a GLM-5.3 gfx942 TP4 emit died here.
         assert!(
             emit_is_amd() || (nv_packed_request_arch(&arch) && tp == 1),
-            "packed request emission requires a packed-request CUDA target (sm_90a, sm_120a), single-GPU direct KV"
+            "packed request emission requires a packed-request CUDA target (sm_90a, sm_120a, sm_121a), single-GPU direct KV"
         );
         assert!(
             emit_is_amd() || capabilities.dense_packet_contracts,
@@ -9636,13 +9662,37 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     }
     if emit_config::active().decode_objects.is_some() {
         assert!(
-            matches!(arch.as_str(), "sm_90a" | "sm_120" | "sm_120a") && tp == 1,
+            (matches!(arch.as_str(), "sm_90a" | "sm_120") || hwspec::IsaLevel::arch_is_sm12x(&arch))
+                && tp == 1,
             "decode objects require a supported single-GPU CUDA target"
         );
         assert!(
             capabilities.decode_objects,
             "decode object bindings are not wired to this emitter"
         );
+    }
+    // Nemotron-H on the sm_120 interpreter: its own emitter (Mamba-2 ops 240-245). Other arches
+    // keep the M4 block prototype below.
+    if matches!(model_type.as_str(), "nemotron_h" | "nemotron_h_omni")
+        && hwspec::IsaLevel::arch_is_sm12x(&arch)
+    {
+        assert!(
+            embed_cubin.is_none() && embed_hsaco.is_none(),
+            "nemotron_h uses an external paired CUDA interpreter"
+        );
+        nemotron_h::run(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            block_spec.as_deref(),
+            rope_gen,
+            &arch,
+            &gpu,
+            verify.as_ref(),
+        );
+        return;
     }
     if model_type == "qwen3_5" {
         assert!(

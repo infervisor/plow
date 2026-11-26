@@ -5,7 +5,7 @@
 //! (`prefill_slot` to build ctx, then one `step_slots` per token).
 //!
 //! Usage:
-//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same [--kv-image] | --spread] [--warmup N] [--multistep] [--packed-prefill]
+//!   step_bench <assets_dir> [slots] [ctx] [steps] [--same [--kv-image] | --spread] [--warmup N] [--each] [--multistep] [--packed-prefill]
 //!              [--dump-tensors name,name --dump-dir dir | --dump-prefill-logits dir]
 //!              [--max-inst N | --max-segments N]
 //! `--same` feeds every slot the SAME prompt and reports how many slots' greedy
@@ -16,9 +16,12 @@
 //! `--spread` gives each slot a pseudo-random prompt over 64K ids, so a MoE model routes a decode batch the way served
 //! traffic does (the default prompts share one 1000-id cycle). `--packed-prefill`
 //! initializes prompts through packed request chunks and the compact terminal, printing each
-//! launch's wall ms; `--pf-chunk N` caps the per-request slice below the packet's request chunk and
+//! launch's wall ms; `--pf-chunk N` caps the per-request slice below the packet's request chunk,
+//! `--pf-width N` the requests per launch (1: each request alone, the lone reference) and
 //! `--pf-reps N` repeats the whole packed prefill (the first pass pays graph capture);
 //! with `--dump-prefill-logits` the last rep's compact-terminal logits are written per slot.
+//! `--dump-step-logits FILE` appends every timed plain step's logits (bf16, slots x vocab rows) to
+//! FILE; with `--force-prompt` two arms' files compare position by position.
 //! `--dump-tensors`
 //! writes the named tensors raw after the last step (block_run's format), which
 //! with `--max-inst N`, one step and zero warmup gives partial decode activations;
@@ -26,6 +29,10 @@
 //! Instruction caps require native decode routes. `--multistep` times the
 //! engine's device multi-step quanta (`PLOW_MULTISTEP=K`) instead of single steps; the digest
 //! covers the same tokens in the same order, so it compares directly with a single-step run.
+//! `--force-prompt` (with `--prompt-tokens`) feeds each slot its prompt's continuation instead of
+//! the greedy token, so two arms decode the same tokens.
+//! `--each` prints every timed step's ms in run order (`STEP_EACH_MS`); `--pause STEP:MS` idles
+//! MS ms after timed step STEP (plain steps; a thermal/clock recovery probe).
 //! Env: PLOW_CHECKPOINT (default <assets>/checkpoint), PLOW_STEP_TIME=1 for
 //! the engine's host-op breakdown.
 
@@ -448,21 +455,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut kv_image_peer = None::<std::path::PathBuf>;
     let mut kv_image_peer_device = None::<String>;
     let mut spread = false;
+    let mut force_prompt = false;
+    let mut each = false;
+    let mut pause = None::<(usize, u64)>;
     let mut multistep = false;
     let mut packed_prefill = false;
     let mut kv_residency = false;
     let mut pf_chunk = usize::MAX;
     let mut pf_reps = 1usize;
+    let mut pf_width = usize::MAX;
     let mut warmup = 16usize;
     let mut sweep: Option<(u32, u32)> = None;
     let mut max_inst: Option<u32> = None;
     let mut max_segments: Option<usize> = None;
     let mut seg_sweep: Option<(usize, usize, usize)> = None;
     let mut prefill_logits_dir = None::<std::path::PathBuf>;
+    let mut step_logits = None::<std::path::PathBuf>;
     let mut ride: Option<(usize, Vec<usize>)> = None;
     let mut ride_dump = None::<std::path::PathBuf>;
     let mut ride_prefix = 0usize;
     let mut ride_salt = 0u32;
+    let mut ride_k = 0usize;
     let (mut dump_names, mut dump_dir) = (None::<String>, None::<String>);
     let mut spec = SpecArgs::default();
     let mut prompt_file = None::<String>;
@@ -474,6 +487,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--spec-k" => spec.k = args.next().ok_or("--spec-k K")?.parse()?,
             "--spec-rung" => spec.rung = args.next().ok_or("--spec-rung R")?.parse()?,
             "--spec-poison" => spec.poison = true,
+            // `--spec-plain-every N`: every Nth tick decodes one plain step instead of verifying
+            // (a plain launch after commits; not with `--spec mtp`).
+            "--spec-plain-every" => {
+                spec.plain_every = args.next().ok_or("--spec-plain-every N")?.parse()?
+            }
             // `--spec-sample T,TOP_K,TOP_P,MIN_P`: sampled verify (see spec_bench); `--spec-host`
             // samples the verify rows on the host instead of with `plow_sample`.
             "--spec-sample" => {
@@ -514,9 +532,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kv_image_peer_device = Some(args.next().ok_or("--kv-image-peer-device amd:N|nv:N")?)
             }
             "--spread" => spread = true,
+            // `--force-prompt`: every decode step (warmup and timed) feeds the next token of the
+            // slot's `--prompt-tokens` prompt instead of its greedy output, so arms whose greedy
+            // streams diverge still decode the same tokens (and a MoE batch the same experts).
+            "--force-prompt" => force_prompt = true,
+            "--each" => each = true,
+            "--pause" => {
+                let p = args.next().ok_or("--pause STEP:MS")?;
+                let (at, ms) = p.split_once(':').ok_or("--pause STEP:MS")?;
+                pause = Some((at.parse()?, ms.parse()?));
+            }
             "--packed-prefill" => packed_prefill = true,
             "--pf-chunk" => pf_chunk = args.next().ok_or("--pf-chunk N")?.parse()?,
             "--pf-reps" => pf_reps = args.next().ok_or("--pf-reps N")?.parse()?,
+            "--pf-width" => pf_width = args.next().ok_or("--pf-width N")?.parse()?,
             "--multistep" => multistep = true,
             "--warmup" => warmup = args.next().ok_or("--warmup N")?.parse()?,
             // `--sweep LO..HI`: time decode steps with instruction caps LO..=HI in this process.
@@ -538,6 +567,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--dump-prefill-logits" => {
                 prefill_logits_dir = Some(args.next().ok_or("--dump-prefill-logits dir")?.into())
             }
+            "--dump-step-logits" => {
+                step_logits = Some(args.next().ok_or("--dump-step-logits file")?.into())
+            }
             "--ride" => {
                 let rows = args.next().ok_or("--ride ROWS W1,W2,..")?.parse()?;
                 let widths = args
@@ -551,6 +583,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--ride-dump" => ride_dump = Some(args.next().ok_or("--ride-dump dir")?.into()),
             "--ride-prefix" => ride_prefix = args.next().ok_or("--ride-prefix N")?.parse()?,
             "--ride-salt" => ride_salt = args.next().ok_or("--ride-salt N")?.parse()?,
+            "--ride-k" => ride_k = args.next().ok_or("--ride-k K")?.parse()?,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -567,6 +600,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if prefill_logits_dir.is_some() && (partial || dumps.is_some() || sweep.is_some() || multistep)
     {
         return Err("--dump-prefill-logits captures prefill only".into());
+    }
+    if step_logits.is_some() && (partial || multistep || spec.mode.is_some()) {
+        return Err("--dump-step-logits captures plain single steps only".into());
     }
     if partial && (steps != 1 || warmup != 0 || multistep || sweep.is_some() || dumps.is_none()) {
         return Err(
@@ -630,6 +666,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             e.vmm_stats()
         );
     }
+    // The drafter loads before any prompt, as in serving: its enable zeroes the drafter's own
+    // cache, which the prompts' target programs may already fill.
+    let draft_kmax = if spec.draft_iters > 0 || matches!(spec.mode.as_deref(), Some("mtp" | "dspark")) {
+        e.spec_draft_enable(&assets)?
+    } else {
+        0
+    };
     let slots = want_slots.min(e.batch());
     if prefill_logits_dir.is_some() && !e.has_prefill() {
         return Err("prefill logit capture requires GPU prefill".into());
@@ -678,6 +721,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(p)
         })
         .transpose()?;
+    let forced = |b: usize, n: usize| -> u32 {
+        let p = file_prompts.as_ref().expect("--force-prompt needs --prompt-tokens");
+        p[b % p.len()][ctx + n]
+    };
+    if force_prompt
+        && file_prompts
+            .as_ref()
+            .is_none_or(|p| p.iter().any(|x| x.len() <= ctx + warmup + steps))
+    {
+        return Err("--force-prompt: --prompt-tokens prompts longer than ctx + warmup + steps".into());
+    }
+    if force_prompt && multistep {
+        return Err("--force-prompt feeds single steps; not with --multistep".into());
+    }
     let prompt_for = |b: usize| -> Vec<u32> {
         if let Some(p) = &file_prompts {
             return p[b % p.len()][..ctx].to_vec();
@@ -711,7 +768,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if chunk == 0 {
             return Err("packed prefill has no chunk capacity".into());
         }
-        let width = e.pf_max_rows() / chunk;
+        let width = (e.pf_max_rows() / chunk).min(pf_width).max(1);
         let mut completed = Vec::new();
         let mut logits_row = Vec::new();
         for rep in 0..pf_reps.max(1) {
@@ -851,13 +908,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some((rows, widths)) = &ride {
         return ride_bench(
             &mut e,
+            &assets,
             &last,
+            file_prompts.as_deref(),
             ctx,
             steps,
             *rows,
             widths,
             ride_prefix,
             ride_salt,
+            ride_k,
             pf_chunk,
             ride_dump.as_deref(),
         );
@@ -877,15 +937,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         last.iter().enumerate().map(|(b, &t)| (b, t)).collect()
     };
     let mut toks = Vec::new();
-    for _ in 0..warmup {
+    if force_prompt {
+        for (b, l) in last.iter_mut().enumerate() {
+            *l = forced(b, 0);
+        }
+    }
+    for w in 0..warmup {
         e.step_slots(&feeds_of(&last), &mut toks)?;
         if let Some(histories) = &mut histories {
             record_inputs(histories, &last, &toks, 1);
         }
         last.copy_from_slice(&toks);
+        if force_prompt {
+            for (b, l) in last.iter_mut().enumerate() {
+                *l = forced(b, w + 1);
+            }
+        }
     }
     if spec.draft_iters > 0 {
-        return draft_bench(&mut e, &assets, &last, spec.draft_iters);
+        return draft_bench(&mut e, draft_kmax, &last, spec.draft_iters);
     }
     if let Some(mode) = spec.mode.clone() {
         let prompts: Vec<Vec<u32>> = (0..slots).map(prompt_for).collect();
@@ -988,6 +1058,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--multistep needs an engine with PLOW_MULTISTEP >= 2".into());
     }
     let mut done = 0;
+    let mut step_logits = match &step_logits {
+        Some(p) => Some((std::fs::File::create(p)?, vec![0u8; slots * e.vocab() * 2])),
+        None => None,
+    };
     while done < steps {
         let t0 = Instant::now();
         if multistep {
@@ -1013,10 +1087,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         e.step_slots(&feeds_of(&last), &mut toks)?;
         ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        if let Some((f, raw)) = &mut step_logits {
+            e.read_tensor_range("act.logits", 0, raw)?;
+            std::io::Write::write_all(f, raw)?;
+        }
+        if pause.is_some_and(|(at, _)| at == ms.len()) {
+            std::thread::sleep(std::time::Duration::from_millis(pause.map_or(0, |p| p.1)));
+        }
         if let Some(histories) = &mut histories {
             record_inputs(histories, &last, &toks, 1);
         }
         last.copy_from_slice(&toks);
+        if force_prompt {
+            for (b, l) in last.iter_mut().enumerate() {
+                *l = forced(b, warmup + done + 1);
+            }
+        }
         for (b, &t) in toks.iter().enumerate() {
             digest = (digest ^ t as u64).wrapping_mul(0x100000001b3);
             streams[b].push(t);
@@ -1043,6 +1129,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // 0 steps: no timing; a dump then holds the allocations right after prefill.
     if !ms.is_empty() {
+        if each {
+            let t: Vec<String> = ms.iter().map(|v| format!("{v:.2}")).collect();
+            println!("STEP_EACH_MS {}", t.join(" "));
+        }
         ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mean = ms.iter().sum::<f64>() / ms.len() as f64;
         let median = ms[ms.len() / 2];
@@ -1099,22 +1189,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// arm rewinds them to N, so the launch's rows attend to N + their own rows.
 /// `--ride-salt S`: other prefill token ids (a rider's logits must not depend on its launch's
 /// other rows; compare `--ride-dump`s across salts).
+/// On a span-rider engine (Mamba chain) each rider is a verify span of `--ride-k K` drafts
+/// (default 0: one row) and the standalone arm is the decode rungs' `spec_verify` of the same
+/// spans; logits rows are the spans' rows in order. With `--prompt-tokens` a span's drafts are
+/// its prompt's continuation (natural text) instead of synthetic ids.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn ride_bench(
     e: &mut plowrt::exec::gpu::GpuEngine,
+    assets: &std::path::Path,
     last: &[u32],
+    prompts: Option<&[Vec<u32>]>,
     ctx: usize,
     iters: usize,
     rows: usize,
     widths: &[usize],
     prefix: usize,
     salt: u32,
+    k: usize,
     request_chunk: usize,
     dump: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plow_asset::token_batch::{Phase, Request, Selection};
+    use plowrt::exec::gpu::spec::{SpecDraw, SpecSpan};
     use std::time::Instant;
     let first = last.len();
+    let spans = e.span_riders_enabled();
+    if spans {
+        e.spec_enable(assets)?;
+    }
+    let k = if spans { k } else { 0 };
+    let span_tokens: Vec<Vec<u32>> = last
+        .iter()
+        .enumerate()
+        .map(|(b, &t)| {
+            (0..=k)
+                .map(|j| match (j, prompts) {
+                    (0, _) => t,
+                    (_, Some(p)) => p[b % p.len()].get(ctx + j).copied().unwrap_or(t),
+                    _ => (t + 7 * j as u32) % 50000,
+                })
+                .collect()
+        })
+        .collect();
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+            .0 as u32
+    };
     let wmax = *widths.iter().max().ok_or("--ride needs a width")?;
     let chunk = e
         .pf_request_max_rows()
@@ -1200,7 +1323,13 @@ fn ride_bench(
             selection: Selection::default(),
         };
         (0..w)
-            .map(|b| request(b, Phase::Decode, std::slice::from_ref(&last[b])))
+            .map(|b| {
+                if spans {
+                    request(b, Phase::Verify, span_tokens[b].as_slice())
+                } else {
+                    request(b, Phase::Decode, std::slice::from_ref(&last[b]))
+                }
+            })
             .chain(
                 fills
                     .iter()
@@ -1236,20 +1365,45 @@ fn ride_bench(
             let t = Instant::now();
             ride_token_batch(e, &reqs, &mut output)?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
-            let ride_ids: Vec<u32> = output.iter().map(|&(_, t)| t).collect();
-            if output.iter().map(|&(id, _)| id as usize).ne(0..w) {
+            let n = w * (k + 1);
+            let mut ride_ids: Vec<u32> = output.iter().map(|&(_, t)| t).collect();
+            if spans {
+                let mut verdicts = Vec::new();
+                e.take_token_batch_verdicts(&mut verdicts);
+                if verdicts.iter().map(|v| v.0).ne(0..w) {
+                    return Err("rider verdicts out of order".into());
+                }
+            } else if output.iter().map(|&(id, _)| id as usize).ne(0..w) {
                 return Err("rider outputs out of order".into());
             }
-            let mut ride_logits = Vec::with_capacity(if it == warm { w } else { 0 });
+            let mut ride_logits = Vec::with_capacity(if it == warm { n } else { 0 });
             if it == warm {
-                for r in 0..w {
+                for r in 0..n {
                     e.logits_row(r, &mut logits)?;
                     ride_logits.push(logits.clone());
+                }
+                if spans {
+                    ride_ids = ride_logits.iter().map(|l| argmax(l)).collect();
                 }
             }
             reset(e)?;
             let t = Instant::now();
-            e.step_slots(&feeds[..w], &mut toks)?;
+            if spans {
+                let sp: Vec<SpecSpan<'_>> = (0..w)
+                    .map(|b| SpecSpan {
+                        slot: b,
+                        tokens: &span_tokens[b],
+                        draw: SpecDraw::Argmax,
+                    })
+                    .collect();
+                let mut verdicts = Vec::new();
+                e.spec_verify(&sp, &[], None, &mut verdicts)?;
+                for (s, v) in sp.iter().zip(&verdicts) {
+                    e.spec_commit(s, v)?;
+                }
+            } else {
+                e.step_slots(&feeds[..w], &mut toks)?;
+            }
             let step_ms = t.elapsed().as_secs_f64() * 1e3;
             if it >= warm {
                 ride.push(ms);
@@ -1257,11 +1411,13 @@ fn ride_bench(
             }
             if it == warm {
                 let (mut max_abs, mut kl_max, mut agree) = (0f32, 0f64, 0);
+                let mut kl_row = vec![0f64; k + 1];
                 let mut raw_ride = Vec::new();
                 let mut raw_step = Vec::new();
                 for (r, rl) in ride_logits.iter().enumerate() {
                     e.logits_row(r, &mut logits)?;
-                    agree += usize::from(ride_ids[r] == toks[r]);
+                    let tok = if spans { argmax(&logits) } else { toks[r] };
+                    agree += usize::from(ride_ids[r] == tok);
                     let lse = |v: &[f32]| {
                         let m = v.iter().copied().fold(f32::MIN, f32::max) as f64;
                         m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
@@ -1276,6 +1432,7 @@ fn ride_bench(
                         })
                         .sum();
                     kl_max = kl_max.max(kl);
+                    kl_row[r % (k + 1)] = kl_row[r % (k + 1)].max(kl);
                     max_abs = rl
                         .iter()
                         .zip(&logits)
@@ -1287,8 +1444,11 @@ fn ride_bench(
                     }
                 }
                 println!(
-                    "RIDE_VS_STEP w={w} ctx={ctx} top1_agree={agree}/{w} max_kl={kl_max:.3e} max_abs={max_abs:.4} ride_ids={ride_ids:?}"
+                    "RIDE_VS_STEP w={w} k={k} ctx={ctx} top1_agree={agree}/{n} max_kl={kl_max:.3e} max_abs={max_abs:.4} ride_ids={ride_ids:?}"
                 );
+                let kl_row: Vec<String> = kl_row.iter().map(|x| format!("{x:.3e}")).collect();
+                let drafts: Vec<&[u32]> = span_tokens[..w].iter().map(|t| &t[1..]).collect();
+                println!("RIDE_KL_BY_SPAN_ROW w={w} k={k} max_kl_per_row={kl_row:?} drafts={drafts:?}");
                 if let Some(dir) = dump {
                     std::fs::write(dir.join(format!("ride-w{w}.bf16")), raw_ride)?;
                     std::fs::write(dir.join(format!("step-w{w}.bf16")), raw_step)?;
@@ -1352,6 +1512,7 @@ struct SpecArgs {
     k: usize,
     rung: usize,
     poison: bool,
+    plain_every: usize,
     nsplit_kvlen: Option<u32>,
     draft_iters: usize,
     sample: Option<(f32, usize, f32, f32)>,
@@ -1405,12 +1566,11 @@ impl plowrt::exec::gpu::spec::SpecSampler for BenchSampler {
 /// the deepest draft against the target's own greedy continuation (prefix agreement).
 fn draft_bench(
     e: &mut plowrt::exec::gpu::GpuEngine,
-    assets: &std::path::Path,
+    kmax: u32,
     last: &[u32],
     iters: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
-    let kmax = e.spec_draft_enable(assets)?;
     let mut toks = Vec::new();
     let rows: Vec<(usize, u32, u32)> = last
         .iter()
@@ -1459,7 +1619,7 @@ fn draft_bench(
         }
     }
     if let Some(dir) = std::env::var_os("STEP_BENCH_DRAFT_DUMP").map(std::path::PathBuf::from) {
-        draft_dump(e, &dir, &rows)?;
+        draft_dump(e, &dir, &rows, kmax)?;
     }
     let k = kmax as usize;
     let mut cur = last.to_vec();
@@ -1498,6 +1658,7 @@ fn draft_dump(
     e: &mut plowrt::exec::gpu::GpuEngine,
     dir: &std::path::Path,
     rows: &[(usize, u32, u32)],
+    kmax: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
     let slots = e.tensor_bytes("in.kvlen").ok_or("no in.kvlen")? as usize / 4;
@@ -1521,7 +1682,7 @@ fn draft_dump(
                 read(e, "act.dspark.d.logits", 0, 7 * vocab * 2)?,
             )?;
         } else {
-            e.spec_draft_stage(&[(b, token, hrow)], 7)?;
+            e.spec_draft_stage(&[(b, token, hrow)], kmax)?;
             e.spec_draft_run(&mut toks)?;
         }
         let drafts7 = toks.clone();
@@ -1542,11 +1703,22 @@ fn draft_dump(
             d.join("act.hn.bin"),
             read(e, "act.hn", hrow as u64 * hidden as u64, hidden)?,
         )?;
+        // `STEP_BENCH_DRAFT_DUMP_HN_ROWS=N`: rows [0, N) of the final-norm activation (after one
+        // B=1 decode step, rows 1.. still hold the prompt's prefill rows).
+        if let Some(n) = std::env::var("STEP_BENCH_DRAFT_DUMP_HN_ROWS").ok() {
+            let n: usize = n.parse()?;
+            std::fs::write(d.join("act.hn.rows.bin"), read(e, "act.hn", 0, n * hidden)?)?;
+        }
+        // Qwen3.5 and Nemotron-H drafter activations; a family binds a subset.
         for n in [
-            "e", "h", "x1", "x2", "x", "xn", "q", "qn", "at", "og", "hn", "fu", "dg", "logits",
+            "e", "h", "x1", "x2", "x", "xn", "q", "qn", "at", "og", "hn", "fu", "dg", "logits", "en",
+            "ao", "mo", "xf", "kg", "vg",
         ] {
             let name = format!("act.mtp.{n}");
-            let row = e.tensor_bytes(&name).ok_or("missing")? as usize / 16;
+            let Some(bytes) = e.tensor_bytes(&name) else {
+                continue;
+            };
+            let row = bytes as usize / 16;
             std::fs::write(d.join(format!("{name}.bin")), read(e, &name, 0, row)?)?;
         }
         dump_kv(e, &d, b, pos, slots, &read)?;
@@ -1572,8 +1744,9 @@ fn dump_kv(
     read: &dyn Fn(&plowrt::exec::gpu::GpuEngine, &str, u64, usize) -> plowrt::Result<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Sliding ring whole; full layer only the committed rows per head (the rest is unmapped).
-    // `STEP_BENCH_DRAFT_DUMP_KV=<sliding layer>,<full layer>:<kv heads>:<head dim>` (default:
-    // the 26B-A4B assistant's 28 and 29:2:512; the 12B assistant is 46,47:1:512).
+    // `STEP_BENCH_DRAFT_DUMP_KV=<sliding layer>,<full layer>:<kv heads>:<row bytes>` (default:
+    // the 26B-A4B assistant's 28 and 29:2:512; the 12B assistant is 46,47:1:512; a layer may be a
+    // name, e.g. Nemotron-H's bf16 drafter cache mtp:2:256). Absent scale tensors are skipped.
     let spec = std::env::var("STEP_BENCH_DRAFT_DUMP_KV").unwrap_or_else(|_| "28,29:2:512".into());
     let kv_layers = spec
         .split(',')
@@ -1581,21 +1754,30 @@ fn dump_kv(
             let bad = || {
                 format!("STEP_BENCH_DRAFT_DUMP_KV: {f:?} is not <layer> or <layer>:<heads>:<dim>")
             };
-            let v = f
+            let (l, rest) = f.split_once(':').map_or((f, ""), |(l, r)| (l, r));
+            let v = rest
                 .split(':')
+                .filter(|x| !x.is_empty())
                 .map(|x| x.parse::<usize>().map_err(|_| bad()))
                 .collect::<Result<Vec<_>, _>>()?;
             match v[..] {
-                [l] => Ok((l, 0, 0)),
-                [l, h, d] if h > 0 && d > 0 => Ok((l, h, d)),
+                [] if !l.is_empty() => Ok((l.to_string(), 0, 0)),
+                [h, d] if h > 0 && d > 0 && !l.is_empty() => Ok((l.to_string(), h, d)),
                 _ => Err(bad()),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
-    for &(l, kvh, row_bytes) in &kv_layers {
+    for (l, kvh, row_bytes) in &kv_layers {
+        let (kvh, row_bytes) = (*kvh, *row_bytes);
         for (t, elt) in [("k", 1), ("v", 1), ("k_scale", 4), ("v_scale", 4)] {
             let name = format!("kv.{l}.{t}");
-            let per = e.tensor_bytes(&name).ok_or("missing kv")? as usize / slots;
+            let Some(total) = e.tensor_bytes(&name) else {
+                if elt == 4 {
+                    continue;
+                }
+                return Err(format!("missing {name}").into());
+            };
+            let per = total as usize / slots;
             let bytes = if kvh == 0 {
                 read(e, &name, (b * per) as u64, per)?
             } else {
@@ -1620,8 +1802,9 @@ fn dump_kv(
 /// slot at a fixed rung (`--spec-rung R`, and `--nsplit-kvlen N` for a fixed dense split) is the
 /// reference; the slots are rewound and the same tokens regenerated through `spec_verify` +
 /// `spec_commit` with drafts from MODE: `oracle` (the reference's next tokens, all accepted),
-/// `adversarial` (every draft wrong, all rejected), `ngram` (prompt lookup over each slot's
-/// history). `--spec-poison` NaN-fills every row a verify will write before it runs, and every
+/// `adversarial` (every draft wrong, all rejected), `cycle` (the reference with one draft wrong,
+/// the cut position cycling over every span position and the full accept), `ngram` (prompt
+/// lookup over each slot's history), `mtp` (the packet's chain drafter). `--spec-poison` NaN-fills every row a verify will write before it runs, and every
 /// uncommitted row after it. `--spec-sample T,TOP_K,TOP_P,MIN_P` makes the reference a plain
 /// sampled run (`plow_sample`, or the host sampler with `--spec-host`; draw `bench_unit(slot, i)`
 /// for token `i`) and samples the verify rows with plain decode's sampler and draws, so the
@@ -1748,12 +1931,25 @@ fn spec_bench(
     let mut hrow: Vec<Option<u32>> = vec![None; slots];
     let mut mtp = Vec::new();
     let mut draft_ms = 0f64;
+    let mut draft_fnv: u64 = 0xcbf29ce484222325;
     let (mut host_rows, mut host_spans, mut host_mismatch) = (0usize, 0usize, 0usize);
-    if mode == "mtp" || mode == "dspark" {
-        e.spec_draft_enable(assets)?;
-    }
+    let t_loop = Instant::now();
     while out.iter().any(|o| o.len() < steps) {
         let live: Vec<usize> = (0..slots).filter(|&b| out[b].len() < steps).collect();
+        if a.plain_every > 0 && ticks % a.plain_every == a.plain_every - 1 {
+            if mode == "mtp" || mode == "dspark" || dev.is_some() {
+                return Err("--spec-plain-every needs a greedy drafter-free mode".into());
+            }
+            let feeds: Vec<(usize, u32)> = live.iter().map(|&b| (b, pending[b])).collect();
+            e.step_slots(&feeds, &mut toks)?;
+            for (&b, &t) in live.iter().zip(&toks) {
+                out[b].push(t);
+                hist[b].push(t);
+                pending[b] = t;
+            }
+            ticks += 1;
+            continue;
+        }
         let drafting = mode == "dspark" || mode == "mtp" && live.iter().all(|&b| hrow[b].is_some());
         if mode == "dspark" {
             let rows: Vec<(usize, u32)> = live.iter().map(|&b| (b, pending[b])).collect();
@@ -1770,6 +1966,9 @@ fn spec_bench(
             e.spec_draft_stage(&rows, a.k as u32)?;
             e.spec_draft_run(&mut mtp)?;
             draft_ms += t.elapsed().as_secs_f64() * 1e3;
+            for &d in &mtp {
+                draft_fnv = (draft_fnv ^ u64::from(d)).wrapping_mul(0x100000001b3);
+            }
         }
         for (li, &b) in live.iter().enumerate() {
             let i = out[b].len();
@@ -1790,6 +1989,15 @@ fn spec_bench(
                     draft.extend(reference[b][i..i + k].iter().map(|&t| (t + 1) % vocab));
                 }
                 "ngram" => ngram_propose(&hist[b], k, 1, 4, &mut draft),
+                "cycle" => {
+                    // Tick t cuts slot b's span at draft (t + b) % (k + 1): every cut position,
+                    // and the full accept, in turn.
+                    draft.clear();
+                    draft.extend_from_slice(&reference[b][i..i + k]);
+                    if let Some(d) = draft.get_mut((ticks + b) % (k + 1)) {
+                        *d = (*d + 1) % vocab;
+                    }
+                }
                 m => return Err(format!("unknown --spec mode {m}").into()),
             }
             inputs[b].clear();
@@ -1817,9 +2025,24 @@ fn spec_bench(
                 e.spec_poison_rows(sp.slot, p0, p0 + sp.tokens.len() as u32)?;
             }
         }
+        // `STEP_BENCH_VERIFY_TRACE=N[,N..]` with a -DPLOW_NV_TRACE object: those ticks' verifies
+        // alone (PLOW_TRACE_RAW gets each timeline as `<raw>.tl.t<N>`).
+        let traced = std::env::var("STEP_BENCH_VERIFY_TRACE")
+            .is_ok_and(|v| v.split(',').any(|t| t == ticks.to_string()));
+        if traced {
+            e.trace_reset()?;
+        }
         let t = Instant::now();
         e.spec_verify(&spans, &[], Some(&mut sampler), &mut verdicts)?;
         verify_ms += t.elapsed().as_secs_f64() * 1e3;
+        if traced {
+            if let Some(profile) = e.trace_summary()? {
+                println!("VERIFY_TRACE tick={ticks} spans={}\n{profile}", spans.len());
+            }
+            if let Ok(raw) = std::env::var("PLOW_TRACE_RAW") {
+                let _ = std::fs::rename(format!("{raw}.tl"), format!("{raw}.tl.t{ticks}"));
+            }
+        }
         if let SpecDraw::Device(_) = draw {
             use plowrt::exec::gpu::spec::SpecSampler;
             let mut r = 0u32;
@@ -1860,6 +2083,7 @@ fn spec_bench(
             hrow[sp.slot] = Some(v.hrow);
         }
     }
+    let tick_ms = t_loop.elapsed().as_secs_f64() * 1e3 / ticks.max(1) as f64;
     if let SpecDraw::Device(_) = draw {
         println!(
             "SPEC_SAMPLE_HOST spans={host_spans} rows={host_rows} verdict_mismatch={host_mismatch}"
@@ -1885,8 +2109,8 @@ fn spec_bench(
     };
     println!(
         "SPEC_IDENTITY {} mode={mode} slots={slots} k={} rung={} base={base} steps={steps} \
-         poison={} sample={:?} draw={} ref_fnv={:016x} spec_fnv={:016x} ticks={ticks} drafted={drafted} accepted={accepted} \
-         mean_emit={:.3} plain_ms={plain_ms:.3} verify_ms={:.3} draft_ms={:.3}",
+         poison={} sample={:?} draw={} ref_fnv={:016x} spec_fnv={:016x} draft_fnv={draft_fnv:016x} ticks={ticks} drafted={drafted} accepted={accepted} \
+         mean_emit={:.3} plain_ms={plain_ms:.3} verify_ms={:.3} draft_ms={:.3} tick_ms={tick_ms:.3}",
         if ok { "ok" } else { "MISMATCH" },
         a.k,
         a.rung,

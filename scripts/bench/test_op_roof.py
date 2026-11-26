@@ -7,6 +7,20 @@ from pathlib import Path
 import op_roof
 
 
+FLOOR_TABLE = Path(__file__).resolve().parents[2] / "crates/costmodel/data/op_floor_cases.json"
+
+
+class SharedFloorTests(unittest.TestCase):
+    def test_reproduces_costmodels_floor_table(self):
+        """crates/costmodel/src/op_floor.rs reproduces the same rows: one floor for both."""
+        for case in json.loads(FLOOR_TABLE.read_text())["cases"]:
+            params = {k: float(v) for k, v in case["params"].items()}
+            got = op_roof.cost(case["op"], params, case["rows"], 0, 2, 2)
+            if got is None:
+                got = op_roof.moe_cost(case["op"], params, case["rows"], 2)
+            self.assertEqual((float(got[0]), float(got[1])), (case["bytes"], case["flops"]), case)
+
+
 class SweepTests(unittest.TestCase):
     def test_roofline_rejects_unpriced_instructions(self):
         program = ("prefill", 128, [(1, "HeadNormRopeFp8", "", {})])
@@ -465,6 +479,26 @@ class MoeCostTests(unittest.TestCase):
         priced = op_roof.price(prog, 128, 2, 2, 3000, 989, 1979, router=table)
         self.assertAlmostEqual(priced[19][1], 8 * (2816 * 704 + 4 * 2816) + 2 * 4 * 8 * 704 + 4 * 8 * 4 * 2816)
 
+    def test_router_table_loads_for_sigmoid_topk_router(self):
+        import os
+        import struct
+        import tempfile
+        text = ("===== program T=1  3 insts, 3 counters\n"
+                "#0 MoeRouterLogitsF32 b=48 logits<-act.moe.logits x<-act.hn W<-g.w | T=1 E=512 H=4096 KS=16\n"
+                "#1 MoeRouterSigmoidTopk b=48 table<-act.moe.table logits<-act.moe.logits bias<-g.b | T=1 E=512 k=22 KS=16 flags=1 scale=5\n"
+                "#2 MoeUpNvfp4 b=48 fu<-act.moe.fu x<-act.moe.xl table<-act.moe.table W<-e.w S<-e.s gs<-e.g | T=1 k=22 I=2688 K=1024 E=512\n")
+        raw = b"".join(struct.pack("<If", e, 0.5) for e in range(22))
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(raw)
+        try:
+            progs = op_roof.parse(text)
+            table = op_roof.load_router(f.name, progs)
+        finally:
+            os.unlink(f.name)
+        self.assertEqual(table.union(512, 22, 1), 22)
+        priced = op_roof.price(progs[0], 128, 2, 2, 238, 93.9, 181.1, router=table)
+        self.assertEqual(priced[2][1], 22 * (2688 * 1024 // 2 + 2688 * 1024 // 16 + 4) + 2 * 1024 + 2 * 22 * 2688)
+
     def test_router_table_rejects_duplicate_or_foreign_experts(self):
         import struct
         with self.assertRaisesRegex(ValueError, "repeats"):
@@ -494,6 +528,21 @@ class CeilingTests(unittest.TestCase):
         args = argparse.Namespace(ceilings=None, bw=None, tflops=None, fp8_tflops=None)
         self.assertIn("NOT calibrated", op_roof.ceilings(args, hw)[3])
 
+    def test_w4a4_experts_take_the_measured_fp4_ceiling_only(self):
+        import argparse
+        args = argparse.Namespace(ceilings=None, bw=None, tflops=None, fp8_tflops=None)
+        self.assertIsNone(op_roof.fp4_ceiling(args, op_roof.lookup_gpu("h100")))
+        gb10 = op_roof.lookup_gpu("gb10")
+        self.assertEqual(op_roof.fp4_ceiling(args, gb10), gb10.fp4_tflops_dense)
+        up = {"T": 8192, "k": 22, "I": 2688, "K": 1024, "E": 1, "w4a4": 1}
+        prog = ("prefill", 8192, [(0, "MoeUpNvfp4Pf", "", up)])
+        fp8 = op_roof.price(prog, 0, 2, 2, 1e9, 93.9, 181.1)[0]
+        fp4 = op_roof.price(prog, 0, 2, 2, 1e9, 93.9, 181.1, fp4_tflops=362.2)[0]
+        self.assertAlmostEqual(fp8[3], 2 * fp4[3])
+        bf16 = op_roof.price(("prefill", 8192, [(0, "MoeUpNvfp4Pf", "", dict(up, w4a4=0))]), 0, 2, 2, 1e9,
+                             93.9, 181.1, fp4_tflops=362.2)[0]
+        self.assertEqual(bf16[3], fp8[2] / (93.9 * 1e9))
+
 
 class RouterDumpTests(unittest.TestCase):
     def test_extract_takes_the_request_rows_of_the_table(self):
@@ -508,6 +557,41 @@ class RouterDumpTests(unittest.TestCase):
         self.assertEqual((topk, n, out), (2, 2, table[16:]))
         with self.assertRaisesRegex(ValueError, "no act.moe.table"):
             router_table.extract(dict(meta, tensors=meta["tensors"][:1]), b"")
+
+
+class UbenchTests(unittest.TestCase):
+    SM = {"dram_gbps": 20.0, "bf16_tflops": 2.0, "fp8_tflops": 4.0, "nvfp4_tflops": 8.0}
+
+    def test_slice_is_priced_against_one_sm_and_the_gap_against_the_whole_gpu(self):
+        p = {"M": 4, "N": 4800, "K": 4096}
+        progs = [("decode", 4, [(0, "GemvFp8", "mixer.in_proj.weight", dict(p)),
+                                (1, "GemvFp8", "mixer.in_proj.weight", dict(p)),
+                                (2, "GemvFp8", "mixer.out_proj.weight", dict(p))])]
+        case = {"set": "m-dec", "case": "gemv", "program_t": 4, "inst": 1, "blocks": 48, "slice_max_us": 100.0}
+        (r,) = op_roof.ubench_rows(progs, [case], self.SM, 1024, 2, 2, 240.0, 90.0, 180.0, 360.0)
+        by = 4800 * 4096 + 4 * 4800 + 2 * 4 * (4096 + 4800)
+        self.assertEqual(r["bound"], "dram")
+        self.assertAlmostEqual(r["floor_sm_us"], by / 48 / 20e3)
+        self.assertAlmostEqual(r["pct_sm"], 100 * by / 48 / 20e3 / 100.0)
+        self.assertEqual(r["n"], 2)
+        self.assertAlmostEqual(r["gap_ms"], 2 * (100.0 - by / 240e3) / 1e3)
+
+    def test_slice_faster_than_the_shared_dram_floor_costs_nothing(self):
+        progs = [("decode", 1, [(0, "Residual", "", {"n": 4096})])]
+        case = {"set": "m-dec", "case": "res", "program_t": 1, "inst": 0, "blocks": 48, "slice_max_us": 1e-3}
+        (r,) = op_roof.ubench_rows(progs, [case], self.SM, 1024, 2, 2, 240.0, 90.0, 180.0, 360.0)
+        self.assertEqual(r["gap_ms"], 0.0)
+
+    def test_w4a4_experts_use_the_fp4_peak_and_the_measured_expert_count(self):
+        p = {"T": 8192, "k": 22, "I": 2688, "K": 1024, "E": 512, "w4a4": 1}
+        progs = [("prefill", 8192, [(0, "MoeUpNvfp4Pf", "", dict(p))])]
+        case = {"set": "m-pf", "case": "up", "program_t": 8192, "inst": 0, "blocks": 48,
+                "slice_max_us": 5000.0, "experts": 512}
+        (r,) = op_roof.ubench_rows(progs, [case], self.SM, 1024, 2, 2, 240.0, 90.0, 180.0, 360.0)
+        by, fl = op_roof.cost("MoeUpNvfp4Pf", dict(p, experts=512), 8192, 1024, 2, 2)
+        self.assertEqual(r["bound"], "mma fp4")
+        self.assertAlmostEqual(r["floor_sm_us"], fl / 48 / 8e6)
+        self.assertAlmostEqual(r["floor_gpu_us"], max(by / 240e3, fl / 360e6))
 
 
 if __name__ == "__main__":

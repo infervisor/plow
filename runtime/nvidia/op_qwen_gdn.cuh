@@ -300,6 +300,136 @@ static __device__ void d_qwen_gdn_step(__nv_bfloat16* out, const __nv_bfloat16* 
     }
 }
 
+#if PLOW_NV_ROW_SLOT
+/* Span-mode verify (plowrt exec/gpu/spec.rs, plow_asset::recurrent_state::VerifyRollback): rows
+ * r0..r0+n-1 carrying the same rowslot entry (bit 31 clear) are one sequence's consecutive
+ * tokens and chain through its recurrent buffers. The buffer after span row j < n-1 lands in
+ * snap[slot][j] (`depth` rows per slot), after the last row in the buffer itself; commit copies a
+ * snapshot back when the span is cut short. Padding rows (bit 31) and inactive rows run nothing.
+ * A plain launch's identity map makes every row a span of one: the plain arithmetic. */
+static __device__ __forceinline__ unsigned qwen_span_len(const int* rowslot, unsigned r0,
+    unsigned batch, unsigned depth) {
+    const int tag = rowslot[r0];
+    if (tag < 0 || (r0 > 0 && rowslot[r0 - 1] == tag)) return 0;
+    unsigned n = 1;
+    while (r0 + n < batch && rowslot[r0 + n] == tag) n++;
+    if (n > depth + 1u) __trap();
+    return n;
+}
+
+// d_qwen_gdn_conv over spans: one thread per (span start row, channel), same arithmetic.
+static __device__ void d_qwen_gdn_conv_span(__nv_bfloat16* out, const __nv_bfloat16* in,
+    const __nv_bfloat16* weight, __nv_bfloat16* history, const int* active, unsigned channels,
+    unsigned width, unsigned batch, unsigned slice, unsigned nblk, unsigned source,
+    const int* rowslot, __nv_bfloat16* snap, unsigned depth) {
+    if (width < 2 || width > 8) { if (threadIdx.x == 0) __trap(); return; }
+    const unsigned is = source ? (source & 0xFFFFu) : channels;
+    in += source >> 16;
+    for (unsigned idx = slice * blockDim.x + threadIdx.x; idx < batch * channels;
+         idx += nblk * blockDim.x) {
+        const unsigned r0 = idx / channels, c = idx % channels;
+        if (active && active[r0] <= 0) continue;
+        const unsigned n = qwen_span_len(rowslot, r0, batch, depth);
+        if (!n) continue;
+        const size_t slot = (size_t)rowslot[r0];
+        __nv_bfloat16* live = history + (slot * channels + c) * (width - 1);
+        __nv_bfloat16 h[7];
+        for (unsigned j = 0; j + 1 < width; j++) h[j] = live[j];
+        const __nv_bfloat16* w = weight + (size_t)c * width;
+        for (unsigned s = 0; s < n; s++) {
+            const unsigned row = r0 + s;
+            float sum = 0.f;
+            for (unsigned j = 0; j + 1 < width; j++)
+                sum = fmaf(__bfloat162float(h[j]), __bfloat162float(w[j]), sum);
+            const __nv_bfloat16 x = in[(size_t)row * is + c];
+            sum = fmaf(__bfloat162float(x), __bfloat162float(w[width - 1]), sum);
+            for (unsigned j = 0; j + 2 < width; j++) h[j] = h[j + 1];
+            h[width - 2] = x;
+            out[(size_t)row * channels + c] = __float2bfloat16(sum / (1.f + expf(-sum)));
+            __nv_bfloat16* dst = s + 1 < n
+                ? snap + ((slot * depth + s) * channels + c) * (width - 1) : live;
+            for (unsigned j = 0; j + 1 < width; j++) dst[j] = h[j];
+        }
+    }
+}
+
+// d_qwen_gdn_step's serial body over spans: a warp owns 8 V rows of one head of one span and
+// walks the span's tokens in order, reading the state its previous token wrote (the same lanes
+// own the same elements, so program order makes it visible). No staging: the direct loads give
+// the staged body's bytes.
+static __device__ void d_qwen_gdn_step_span(__nv_bfloat16* out, const __nv_bfloat16* qkv,
+    const __nv_bfloat16* a, const __nv_bfloat16* b, const void* a_log,
+    const __nv_bfloat16* dt_bias, float* state, const int* active,
+    unsigned hk, unsigned hv, unsigned kdim, unsigned vdim, unsigned batch,
+    float scale, float eps, unsigned alog_f32, unsigned slice, unsigned nblk,
+    const int* rowslot, float* snap, unsigned depth) {
+    if (!hk || !hv || hv % hk || kdim != 128 || !vdim) {
+        if (threadIdx.x == 0) __trap(); return;
+    }
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned warps = blockDim.x >> 5;
+    const unsigned packed = 2 * hk * kdim + hv * vdim;
+    const unsigned tiles = (vdim + 7u) / 8u;
+    const size_t head_floats = (size_t)vdim * kdim;
+    for (unsigned tile = slice * warps + warp; tile < batch * hv * tiles; tile += nblk * warps) {
+        const unsigned r0 = tile / (hv * tiles);
+        if (active && active[r0] <= 0) continue;
+        const unsigned n = qwen_span_len(rowslot, r0, batch, depth);
+        if (!n) continue;
+        const size_t sslot = (size_t)rowslot[r0];
+        const unsigned head = tile / tiles % hv, first_v = (tile % tiles) * 8u;
+        const unsigned qhead = head / (hv / hk);
+        const float al = alog_f32 ? ((const float*)a_log)[head] : __bfloat162float(((const __nv_bfloat16*)a_log)[head]);
+        for (unsigned s = 0; s < n; s++) {
+            const unsigned row = r0 + s;
+            const __nv_bfloat16* x = qkv + (size_t)row * packed;
+            float q[4], k[4], h[4], qq = 0.f, kk = 0.f;
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) {
+                unsigned d = lane + 32 * j;
+                q[j] = __bfloat162float(x[qhead * kdim + d]);
+                k[j] = __bfloat162float(x[hk * kdim + qhead * kdim + d]);
+                qq += q[j] * q[j]; kk += k[j] * k[j];
+            }
+            const float qs = scale / sqrtf(qwen_warp_sum(qq) + eps);
+            const float ks = 1.f / sqrtf(qwen_warp_sum(kk) + eps);
+            const unsigned gate = row * hv + head;
+            const float dt = __bfloat162float(a[gate]) + __bfloat162float(dt_bias[head]);
+            const float softplus = dt > 20.f ? dt : log1pf(expf(dt));
+            const float decay = expf(-expf(al) * softplus);
+            const float beta = __bfloat162float(__float2bfloat16(1.f / (1.f + expf(-__bfloat162float(b[gate])))));
+#pragma unroll
+            for (unsigned j = 0; j < 4; j++) { q[j] *= qs; k[j] *= ks; }
+            const float* src = s == 0 ? state + (sslot * hv + head) * head_floats
+                                      : snap + ((sslot * depth + s - 1) * hv + head) * head_floats;
+            float* dst = s + 1 < n ? snap + ((sslot * depth + s) * hv + head) * head_floats
+                                   : state + (sslot * hv + head) * head_floats;
+#pragma unroll 1
+            for (unsigned vcol = first_v; vcol < vdim && vcol < first_v + 8u; vcol++) {
+                const float* sr = src + (size_t)vcol * kdim;
+                float projection = 0.f;
+#pragma unroll
+                for (unsigned j = 0; j < 4; j++) {
+                    h[j] = sr[lane + 32 * j] * decay;
+                    projection += h[j] * k[j];
+                }
+                const float value = __bfloat162float(x[2 * hk * kdim + head * vdim + vcol]);
+                const float delta = (value - qwen_warp_sum(projection)) * beta;
+                float result = 0.f;
+#pragma unroll
+                for (unsigned j = 0; j < 4; j++) {
+                    h[j] = fmaf(delta, k[j], h[j]);
+                    dst[(size_t)vcol * kdim + lane + 32 * j] = h[j];
+                    result += h[j] * q[j];
+                }
+                result = qwen_warp_sum(result);
+                if (lane == 0) out[((size_t)row * hv + head) * vdim + vcol] = __float2bfloat16(result);
+            }
+        }
+    }
+}
+#endif /* PLOW_NV_ROW_SLOT */
+
 // PF: the prefill fast path (the prefill interpreter and the decode object's light_pf, which
 // instantiates it on its own register/stack budget); the decode interpreter stays generic.
 template <bool PF>
@@ -465,7 +595,7 @@ static __device__ void d_qwen_sigmoid_gate(__nv_bfloat16* out, const __nv_bfloat
 // `WIDE` (the light entry only): the warp-per-row path stages S chunks per lane and splits a row
 // over up to four warps; inside the interpreter objects the staged chunks alone grew the decode
 // entry's stack 320 -> 800 B at the 255-register cap, so they keep the one-chunk walk.
-template <bool WIDE = false, bool RESIDENT = false>
+template <bool WIDE = false, bool RESIDENT = false, unsigned RESIDENT_RB = 32>
 static __device__ void d_qwen_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* gamma, const int* active, unsigned dim, unsigned batch,
     float eps, float offset, unsigned slice, unsigned nblk, float* part,
@@ -559,7 +689,7 @@ static __device__ void d_qwen_rmsnorm(__nv_bfloat16* out, const __nv_bfloat16* i
     // elements per thread, the same element -> thread map and ascending-k sum as the walk
     // below, so the same bits). The walk was two dependent 2-byte load chains per row, ~18 us
     // per 5120-wide norm.
-    constexpr unsigned RB = 32;
+    constexpr unsigned RB = RESIDENT_RB;
     if constexpr (RESIDENT) if (dim <= RB * blockDim.x) {
         for (unsigned row = slice; row < batch; row += nblk) {
             if (active && active[row] <= 0) continue;
@@ -731,12 +861,36 @@ static __device__ void d_qwen_fold_norm(__nv_bfloat16* hn, __nv_bfloat16* resid_
 #ifndef PLOW_NV_KV_ILV
 #define PLOW_NV_KV_ILV 0  /* op_attention.cuh: head-interleaved KV rows */
 #endif
+#ifndef PLOW_NV_KV_E4M3
+#define PLOW_NV_KV_E4M3 0 /* manifest `kv_e4m3`: every KV cache holds E4M3 at unit scale */
+#endif
 static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloat16* in,
     const __nv_bfloat16* gamma, const float* cos, const float* sin, const int* positions,
     const int* active, unsigned heads, unsigned dim, unsigned rotary, unsigned batch,
     unsigned context, unsigned normalize, float eps, float offset, unsigned slice, unsigned nblk,
-    unsigned prefill = 0, const int* pfslot = nullptr, unsigned source = 0) {
-    if (dim != 256 || (rotary != 0 && rotary != 64)) { if (threadIdx.x == 0) __trap(); return; }
+    unsigned prefill = 0, const int* pfslot = nullptr, unsigned source = 0, unsigned layout = 0) {
+    /* dim 128 (Nemotron-H NoPE KV writer) takes no rotary. */
+    if (!(dim == 256 && (rotary == 0 || rotary == 64)) && !(dim == 128 && rotary == 0)) {
+        if (threadIdx.x == 0) __trap();
+        return;
+    }
+    /* i7 bit 8 (live_kv::KV_E4M3): this cache stores sat_e4m3(x / 1.0), vLLM's
+     * reshape_and_cache_flash at the default unit k/v scale. The object's flash arms read the
+     * same encoding, so a cache writer that disagrees with the object traps. */
+    const bool e4m3 = context && (layout & 0x100u);
+    if (context && e4m3 != (PLOW_NV_KV_E4M3 != 0)) {
+        if (threadIdx.x == 0) __trap();
+        return;
+    }
+    /* i7 bit 9 (live_kv::KV_SCALE, drafter caches): sat_e4m3(x / s), s = the checkpoint's static
+     * per-tensor k/v scale in the cos slot (t3); IEEE division, as vLLM's reshape_and_cache_flash. */
+    const bool kv_scaled = context && (layout & 0x200u);
+    const float kv_s = kv_scaled && cos ? cos[0] : 1.f;
+    if (kv_scaled && (!e4m3 || rotary || !cos || !(kv_s > 0.f))) {
+        if (threadIdx.x == 0) __trap();
+        return;
+    }
+    const unsigned per = dim / 32u;
     /* source (j1): 0 = in[rows][heads][dim]; else in_stride | in_col << 16 (elements), the row
      * pitch and column of this projection inside an N-concatenated output. */
     const unsigned in_stride = source ? (source & 0xFFFFu) : heads * dim, in_col = source >> 16;
@@ -749,9 +903,10 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
         if (pfslot) { const int ps = pfslot[slot]; if (ps < 0) continue; kvslot = (unsigned)ps; }
         const int pos = positions ? positions[slot] : 0;
         if (pos < 0 || (context && (unsigned)pos >= context)) { if (lane == 0) __trap(); continue; }
-        float x[8], sum = 0.f;
+        float x[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}, sum = 0.f;
 #pragma unroll
         for (unsigned j = 0; j < 8; j++) {
+            if (j >= per) break;
             x[j] = __bfloat162float(in[(size_t)slot * in_stride + in_col + head * dim + lane + j * 32]);
             sum += x[j] * x[j];
         }
@@ -759,6 +914,7 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
             const float inv = rsqrtf(qwen_warp_sum(sum) / dim + eps);
 #pragma unroll
             for (unsigned j = 0; j < 8; j++) {
+                if (j >= per) break;
                 float g = gamma ? __bfloat162float(gamma[lane + j * 32]) + offset : 1.f;
                 x[j] = __bfloat162float(__float2bfloat16(x[j] * inv * g));
             }
@@ -777,8 +933,22 @@ static __device__ void d_qwen_headnorm_rope(__nv_bfloat16* out, const __nv_bfloa
         size_t dest = context ? ((size_t)kvslot * heads + head) * context * dim + (size_t)pos * dim
                               : (size_t)row * dim;
 #endif
+#if PLOW_NV_KV_E4M3
+        if (e4m3) {
 #pragma unroll
-        for (unsigned j = 0; j < 8; j++) out[dest + lane + j * 32] = __float2bfloat16(x[j]);
+            for (unsigned j = 0; j < 8; j++) {
+                if (j >= per) break;
+                reinterpret_cast<__nv_fp8_storage_t*>(out)[dest + lane + j * 32] =
+                    __nv_cvt_float_to_fp8(kv_scaled ? __fdiv_rn(x[j], kv_s) : x[j], __NV_SATFINITE, __NV_E4M3);
+            }
+            continue;
+        }
+#endif
+#pragma unroll
+        for (unsigned j = 0; j < 8; j++) {
+            if (j >= per) break;
+            out[dest + lane + j * 32] = __float2bfloat16(x[j]);
+        }
     }
 }
 

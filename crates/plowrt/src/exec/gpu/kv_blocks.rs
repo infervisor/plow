@@ -1224,8 +1224,9 @@ impl GpuEngine {
 
     /// Rows from `c0` to the next capture boundary of `prompt` on a recurrent model whose state
     /// the store captures; `usize::MAX` when no cut applies (no state class, attach off for the
-    /// slot, prompt-end boundary passed). Packed chunks take `min` with it so the chunk ends
-    /// exactly at the boundary and [`Self::state_capture_publish`] can capture there.
+    /// slot, prompt-end boundary passed or not expected to be attached). Packed chunks take `min`
+    /// with it so the chunk ends exactly at the boundary and [`Self::state_capture_publish`] can
+    /// capture there.
     pub fn state_capture_cut(&self, b: usize, prompt: &[u32], c0: usize) -> usize {
         self.state_capture_stop(b, prompt, c0)
             .map_or(usize::MAX, |(rows, _)| rows as usize - c0)
@@ -1234,7 +1235,8 @@ impl GpuEngine {
     /// The next row past `c0` where slot `b`'s recurrent state must be captured, the only rows
     /// another request can attach to: a whole-block checkpoint a request waits on
     /// (`VmmKv::inflight_prefix`), the shared-prefix end (`VmmKv::share_rows`: a system prompt
-    /// another prompt also sent), then the prompt-end boundary.
+    /// another prompt also sent), then the prompt-end boundary when a later request is expected
+    /// to attach it (`VmmKv::prompt_end_expected`, not the session's last turn).
     fn state_capture_stop(
         &self,
         b: usize,
@@ -1253,21 +1255,25 @@ impl GpuEngine {
         let Some((_, kv)) = self.vmm_prefix() else {
             return Some((p_a, Kind::PROMPT_END));
         };
-        let mut stop = (p_a, Kind::PROMPT_END);
+        // The cut costs a launch of its own (a full weight pass): a prompt end no later request
+        // is expected to attach is captured only where a launch ends anyway.
+        let mut stop = (!self.session_end[b] && kv.prompt_end_expected(b))
+            .then_some((p_a, Kind::PROMPT_END));
         let share = kv.share_rows(b);
-        if share as usize > c0 && share < stop.0 {
-            stop = (share, Kind::SHARED_END);
+        if share as usize > c0 && stop.is_none_or(|(rows, _)| share < rows) {
+            stop = Some((share, Kind::SHARED_END));
         }
         let br = kv.block_rows();
+        let limit = stop.map_or(p_a, |(rows, _)| rows);
         let mut p = (c0 as u32 / br + 1) * br;
-        while p < stop.0 {
+        while p < limit {
             if kv.checkpoint_awaited(prompt, p) {
-                stop = (p, Kind::CHECKPOINT);
+                stop = Some((p, Kind::CHECKPOINT));
                 break;
             }
             p += br;
         }
-        Some(stop)
+        stop
     }
 
     /// After a chunk that ended exactly at a capture boundary of a recurrent model
@@ -1371,8 +1377,15 @@ impl GpuEngine {
 
     /// Copy the state tensors slot `b` still reads from its attached block (`tensor`, or every
     /// one) into the slot: whatever reads the slot's state other than the packed prefill's
-    /// gather (an unpacked chunk, a rider step, a publish) reads it there.
+    /// gather (an unpacked chunk, a rider step, a publish) reads it there, after any deferred
+    /// verify commit is replayed.
     pub(crate) fn state_materialize(&self, b: usize, tensor: Option<usize>) -> Result<()> {
+        self.recurrent_replay_flush()?;
+        self.state_materialize_attached(b, tensor)
+    }
+
+    /// [`Self::state_materialize`] without the replay (a verify replays deferred commits itself).
+    pub(crate) fn state_materialize_attached(&self, b: usize, tensor: Option<usize>) -> Result<()> {
         let Some(bs) = self.kv_blocks() else {
             return Ok(());
         };

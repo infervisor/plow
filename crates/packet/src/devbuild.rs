@@ -445,6 +445,9 @@ pub struct Builder {
     attn_res_f32mix_segments: bool,
     /// Isolate exact gfx942 Gemma-4 BF16 gate/up packets for the raw C2/C5 object.
     native_gemma4_glu_segments: bool,
+    /// Isolate W4A4 NVFP4 MoE up / down packets (`MoeUpNvfp4Pf` i5 = 1, `MoeDownNvfp4Pf` i6 = 1) for
+    /// the sm_12x segment entry `plow_moe_w4a4_pf`.
+    w4a4_moe_segments: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -750,6 +753,7 @@ impl Builder {
             fuse_materialized_residual_inputs: true,
             attn_res_f32mix_segments: false,
             native_gemma4_glu_segments: false,
+            w4a4_moe_segments: false,
             gemv_split: 1,
             gemm_small_splitk: 0,
             gemm_small_splitk_2p: false,
@@ -784,6 +788,10 @@ impl Builder {
 
     pub fn set_native_gemma4_glu_segments(&mut self, enabled: bool) {
         self.native_gemma4_glu_segments = enabled;
+    }
+
+    pub fn set_w4a4_moe_segments(&mut self, enabled: bool) {
+        self.w4a4_moe_segments = enabled;
     }
 
     /// Refuse to honour `PLOW_UNISEG` for this program, whatever the environment says.
@@ -2056,6 +2064,16 @@ impl Builder {
                 Some(l)
             }
         });
+        if self.w4a4_moe_segments {
+            for op in &mut self.ops {
+                let inst = &op.inst;
+                if (inst.op == DevOp::MoeUpNvfp4Pf as u16 && inst.i[5] == 1)
+                    || (inst.op == DevOp::MoeDownNvfp4Pf as u16 && inst.i[6] == 1)
+                {
+                    op.isolated = true;
+                }
+            }
+        }
         let mut native_gemma4_glu = false;
         if self.native_gemma4_glu_segments && l2_place.is_none() {
             for op in &mut self.ops {

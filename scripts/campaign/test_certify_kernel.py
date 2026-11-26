@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,10 @@ from certify_kernel import certify_data, evaluate_efficiency
 
 
 class TestCertifyKernel(unittest.TestCase):
+    def test_gate_is_costmodels(self):
+        import certify_kernel
+        self.assertEqual((certify_kernel.MIN_MEMORY, certify_kernel.MIN_COMPUTE), (0.80, 0.75))
+
     def test_evaluate_memory_pass(self):
         row = {"phase": "decode", "bound": "memory", "efficiency": 0.84, "point": "decode:1:0"}
         res = evaluate_efficiency(row)

@@ -175,6 +175,103 @@ pub(super) fn validate_moe_lt_ladder(blob: &DevBlob, metadata: &SegmentRoles) ->
     validate_decode_ladder_impl(blob, true, &[])
 }
 
+/// Normalises one decode instruction of a `t`-row rung to its one-row form. `Ok(false)`: the op
+/// has no arm, and a ladder carrying it keeps the widest rung.
+pub(super) fn normalize_rows(d: &mut DevInst64, t: u32, routed: bool) -> Result<bool> {
+    let reject = |reason: &str| RuntimeError::Rejected(format!("decode ladder: {reason}"));
+    match DevOp::from_u16(d.op) {
+        Some(DevOp::Nop) => {}
+        Some(
+            op @ (DevOp::QuantFp8
+            | DevOp::GemmFp8
+            | DevOp::GemmMedFp8
+            | DevOp::GemmSmallFp8),
+        ) => {
+            if d.i[0] != t {
+                return Err(reject("FP8 instruction rows disagree with rung width"));
+            }
+            d.i[0] = 1;
+            // Block-scaled QuantFp8 (i3 = the 1x128 group): i4 = the rung's rows padded to
+            // the activation-scale layout's multiple of 4.
+            if op == DevOp::QuantFp8 && d.i[3] == packet::dev::FP8_BLOCK_GROUP {
+                if d.i[4] != t.next_multiple_of(4) {
+                    return Err(reject("FP8 group-scale rows disagree with rung width"));
+                }
+                d.i[4] = 1;
+            }
+            // Native W8A8 rungs (devgen qwen35.rs `proj`): only the single-row rung binds
+            // its weight TMA map in i[7] (i[6] is the prefill input map); the per-rung
+            // maps are a rung-local choice, not program shape.
+            if op == DevOp::GemmFp8 && !routed {
+                d.i[6] = 0;
+                d.i[7] = 0;
+            }
+        }
+        Some(DevOp::Residual | DevOp::Glu | DevOp::GluPitched | DevOp::SoftCap) => {
+            if d.i[0] == 0 || d.i[0] % t != 0 {
+                return Err(reject("invalid elementwise row extent"));
+            }
+            d.i[0] /= t;
+        }
+        Some(DevOp::Argmax | DevOp::ArgmaxFin) => {
+            if d.i[1].max(1) != t {
+                return Err(reject("invalid argmax row extent"));
+            }
+            d.i[1] = 1;
+        }
+        // Gemma-4 E-series: the per-layer input norm runs over `t * layers` rows.
+        Some(DevOp::RmsNorm) if d.i[0] != t => {
+            if d.i[0] == 0 || d.i[0] % t != 0 {
+                return Err(reject("invalid norm row extent"));
+            }
+            d.i[0] /= t;
+        }
+        Some(
+            DevOp::HeadNormRope
+            | DevOp::HeadNormRopeFp8
+            | DevOp::FlashDecode
+            | DevOp::FlashDecodeFp8
+            | DevOp::FlashMerge,
+        ) => {
+            if d.i[0] != t {
+                return Err(reject("instruction rows disagree with rung width"));
+            }
+            d.i[0] = 1;
+            if matches!(
+                DevOp::from_u16(d.op),
+                Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8)
+            ) && d.i[6] != 0
+            {
+                if d.i[6] != t {
+                    return Err(reject("KV writer uses a different slot count"));
+                }
+                d.i[6] = 1;
+            }
+            if matches!(
+                DevOp::from_u16(d.op),
+                Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
+            ) {
+                d.i[5] = 0;
+                d.fj[1] = 0;
+            } else if d.op == DevOp::FlashMerge as u16 {
+                d.i[2] = 0;
+            }
+        }
+        // Every other op whose row count rides one immediate (packet::slots::rows_imm):
+        // the dense row ops, the Qwen3.5 / Nemotron-H hybrids, the MoE decode families.
+        Some(op) if packet::slots::rows_imm(op).is_some_and(|r| r.has_decode_form()) => {
+            let r = packet::slots::rows_imm(op).expect("guarded");
+            let want = if r.zero_at_one && t == 1 { 0 } else { t };
+            if d.i[r.rows] != want || r.is_prefill_form(&d.i) {
+                return Err(reject(&format!("{op:?} rows disagree with rung width")));
+            }
+            d.i[r.rows] = u32::from(!r.zero_at_one);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// `routed[i]`: decode rung `i` runs the cuBLASLt projection program. Rungs are held to the same
 /// normalized program only within their class: routed, folded (a Qwen3.5 rung whose projections
 /// carry the residual + RMSNorm prologue, devgen PLOW_QWEN_FOLD_NORM up to PLOW_QWEN_FOLD_MAX
@@ -269,186 +366,15 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         for d in logical.map_or(g.insts.as_slice(), |p| p.instructions.as_slice()) {
             let mut d = *d;
             d.blocks = 0;
-            match DevOp::from_u16(d.op) {
-                Some(DevOp::Nop) => {}
-                Some(
-                    op @ (DevOp::QuantFp8
-                    | DevOp::GemmFp8
-                    | DevOp::GemmMedFp8
-                    | DevOp::GemmSmallFp8),
-                ) => {
-                    if d.i[0] != g.t {
-                        return Err(reject("FP8 instruction rows disagree with rung width"));
-                    }
-                    d.i[0] = 1;
-                    // Block-scaled QuantFp8 (i3 = the 1x128 group): i4 = the rung's rows padded to
-                    // the activation-scale layout's multiple of 4.
-                    if op == DevOp::QuantFp8 && d.i[3] == packet::dev::FP8_BLOCK_GROUP {
-                        if d.i[4] != g.t.next_multiple_of(4) {
-                            return Err(reject("FP8 group-scale rows disagree with rung width"));
-                        }
-                        d.i[4] = 1;
-                    }
-                    // Native W8A8 rungs (devgen qwen35.rs `proj`): only the single-row rung binds
-                    // its weight TMA map in i[7] (i[6] is the prefill input map); the per-rung
-                    // maps are a rung-local choice, not program shape.
-                    if op == DevOp::GemmFp8 && !routed.get(index).copied().unwrap_or(false) {
-                        d.i[6] = 0;
-                        d.i[7] = 0;
-                    }
+            if !normalize_rows(&mut d, g.t, routed.get(index).copied().unwrap_or(false))? {
+                if crate::config::RuntimeConfig::get().nv.ladder_debug {
+                    eprintln!(
+                        "ladder: rung {index} inst {} op {} has no normalization arm",
+                        insts.len(),
+                        d.op
+                    );
                 }
-                Some(DevOp::Residual | DevOp::Glu | DevOp::GluPitched | DevOp::SoftCap) => {
-                    if d.i[0] == 0 || d.i[0] % g.t != 0 {
-                        return Err(reject("invalid elementwise row extent"));
-                    }
-                    d.i[0] /= g.t;
-                }
-                Some(DevOp::Argmax | DevOp::ArgmaxFin) => {
-                    if d.i[1].max(1) != g.t {
-                        return Err(reject("invalid argmax row extent"));
-                    }
-                    d.i[1] = 1;
-                }
-                Some(DevOp::MoeRouterTopkPf) => {
-                    if d.i[4] != g.t {
-                        return Err(reject("MoE router rows disagree with rung width"));
-                    }
-                    d.i[4] = 1;
-                }
-                Some(DevOp::MoeGluMx | DevOp::MoeDownMx) => {
-                    if d.i[6] != g.t {
-                        return Err(reject("MoE expert rows disagree with rung width"));
-                    }
-                    d.i[6] = 1;
-                }
-                Some(DevOp::MoeCombinePf) => {
-                    if d.i[2] != g.t {
-                        return Err(reject("MoE combine rows disagree with rung width"));
-                    }
-                    d.i[2] = 1;
-                }
-                // Grouped-decode align (PLOW_GEMMA_MOE_DEC_GROUP): rows ride i0, like prefill.
-                Some(DevOp::MoeAlignGemmaPf) => {
-                    if d.i[0] != g.t {
-                        return Err(reject("MoE align rows disagree with rung width"));
-                    }
-                    d.i[0] = 1;
-                }
-                // Gemma MoE decode carries B in a spare immediate, 0 at B=1 (devgen `nb`).
-                Some(
-                    op @ (DevOp::MoeRouterGemmaScore
-                    | DevOp::MoeRouterGemmaScoreFast
-                    | DevOp::MoeRouterGemmaTopk
-                    | DevOp::MoeExpertGluNormGemma
-                    | DevOp::MoeExpertDownGemma
-                    | DevOp::MoeExpertGluGemmaFp8
-                    | DevOp::MoeExpertDownGemmaFp8
-                    | DevOp::MoeCombineNormGemma
-                    | DevOp::MoeCombineResidNormGemma),
-                ) => {
-                    let field = match op {
-                        DevOp::MoeRouterGemmaScore
-                        | DevOp::MoeRouterGemmaScoreFast
-                        | DevOp::MoeCombineNormGemma
-                        // op72, the fused combine+NRN tail: carries B in i[2] exactly as the
-                        // unfused op70 it replaces, so it normalizes the same way. Without this
-                        // arm the ladder silently falls back to widest-only execution.
-                        | DevOp::MoeCombineResidNormGemma => 2,
-                        DevOp::MoeRouterGemmaTopk => 3,
-                        _ => 5,
-                    };
-                    if d.i[field] != if g.t > 1 { g.t } else { 0 } {
-                        return Err(reject("Gemma MoE rows disagree with rung width"));
-                    }
-                    d.i[field] = 0;
-                }
-                // Gemma-4 E-series: the per-layer input norm runs over `t * layers` rows.
-                Some(DevOp::RmsNorm) if d.i[0] != g.t => {
-                    if d.i[0] == 0 || d.i[0] % g.t != 0 {
-                        return Err(reject("invalid norm row extent"));
-                    }
-                    d.i[0] /= g.t;
-                }
-                // Qwen3.5 hybrid (devgen qwen35.rs): the row count rides a per-op immediate.
-                Some(
-                    op @ (DevOp::QwenRmsNorm
-                    | DevOp::QwenSigmoidGate
-                    | DevOp::QwenGdnConv
-                    | DevOp::QwenGatedNorm
-                    | DevOp::QwenQGateSplit
-                    | DevOp::QwenHeadNormRope
-                    | DevOp::QwenGdnStep),
-                ) => {
-                    let field = match op {
-                        DevOp::QwenRmsNorm | DevOp::QwenSigmoidGate => 1,
-                        DevOp::QwenGdnConv | DevOp::QwenGatedNorm | DevOp::QwenQGateSplit => 2,
-                        DevOp::QwenHeadNormRope => 3,
-                        _ => 4,
-                    };
-                    if d.i[field] != g.t {
-                        return Err(reject("Qwen rows disagree with rung width"));
-                    }
-                    d.i[field] = 1;
-                }
-                Some(
-                    DevOp::RmsNorm
-                    | DevOp::RowRms
-                    | DevOp::GluStrided
-                    | DevOp::HeadNormRope
-                    | DevOp::HeadNormRopeFp8
-                    | DevOp::Gemm
-                    | DevOp::GemmNorm
-                    | DevOp::Gemv
-                    | DevOp::GemvArgmax
-                    | DevOp::GemvFp8
-                    | DevOp::GemvQkv
-                    | DevOp::GemvGlu
-                    | DevOp::GemvGluFp8
-                    | DevOp::GemmGlu
-                    | DevOp::NormResidual
-                    | DevOp::NormResidualNorm
-                    | DevOp::AddNorm
-                    | DevOp::Embed
-                    | DevOp::EmbedPosBf16
-                    | DevOp::EmbedFrameBf16
-                    | DevOp::FlashDecode
-                    | DevOp::FlashDecodeFp8
-                    | DevOp::FlashMerge,
-                ) => {
-                    if d.i[0] != g.t {
-                        return Err(reject("instruction rows disagree with rung width"));
-                    }
-                    d.i[0] = 1;
-                    if matches!(
-                        DevOp::from_u16(d.op),
-                        Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8)
-                    ) && d.i[6] != 0
-                    {
-                        if d.i[6] != g.t {
-                            return Err(reject("KV writer uses a different slot count"));
-                        }
-                        d.i[6] = 1;
-                    }
-                    if matches!(
-                        DevOp::from_u16(d.op),
-                        Some(DevOp::FlashDecode | DevOp::FlashDecodeFp8)
-                    ) {
-                        d.i[5] = 0;
-                        d.fj[1] = 0;
-                    } else if d.op == DevOp::FlashMerge as u16 {
-                        d.i[2] = 0;
-                    }
-                }
-                _ => {
-                    if crate::config::RuntimeConfig::get().nv.ladder_debug {
-                        eprintln!(
-                            "ladder: rung {index} inst {} op {} has no normalization arm",
-                            insts.len(),
-                            d.op
-                        );
-                    }
-                    compatible = false;
-                }
+                compatible = false;
             }
             insts.push(d);
         }
@@ -510,6 +436,13 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                 .and_then(|r| blob.init.get(r))
                 .is_some_and(|w| w.len() == 44 && w[28..32] == (pos as u32).to_le_bytes())
     };
+    // Span mode on a BF16 cache: the row-slot map rides the reader's t6.
+    let bf16_span = |d: &DevInst64| {
+        d.op == DevOp::FlashDecode as u16
+            && row_slot != TENSOR_NONE16
+            && d.t[6] == row_slot
+            && d.t[7] == TENSOR_NONE16
+    };
     let mut caches = std::collections::BTreeMap::new();
     let mut scales = std::collections::BTreeMap::new();
     for d in &widest.insts {
@@ -522,7 +455,10 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
         if !matches!(d.i[6], 64 | 128 | 256 | 512)
             || (fp8 && d.i[6] == 64)
-            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) && !hnr_fold(d))
+            || (!fp8
+                && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16)
+                && !hnr_fold(d)
+                && !bf16_span(d))
         {
             if crate::config::RuntimeConfig::get().nv.ladder_debug {
                 eprintln!("ladder: unsupported FlashDecode geometry or bound slot/fold operands");
@@ -541,10 +477,16 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         {
             return Err(reject("invalid KV reader geometry"));
         }
+        // A unit-scale E4M3 cache is declared by its writer (live_kv::KV_E4M3), not the reader.
+        let e4m3 = widest.insts.iter().any(|w| {
+            w.op == DevOp::QwenHeadNormRope as u16
+                && w.t[0] == d.t[3]
+                && w.i[7] & plow_asset::live_kv::KV_E4M3 != 0
+        });
         let bytes = u64::from(widest.t)
             .checked_mul(u64::from(heads))
             .and_then(|n| n.checked_mul(u64::from(stride)))
-            .and_then(|n| n.checked_mul(u64::from(hd) * if fp8 { 1 } else { 2 }))
+            .and_then(|n| n.checked_mul(u64::from(hd) * if fp8 || e4m3 { 1 } else { 2 }))
             .ok_or_else(|| reject("KV extent overflow"))?;
         for (kind, &id) in d.t[3..5].iter().enumerate() {
             let scale = fp8.then_some(d.t[6 + kind]);
@@ -605,7 +547,9 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     return Err(reject("invalid KV length handle or split count"));
                 }
                 // A span-mode row (slot map in j1) may address any slot of the widest rung.
-                let slots = if row_slot != TENSOR_NONE16 && d.fj[2] == u32::from(row_slot) {
+                let slots = if (row_slot != TENSOR_NONE16 && d.fj[2] == u32::from(row_slot))
+                    || bf16_span(d)
+                {
                     widest_rows
                 } else {
                     g.t

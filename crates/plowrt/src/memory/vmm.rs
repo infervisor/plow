@@ -892,7 +892,7 @@ impl LiveKvLayout {
         let mut full_shape = None;
         for c in &m.caches {
             cache_tensors.extend(c.pair.map(usize::from));
-            let elem = if c.scales.is_some() { 1 } else { 2 };
+            let elem = c.elem_bytes();
             // A row-interleaved cache is one `heads * hd` head window per slot: a row maps as one
             // unit, so the allocator charges whole rows instead of a block per head.
             let (heads, hd) = match c.layout {
@@ -1661,9 +1661,11 @@ struct Inner {
     /// [`VmmKv::enable_host_tier`]: `None` = evicted snapshots are freed.
     host: Option<HostTier>,
     /// Recent prompt heads ([`note_share`]).
-    recent: std::collections::VecDeque<Box<[u32]>>,
+    recent: std::collections::VecDeque<RecentPrompt>,
     /// Per seq: where its prompt stops matching a recent prompt ([`VmmKv::share_rows`]).
     share: Vec<u32>,
+    /// Per seq: its prompt continues a recent prompt ([`note_share`]).
+    continues: Vec<bool>,
     /// Bytes of zero-ref blocks handed to the reclaimer thread ([`Job::Release`]) so far:
     /// released, but not yet visible to [`VmmOps::free_bytes`] (`trim_cache`).
     release_queued: u64,
@@ -1972,6 +1974,7 @@ impl VmmKv {
                 host: None,
                 recent: std::collections::VecDeque::new(),
                 share: vec![0; batch],
+                continues: vec![false; batch],
                 release_queued: 0,
                 drop_mech: Mechanism::Other,
                 drop_trigger: Trigger::None,
@@ -2449,6 +2452,25 @@ impl VmmKv {
         self.shared.inner.lock().share[seq]
     }
 
+    /// Whether a later request is likely to attach `seq`'s prompt end: the sequence attached a
+    /// boundary, names a session, or continues a recent prompt (a conversation's next turn, a
+    /// retry). Valid from `try_attach` to the next `begin_seq`.
+    pub fn prompt_end_expected(&self, seq: usize) -> bool {
+        let inner = self.shared.inner.lock();
+        let s = &inner.seqs[seq];
+        let expected = s.attached.is_some() || s.session_ttl.is_some() || inner.continues[seq];
+        tracing::debug!(
+            seq,
+            prompt = s.prompt_rows,
+            attached = s.attached.is_some(),
+            session = s.session_ttl.is_some(),
+            continues = inner.continues[seq],
+            expected,
+            "vmm: prompt end expected"
+        );
+        expected
+    }
+
     /// The request in `seq` finished: queue its [`Job::CopyOut`] ([`Self::enable_release_retire`]).
     pub fn retire_released(&self, seq: usize) {
         if !self.release_retire {
@@ -2583,6 +2605,7 @@ impl VmmKv {
         // boundary (never retired behind a sibling; LRU takes it).
         inner.seqs[seq].lineage = None;
         inner.share[seq] = 0;
+        inner.continues[seq] = false;
         let before = inner.stats;
         let t0 = std::time::Instant::now();
         let unmapped = if inner.jobs.is_some() {
@@ -4434,19 +4457,34 @@ const RECENT_PROMPTS: usize = 32;
 const RECENT_ROWS: usize = 16384;
 /// Rows a shared prefix must reach past the attached boundary to be worth a snapshot.
 const SHARE_MIN_ROWS: usize = 256;
+/// Last rows of a recent prompt a continuing one may re-render (a chat template's generation
+/// prompt, a dropped thought channel).
+const CONTINUE_SLACK: usize = 64;
+
+/// A recent prompt head ([`note_share`]) and the seq that sent it.
+struct RecentPrompt {
+    seq: usize,
+    rows: Box<[u32]>,
+}
 
 /// Record where `prompt` stops matching the longest common prefix with a recent prompt
 /// (32-row aligned): a system prompt seen by two sequences ends there. The engine
-/// publishes that boundary while prefill passes it, so later sequences attach to it.
+/// publishes that boundary while prefill passes it, so later sequences attach to it. Also
+/// records whether `prompt` continues a recent prompt to within the rows a next turn re-renders.
 fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
+    let mut best: Option<(usize, usize, usize)> = None;
     let common = inner
         .recent
         .iter()
         .map(|r| {
-            (
-                r.iter().zip(prompt).take_while(|(a, b)| a == b).count(),
-                r.len(),
-            )
+            let c = r.rows.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+            if c >= SHARE_MIN_ROWS
+                && c + CONTINUE_SLACK >= r.rows.len()
+                && best.is_none_or(|(b, _, _)| c > b)
+            {
+                best = Some((c, r.rows.len(), r.seq));
+            }
+            (c, r.rows.len())
         })
         // Boundary tree: a recent prompt matched to its end (the same history, or a truncated
         // copy of it) or one this prompt is a prefix of showed no divergence: its prompt end
@@ -4455,6 +4493,16 @@ fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
         .map(|(c, _)| c)
         .max()
         .unwrap_or(0);
+    inner.continues[seq] = best.is_some();
+    tracing::debug!(
+        seq,
+        prompt = prompt.len(),
+        continues = best.is_some(),
+        matched_rows = best.map(|(c, _, _)| c),
+        matched_len = best.map(|(_, len, _)| len),
+        matched_seq = best.map(|(_, _, s)| s),
+        "vmm: prompt continuation"
+    );
     let rows = common / 32 * 32;
     inner.share[seq] = if rows >= attached as usize + SHARE_MIN_ROWS && rows < prompt.len() {
         rows as u32
@@ -4464,9 +4512,10 @@ fn note_share(inner: &mut Inner, seq: usize, prompt: &[u32], attached: u32) {
     if inner.recent.len() == RECENT_PROMPTS {
         inner.recent.pop_front();
     }
-    inner
-        .recent
-        .push_back(prompt[..prompt.len().min(RECENT_ROWS)].into());
+    inner.recent.push_back(RecentPrompt {
+        seq,
+        rows: prompt[..prompt.len().min(RECENT_ROWS)].into(),
+    });
 }
 
 /// [`alloc_snapshot`] for a cold publish: out of memory it frees only other cold boundaries, and
@@ -8738,6 +8787,41 @@ mod tests {
             0,
             "a 100-row common head is below SHARE_MIN_ROWS"
         );
+    }
+
+    /// A prompt end is expected to be attached when the prompt continues a recent one (a next
+    /// turn re-rendering its last rows, a retry) or names a session; a fresh prompt that only
+    /// shares a head is not.
+    #[test]
+    fn prompt_end_expected_follows_a_continued_prompt_or_a_session() {
+        let p = uniform_pool(Arc::new(MockVmm::default()));
+        let turn1 = prompt(400);
+        let turn2: Vec<u32> = turn1[..380]
+            .iter()
+            .copied()
+            .chain(100_000..100_200)
+            .collect();
+        let fresh: Vec<u32> = turn1[..300]
+            .iter()
+            .copied()
+            .chain(200_000..200_200)
+            .collect();
+        assert!(p.try_attach(0, &turn1).unwrap().is_none());
+        assert!(!p.prompt_end_expected(0), "nothing recent");
+        p.begin_seq(0);
+        assert!(p.try_attach(0, &turn2).unwrap().is_none());
+        assert!(
+            p.prompt_end_expected(0),
+            "turn 2 re-renders 20 of turn 1's rows"
+        );
+        p.begin_seq(0);
+        assert!(p.try_attach(0, &fresh).unwrap().is_none());
+        assert!(!p.prompt_end_expected(0), "a shared 300-row head only");
+        p.hold_session(0, std::time::Duration::from_secs(60));
+        assert!(p.prompt_end_expected(0), "a session's turn");
+        p.begin_seq(0);
+        assert!(p.try_attach(0, &turn1).unwrap().is_none());
+        assert!(p.prompt_end_expected(0), "a retry of a recent prompt");
     }
 
     /// A burst of prompts sharing a system prompt far below their prompt ends: later ones wait

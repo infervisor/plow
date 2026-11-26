@@ -163,7 +163,13 @@ fn moe(nn: &mut Nn, cfg: &MuseSparkConfig, p: &str, layer: u32, x: TensorId) -> 
             let e = format!("{p}.experts.{e}");
             let inter = cfg.moe_intermediate_size;
             RoutedExpertBinding {
-                gate: expert_projection(nn, cfg, &format!("{e}.gate_proj"), m, inter),
+                gate: Some(expert_projection(
+                    nn,
+                    cfg,
+                    &format!("{e}.gate_proj"),
+                    m,
+                    inter,
+                )),
                 up: expert_projection(nn, cfg, &format!("{e}.up_proj"), m, inter),
                 down: expert_projection(nn, cfg, &format!("{e}.down_proj"), inter, m),
             }
@@ -214,6 +220,8 @@ fn expert_projection(
     nn.param_dtype(&weight, [Dim::stat(output), Dim::stat(input)], dtype);
     ExpertProjectionBinding {
         scale: (dtype == DType::F4).then(|| format!("{module}.weight_scale")),
+        scale_2: None,
+        input_scale: None,
         weight,
     }
 }

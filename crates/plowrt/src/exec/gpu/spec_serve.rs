@@ -47,6 +47,12 @@ pub struct SpecTick {
     pub draft_k: u32,
     pub draft_ms: f64,
     pub verify_ms: f64,
+    /// `PLOW_PF_PACKLOG` only: the draft and verify launches' device time (events around the
+    /// launch and its read-back), the verify launch's rung rows and the commit's host time.
+    pub draft_gpu_us: u64,
+    pub verify_gpu_us: u64,
+    pub launch_rows: usize,
+    pub commit_us: u64,
     /// Rows committed: none means every slot is as it was (rows past `pos` are dead by design).
     pub committed: usize,
     drafts: Vec<u32>,
@@ -59,6 +65,33 @@ fn reject(m: impl std::fmt::Display) -> RuntimeError {
 }
 
 impl GpuEngine {
+    /// `PLOW_PF_PACKLOG` only: record the start (`end = false`) or end of a timed launch on the
+    /// stream.
+    pub(super) fn packlog_mark(&mut self, end: bool) {
+        if !crate::config::RuntimeConfig::get().pf_packlog {
+            return;
+        }
+        if self.step_events.is_none() {
+            let (Ok(a), Ok(b)) = (self.be.event_create(true), self.be.event_create(true)) else {
+                return;
+            };
+            self.step_events = Some((a, b));
+        }
+        if let Some((start, stop)) = self.step_events.as_ref() {
+            let ev = if end { stop } else { start };
+            let _ = self.be.event_record(ev, &self.stream);
+        }
+    }
+
+    /// The device time between the last two marks, once the stream synchronized past them.
+    pub(super) fn packlog_gpu_us(&self) -> u64 {
+        self.step_events
+            .as_ref()
+            .filter(|_| crate::config::RuntimeConfig::get().pf_packlog)
+            .and_then(|(start, stop)| self.be.event_elapsed_ms(start, stop).ok())
+            .map_or(0, |ms| (ms * 1e3) as u64)
+    }
+
     /// Arm verify and load the packet's drafter for serving.
     pub fn spec_serve_enable(&mut self, assets: &Path) -> Result<SpecLimits> {
         let ring_k = self.spec_enable(assets)?;
@@ -141,6 +174,7 @@ impl GpuEngine {
             staged?;
             self.spec_draft_run(&mut out.drafts)?;
             out.draft_ms = t.elapsed().as_secs_f64() * 1e3;
+            out.draft_gpu_us = self.packlog_gpu_us();
         }
         out.tokens.clear();
         let (mut d, mut f) = (0usize, 0usize);
@@ -173,12 +207,16 @@ impl GpuEngine {
         let t = Instant::now();
         self.spec_verify(&spans, stop, sampler, &mut out.verdicts)?;
         out.verify_ms = t.elapsed().as_secs_f64() * 1e3;
+        out.verify_gpu_us = self.packlog_gpu_us();
+        out.launch_rows = self.spec_last_launch_rows;
+        let t = Instant::now();
         for (sp, v) in spans.iter().zip(&out.verdicts) {
             let pos = self.pos[sp.slot] + u32::from(v.n_emit);
             self.spec_hidden_save(sp.slot, v.hrow, pos)?;
             self.spec_commit(sp, v)?;
             out.committed += 1;
         }
+        out.commit_us = t.elapsed().as_micros() as u64;
         Ok(())
     }
 }

@@ -1,0 +1,133 @@
+# Experimental, NOT qualified: Qwen3.8-27B on GB10 (DGX Spark, sm_121a, 48 SMs, 273 GB/s unified
+# LPDDR5X), 256K context, native sm_120-interpreter arms only. No GPU run yet: emits CPU-only;
+# objects, rung gates, FP32 gate and serving are all open.
+#
+# Precision route: the BF16 checkpoint re-quantized per output row to FP8 e4m3 at load (`fp8/<name>`
+# + per-row f32 scale), one weight copy shared by both phases:
+#   prefill  QuantFp8 (per-token) + GemmFp8 as one cuBLASLt scalar-scale (unit) FP8 matmul, then a
+#            RowColScale (out *= a_scale[t] * w_scale[n]) on the interpreter: cuBLASLt has no
+#            OUTER_VEC / alpha-vector FP8 algorithm on sm_121 (12.9 and 13.x return NOT_SUPPORTED);
+#            scale mode 0 runs ~170-200 TF (13.x) vs ~30 TF on the native d_gemm_w8a8
+#   decode   GemvFp8 per-channel (W8A16, d_gemv_fp8): the sm_120 decode object has no W8A8 GEMM arm
+# Decode streams ~27 GB of FP8 projections + the BF16 lm_head per step (vs ~54 GB BF16), so it is
+# the only route that halves the bandwidth floor on this part. The hub block-128 FP8 checkpoint is
+# refused here: it runs on cuBLASLt with sm_90a vector scales (no block-scaled interpreter GEMM).
+#
+# Off on this target (sm_90a-only; qwen35::refuse_sm90_routes refuses them): KV interleave (traps
+# in every interpreter flash-prefill body), generated kernels, FA4 library attention, block-FP8
+# decode, cuBLASLt vector-scale FP8 (the unit-scale prefill route above replaces it), TMA maps.
+# FP8 KV: qwen3_5 has no FP8 KV writer, so KV is bf16 (16 GiB per 256K slot, committed per
+# admitted row under PLOW_VMM_LIVE).
+# GDN prefill: gdn_prefill_sm120.cubin (CMake, PLOW_SM120_CUBIN with PLOW_CUBIN_ARCH=sm_121a);
+# the packet declares it from its abi.json ISA (dist::manifest::gdn_prefill_object).
+#
+#   python3 scripts/campaign/campaign.py build scripts/campaign/recipes/qwen38-27b.gb10.fp8.toml \
+#     --out <dir> --no-probe
+
+schema = "plow.recipe.v1"
+namespace = "infervisor"
+name = "qwen3.8-27b"
+label = "sm121a-gb10-tp1-fp8"
+status = "emits"
+plow_git = "a823423af33ce0cd09242e716397716f371e337c"
+network = "qwen3.5"
+
+[target]
+vendor = "nvidia"
+isa = "sm_121a"
+sku = "GB10"
+units = 48
+num_gpus = 1
+parallel = "tp"
+max_ctx = 262144
+toolchain = "cuda-12.9-nix"
+
+[checkpoint]
+source = "hf:Qwen/Qwen3.8-27B"
+revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+layout = "hf-bf16"
+
+[cell]
+name = "qwen38-27b.gb10.fp8-256k"
+model = "Qwen/Qwen3.8-27B"
+revision = "local"
+hf_dir = "{env:QWEN38_CHECKPOINT}"
+gpu = "GB10"
+arch = "sm_121a"
+n_cu = 48
+max_ctx = 262144
+precision = "fp8"
+
+[emit]
+emit = "devblob+cubin"
+args = ["--served-name", "qwen3.8-27b"]
+[emit.env]
+PLOW_FP8 = "1"
+PLOW_W8A8 = "1"
+PLOW_QWEN_W8A8_PREFILL = "1"
+# One activation quant per shared input (prefill only; W8A8 runs only there on this target).
+PLOW_QWEN_SHARE_QUANT = "1"
+# The W8A8 prefill buckets (ladder assertion); 8192 is the always rung.
+PLOW_QWEN_PREFILL = "128,1024,4096,8192"
+# The prefill projections on cuBLASLt (unit-scale FP8 + RowColScale; segment_roles::
+# cublaslt_prefill_fp8_unit). Decode is unchanged (GemvFp8). plowrt binds libcublasLt.so.13 from
+# the aarch64 CUDA shell (cudaPackages_13 libcublas 13.4).
+PLOW_EMIT_PREFILL_CUBLASLT = "1"
+PLOW_DECODE_BATCH_LADDER = "1,2,4,8,16"
+# Decode FP8 GEMVs on the tensor cores from rung 1 (W8A16 mma.sync, f32 accumulation in another
+# order than the FFMA walk). step_bench plain --force-prompt, ctx 1024, ms/step FFMA -> TC: B=1
+# 137.0 -> 123.2, B=2 129.4 -> 125.7, B=4 141.9 -> 130.3, B=8 257.2 -> 139.3, B=16 238.6 -> 157.4.
+# Screen only (same forced tokens, 64 steps, FFMA rerun bitwise): B=1/8/16 top-1 0.969 / 0.998 /
+# 0.995, KL mean 4.4e-4 / 6.8e-4 / 6.6e-4, max 2.4e-2. Pending [gates.llm_fp32_ref]. MTP span
+# identity breaks with it at B=4 (16 verify rows take the two-group tile, plain B=4 the one-group).
+PLOW_FP8_DECODE_TC = "1"
+# plowc's sm_12x default (one cooperative launch per program), stated because build.json replays it.
+PLOW_UNISEG = "1"
+# No PLOW_EMIT_PACKED_PREFILL: refused on this target (no attention-isolated segment). The packet
+# still carries the live_kv section PLOW_VMM_LIVE binds (256K x 16 slots of bf16 KV = 256 GiB flat).
+
+# Speculative decode with the checkpoint's own MTP layer (mtp.*, one dense full-attention layer,
+# shared embeddings and head; BF16, ~0.85 GB + the 2.5 GB head per draft step). The decode rungs
+# verify k+1 rows per sequence in one launch; every GDN layer chains the span and keeps k
+# snapshots of its state + conv history per slot (147 MiB per slot per k: 7.05 GiB at 16 slots,
+# k 3), committed by copy when a span is cut short (recurrent_state.verify). The drafter's own
+# cache kv.mtp.{k,v} is flat (outside live KV): slots x ctx x 4 KiB = 16 GiB at 256K x 16.
+# Emit only: span arms, drafter and acceptance are unvalidated on a GPU, so serve stays false.
+[spec]
+kind = "qwen3_5_mtp"
+k_max = 3
+rows = [1, 2, 4, 8]
+emit = true
+serve = false
+
+[serve.env]
+PLOW_VMM_LIVE = "1"
+PLOW_PREFIX_CACHE = "1"
+PLOW_VMM_PREFIX = "1"
+# GB10 is integrated: a pinned host KV tier would only move KV within the same LPDDR5X pool.
+PLOW_HOST_KVCACHE_SIZE = "0"
+
+[bench]
+backend = "openai"
+in_lens = "128 1024 4096"
+concs = "1"
+nprompt = 32
+outlen = 128
+warmups = 2
+seed = 42
+tokenizer = "{env:QWEN38_CHECKPOINT}"
+model_id = "qwen3.8-27b"
+gate_prompt = "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+[bench.profiles.long_context]
+in_lens = "8192 32768 131072 262000"
+concs = "1"
+nprompt = 8
+
+[gates]
+python = "{env:PYREF}"
+[gates.llm_fp32_ref]
+reference = "{env:QWEN38_FP32_REF}"
+eos = [248046, 248044]
+concurrency = [1, 8]
+vllm_capture = { c1 = "{env:QWEN38_FP32_VLLM}", c8 = "{env:QWEN38_FP32_VLLM_C8}" }

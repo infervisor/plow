@@ -20,6 +20,22 @@
 
 use crate::spec::{GpuSpec, MmaDtype, Vendor};
 
+/// [`IsaLevel::family`] of GB202 and GB10.
+pub const SM12X: &str = "sm12x";
+
+/// A cuBLASLt FP8 matmul scale mode ([`IsaLevel::lt_fp8_scales`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LtFp8Scale {
+    /// Unit scales; the packet's `RowColScale` applies the row and column scales after.
+    Unit,
+    /// One f32 activation and one f32 weight scale (SCALAR_32F pointers).
+    Tensor,
+    /// Per-row activation and per-channel weight scales (OUTER_VEC).
+    Vector,
+    /// 1x128 activation and 128x128 weight blocks.
+    Block,
+}
+
 /// The instruction-set level a kernel is compiled for.
 ///
 /// This is the `-arch=` / `--offload-arch=` the build actually passes, not a
@@ -42,6 +58,9 @@ pub enum IsaLevel {
     /// name with [`Self::Sm100a`] does not share its instructions.
     /// Reference: `docs/bringup/isa/sm120.md`.
     Sm120a,
+    /// NVIDIA GB10 (DGX Spark): the sm_120a instruction set at CC 12.1. A separate level
+    /// because an `sm_120a` cubin does not load on 12.1. Reference: `docs/bringup/isa/sm120.md`.
+    Sm121a,
     /// AMD CDNA 3 (MI300X/MI325X). 64 KiB LDS, `v_mfma_f32_32x32x8_bf16`.
     /// See [`IsaLevel::geometry`] for the tile and stage-buffer policy that
     /// budget forces. Reference: `docs/bringup/isa/gfx942.md`.
@@ -76,6 +95,7 @@ impl IsaLevel {
             IsaLevel::Sm90a => "sm_90a",
             IsaLevel::Sm100a => "sm_100a",
             IsaLevel::Sm120a => "sm_120a",
+            IsaLevel::Sm121a => "sm_121a",
             IsaLevel::Gfx942 => "gfx942",
             IsaLevel::Gfx950 => "gfx950",
             IsaLevel::Gfx1201 => "gfx1201",
@@ -97,21 +117,75 @@ impl IsaLevel {
     /// feature suffixes that do not change the code-object arch.
     pub fn from_arch_flag(s: &str) -> Option<Self> {
         let base = s.split(':').next().unwrap_or(s);
-        [
-            IsaLevel::Sm89,
-            IsaLevel::Sm90a,
-            IsaLevel::Sm100a,
-            IsaLevel::Sm120a,
-            IsaLevel::Gfx942,
-            IsaLevel::Gfx950,
-            IsaLevel::Gfx1201,
-            IsaLevel::Metal3,
-            IsaLevel::Avx512,
-            IsaLevel::Amx,
-            IsaLevel::CpuRef,
-        ]
-        .into_iter()
-        .find(|l| l.arch_flag().eq_ignore_ascii_case(base))
+        Self::ALL
+            .into_iter()
+            .find(|l| l.arch_flag().eq_ignore_ascii_case(base))
+    }
+
+    pub const ALL: [IsaLevel; 12] = [
+        IsaLevel::Sm89,
+        IsaLevel::Sm90a,
+        IsaLevel::Sm100a,
+        IsaLevel::Sm120a,
+        IsaLevel::Sm121a,
+        IsaLevel::Gfx942,
+        IsaLevel::Gfx950,
+        IsaLevel::Gfx1201,
+        IsaLevel::Metal3,
+        IsaLevel::Avx512,
+        IsaLevel::Amx,
+        IsaLevel::CpuRef,
+    ];
+
+    /// The NVIDIA level a live device's compute capability runs.
+    pub fn from_nvidia_cc(cc: (u32, u32)) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|l| l.vendor() == Vendor::Nvidia && !l.is_cpu() && l.compute_cap() == Some(cc))
+    }
+
+    /// The `sm_XY` number an NVIDIA level's cubins carry in their ELF header.
+    pub fn cubin_sm(self) -> Option<u32> {
+        self.compute_cap().map(|(major, minor)| major * 10 + minor)
+    }
+
+    fn compute_cap(self) -> Option<(u32, u32)> {
+        Some(match self {
+            IsaLevel::Sm89 => (8, 9),
+            IsaLevel::Sm90a => (9, 0),
+            IsaLevel::Sm100a => (10, 0),
+            IsaLevel::Sm120a => (12, 0),
+            IsaLevel::Sm121a => (12, 1),
+            _ => return None,
+        })
+    }
+
+    /// GB202 (`sm_120a`) and GB10 (`sm_121a`): one instruction set, one interpreter source,
+    /// separate cubins. Every "the sm_120 interpreter" decision keys on this, not on a level.
+    pub fn is_sm12x(self) -> bool {
+        matches!(self, IsaLevel::Sm120a | IsaLevel::Sm121a)
+    }
+
+    /// [`Self::is_sm12x`] of an `--arch` string (`sm_120a`, `sm_121a`).
+    pub fn arch_is_sm12x(arch: &str) -> bool {
+        Self::from_arch_flag(arch).is_some_and(Self::is_sm12x)
+    }
+
+    /// The ISA family a level belongs to, by name: the knob registry's `Family` atom.
+    pub fn family(self) -> Option<&'static str> {
+        self.is_sm12x().then_some(SM12X)
+    }
+
+    /// The cuBLASLt FP8 matmul scale modes plow routes on this level. sm_12x has no vector-scale
+    /// FP8 algorithm (OUTER_VEC and the alpha-vector pointer modes return NOT_SUPPORTED on GB10,
+    /// cuBLASLt 12.9 and 13.1), so its routes are the scalar ones; Hopper's are per-channel
+    /// vectors and 128-blocks.
+    pub fn lt_fp8_scales(self) -> &'static [LtFp8Scale] {
+        match self {
+            IsaLevel::Sm90a => &[LtFp8Scale::Vector, LtFp8Scale::Block],
+            l if l.is_sm12x() => &[LtFp8Scale::Unit, LtFp8Scale::Tensor],
+            _ => &[],
+        }
     }
 
     /// Levels the plowrt CPU engine executes (host ISAs, no device object).
@@ -121,7 +195,11 @@ impl IsaLevel {
 
     pub fn vendor(self) -> Vendor {
         match self {
-            IsaLevel::Sm89 | IsaLevel::Sm90a | IsaLevel::Sm100a | IsaLevel::Sm120a => {
+            IsaLevel::Sm89
+            | IsaLevel::Sm90a
+            | IsaLevel::Sm100a
+            | IsaLevel::Sm120a
+            | IsaLevel::Sm121a => {
                 Vendor::Nvidia
             }
             IsaLevel::Gfx942 | IsaLevel::Gfx950 | IsaLevel::Gfx1201 => Vendor::Amd,
@@ -139,10 +217,7 @@ impl IsaLevel {
     /// decides.
     pub fn from_spec(spec: &GpuSpec) -> Option<Self> {
         Some(match (spec.vendor, spec.compute_cap) {
-            (Vendor::Nvidia, (8, 9)) => IsaLevel::Sm89,
-            (Vendor::Nvidia, (9, 0)) => IsaLevel::Sm90a,
-            (Vendor::Nvidia, (10, 0)) => IsaLevel::Sm100a,
-            (Vendor::Nvidia, (12, 0)) => IsaLevel::Sm120a,
+            (Vendor::Nvidia, cc) => return Self::from_nvidia_cc(cc),
             (Vendor::Amd, (9, 4)) => IsaLevel::Gfx942,
             (Vendor::Amd, (9, 5)) => IsaLevel::Gfx950,
             (Vendor::Amd, (12, 0)) => IsaLevel::Gfx1201,
@@ -215,7 +290,7 @@ impl IsaLevel {
             },
             // The load-bearing row. Consumer Blackwell gets fp4 tensor cores but
             // NOT tcgen05/TMEM, and reaches them through `mma.sync`.
-            IsaLevel::Sm120a => IsaCaps {
+            IsaLevel::Sm120a | IsaLevel::Sm121a => IsaCaps {
                 mma_sync: true,
                 wgmma: false,
                 tcgen05: false,
@@ -794,6 +869,25 @@ mod tests {
         assert!(!rtx.caps().tmem, "consumer Blackwell has no TMEM");
     }
 
+    #[test]
+    fn sm12x_family_is_gb202_and_gb10_only() {
+        let family: Vec<_> = IsaLevel::ALL.into_iter().filter(|l| l.is_sm12x()).collect();
+        assert_eq!(family, [IsaLevel::Sm120a, IsaLevel::Sm121a]);
+        assert!(IsaLevel::arch_is_sm12x("sm_121a") && IsaLevel::arch_is_sm12x("sm_120a"));
+        assert!(!IsaLevel::arch_is_sm12x("sm_90a") && !IsaLevel::arch_is_sm12x("sm120"));
+        assert_eq!(IsaLevel::from_nvidia_cc((12, 1)), Some(IsaLevel::Sm121a));
+        assert_eq!(IsaLevel::from_nvidia_cc((12, 2)), None);
+        for spec in registry::ALL.iter().copied() {
+            let cc = IsaLevel::from_spec(spec).and_then(IsaLevel::compute_cap);
+            if spec.vendor == crate::spec::Vendor::Nvidia {
+                assert_eq!(cc, Some(spec.compute_cap), "{}", spec.name);
+            }
+        }
+        assert_eq!(IsaLevel::Sm121a.lt_fp8_scales(), IsaLevel::Sm120a.lt_fp8_scales());
+        assert!(!IsaLevel::Sm121a.lt_fp8_scales().contains(&LtFp8Scale::Vector));
+        assert!(IsaLevel::Sm90a.lt_fp8_scales().contains(&LtFp8Scale::Vector));
+    }
+
     /// Hopper has wgmma; consumer Blackwell does not, despite being newer.
     /// Capability is not ordered by release date, which is why predicates read
     /// capabilities rather than comparing levels.
@@ -865,6 +959,7 @@ mod tests {
             IsaLevel::Sm90a,
             IsaLevel::Sm100a,
             IsaLevel::Sm120a,
+            IsaLevel::Sm121a,
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
             IsaLevel::Gfx1201,
@@ -946,6 +1041,7 @@ mod tests {
             IsaLevel::Sm90a,
             IsaLevel::Sm100a,
             IsaLevel::Sm120a,
+            IsaLevel::Sm121a,
             IsaLevel::Gfx942,
             IsaLevel::Gfx950,
             IsaLevel::Gfx1201,

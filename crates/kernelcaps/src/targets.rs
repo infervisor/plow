@@ -111,7 +111,7 @@ pub fn prefill_recipe(isa: IsaLevel) -> Option<ObjectRecipe> {
             tile_macros: Some(("op_gemm_sm90.cuh", ["PGM90_BM", "PGM90_BN", "PGM90_BK"])),
         },
         // scripts/build_sm120_cubin.sh, prefill variant.
-        IsaLevel::Sm120a => ObjectRecipe {
+        isa if isa.is_sm12x() => ObjectRecipe {
             isa,
             profile: ProfileId::PrefillDense,
             source: "runtime/nvidia/interp_sm120.cu",
@@ -122,7 +122,10 @@ pub fn prefill_recipe(isa: IsaLevel) -> Option<ObjectRecipe> {
                 "PLOW_NV_EMBED_SMEM=1",
                 "PLOW_NV_PREFILL=1",
             ],
-            arch_flag: "-arch=sm_120a",
+            arch_flag: match isa {
+                IsaLevel::Sm121a => "-arch=sm_121a",
+                _ => "-arch=sm_120a",
+            },
             compiler: "/usr/local/cuda/bin/nvcc",
             dispatch_fn: "plow_exec",
             tile_macros: Some(("op_gemm.cuh", ["PGM_BM", "PGM_BN", "PGM_BK"])),
@@ -440,7 +443,7 @@ mod tests {
     /// the decode object's arms and the tiled GEMM silently disappears.
     #[test]
     fn nvidia_prefill_recipes_enable_prefill() {
-        for isa in [IsaLevel::Sm90a, IsaLevel::Sm120a] {
+        for isa in [IsaLevel::Sm90a, IsaLevel::Sm120a, IsaLevel::Sm121a] {
             let r = prefill_recipe(isa).unwrap();
             assert!(
                 r.defines.iter().any(|d| d.starts_with("PLOW_NV_PREFILL")),
@@ -448,6 +451,10 @@ mod tests {
                 isa.arch_flag()
             );
         }
+        assert_eq!(
+            prefill_recipe(IsaLevel::Sm121a).unwrap().arch_flag,
+            "-arch=sm_121a"
+        );
     }
 
     /// A recipe is only useful if it matches the build script it mirrors, and

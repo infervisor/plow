@@ -22,11 +22,15 @@ pub mod apple;
 pub mod intel;
 pub mod isa;
 pub mod nvidia;
+pub mod peak;
 pub mod registry;
 pub mod spec;
 pub mod units;
 
-pub use isa::{ArchGeometry, CalibrationTier, GemmTile, HardwareFingerprint, IsaCaps, IsaLevel};
+pub use isa::{
+    ArchGeometry, CalibrationTier, GemmTile, HardwareFingerprint, IsaCaps, IsaLevel, LtFp8Scale,
+};
+pub use peak::{fp4_peak_measured, peak_compute_tflops, sm_ceilings, SmCeilings};
 pub use spec::{
     Arch, ChipletGrouping, DsmDomainKind, DsmGrouping, GpuSpec, Interconnect, InterconnectKind,
     L2Partitioning, MatrixThroughput, MemKind, MemorySpec, MmaDtype, SmSpec, SocSpec, Vendor,

@@ -328,11 +328,26 @@ const MINIMAX_M2: &str = r#"{
   "num_local_experts":256, "num_experts_per_tok":8
 }"#;
 
-const NEMOTRON3: &str = r#"{
-  "architectures":["NemotronHForCausalLM"], "model_type":"nemotron_h",
-  "hidden_size":2688, "num_hidden_layers":52,
-  "hybrid_override_pattern":"MEMEM*", "conv_kernel":4,
-  "mamba_head_dim":64, "mamba_num_heads":64, "ssm_state_size":128
+// Scaled nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4: the graph builds,
+// device emit is the refusal.
+const NEMOTRON_H_OMNI: &str = r#"{
+  "architectures":["NemotronH_Omni_Reasoning_V3"], "model_type":"nemotron_h_omni",
+  "dtype":"bfloat16", "vision_config":{"model_type":"radio"},
+  "llm_config": {
+    "model_type":"nemotron_h", "vocab_size":64, "hidden_size":32,
+    "layer_norm_epsilon":1e-5, "layers_block_type":["mamba","moe","attention"],
+    "tie_word_embeddings":false, "num_nextn_predict_layers":1,
+    "mamba_num_heads":4, "mamba_head_dim":8, "ssm_state_size":8, "n_groups":2,
+    "conv_kernel":4, "chunk_size":8, "mamba_hidden_act":"silu",
+    "use_conv_bias":true, "use_bias":false,
+    "time_step_limit":[0.0, {"__float__":"Infinity"}],
+    "num_attention_heads":4, "num_key_value_heads":2, "head_dim":8,
+    "attention_bias":false, "n_routed_experts":4, "num_experts_per_tok":2,
+    "moe_intermediate_size":16, "moe_latent_size":16,
+    "moe_shared_expert_intermediate_size":32, "n_shared_experts":1,
+    "n_group":1, "topk_group":1, "norm_topk_prob":true,
+    "routed_scaling_factor":5.0, "mlp_hidden_act":"relu2", "mlp_bias":false
+  }
 }"#;
 
 // deepseek-ai/DeepSeek-V4-Flash-0731's config.json, VERBATIM. Not scaled: the
@@ -938,9 +953,9 @@ fn packet_routes_missing_from_model_source_fail_closed_instead_of_generic_loweri
             "MiniMax-M2 hybrid linear-attention MoE is not implemented",
         ),
         (
-            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-            NEMOTRON3,
-            "Nemotron Mamba-2 hybrid is not implemented in the nn-graph packet path",
+            "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+            NEMOTRON_H_OMNI,
+            "Nemotron-H text graph builds, but device emit is not implemented",
         ),
         (
             "deepseek-ai/DeepSeek-V4-Flash-0731",

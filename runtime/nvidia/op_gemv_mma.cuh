@@ -580,7 +580,7 @@ __device__ __forceinline__ void gvmma_xk_unit(Output* __restrict__ C, const __nv
     if (threadIdx.x == 0) atomicExch(gvmma_xk_cnt + g, 0u);
 }
 #endif
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && !GVMMA_RED_DYN
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X && !GVMMA_RED_DYN
 template <bool BIAS, int MT, bool ONE, bool FOLD>
 __device__ __forceinline__ gvmma_red_t<MT>* gvmma_tp_red2() {
     __shared__ gvmma_red_t<MT> red[2];
@@ -625,7 +625,7 @@ __device__ __forceinline__ void gemv_rows_mma(Output* __restrict__ C,
         /* Narrow N: the pairs of this block split K over S warps each, as the unpaired split-K
          * below does per row block — taken only when S divides the k-steps, else that one runs. */
         if (per != 0u && gpow <= PLOW_NV_WARPS / 2u && (nkb % (PLOW_NV_WARPS / gpow)) == 0u) {
-#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && !GVMMA_RED_DYN
+#if PLOW_PACKET_REQUIRES_XR_PARTIAL_F32 && PLOW_SM12X && !GVMMA_RED_DYN
             gvmma_red_t<MT>* const red2 = gvmma_tp_red2<BIAS, MT, ONE, FOLD>();
 #else
             gvmma_red_t<MT>* const red2 = gvmma_red2<MT>();

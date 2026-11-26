@@ -876,6 +876,7 @@ mod tests {
                     window: 0,
                     mask: u32::MAX,
                     layout: 0,
+                    e4m3: false,
                 },
                 plow_asset::live_kv::Cache {
                     pair: [5, 6],
@@ -886,6 +887,7 @@ mod tests {
                     window: 1024,
                     mask: 8191,
                     layout: 0,
+                    e4m3: false,
                 },
             ],
             maps: Vec::new(),

@@ -320,3 +320,71 @@ fn automatic_prefix_selection_covers_dense_hd128() {
     assert!(!selected(&cfg, (12, 0)));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A chain drafter's own cache (`kv.mtp.{k,v}`) in the full layers' shape is one more pool track,
+/// so an attached prefix carries the drafter rows; a cache of another shape stays off the pool.
+#[test]
+fn prefix_layout_pools_a_full_shaped_drafter_cache() {
+    let dir = std::env::temp_dir().join(format!("plow-prefix-mtp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "num_hidden_layers": 2, "num_key_value_heads": 8, "head_dim": 128,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let kv = plow_asset::serve_manifest::KvGeometry::from_config(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+    let layout = |mtp_bytes: u64| {
+        let tensor = |name: &str, bytes| DevTensor {
+            name: name.into(),
+            bytes,
+            init: None,
+        };
+        let blob = DevBlob {
+            n_cu: 48,
+            flags: 0,
+            target: 0,
+            tensors: vec![
+                tensor("in.pos", 8192 * 4),
+                tensor("kv.0.k", 16 << 20),
+                tensor("kv.0.v", 16 << 20),
+                tensor("kv.1.k", 16 << 20),
+                tensor("kv.1.v", 16 << 20),
+                tensor("kv.mtp.k", mtp_bytes),
+                tensor("kv.mtp.v", mtp_bytes),
+            ],
+            init: Vec::new(),
+            kvrow: Vec::new(),
+            sections: Vec::new(),
+            gen: Vec::new(),
+            tp: None,
+            parent: None,
+            progs: vec![DevProg {
+                t: 1,
+                role: packet::devbuild::ProgramRole::DecodeRung { rows: 1 },
+                n_counter: 0,
+                insts: Vec::new(),
+                stream: Vec::new(),
+                stream_ofs: Vec::new(),
+                stream_len: Vec::new(),
+                waits: Vec::new(),
+                succs: Vec::new(),
+                gq_stream: Vec::new(),
+                gq_seg_ofs: vec![0, 0],
+                l2_domains: 0,
+            }],
+        };
+        GpuEngine::vmm_prefix_layout(&blob, kv.as_ref(), Some(false)).expect("layout")
+    };
+    let pooled = layout(16 << 20).geo.full_layers;
+    assert_eq!(pooled.len(), 3);
+    assert_eq!(&pooled[..2], &[0, 1]);
+    assert_eq!(
+        super::prefix::prefix_track_name("kv.mtp.v"),
+        Some((pooled[2], 1))
+    );
+    assert_eq!(layout(8 << 20).geo.full_layers, vec![0, 1]);
+}

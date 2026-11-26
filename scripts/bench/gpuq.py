@@ -184,7 +184,7 @@ def main():
         for path in sorted(root.glob("*.json")):
             print(path.stem, json.loads(path.read_text()))
     else:
-        in_nix = os.environ.get("ROCM_PATH") or (platform.system() == "Darwin" and os.environ.get("IN_NIX_SHELL"))
+        in_nix = os.environ.get("ROCM_PATH") or os.environ.get("PLOW_NIX_GPU") or (platform.system() == "Darwin" and os.environ.get("IN_NIX_SHELL"))
         if not in_nix and os.environ.get("PLOW_CAMPAIGN_NO_NIX") != "1":
             parser.error("submit inside nix develop (hand-built box without nix: PLOW_CAMPAIGN_NO_NIX=1)")
         if platform.system() == "Darwin" and args.ngpu != 1:

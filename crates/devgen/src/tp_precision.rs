@@ -10,10 +10,11 @@ pub(crate) fn apply(
     if !enabled {
         return Ok(());
     }
-    let nvidia = arch == "sm_120a";
+    let nvidia = hwspec::IsaLevel::arch_is_sm12x(arch);
     if (arch != "gfx1201" && !nvidia) || slots[0].0 == slots[1].0 {
         return Err(
-            "FP32 TP partials require gfx1201 or sm_120a and two distinct peer slots".into(),
+            "FP32 TP partials require gfx1201 or sm_120a/sm_121a and two distinct peer slots"
+                .into(),
         );
     }
     let mut old_bytes = None;

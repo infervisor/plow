@@ -11,6 +11,8 @@ Writes {bw_gbps, bf16_tflops, fp8_tflops, ...}: `op_roof.py --ceilings` and
                weight/KV-stream floors. The copy rate (read + write) is recorded beside it.
   bf16_tflops  dense BF16 GEMM (torch.matmul, cuBLAS) at a square shape that saturates the part.
   fp8_tflops   dense e4m3 GEMM (torch._scaled_mm).
+  fp4_tflops   dense NVFP4 GEMM (torch._scaled_mm on e2m1 pairs with e4m3 scales per 16), only
+               where the part and torch run it; op_roof prices W4A4 experts at it.
 
 Medians of CUDA-event-timed repeats after warmup. Run it on an otherwise idle card (the queue
 guarantees that); the SM clock and power limit at the time are recorded, since a clocked-down or
@@ -55,6 +57,21 @@ def smi(fields):
         return {}
 
 
+def nvfp4_gemm(m, reps):
+    """(median s, spread) of an m^3 NVFP4 _scaled_mm, or (None, None) where unsupported."""
+    fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4 is None:
+        return None, None
+    x = torch.randint(0, 256, (m, m // 2), dtype=torch.uint8, device="cuda").view(fp4)
+    y = torch.randint(0, 256, (m, m // 2), dtype=torch.uint8, device="cuda").view(fp4)
+    s = torch.ones(m, m // 16, device="cuda").to(torch.float8_e4m3fn)
+    try:
+        torch._scaled_mm(x, y.t(), scale_a=s, scale_b=s, out_dtype=torch.bfloat16)
+    except (RuntimeError, NotImplementedError):
+        return None, None
+    return timed(lambda: torch._scaled_mm(x, y.t(), scale_a=s, scale_b=s, out_dtype=torch.bfloat16), reps)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
@@ -81,20 +98,23 @@ def main():
     one = torch.ones(1, device="cuda")
     fp8_s, fp8_spread = timed(lambda: torch._scaled_mm(x8, y8, scale_a=one, scale_b=one,
                                                        out_dtype=torch.bfloat16), a.reps)
+    fp4_s, fp4_spread = nvfp4_gemm(m, a.reps)
     flops = 2.0 * m ** 3
     record = {
         "bw_gbps": round(2 * n / read_s / 1e9, 1),
         "copy_gbps": round(4 * n / copy_s / 1e9, 1),
         "bf16_tflops": round(flops / bf16_s / 1e12, 1),
         "fp8_tflops": round(flops / fp8_s / 1e12, 1),
+        **({"fp4_tflops": round(flops / fp4_s / 1e12, 1)} if fp4_s else {}),
         "spread": {"read": round(read_spread, 4), "copy": round(copy_spread, 4),
-                   "bf16": round(bf16_spread, 4), "fp8": round(fp8_spread, 4)},
+                   "bf16": round(bf16_spread, 4), "fp8": round(fp8_spread, 4),
+                   **({"fp4": round(fp4_spread, 4)} if fp4_s else {})},
         "device": torch.cuda.get_device_name(),
         "fp8_encoding": str(f8).split(".")[-1],
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu_state": clocks,
-        "method": f"read: bf16 sum over {a.bw_gib:g} GiB; GEMM: {m}^3 bf16 matmul / e4m3 _scaled_mm; "
+        "method": f"read: bf16 sum over {a.bw_gib:g} GiB; GEMM: {m}^3 bf16 matmul / e4m3 / nvfp4 _scaled_mm; "
                   f"median of {a.reps} CUDA-event repeats",
         "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
     }

@@ -79,6 +79,9 @@ def parse(text):
         if m.group(2) == "GemmGluFp8":
             scale = re.search(r"a_scale<-(\S+)", head)
             p["fp8_activation"] = bool(scale and scale.group(1) != "—")
+        if m.group(2) == "QwenRmsNorm":
+            radd = re.search(r"\bradd<-(\S+)", head)
+            p["has_radd"] = bool(radd and radd.group(1) != "—")
         if m.group(2) == "QuantFp8":
             gate = re.search(r"gate<-(\S+)", head)
             p["fused_glu"] = bool(gate and gate.group(1) != "—")
@@ -167,6 +170,9 @@ def cost(op, p, rows, ctx, wb, kvb):
         return 6 * g("rows", rows) * g("width"), 0
     if op in ("Glu", "GluPitched", "Residual"):
         return 6 * g("n"), 0
+    if op == "RowColScale":  # unit-scale FP8 GEMM outer scaling: bf16 x read, bf16 out written
+        mm, n = g("M", rows), g("N")
+        return 4 * mm * n + 4 * (mm + n), 0
     if op == "HeadNormRope":
         return 4 * g("ntok") * g("nhead") * g("hd"), 0
     if op == "HeadNormRopeFp8" and all(g(k) is not None for k in ("ntok", "nhead", "hd")):
@@ -186,8 +192,8 @@ def cost(op, p, rows, ctx, wb, kvb):
     if op in ("Argmax", "ArgmaxFin"):
         return 4 * g("n", 0), 0
     # Qwen3.5 hybrid (qwen35.rs): B = decode rows, T = prefill rows; elementwise ops are byte floors.
-    if op == "QwenRmsNorm":
-        return 4 * g("B", rows) * g("width"), 0
+    if op == "QwenRmsNorm":  # fused residual (radd): also reads radd and writes the sum over x
+        return (8 if g("has_radd") else 4) * g("B", rows) * g("width"), 0
     if op == "QwenHeadNormRope":
         return 4 * g("rows", rows) * g("H") * g("D"), 0
     if op == "QwenQGateSplit":  # packed [q | gate] read, both halves written
@@ -210,6 +216,29 @@ def cost(op, p, rows, ctx, wb, kvb):
     if op == "QwenGdnPrefill":  # chunked delta rule: state in/out, q/k/v/o rows, ~6 HV K V per token
         hv, k, v, t = g("HV"), g("K"), g("V"), g("T", rows)
         return 8 * hv * k * v + 2 * t * (2 * g("HK") * k + 2 * hv * v), 6 * t * hv * k * v
+    # Nemotron-H Mamba-2 (op_mamba.cuh): bf16 activations, SSM state [H][P][N] per slot of
+    # `state_bytes` per element (fp16; packets before that immediate carried f32).
+    if op == "Mamba2Conv":
+        n, c, w = g("rows", rows), g("C"), g("W")
+        history = (w - 1) * c * 2 * (1 if g("prefill", 0) else 2 * n)
+        return 4 * n * c + history + 2 * c * (w + 1), 2 * n * c * w
+    if op == "Mamba2Step":  # per row: state read + written, x/B/C/dt read, y written
+        n, hh, pp, nn, gg, sb = g("B", rows), g("H"), g("P"), g("N"), g("G"), g("state_bytes") or 4
+        return n * (2 * sb * hh * pp * nn + 2 * (hh * pp + 2 * gg * nn) + 2 * hh * pp), 6 * n * hh * pp * nn
+    if op == "Mamba2GatedNorm":  # y and z read, out written
+        return 6 * g("rows", rows) * g("groups") * g("group"), 0
+    if op in ("Mamba2ChunkState", "Mamba2ChunkPass", "Mamba2ChunkOut"):
+        r, hh, pp, nn = g("R", rows), g("H"), g("P"), g("N")
+        chunks = -(-r // 128)
+        states = 4 * chunks * hh * pp * nn
+        if op == "Mamba2ChunkPass":
+            return 2 * states + 2 * (g("state_bytes") or 4) * hh * pp * nn + 4 * hh * r, 2 * chunks * hh * pp * nn
+        gg = g("G")
+        xbc = 2 * r * (hh * pp + 2 * gg * nn)
+        if op == "Mamba2ChunkState":
+            return xbc + states + 8 * hh * r, 2 * r * hh * pp * nn
+        flops = 2 * r * (128 * nn * gg + 128 * pp * hh + nn * pp * hh)
+        return xbc + states + 8 * hh * r + 2 * r * hh * pp, flops
     # Encoder sidecars (devgen mm.rs, f32 activations): bf16 or f32 weights, f32 rows in and out.
     # The matrix floor uses the BF16 peak (an optimistic floor for the tf32x3 conv taps).
     if op == "DenseGemmF32":
@@ -314,6 +343,9 @@ GEMMA_MOE_EXPERT = {"MoeExpertGluGemma", "MoeExpertGluNormGemma", "MoeExpertGluG
                     "MoeGroupDownGemmaPf", "MoeGroupDownGemmaPfW8a8"}
 
 
+NVFP4_MOE_EXPERT = {"MoeUpNvfp4", "MoeDownNvfp4", "MoeUpNvfp4Pf", "MoeDownNvfp4Pf"}
+
+
 def moe_cost(op, p, rows, wb):
     """Gemma-4 MoE (NVIDIA). Expert weights are charged for `experts` touched experts (`price`
     injects it from the router-table or uniform-routing model); FP8/W8A8 experts carry one-byte
@@ -330,6 +362,42 @@ def moe_cost(op, p, rows, wb):
     if op in ("MoeCombineNormGemma", "MoeCombineNormGemmaPf"):
         t = g("T", rows) if op == "MoeCombineNormGemmaPf" else rows
         return t * g("H") * (4 * g("k") + 4) + 2 * g("H"), 0
+    # Nemotron latent NVFP4 MoE (op_moe_nvfp4.cuh, W4A16): e2m1 weights + e4m3 scale per 16 +
+    # f32 gs per expert; `experts` touched (1 for the dense shared expert, E = 1).
+    if op == "MoeRouterLogitsF32":
+        t, e, h = g("T", rows), g("E"), g("H")
+        return 2 * e * h + 2 * t * h + 4 * max(g("KS", 1), 1) * t * e, 2 * t * e * h
+    if op == "MoeRouterSigmoidTopk":
+        t, e = g("T", rows), g("E")
+        return 4 * max(g("KS", 1), 1) * t * e + 4 * e + 8 * t * g("k"), 0
+    if op == "MoeAlignNvfp4":
+        return 20 * g("T", rows) * g("k") + 12 * g("E"), 0
+    if op == "MoeCombinePf":
+        t, h, k = g("T", rows), g("H"), g("k")
+        if g("bf16", 0):  # bf16 partials + the routing table's gates
+            return t * h * (2 * k + 2) + 8 * t * k, 0
+        return t * h * (4 * k + 2), 0
+    if op == "MoeQuantNvfp4":  # bf16 rows in, e2m1 + e4m3 per 16 out
+        return 2 * g("R") * g("K") + g("R") * g("K") * 9 // 16 + 4 * g("n"), 0
+    if op in NVFP4_MOE_EXPERT:
+        t, e = g("T", rows), g("E")
+        k = g("k") if e > 1 else 1
+        if op.startswith("MoeUp"):
+            n, kin, out = g("I"), g("K"), 2
+        else:
+            n, kin, out = g("H"), g("I"), 4 if e > 1 and g("mode", 0) != 2 else 2
+        experts = g("experts") if e > 1 else 1
+        if experts is None:
+            raise ValueError(f"{op}: needs the touched-expert count")
+        weight = experts * (n * kin // 2 + n * kin // 16 + 4)
+        act_in = 2 * t * (kin if op.startswith("MoeUp") else k * kin)
+        rows_out = t * k if (e > 1 or op.startswith("MoeUp")) else t
+        if g("w4a4", 0):  # NVFP4 q tensors (9/16 B per element) in, and out of the up projection
+            act_in = act_in * 9 // 32
+            out = 9 / 16 if op.startswith("MoeUp") else out
+        if e == 1 and g("mode", 0) == 3:  # dense down + bf16 residual rows read in the epilogue
+            out += 2
+        return weight + act_in + int(out * rows_out * n), 2 * t * k * n * kin
     if op not in GEMMA_MOE_EXPERT:
         return None
     t, k, h = g("T", rows), g("k"), g("H")
@@ -379,11 +447,24 @@ class RouterTable:
         return sum(map(len, samples)) / len(samples)
 
 
-def price(prog, ctx, wb, kvb, bw, tflops, fp8_tflops=None, prefill_past=None, router=None):
+def matrix_dtype(op, p):
+    """The matrix peak an op's FLOPs are priced at: W4A4 NVFP4 experts at FP4 where measured (else
+    FP8's, an upper bound of the FP4 floor), FP8-activation GEMMs at FP8, everything else BF16."""
+    if op in NVFP4_MOE_EXPERT and p.get("w4a4", 0):
+        return "fp4"
+    if op in ("GemmFp8", "GemmMedFp8", "GemmSmallFp8") or (op == "GemmGluFp8" and p.get("fp8_activation", False)):
+        return "fp8"
+    return "bf16"
+
+
+def price(prog, ctx, wb, kvb, bw, tflops, fp8_tflops=None, prefill_past=None, router=None, fp4_tflops=None):
     """Per instruction: key, bytes, flops, floor ms, bound. `router` (a RouterTable) replaces
     uniform routing when charging touched experts."""
     out = {}
     routed = None  # (T, k, n_exp) of the program's latest router
+    # An E4M3 cache writer (live_kv KV_E4M3, `layout` bit 8): the bf16-opcode flash reads 1 B/elem.
+    if any(op == "QwenHeadNormRope" and int(p.get("layout", 0)) & 0x100 for _, op, _, p in prog[2]):
+        kvb = 1
     for idx, op, name, p in prog[2]:
         if prog[0] == "prefill" and op in ("FlashPrefill", "FlashPrefillFp8") and prefill_past is not None:
             p = dict(p, q_pos0=prefill_past, n_kv=prefill_past + p["n_q"])
@@ -395,13 +476,22 @@ def price(prog, ctx, wb, kvb, bw, tflops, fp8_tflops=None, prefill_past=None, ro
             t, k, n = routed
             touched = (router.union if router else uniform_union)(n, k, t)
             p = dict(p, T=t, k=k, experts=touched)
+        if op == "MoeRouterSigmoidTopk":
+            routed = (p.get("T", prog[1]), p["k"], p["E"])
+        if op in NVFP4_MOE_EXPERT and p.get("E", 1) > 1:
+            if routed is None or routed[2] != p["E"]:
+                raise ValueError(f"{op} at #{idx} has no preceding router of its expert count")
+            t, k, n = routed
+            p = dict(p, experts=(router.union if router else uniform_union)(n, k, t))
         c = cost(op, p, prog[1], ctx, wb, kvb)
         if c is None:
             out[idx] = (f"{op}", None, None, 0.0, "unpriced")
             continue
-        fp8_compute = op in ("GemmFp8", "GemmMedFp8", "GemmSmallFp8") or (
-            op == "GemmGluFp8" and p.get("fp8_activation", False))
-        peak = fp8_tflops if fp8_tflops is not None and fp8_compute else tflops
+        kind, peak = matrix_dtype(op, p), tflops
+        if kind in ("fp8", "fp4") and fp8_tflops is not None:
+            peak = fp8_tflops
+        if kind == "fp4" and fp4_tflops is not None:
+            peak = fp4_tflops
         mem, mat = c[0] / (bw * 1e6), c[1] / (peak * 1e9)
         key = f"{op}:{name}" if name else op
         out[idx] = (key, c[0], c[1], max(mem, mat), "matrix" if mat > mem else "hbm")
@@ -427,11 +517,22 @@ def ceilings(a, hw):
     return a.bw or bw, a.tflops or tf, a.fp8_tflops or f8, source
 
 
+def fp4_ceiling(a, hw):
+    """Dense NVFP4 GEMM TFLOP/s for W4A4 experts: the ceilings file's `fp4_tflops`, else the
+    registry's measured value; None (price at FP8) where neither was measured."""
+    if getattr(a, "ceilings", None):
+        with open(a.ceilings) as f:
+            cal = json.load(f)
+        if cal.get("fp4_tflops"):
+            return cal["fp4_tflops"]
+    return hw.fp4_tflops_dense
+
+
 def load_router(path, progs):
     if not path:
         return None
     ks = {p["k"] for _, _, insts in progs for _, op, _, p in insts
-          if op in ("MoeRouterGemmaPf", "MoeRouterGemmaTopk")}
+          if op in ("MoeRouterGemmaPf", "MoeRouterGemmaTopk", "MoeRouterSigmoidTopk")}
     if len(ks) != 1:
         raise ValueError("--router-table needs a packet with one MoE top-k")
     with open(path, "rb") as f:
@@ -482,6 +583,70 @@ def table(title, rows, measured_total, extra_lines, top):
         rest = order[top:]
         out.append(f"| (other {len(rest)} ops) | {sum(r[0] for _, r in rest)} | | | | {sum(r[3] for _, r in rest):.3f} |"
                    + (f" {sum(r[4] or 0 for _, r in rest):.3f} | |" if have else ""))
+    out.append("")
+    return "\n".join(out)
+
+
+def ubench_rows(progs, cases, sm, ctx, wb, kvb, bw, tflops, fp8_tflops, fp4_tflops):
+    """Single-SM rows for runtime/ubench NVIDIA cases (`ubench_cu_roofline_nv --pkt ... --json`).
+
+    A case is one packet instruction timed on ONE SM: `slice_max_us` is the slowest of its
+    `blocks` slices, each launched alone with L2 flushed. Its slice of the instruction's bytes
+    and FLOPs (op_roof's formulas / blocks) against the single-SM ceilings `sm` (the driver's
+    `--ceilings` JSON "sm" object) gives the inner loop's % of its single-SM roofline. At full GPU
+    the slice can be no faster than the whole-GPU floor (all SMs share DRAM), so the gap the inner
+    loop costs per program is n x (max(slice, floor) - floor) over the program's `n` instructions
+    with the same op, weight and shape."""
+    find = {(phase, rows): insts for phase, rows, insts in progs}
+    peak_sm = {"bf16": sm["bf16_tflops"], "fp8": sm["fp8_tflops"], "fp4": sm.get("nvfp4_tflops") or sm["fp8_tflops"]}
+    rows = []
+    for c in cases:
+        phase = "decode" if c["set"].endswith("-dec") else "prefill"
+        insts = find.get((phase, c["program_t"]))
+        if insts is None:
+            raise ValueError(f"{c['case']}: no {phase} program T={c['program_t']} in the disassembly")
+        prog = (phase, c["program_t"], insts)
+        cctx = c.get("ctx") or ctx
+        by_idx = {i: (op, name, p) for i, op, name, p in insts}
+        op, name, p = by_idx[c["inst"]]
+        if op in NVFP4_MOE_EXPERT and p.get("E", 1) > 1 and c.get("experts"):
+            by, fl = cost(op, dict(p, experts=c["experts"]), c["program_t"], cctx, wb, kvb)
+        else:
+            _, by, fl, _, _ = price(prog, cctx, wb, kvb, bw, tflops, fp8_tflops, None, None, fp4_tflops)[c["inst"]]
+        if by is None:
+            rows.append(dict(case=c["case"], op=op, t=c["program_t"], unpriced=True))
+            continue
+        kind = matrix_dtype(op, p)
+        gpu_peak = {"fp4": fp4_tflops or fp8_tflops, "fp8": fp8_tflops}.get(kind) or tflops
+        blocks, meas = c["blocks"], c["slice_max_us"]
+        sb, sf = by / blocks, fl / blocks
+        t_mem, t_mat = sb / (sm["dram_gbps"] * 1e3), sf / (peak_sm[kind] * 1e6)
+        floor_sm = max(t_mem, t_mat)
+        floor_gpu = max(by / (bw * 1e3), fl / (gpu_peak * 1e6))
+        n = sum(1 for _, o, nm, q in insts if o == op and nm == name and q == p)
+        rows.append(dict(
+            case=c["case"], op=op, t=c["program_t"], ctx=cctx, blocks=blocks, bound="mma " + kind if t_mat > t_mem else "dram",
+            slice_bytes=sb, slice_flops=sf, slice_us=meas, floor_sm_us=floor_sm,
+            pct_sm=100.0 * floor_sm / meas if meas > 0 else 0.0, gbps=sb / (meas * 1e3) if meas > 0 else 0.0,
+            tflops=sf / (meas * 1e6) if meas > 0 else 0.0, floor_gpu_us=floor_gpu, n=n,
+            gap_ms=n * (max(meas, floor_gpu) - floor_gpu) / 1e3, verify=c.get("verify", ""),
+            experts=c.get("experts") or None))
+    return rows
+
+
+def ubench_table(rows, title):
+    out = [f"### {title}", "",
+           "| op (case) | T | bound | % of 1-SM roofline | slice us | 1-SM floor us | GB/s | TFLOP/s | n | "
+           "full-GPU floor us | gap ms / program | grid vs 1 SM |",
+           "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+    for r in sorted(rows, key=lambda r: -r.get("gap_ms", -1)):
+        if r.get("unpriced"):
+            out.append(f"| `{r['op']}` ({r['case']}) | {r['t']} | unpriced | | | | | | | | | |")
+            continue
+        exp = f", {r['experts']:.0f} experts" if r.get("experts") else ""
+        out.append(f"| `{r['op']}` ({r['case']}{exp}) | {r['t']} | {r['bound']} | {r['pct_sm']:.0f}% | "
+                   f"{r['slice_us']:.2f} | {r['floor_sm_us']:.2f} | {r['gbps']:.1f} | {r['tflops']:.3f} | {r['n']} | "
+                   f"{r['floor_gpu_us']:.1f} | {r['gap_ms']:.3f} | {r['verify']} |")
     out.append("")
     return "\n".join(out)
 
@@ -644,6 +809,9 @@ def main():
                     "--bw/--tflops/--fp8-tflops override its fields")
     ap.add_argument("--router-table", help="captured act.moe.table (scripts/bench/router_table.py); "
                     "default: uniform routing")
+    ap.add_argument("--ubench", action="append", default=[], metavar="CASES.json",
+                    help="runtime/ubench NVIDIA cases (single-SM, per-slice); needs --sm-ceilings")
+    ap.add_argument("--sm-ceilings", help="runtime/ubench --ceilings JSON (its \"sm\" object: one SM at gridDim=1)")
     ap.add_argument("--wbytes", type=float, default=2.0)
     ap.add_argument("--kvbytes", type=float, default=2.0)
     ap.add_argument("--top", type=int, default=15)
@@ -662,12 +830,13 @@ def main():
         ap.error("--ctx is required for theoretical roofline analysis")
     hw = lookup_gpu(a.gpu)
     bw, tf, fp8_tf, source = ceilings(a, hw)
+    fp4_tf = fp4_ceiling(a, hw)
     progs = parse(open(a.disasm).read())
     router = load_router(a.router_table, progs)
     if not progs:
         sys.exit(f"{a.disasm}: no programs (expected `plowrt disasm` output)")
     print(f"# Op roofline: {os.path.basename(a.disasm)}, ctx {a.ctx}, {bw:.0f} GB/s, {tf:.0f} BF16 / "
-          f"{fp8_tf:.0f} FP8 TFLOP/s ({source})\n")
+          f"{fp8_tf:.0f} FP8 / {fp4_tf or fp8_tf:.0f} FP4 TFLOP/s ({source})\n")
     if a.prefill_past is not None:
         print(f"Prefill scenario: one contiguous chunk after {a.prefill_past} prefix tokens; "
               "not a packed mixture of requests.\n")
@@ -675,12 +844,25 @@ def main():
         print("Prefill uses emitted q_pos0/n_kv; --ctx affects decode only.\n")
     find = lambda phase, rows: next((p for p in progs if p[0] == phase and p[1] == rows), None)
 
+    if a.ubench:
+        if not a.sm_ceilings:
+            ap.error("--ubench needs --sm-ceilings")
+        sm = json.load(open(a.sm_ceilings))["sm"]
+        print(f"Single-SM ceilings ({a.sm_ceilings}): {sm['dram_gbps']:.1f} GB/s DRAM, {sm['bf16_tflops']:.3f} BF16 / "
+              f"{sm['fp8_tflops']:.3f} FP8 / {sm.get('nvfp4_tflops', 0):.3f} NVFP4 TFLOP/s at {sm['clock_ghz']:.2f} GHz\n")
+        cases = [c for path in a.ubench for c in json.load(open(path))["cases"]]
+        rows = ubench_rows(progs, cases, sm, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, fp4_tf)
+        for key in sorted({(r["t"], c["set"]) for r, c in zip(rows, cases)}, key=lambda k: (k[1], k[0])):
+            sel = [r for r, c in zip(rows, cases) if (r["t"], c["set"]) == key]
+            print(ubench_table(sel, f"{key[1]} T={key[0]}"))
+        return
+
     for spec in a.sweep:
         b, path = spec.split("=", 1)
         prog = find("decode", int(b))
         if prog is None:
             sys.exit(f"no decode program T={b} in {a.disasm}")
-        pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router)
+        pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router, fp4_tf)
         require_priced(prog, pr)
         skel, delta, full = sweep_deltas(path)
         if delta.keys() != pr.keys():
@@ -709,7 +891,7 @@ def main():
         prog = find("prefill", a.segtime_rows)
         if prog is None:
             sys.exit(f"no prefill program T={a.segtime_rows} in {a.disasm}")
-        pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router)
+        pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router, fp4_tf)
         require_priced(prog, pr)
         rows, chunks = collections.OrderedDict(), 0
         with open(a.segtime, errors="replace") as source:
@@ -748,7 +930,7 @@ def main():
         print("| program | rows | floor ms | floor ms/row | top op (floor) |")
         print("|---|---:|---:|---:|---|")
         for prog in progs:
-            pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router)
+            pr = price(prog, a.ctx, a.wbytes, a.kvbytes, bw, tf, fp8_tf, a.prefill_past, router, fp4_tf)
             require_priced(prog, pr)
             by = collections.Counter()
             for key, _, _, fm, _ in pr.values():

@@ -49,6 +49,8 @@ class HardwareSpec:
     bf16_tflops_dense: float
     fp8_tflops_dense: float
     fp16_tflops_dense: float
+    # Dense NVFP4 GEMM, only where measured (W4A4 experts fall back to FP8 elsewhere).
+    fp4_tflops_dense: Optional[float] = None
 
     @property
     def bandwidth_for_bound_gbps(self) -> float:
@@ -118,6 +120,24 @@ HARDWARE_REGISTRY: Dict[str, HardwareSpec] = {
         bf16_tflops_dense=235.0,  # measured cuBLAS bf16 GEMM, fp32 accumulate (GeForce: half rate)
         fp8_tflops_dense=1670.0,
         fp16_tflops_dense=235.0,
+    ),
+    # DGX Spark: LPDDR5X shared with the Grace CPU. Not measured; TFLOPS are the RTX 5090 bf16
+    # rate scaled by SM count x clock, fp8 the datasheet 1 PFLOP sparse FP4 / 4.
+    "gb10": HardwareSpec(
+        name="GB10",
+        arch="sm_121a",
+        vendor="nvidia",
+        sm_or_cu_count=48,
+        clock_boost_mhz=2418.0,
+        bandwidth_datasheet_gbps=273.0,
+        # Measured (calibrate_ceilings, 2026-11-21); crates/hwspec holds the same numbers and its
+        # gb10_python_registry_matches test fails when the two drift.
+        bandwidth_measured_gbps=238.0,
+        bf16_tflops_dense=93.9,
+        fp8_tflops_dense=181.1,
+        fp16_tflops_dense=93.9,
+        # cuBLASLt NVFP4 torch._scaled_mm 8192^3, e4m3 scales per 16 elements, 2026-11-24.
+        fp4_tflops_dense=378.6,
     ),
     "rtx 4090": HardwareSpec(
         name="RTX 4090",
@@ -247,6 +267,8 @@ def lookup_gpu(name_or_arch: str) -> HardwareSpec:
         return HARDWARE_REGISTRY["h200 sxm"]
     if "5090" in q:
         return HARDWARE_REGISTRY["rtx 5090"]
+    if "spark" in q:
+        return HARDWARE_REGISTRY["gb10"]
     if "4090" in q:
         return HARDWARE_REGISTRY["rtx 4090"]
     if "mi300" in q or "gfx942" in q:

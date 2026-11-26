@@ -91,7 +91,8 @@ pub fn class_of(op: DevOp) -> RowClass {
         // Nothing here reads a position or couples two rows. Dense projections, norms,
         // elementwise, quantization, argmax, the collectives, and the whole MoE routing /
         // grouping / combine chain, whose row maps are built from the batch it is given.
-        Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | GluPitched | SituGlu | SoftCap
+        Nop | RmsNorm | RowRms | Residual | Sum4Bf16 | Glu | GluPitched | RowColScale | SituGlu
+        | SoftCap
         | LayerNorm | NormResidual | AddNorm | NormResidualNorm | PerLayerInput | GluStrided
         | QuantFp8 | ZeroF32 | CastF32Bf16 | MlaOutGate | KdaGatedNorm | QwenGatedNorm
         | QwenQGateSplit | QwenSigmoidGate | QwenRmsNorm | LayerNormF32 | ScaledAddF32 | GluF32
@@ -156,7 +157,9 @@ pub fn class_of(op: DevOp) -> RowClass {
         | MoeCombine | MoeCombinePf | MoeGroupGluPf | MoeGroupDownPf | MoeExpertGluFp8Blk
         | MoeExpertDownFp8Blk | MoeGroupGluFp8Blk | MoeGroupDownFp8Blk | MoeGluMx | MoeDownMx
         | MoeGluMxPf | MoeDownMxPf | MoeAiterFp8Pf | MoeGluFp8Block128 | MoeQuantFp8Block128
-        | MoeDownFp8Block128 | MuseMoeCombineNorm => RowClass::A,
+        | MoeDownFp8Block128 | MuseMoeCombineNorm | MoeRouterLogitsF32 | MoeRouterSigmoidTopk
+        | MoeUpNvfp4 | MoeDownNvfp4 | MoeAlignNvfp4 | MoeUpNvfp4Pf | MoeDownNvfp4Pf
+        | MoeQuantNvfp4 => RowClass::A,
         MoeRouterGemma
         | MoeRouterGemmaScore
         | MoeRouterGemmaScoreFast
@@ -282,6 +285,11 @@ pub fn class_of(op: DevOp) -> RowClass {
         KdaConv | KdaConv3 | KdaStateStep | KdaStateStepG | KdaConvStateStepG | KdaDecodeFused
         | KdaChunkPrepare | KdaChunkIntra | KdaChunkWu | KdaChunkCarry => RowClass::D,
         Mamba2Scan => RowClass::D,
+        // Conv carries both forms behind i4 (decode per-row slot, prefill one sequence): the
+        // single-sequence form decides, as for KDA. The chunk scan is single-sequence.
+        Mamba2Conv | Mamba2ChunkState | Mamba2ChunkPass | Mamba2ChunkOut => RowClass::D,
+        Mamba2Step => RowClass::B,
+        Mamba2GatedNorm => RowClass::A,
     }
 }
 

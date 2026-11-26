@@ -269,7 +269,7 @@ impl GpuEngine {
         let rows = rows.min(self.max_ctx.saturating_sub(1));
         let copy = (|| -> Result<()> {
             for cache in &manifest.caches {
-                let head_row = u64::from(cache.hd) * 2;
+                let head_row = u64::from(cache.hd * cache.elem_bytes());
                 let head_bytes = u64::from(cache.stride) * head_row;
                 let slot_bytes = u64::from(cache.heads) * head_bytes;
                 for &handle in &cache.pair {
@@ -441,10 +441,10 @@ impl GpuEngine {
             return declined("encoder overlay rows are not keyed by the prompt ids");
         }
         let requested = config.nv_vmm_prefix();
-        // GB202 (sm_120) auto-selects the cache for every packet with a layout, rank groups
+        // GB202 / GB10 (sm_120a / sm_121a) auto-select the cache for every packet with a layout, rank groups
         // included. Hopper keeps the geometry allowlist it was qualified on; other targets
         // need an explicit PLOW_VMM_PREFIX=1.
-        let gb202 = capability == (12, 0);
+        let gb202 = hwspec::IsaLevel::from_nvidia_cc(capability).is_some_and(hwspec::IsaLevel::is_sm12x);
         if requested == Some(false)
             || (requested.is_none()
                 && ((capability != (9, 0) && !gb202)
@@ -594,7 +594,11 @@ impl GpuEngine {
             }
         };
         let full_fp8 = geo.full_layers.first().map(|&l| scales_of(l).is_some());
-        geo.elem = if full_fp8 == Some(true) { 1 } else { 2 };
+        // Unit-scale E4M3 caches carry no scale tensors: the LIVE manifest's writers declare them.
+        let unit_e4m3 = blob
+            .with_packet_view(plow_asset::live_kv::emit)
+            .is_ok_and(|m| m.caches.iter().any(|c| c.e4m3));
+        geo.elem = if full_fp8 == Some(true) || unit_e4m3 { 1 } else { 2 };
 
         // Full layers: declared bytes must equal the batch-major shape at the
         // resolved elem, and the fp8 discriminator must be uniform — a layer
@@ -618,6 +622,7 @@ impl GpuEngine {
             }
             match (geo.elem, scales_of(l)) {
                 (2, None) => {}
+                (1, None) if unit_e4m3 => {}
                 (1, Some((ik, iv))) => {
                     let want = batch as u64 * geo.kvh_full as u64 * geo.max_ctx as u64 * 4;
                     if blob.tensors[ik].bytes != want || blob.tensors[iv].bytes != want {
@@ -631,6 +636,17 @@ impl GpuEngine {
                     return None;
                 }
             }
+        }
+        // A chain drafter's own cache (`kv.mtp.{k,v}`, Nemotron-H MTP) in the full layers' shape
+        // rides the pool as one more track: an attached prefix then carries the drafter rows the
+        // publisher's prefill wrote instead of the slot's stale ones. Unit-scale or bf16 caches
+        // only: per-row scales (`full_scale`) are laid out per backbone layer.
+        if full_scale.is_empty()
+            && [find("kv.mtp.k"), find("kv.mtp.v")]
+                .iter()
+                .all(|t| t.is_some_and(|i| blob.tensors[i].bytes == geo.full_tensor_bytes()))
+        {
+            geo.full_layers.push(DRAFT_KV_LAYER);
         }
 
         // Sliding layers: resolve ring geometry for the boundary snapshots.
@@ -797,7 +813,7 @@ impl GpuEngine {
                         .iter()
                         .enumerate()
                         .filter_map(|(id, tensor)| {
-                            let (layer, which) = kv_tensor_name(&tensor.name)?;
+                            let (layer, which) = prefix_track_name(&tensor.name)?;
                             kv.tensor_va(layer, which).map(|_| (id, layer, which))
                         })
                         .collect(),
@@ -1338,6 +1354,17 @@ pub(super) fn trace_init(v: &VmmServe) {
 /// rows (Gemma 4 drops the generation prompt's empty thought channel, 4 tokens), so a boundary
 /// within them never attaches — about one turn in eight missed that way.
 const SESSION_PROMPT_REWRITE: u32 = 8;
+
+/// Pool layer id of the drafter's own cache (`vmm_prefix_layout`), above any model layer.
+const DRAFT_KV_LAYER: u32 = 1 << 20;
+
+pub(super) fn prefix_track_name(name: &str) -> Option<(u32, u32)> {
+    match name {
+        "kv.mtp.k" => Some((DRAFT_KV_LAYER, 0)),
+        "kv.mtp.v" => Some((DRAFT_KV_LAYER, 1)),
+        _ => kv_tensor_name(name),
+    }
+}
 
 /// The publish at the end of a prompt's prefill: the whole prompt with the last row held back
 /// (`max_rows < rows`), or a packed pass that withheld the last prompt token (`pos` and

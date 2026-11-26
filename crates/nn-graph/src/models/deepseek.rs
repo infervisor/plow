@@ -292,13 +292,13 @@ fn register_experts(
         .map(|expert| {
             let p = format!("{p}.experts.{expert}");
             RoutedExpertBinding {
-                gate: register_projection(
+                gate: Some(register_projection(
                     nn,
                     cfg,
                     &format!("{p}.gate_proj"),
                     hidden,
                     cfg.moe_intermediate_size,
-                ),
+                )),
                 up: register_projection(
                     nn,
                     cfg,
@@ -341,5 +341,10 @@ fn register_projection(
         );
         scale
     });
-    ExpertProjectionBinding { weight, scale }
+    ExpertProjectionBinding {
+        weight,
+        scale,
+        scale_2: None,
+        input_scale: None,
+    }
 }

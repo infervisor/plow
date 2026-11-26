@@ -92,7 +92,12 @@ pb_detect_arch() {
         elif compgen -G "$obj/*sm90*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_90*.cubin" >/dev/null 2>&1; then
             echo "sm_90a"; return 0
         elif compgen -G "$obj/*sm120*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_120*.cubin" >/dev/null 2>&1; then
-            echo "sm_120"; return 0
+            # GB10 (sm_121a) objects share the sm120 stems; only the device tells them apart.
+            case "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')" in
+                12.1*) echo "sm_121a" ;;
+                *) echo "sm_120" ;;
+            esac
+            return 0
         elif compgen -G "$obj/*sm89*.cubin" >/dev/null 2>&1 || compgen -G "$obj/*sm_89*.cubin" >/dev/null 2>&1; then
             echo "sm_89"; return 0
         elif compgen -G "$obj/*.cubin" >/dev/null 2>&1; then
@@ -106,6 +111,7 @@ pb_detect_arch() {
         case "$cap" in
             9.0*) echo "sm_90a"; return 0 ;;
             12.0*) echo "sm_120"; return 0 ;;
+            12.1*) echo "sm_121a"; return 0 ;;
             8.9*) echo "sm_89"; return 0 ;;
             8.0*) echo "sm_80"; return 0 ;;
             "") ;;
@@ -157,11 +163,11 @@ pb_require_nix() {
         pb_ok "PLOW_CAMPAIGN_NO_NIX=1: hand-built shell (CUDA_PATH=${CUDA_PATH:-unset})"
         return 0
     fi
-    if [ -z "${ROCM_PATH:-}" ]; then
-        pb_bad "not inside 'nix develop' (ROCM_PATH unset) — build and serve tasks need it"
+    if [ -z "${ROCM_PATH:-}" ] && [ -z "${PLOW_NIX_GPU:-}" ]; then
+        pb_bad "not inside 'nix develop' (ROCM_PATH and PLOW_NIX_GPU unset) — build and serve tasks need it"
         return 1
     fi
-    local info="ROCM_PATH=$ROCM_PATH"
+    local info="ROCM_PATH=${ROCM_PATH:-none (CUDA-only shell)}"
     [ -n "${CUDA_PATH:-}" ] && info="$info CUDA_PATH=$CUDA_PATH"
     pb_ok "nix dev shell ($info)"
 }

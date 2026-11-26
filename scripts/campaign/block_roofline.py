@@ -78,13 +78,31 @@ def floor_ms(priced):
     return sum(entry[3] for entry in priced.values())
 
 
+def fp4(ceil):
+    """The FP4 ceiling of a (bw, bf16, fp8[, fp4]) tuple, None when absent."""
+    return ceil[3] if len(ceil) > 3 else None
+
+
 def decode_floor(progs, b, ctx, ceil, wb, kvb, router):
     prog = program(progs, "decode", b)
     if prog is None:
         raise ValueError(f"block packet has no decode rung B={b}")
-    priced = op_roof.price(prog, ctx, wb, kvb, *ceil, router=router)
+    priced = op_roof.price(prog, ctx, wb, kvb, *ceil[:3], router=router, fp4_tflops=fp4(ceil))
     op_roof.require_priced(prog, priced)
     return floor_ms(priced), priced
+
+
+def padded_decode_floor(progs, b, ctx, ceil, wb, kvb, router):
+    """B active rows on the narrowest rung that holds them: (floor at the B real rows, what the
+    rung's inactive rows add, the rung, priced)."""
+    fits = sorted(p[1] for p in progs if p[0] == "decode" and p[1] >= b)
+    if not fits:
+        raise ValueError(f"block packet has no decode rung B={b}")
+    rung, _ = decode_floor(progs, fits[0], ctx, ceil, wb, kvb, router)
+    priced = op_roof.price(at_rows(program(progs, "decode", fits[0]), b), ctx, wb, kvb, *ceil[:3], router=router,
+                           fp4_tflops=fp4(ceil))
+    real = floor_ms(priced)
+    return real, rung - real, fits[0], priced
 
 
 # Op fields that count launch rows: a padded bucket scales them to the real rows. `n` is rows x
@@ -116,11 +134,11 @@ def packed_floor(progs, requests, rows, prior, riders, rider_ctx, ceil, wb, kvb,
     prog = bucket(progs, total)
     if prog is None:
         raise ValueError(f"no prefill bucket holds {total} rows")
-    bw, tflops, fp8_tflops = ceil
-    padded = op_roof.price(prog, rider_ctx, wb, kvb, bw, tflops, fp8_tflops, router=router)
+    bw, tflops, fp8_tflops = ceil[:3]
+    padded = op_roof.price(prog, rider_ctx, wb, kvb, bw, tflops, fp8_tflops, router=router, fp4_tflops=fp4(ceil))
     op_roof.require_priced(prog, padded)
     real = at_rows(prog, total)
-    priced = op_roof.price(real, rider_ctx, wb, kvb, bw, tflops, fp8_tflops, router=router)
+    priced = op_roof.price(real, rider_ctx, wb, kvb, bw, tflops, fp8_tflops, router=router, fp4_tflops=fp4(ceil))
     total_ms = pad_ms = 0.0
     for idx, op, _, p in real[2]:
         if op not in ATTENTION_PREFILL:
@@ -179,8 +197,8 @@ def build_rows(progs, desc, plow, current, vllm, ceil, wb, kvb, router):
     for key in sorted(set(plow) | set(current), key=str):
         if key[0] == "decode":
             _, b, ctx = key
-            floor, priced = decode_floor(progs, b, ctx, ceil, wb, kvb, router)
-            point, pad = f"decode B={b}, ctx {ctx}", 0.0
+            floor, pad, rung, priced = padded_decode_floor(progs, b, ctx, ceil, wb, kvb, router)
+            point = f"decode B={b}, ctx {ctx}" + (f" (rung {rung}, +{pad:.3f} ms pad floor)" if rung != b else "")
         else:
             _, n, q, prior, riders, rctx = key
             floor, pad, priced = packed_floor(progs, n, q, prior, riders, rctx, ceil, wb, kvb, router)
@@ -189,7 +207,10 @@ def build_rows(progs, desc, plow, current, vllm, ceil, wb, kvb, router):
             if launch > n * q + riders:
                 point += f" (bucket {launch}: {launch - n * q - riders} pad rows, +{pad:.3f} ms floor)"
         top = max(priced.values(), key=lambda e: e[3])
-        rows.append({"block": name, "point": point, "key": list(key), "floor_ms": floor,
+        t = plow.get(key)
+        # `phase` + `efficiency` (floor / measured) are what certify_kernel.py gates on.
+        rows.append({"block": name, "point": point, "key": list(key), "phase": key[0],
+                     "efficiency": floor / t if t else 0.0, "floor_ms": floor,
                      "pad_floor_ms": pad,
                      "time_ms": plow.get(key), "current_ms": current.get(key), "vllm_ms": vllm.get(key),
                      "top_op": top[0], "top_op_floor_ms": top[3]})
@@ -233,6 +254,7 @@ def main():
     if not progs:
         sys.exit(f"{a.block}: no programs in the disassembly")
     bw, tf, f8, source = op_roof.ceilings(a, lookup_gpu(a.gpu))
+    f4 = op_roof.fp4_ceiling(a, lookup_gpu(a.gpu))
     router = op_roof.load_router(a.router_table, progs)
     plow, current = load_sweep(a.plow), load_sweep(a.current)
     for spec in a.point:
@@ -243,13 +265,14 @@ def main():
     if not plow and not current:
         ap.error("give --plow/--current measurements or --point")
     vllm = load_sweep(a.vllm)
-    rows = build_rows(progs, desc, plow, current, vllm, (bw, tf, f8), a.wbytes, a.kvbytes, router)
+    rows = build_rows(progs, desc, plow, current, vllm, (bw, tf, f8, f4), a.wbytes, a.kvbytes, router)
     routing = f"router table {a.router_table}" if router else "uniform routing"
-    print(f"Ceilings: {bw:.0f} GB/s, {tf:.0f} BF16 / {f8:.0f} FP8 TFLOP/s ({source}); MoE: {routing}\n")
+    print(f"Ceilings: {bw:.0f} GB/s, {tf:.0f} BF16 / {f8:.0f} FP8 / {f4 or f8:.0f} FP4 TFLOP/s ({source}); MoE: {routing}\n")
     print(table(rows, bool(vllm)))
     if a.json:
         Path(a.json).write_text(json.dumps({"ceilings": {"bw_gbps": bw, "bf16_tflops": tf,
-                                                         "fp8_tflops": f8, "source": source},
+                                                         "fp8_tflops": f8, "fp4_tflops": f4,
+                                                         "source": source},
                                             "router": a.router_table, "block": desc, "rows": rows},
                                            indent=2) + "\n")
 

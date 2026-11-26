@@ -148,6 +148,8 @@ const ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
 /// (`PAGEABLE_MEMORY_ACCESS`), which HMM also sets on PCIe boxes where the
 /// same copy degrades to fault-driven migration.
 const ATTR_PAGEABLE_USES_HOST_PAGE_TABLES: i32 = 100;
+/// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: the GPU shares system memory (GB10 / DGX Spark).
+const ATTR_INTEGRATED: i32 = 18;
 // CUfunction_attribute.
 pub(crate) const FUNC_ATTR_MAX_THREADS_PER_BLOCK: i32 = 0;
 pub(crate) const FUNC_ATTR_SHARED_SIZE_BYTES: i32 = 1;
@@ -981,6 +983,9 @@ pub struct CudaBackend {
     /// Hardware-coherent pageable access (attr 100) — see
     /// [`Backend::coherent_host_dma`].
     coherent_host_dma: bool,
+    /// Integrated GPU (attr 18): device memory is system memory, so reclaimable
+    /// page cache counts as free (see [`Self::mem_info`]).
+    integrated: bool,
     /// PCI address (`0000:41:00.0`), for host-thread placement on the device's socket.
     pci_bdf: Option<String>,
     /// Real loaded modules by placeholder-exclusive id (id 0 = "no module",
@@ -1244,6 +1249,7 @@ impl CudaBackend {
                     (api.cuDeviceGetAttribute)(&mut v, ATTR_PAGEABLE_USES_HOST_PAGE_TABLES, dev);
                 rc == 0 && v == 1
             };
+            let integrated = attr(ATTR_INTEGRATED, "attr integrated").is_ok_and(|v| v == 1);
             let pci_bdf = match (
                 attr(ATTR_PCI_DOMAIN_ID, "pci"),
                 attr(ATTR_PCI_BUS_ID, "pci"),
@@ -1266,6 +1272,7 @@ impl CudaBackend {
                 cc_major,
                 cc_minor,
                 coherent_host_dma,
+                integrated,
                 driver = %format_args!("{}.{}", driver_version / 1000, (driver_version % 1000) / 10),
                 "CUDA device ready"
             );
@@ -1297,6 +1304,7 @@ impl CudaBackend {
                 compute_capability,
                 smem_optin,
                 coherent_host_dma,
+                integrated,
                 pci_bdf,
                 modules: Mutex::new(FxHashMap::default()),
                 module_images: Mutex::new(FxHashMap::default()),
@@ -2809,7 +2817,17 @@ impl CudaBackend {
             unsafe { (self.api.cuMemGetInfo_v2)(&mut free, &mut total) },
             "cuMemGetInfo",
         )?;
-        Ok((free as u64, total as u64))
+        let (mut free, total) = (free as u64, total as u64);
+        // cuMemGetInfo on an integrated GPU excludes reclaimable page cache (e.g. the
+        // checkpoint just read), which the kernel hands back on allocation. The host
+        // reserve stays out of the device budget: the CPU draws from the same pool.
+        if self.integrated {
+            if let Some((avail, host_total)) = crate::memory::vmm::host_mem_available() {
+                let usable = avail.saturating_sub(crate::memory::vmm::host_reserve(host_total));
+                free = free.max(usable.min(total));
+            }
+        }
+        Ok((free, total))
     }
 
     /// This device's `CUmemAllocationProp` for pinned device-local VMM
@@ -3942,7 +3960,7 @@ impl crate::exec::device_api::EngineDevice for CudaBackend {
     fn arch(&self) -> String {
         match self.compute_capability() {
             (9, 0) => "sm90a".into(),
-            (12, 0) => "sm120".into(),
+            cc if hwspec::IsaLevel::from_nvidia_cc(cc).is_some_and(hwspec::IsaLevel::is_sm12x) => "sm120".into(),
             (major, minor) => format!("sm{major}{minor}"),
         }
     }

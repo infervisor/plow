@@ -82,10 +82,11 @@ def load_ceilings(path=None):
     c = dict(CEILINGS, source="calibrated H100 SXM5 (docs/bringup/isa/sm90a.md)")
     if path:
         c.update(json.load(open(path)), source=path)
-    return {"bw": c["bw_gbps"] * 1e9,
-            "peak": {"bf16": c["bf16_tflops"] * 1e12, "fp8": c["fp8_tflops"] * 1e12,
-                     "tf32": speech_roofline.PEAK["tf32"], "fp32": speech_roofline.PEAK["fp32"]},
-            "source": c["source"]}
+    peak = {"bf16": c["bf16_tflops"] * 1e12, "fp8": c["fp8_tflops"] * 1e12,
+            "tf32": speech_roofline.PEAK["tf32"], "fp32": speech_roofline.PEAK["fp32"]}
+    if "fp4_tflops" in c:  # block-scaled e2m1 MMA: only a box's own ceilings JSON carries it
+        peak["fp4"] = c["fp4_tflops"] * 1e12
+    return {"bw": c["bw_gbps"] * 1e9, "peak": peak, "source": c["source"]}
 
 
 def floor_us(cost, ceil):

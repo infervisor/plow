@@ -18,7 +18,34 @@ fn pf_packlog_on() -> bool {
     RuntimeConfig::get().pf_packlog
 }
 
-/// Fixed cost of ONE prefill launch, in padded-row equivalents (measured on sm_120 / gemma-4-12B).
+/// `(slope, intercept >= 0)` of the least-squares line through `(rows, ms)` points; `None` under
+/// two distinct row counts or a non-positive slope.
+fn launch_fit(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if pts.len() < 2 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+    let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let sxx: f64 = pts.iter().map(|p| (p.0 - mx) * (p.0 - mx)).sum();
+    let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+    let slope = sxy / sxx;
+    let fixed = my - slope * mx;
+    (slope > 0.0 && fixed.is_finite()).then_some((slope, fixed.max(0.0)))
+}
+
+#[cfg(test)]
+#[test]
+fn launch_fit_recovers_fixed_cost() {
+    assert_eq!(launch_fit(&[(128.0, 300.0)]), None);
+    assert_eq!(launch_fit(&[(128.0, 300.0), (128.0, 310.0)]), None);
+    let (slope, fixed) = launch_fit(&[(128.0, 300.0), (1024.0, 580.0), (8192.0, 2820.0)]).unwrap();
+    assert!((slope - 0.3125).abs() < 1e-3 && (fixed - 260.0).abs() < 1.0, "{slope} {fixed}");
+    assert_eq!(launch_fit(&[(128.0, 300.0), (1024.0, 290.0)]), None);
+}
+
+/// Fixed cost of ONE prefill launch, in padded-row equivalents (measured on sm_120 / gemma-4-12B):
+/// the serial cover's floor once launches are measured (`GpuEngine::pf_chunk_cost_rows`).
 pub(crate) const PF_CHUNK_COST_ROWS: usize = 512;
 
 /// The smallest rung of an ascending `ladder` holding `rows`; the widest when none does (0 when
@@ -205,6 +232,7 @@ mod row_decode;
 mod segment_gates;
 mod shared_tail;
 pub mod spec;
+mod span_riders;
 mod spec_draft;
 mod spec_serve;
 pub use spec_serve::{SpecLimits, SpecRow, SpecTick};
@@ -297,6 +325,16 @@ struct InterpreterProfile {
     embedded_decode: &'static str,
 }
 
+/// A padded-prefill site (`packet::slots::rows_imm` with a `bucket`): `rows` real rows of a
+/// `bucket`-row launch.
+fn set_padded_rows(d: &mut DevInst64, rows: u32, bucket: u32) {
+    let r = DevOp::from_u16(d.op)
+        .and_then(packet::slots::rows_imm)
+        .expect("padded-prefill site");
+    d.i[r.rows] = rows;
+    d.i[r.bucket.expect("padded-prefill site")] = bucket;
+}
+
 fn interpreter_profile(cc: (u32, u32)) -> Option<InterpreterProfile> {
     match cc {
         (9, 0) => Some(InterpreterProfile {
@@ -307,7 +345,7 @@ fn interpreter_profile(cc: (u32, u32)) -> Option<InterpreterProfile> {
             prefill_symbol: "_Z15interp_sm90a_pf11PlowProgram",
             embedded_decode: "interp_sm90a",
         }),
-        (12, 0) => Some(InterpreterProfile {
+        cc if hwspec::IsaLevel::from_nvidia_cc(cc).is_some_and(hwspec::IsaLevel::is_sm12x) => Some(InterpreterProfile {
             tag: "sm120",
             decode_file: "interp_sm120.cubin",
             prefill_file: "interp_sm120_pf.cubin",
@@ -2121,6 +2159,8 @@ struct SegPf {
     /// `plow_norm_rms_pf` ABI 2: a grid covering the rows runs the RmsNorm one block per row.
     norm_rms_row_grid: bool,
     rope_pf: Option<KernelFn>,
+    /// `plow_moe_w4a4_pf`: a W4A4 MoE up / down segment as its own launch (sm_12x NVFP4 MoE).
+    moe_w4a4_pf: Option<KernelFn>,
     smem_flash: u32,
     grid_flash: u32,
     f_gemm: KernelFn,
@@ -2137,10 +2177,20 @@ struct SegPf {
     class_policy: crate::asset::devblob::SegmentClassPolicy,
     /// Both objects skip padding rows whose slot is -1 (`PLOW_NV_MASKED_PADDING`).
     masked_padding: bool,
+    /// A Mamba packed packet's unpacked pair: unbound (one-request) launches run the serial
+    /// packet's objects.
+    serial: Option<SerialSegPair>,
     _m_flash: Module,
     _m_gemm: Module,
     _m_fa512: Option<Module>,
     _m_fa256_gqa2: Option<Module>,
+}
+
+struct SerialSegPair {
+    flash: (KernelFn, u32, u32),
+    gemm: (KernelFn, u32, u32, u32),
+    _m_flash: Module,
+    _m_gemm: Module,
 }
 
 impl SegPf {
@@ -2393,6 +2443,10 @@ struct PrefillBucket {
     /// Whether the one-time PX-1 batched-mode patch has been applied (t6 = the
     /// slot-map / request-table handles, t5 = fused output, merge neutered).
     batch_patched: bool,
+    /// The body's head tail is Nop'ed: the packed terminal scores this launch's rows.
+    tail_discarded: bool,
+    /// `in.mtp.shift.{t}`: the MTP drafter tail's next-id row per row, staged per launch.
+    mtp_shift: Option<usize>,
     /// This bucket's combined counter+cursor slab (its GQ cursor sits at
     /// the tail; `ctr_bytes` is the full reset size).
     d_ctr: DeviceMem,
@@ -2605,6 +2659,15 @@ struct RecurrentState {
     tensors: Vec<(usize, u64)>,
     initstate: Option<(usize, u64)>,
     prefill_updates_state: bool,
+    /// `recurrent_state.step_seed`: the SplitMix64 state drawing the seed word written after the
+    /// mask before every launch (fixed start: a run's rounding is reproducible).
+    step_seed: Option<u64>,
+    /// Speculative-verify rollback (`recurrent_state.verify`) with the manifest's buffers it
+    /// indexes.
+    verify: Option<(
+        plow_asset::recurrent_state::VerifyRollback,
+        Vec<plow_asset::recurrent_state::Buffer>,
+    )>,
 }
 
 struct NvDenseNsplitProg {
@@ -2702,9 +2765,19 @@ fn recurrent_state_from(
     manifest
         .validate(slots as u32, facts)
         .map_err(RuntimeError::Rejected)?;
-    // A buffer the section omits would keep another request's history across slot reuse.
+    // A buffer the section omits would keep another request's history across slot reuse; a
+    // verify snapshot (or replay record) is written by every verify before a commit reads it.
+    let snapshot = |handle: usize| {
+        manifest.verify.as_ref().is_some_and(|v| {
+            v.snapshots.iter().any(|s| usize::from(s.tensor) == handle)
+                || v.replay
+                    .as_ref()
+                    .is_some_and(|r| r.records.iter().any(|r| usize::from(r.tensor) == handle))
+        })
+    };
     if let Some((handle, tensor)) = tensors.iter().enumerate().find(|(handle, t)| {
         t.name.starts_with("state.")
+            && !snapshot(*handle)
             && !manifest
                 .buffers
                 .iter()
@@ -2722,6 +2795,11 @@ fn recurrent_state_from(
         tensors: manifest.buffers.iter().map(view).collect(),
         initstate: manifest.prefill_initstate.as_ref().map(view),
         prefill_updates_state: manifest.prefill_updates_state,
+        step_seed: manifest.step_seed.then_some(0),
+        verify: manifest
+            .verify
+            .clone()
+            .map(|v| (v, manifest.buffers.clone())),
     }))
 }
 
@@ -2785,6 +2863,8 @@ pub struct GpuEngine {
     smem_pf: u32,
     grid_pf: u32,
     prefill: Vec<PrefillBucket>,
+    /// Fastest wall ms of a serial prefill launch per bucket (`INFINITY` until one ran).
+    pf_launch_min_ms: Vec<f64>,
     /// Read in `Drop` (unloaded separately from [`Self::module`]), so not
     /// underscore-prefixed either.
     module_pf: Option<Module>,
@@ -2963,6 +3043,8 @@ pub struct GpuEngine {
     window_event: Option<CudaEvent>,
     /// `PLOW_PF_PACKLOG` device span of a token-batch launch.
     step_events: Option<(CudaEvent, CudaEvent)>,
+    /// Rung rows of the last speculative verify launch (`PLOW_PF_PACKLOG` SPEC lines).
+    spec_last_launch_rows: usize,
     /// Stop-token set (the checkpoint's `eos_token_id`). `Arc` so the mux can
     /// take a per-tick handle without cloning the Vec while the engine stays
     /// mutably borrowed.
@@ -3012,7 +3094,8 @@ pub struct GpuEngine {
     /// `prefill_initstate`.
     recurrent_initstate: Option<usize>,
     /// The recurrent chain packs: the external adapter scans variable-length sequences and the
-    /// packet declares the initial-state scratch (`qwen_packs` at load).
+    /// packet declares the initial-state scratch (`qwen_packs` at load), or the Mamba-2 prefill
+    /// ops read the request table themselves (`mamba_packs`).
     recurrent_packs: bool,
     /// The packed launch's Qwen requests as (slot, rows), taken by `launch_prefill_chain`.
     qwen_pack: Vec<(usize, u32)>,
@@ -3021,6 +3104,10 @@ pub struct GpuEngine {
     token_batch: Option<token_batch::CudaTokenBatch>,
     /// Split attention for decode rows riding a packed prefill launch (`riders.rs`).
     riders: Option<riders::Riders>,
+    /// Verify spans riding a packed Mamba prefill launch (`span_riders.rs`).
+    span_riders: Option<span_riders::SpanRiders>,
+    /// The next packed body's trailing rider spans: their first row and spans.
+    pf_span: Option<(u32, Vec<span_riders::Span>)>,
     /// The packet's generated flash-decode object (`gen_role.rs`), runtime-launched.
     gen_decode: Option<gen_role::GenDecode>,
     /// Its shared launch state when decode rungs route their attention pairs to it.
@@ -3065,6 +3152,14 @@ pub struct GpuEngine {
     prefill_family: crate::obs::bucket::Family,
     /// The serial prefill's last chunk's terminal row (its lm_head row of `act.hn`).
     pf_terminal_row: u32,
+    /// Host staging of [`Self::upload_mtp_shift`].
+    pf_shift: Vec<i32>,
+    /// `in.mtp.dshift`, the decode rungs' drafter-tail gather, and the span lengths it holds
+    /// ([`Self::stage_mtp_dshift`]; `None`: the packet's initial table).
+    mtp_dshift: Option<usize>,
+    mtp_dshift_lens: Option<Vec<u32>>,
+    /// The serial launch in flight serves a one-request pack: the packed terminal scores it.
+    pf_lone: bool,
     /// Span-mode verify (`in.rowslot` packets); see [`spec`].
     spec: Option<spec::SpecRt>,
     spec_draft: Option<spec_draft::SpecDraft>,
@@ -3744,7 +3839,7 @@ impl Drop for UploadPipe<'_> {
 
 /// Pinned per-step staging slab: `[ids B][pos B][kvlen B]` i32, uploaded with
 /// three async H2D copies on the engine stream, plus an optional active-slot mask
-/// for recurrent models. `ids` doubles as the token
+/// (and step seed word) for recurrent models. `ids` doubles as the token
 /// readback destination — the same `in.ids` tensor round-trips (`ARGMAX_FIN`
 /// writes the next token there), so no separate download buffer exists.
 struct StepStage {
@@ -3753,11 +3848,22 @@ struct StepStage {
 }
 
 impl StepStage {
-    fn new(be: &CudaBackend, batch: usize, recurrent: bool) -> Result<StepStage> {
+    fn new(be: &CudaBackend, batch: usize, active_words: usize) -> Result<StepStage> {
         Ok(StepStage {
-            slab: be.host_alloc_pinned((3 + usize::from(recurrent)) * batch * 4)?,
+            slab: be.host_alloc_pinned((3 * batch + active_words) * 4)?,
             batch,
         })
+    }
+
+    /// The recurrent `in.active` image after kvlen: `words` i32 (slots, then the step seed).
+    fn active_mut(&mut self, words: usize) -> &mut [u8] {
+        let b = self.batch;
+        &mut self.slab.as_mut_slice()[3 * b * 4..(3 * b + words) * 4]
+    }
+
+    fn active(&self, words: usize) -> &[u8] {
+        let b = self.batch;
+        &self.slab.as_slice()[3 * b * 4..(3 * b + words) * 4]
     }
 
     /// The three staging sections for the host fill.
@@ -4814,12 +4920,17 @@ impl GpuEngine {
         }
         let keyed_overlays = crate::tts::SpeechContract::load(assets_dir)?
             .is_some_and(|c| c.depth && c.slot_prefix_reuse);
+        // A packet emitted before its config shape was understood (Nemotron-H `llm_config`)
+        // carries no KV geometry: read it from the checkpoint, as the AMD engine does.
+        let prefix_kv = serve.manifest.kv.clone().or_else(|| {
+            plow_asset::serve_manifest::KvGeometry::from_config(checkpoint_dir)
+        });
         let prefix_layout = crate::memory::vmm::VmmOps::granularity(be.as_ref())
             .ok()
             .and_then(|granularity| {
                 Self::select_vmm_prefix_layout(
                     &blob,
-                    serve.manifest.kv.as_ref(),
+                    prefix_kv.as_ref(),
                     config,
                     be.compute_capability(),
                     granularity,
@@ -5261,9 +5372,9 @@ impl GpuEngine {
         let prefill_image =
             resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
         if xr_partial_f32 {
-            if want_sm != 120 {
+            if !hwspec::IsaLevel::from_nvidia_cc((want_sm / 10, want_sm % 10)).is_some_and(hwspec::IsaLevel::is_sm12x) {
                 return Err(RuntimeError::Rejected(
-                    "FP32 peer partials require sm_120a".into(),
+                    "FP32 peer partials require sm_120a or sm_121a".into(),
                 ));
             }
             if let Some(reason) = xr_capability_unavailable(
@@ -7986,6 +8097,16 @@ impl GpuEngine {
         let recurrent_initstate = recurrent.as_ref().and_then(|r| r.initstate);
         // The GDN chain packs when its packet declares the gathered initial-state scratch.
         let qwen_packs = qwen_prefill.is_some() && recurrent_initstate.is_some();
+        // The Mamba-2 chain packs in place: its prefill ops walk each request's rows from the
+        // slot state through the request table the packed manifest binds (op_mamba_pf.cuh).
+        let mamba_packs = packed_prefill.is_some()
+            && recurrent_initstate.is_none()
+            && !prefill.is_empty()
+            && prefill.iter().all(|b| {
+                b.h_inst
+                    .iter()
+                    .any(|i| i.op == DevOp::Mamba2ChunkPass as u16)
+            });
         if let (true, Some((_, stride))) = (qwen_packs, recurrent_initstate) {
             if stride != crate::device::cuda::qwen_gdn::STATE_BYTES {
                 return Err(RuntimeError::Rejected(format!(
@@ -8009,7 +8130,7 @@ impl GpuEngine {
                 if f_pf.is_some() && !prefill.is_empty() =>
             {
                 if (vmm.as_ref().is_some_and(|v| v.prefix_kv().is_some()) && !packed_prefix)
-                    || (recurrent.is_some() && !qwen_packs)
+                    || (recurrent.is_some() && !qwen_packs && !mamba_packs)
                     || prefill.iter().any(|b| {
                         b.seg_class.len() < 2
                             || (!qwen_packs && b.qwen_segments.iter().any(Option::is_some))
@@ -8077,7 +8198,13 @@ impl GpuEngine {
         // The engine's ordered device queue + pinned per-step staging + the
         // flag-gated (`--step-time` / PLOW_STEP_TIME=1) CUDA-event timing
         // (plan stage 1: async submission path).
-        let stage = StepStage::new(&be, batch, recurrent.is_some())?;
+        let stage = StepStage::new(
+            &be,
+            batch,
+            recurrent
+                .as_ref()
+                .map_or(0, |r| batch + usize::from(r.step_seed.is_some())),
+        )?;
         let h2d_ev = be.event_create(false)?;
         let timing = match crate::config::RuntimeConfig::get().nv.step_time {
             true => Some(StepTiming::new(&be)?),
@@ -8322,6 +8449,7 @@ impl GpuEngine {
             seg_graphs: std::collections::HashMap::new(),
             smem_pf,
             grid_pf,
+            pf_launch_min_ms: vec![f64::INFINITY; prefill.len()],
             prefill,
             module_pf,
             sampler,
@@ -8400,6 +8528,7 @@ impl GpuEngine {
             deferred_attach: Vec::new(),
             window_event: None,
             step_events: None,
+            spec_last_launch_rows: 0,
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
             stage,
@@ -8422,12 +8551,14 @@ impl GpuEngine {
             lib_attention_routed: false,
             attention_requests: Vec::new(),
             recurrent_initstate,
-            recurrent_packs: qwen_packs,
+            recurrent_packs: qwen_packs || mamba_packs,
             qwen_pack: Vec::new(),
             mixed_step,
             row_decode: None,
             token_batch: None,
             riders: None,
+            span_riders: None,
+            pf_span: None,
             gen_decode,
             gen_decode_launch,
             state_copy: None,
@@ -8455,6 +8586,10 @@ impl GpuEngine {
             decode_extent: 0,
             prefill_family: crate::obs::bucket::Family::Prefill,
             pf_terminal_row: 0,
+            pf_shift: Vec::new(),
+            mtp_dshift: None,
+            mtp_dshift_lens: None,
+            pf_lone: false,
             spec,
             spec_draft: None,
             row_slot_twin,
@@ -8474,6 +8609,7 @@ impl GpuEngine {
         };
         engine.spec_upload_identity()?;
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
+        engine.mtp_dshift = engine.handle_of("in.mtp.dshift");
         engine.encoder = engine.handle_of("act.enc_out").is_some();
         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
         if blob.reserved_metadata(raw, "block.json")?.is_none() {
@@ -8489,9 +8625,14 @@ impl GpuEngine {
         engine.row_decode = row_decode::RowDecode::load(&engine, &blob, raw, assets_dir)?;
         if token_batch::CudaTokenBatch::eligible(&engine) {
             engine.riders = riders::Riders::load(&engine, &blob)?;
+            engine.span_riders = span_riders::SpanRiders::load(&engine, &blob).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "span riders unavailable");
+                None
+            });
             engine.token_batch = token_batch::CudaTokenBatch::load(&engine);
             if engine.token_batch.is_none() {
                 engine.riders = None;
+                engine.span_riders = None;
             }
         }
         if engine.recurrent_initstate.is_some() {
@@ -9123,6 +9264,7 @@ impl GpuEngine {
         self.reset_packed_admission(b);
         self.prefix_attach_off[b] = attach_off;
         self.state_drop(b);
+        self.recurrent_replay_drop(b);
         // A retirement deferred behind a step that then failed (queue cleared) must not fire
         // against the request seated here now.
         if let Some(p) = self.pipe.as_mut() {
@@ -9214,6 +9356,7 @@ impl GpuEngine {
         if let Some(s) = &mut self.spec {
             s.end_pending()?;
         }
+        self.recurrent_replay_drop(b);
         self.seq_tokens[b].truncate(len);
         self.pos[b] = len as _;
         self.spec_hidden_forget(b);
@@ -9223,6 +9366,7 @@ impl GpuEngine {
     /// Bench-only: remember slot `b`'s recurrent state at its current position for `rewind_slot`.
     /// A no-op without recurrent state.
     pub fn snapshot_slot(&mut self, b: usize) -> Result<()> {
+        self.recurrent_replay_flush()?;
         let Some(rec) = &self.recurrent else {
             return Ok(());
         };
@@ -9682,19 +9826,27 @@ impl GpuEngine {
     }
 
     fn upload_active_slots(&mut self, slots: impl Iterator<Item = usize>) -> Result<()> {
-        let Some(state) = &self.recurrent else {
+        let Some(state) = &mut self.recurrent else {
             return Ok(());
         };
-        let mask: &mut [i32] = bytemuck::cast_slice_mut(self.stage.section_mut(3));
+        let words = self.batch + usize::from(state.step_seed.is_some());
+        let mask: &mut [i32] = bytemuck::cast_slice_mut(self.stage.active_mut(words));
         mask.fill(0);
         for slot in slots {
             mask[slot] = 1;
+        }
+        if let Some(seed) = &mut state.step_seed {
+            *seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            mask[self.batch] = (z ^ (z >> 31)) as u32 as i32;
         }
         // The pinned mask survives until the step sync or prompt H2D event.
         unsafe {
             self.be.memcpy_htod_async(
                 self.devp[state.active].base,
-                self.stage.section(3),
+                self.stage.active(words),
                 &self.stream,
             )?;
         }
@@ -10296,6 +10448,7 @@ impl GpuEngine {
             .map(|contexts| contexts.select(&self.pos, slots))
             .transpose()?
             .flatten();
+        self.stage_mtp_dshift(&[])?;
         let highest = highest.max(self.debug_min_rows.saturating_sub(1));
         Ok(decode_selection(self.decode_rung(highest), band))
     }
@@ -10321,11 +10474,13 @@ impl GpuEngine {
         }
     }
 
-    /// A plain decode launch: reads the identity row map and ends any pending verify.
+    /// A plain decode launch: reads the identity row map, ends any pending verify and replays
+    /// its deferred commits first.
     fn launch_selected_decode(&mut self, selection: DecodeSelection) -> Result<()> {
         if let Some(s) = &mut self.spec {
             s.end_pending()?;
         }
+        self.recurrent_replay_flush()?;
         if self.rank_bind.as_ref().is_some_and(|r| r.tp > 1) {
             let sel = match selection {
                 DecodeSelection::Base(r) => r.map_or(0, |r| r as u64 + 1),
@@ -10446,9 +10601,21 @@ impl GpuEngine {
                 Some(&self.stream),
             )
         } else if self.span_launch {
-            Err(RuntimeError::Rejected(
-                "speculative launch on the widest rung".into(),
-            ))
+            let Some((full, _)) = self.row_slot_twin.as_ref().filter(|_| self.span_main()) else {
+                return Err(RuntimeError::Rejected(
+                    "speculative launch on the widest rung".into(),
+                ));
+            };
+            let mut arg = self.kernarg;
+            let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+            self.be.launch_cooperative(
+                full.function,
+                full.grid,
+                full.block,
+                full.smem,
+                &mut params,
+                Some(&self.stream),
+            )
         } else {
             self.launch_decode()
         }
@@ -10457,12 +10624,27 @@ impl GpuEngine {
     /// The widest verify launch a speculative tick may use: the interpreter-only rungs. Library
     /// routes (graph captures, light segments) and sibling objects run on the identity map only.
     pub fn spec_max_rows(&self) -> usize {
+        let plain = |r: &&DecodeRung| r.library.is_none() && r.object.is_none();
+        if self.decode_rungs.iter().all(|r| plain(&r)) && self.span_main() {
+            return self.batch;
+        }
         self.decode_rungs
             .iter()
-            .take_while(|r| r.library.is_none() && r.object.is_none())
+            .take_while(plain)
             .map(|r| r.rows)
             .last()
             .unwrap_or(0)
+    }
+
+    /// The widest program is one interpreter launch of the main kernarg, so a verify can run it
+    /// on the `_rs` twin.
+    fn span_main(&self) -> bool {
+        self.row_slot_twin.is_some()
+            && self.cublaslt_decode.is_empty()
+            && self.decode_packet_roles.is_empty()
+            && self.routed_decode.is_none()
+            && self.gemv_wide.is_none()
+            && !self.moe_lt_decode
     }
 
     fn reset_decode_counters(&self) -> Result<()> {
@@ -11504,12 +11686,19 @@ impl GpuEngine {
         self.prefill.iter().map(|b| b.t as usize).collect()
     }
 
+    /// The packed prefill binds the Mamba-2 chain (no initstate snapshot).
+    pub fn mamba_packs(&self) -> bool {
+        self.recurrent_packs && self.recurrent_initstate.is_none()
+    }
+
     /// Rows to slice off a request with `rem` prefill rows still unsent, under per-launch
     /// `cap`. Plans the WHOLE remainder, so the slice lands on a rung that fills exactly
     /// instead of leaving a stranded tail: 8192 rows under a 4224 cap runs [4096, 4096]
     /// (no padding) where clamping to the cap first ran [4224, 3968->4096] (128 padded rows).
-    pub fn pf_plan_slice(&self, rem: usize, cap: usize) -> usize {
-        if self.prefill.is_empty() {
+    pub fn pf_plan_slice(&self, rem: usize, cap: usize, packing: bool) -> usize {
+        // A Mamba pack pays one launch for all its requests: a lone-launch plan's small first
+        // rung (1058 rows -> [128, 1024]) would cost the whole pack an extra launch.
+        if self.prefill.is_empty() || (packing && self.mamba_packs()) {
             return rem.min(cap);
         }
         let rung = self.prefill[self.pick_prefill_bucket(rem, cap)].t as usize;
@@ -11687,7 +11876,7 @@ impl GpuEngine {
                     let img = std::fs::read(dir.join(file)).map_err(|e| {
                         RuntimeError::Device(format!("segmented prefill object: read {file}: {e}"))
                     })?;
-                    if let Some(pack) = packed {
+                    if let Some(pack) = packed.filter(|_| suffix.starts_with("_pfpacked")) {
                         pack.validate_object(|name| cubin::global_u32(&img, name))
                             .map_err(|e| RuntimeError::Rejected(format!("{file}: {e}")))?;
                     }
@@ -11724,6 +11913,46 @@ impl GpuEngine {
                 let (m1, f1, s1, g1) = load(&seg_file, &seg_sym, &seg_global_suffix, &seg_arena)?;
                 let (m2, f2, s2, _g2unused) =
                     load(&gemm_file, &gemm_sym, &gemm_global_suffix, &gemm_arena)?;
+                let serial_files = [
+                    format!("interp_{interp_tag}_pfseg.cubin"),
+                    format!("interp_{interp_tag}_pfgemm.cubin"),
+                ];
+                let serial = if packed_requests
+                    && kv_suffix.is_empty()
+                    && small_gemm_path.is_none()
+                    && serial_files.iter().all(|f| dir.join(f).is_file())
+                    && blob
+                        .progs
+                        .iter()
+                        .flat_map(|p| &p.insts)
+                        .any(|i| i.op == DevOp::Mamba2ChunkPass as u16)
+                {
+                    let sym = |name: &str| format!("_Z{}{name}11PlowProgram", name.len());
+                    let seg = format!("interp_{interp_tag}_pfseg");
+                    let gemm = format!("interp_{interp_tag}_pfgemm");
+                    let (ma, fa, sa, ga) = load(
+                        &serial_files[0],
+                        &sym(&seg),
+                        "_pfseg",
+                        "plow_arena_bytes_pfseg",
+                    )?;
+                    let (mb, fb, sb, _) = load(
+                        &serial_files[1],
+                        &sym(&gemm),
+                        "_pfgemm",
+                        "plow_arena_bytes_pfgemm",
+                    )?;
+                    let block = be.module_global_u32(&mb, "plow_block_pfgemm")?.unwrap_or(BLOCK);
+                    let grid = be.occupancy_blocks_per_sm(fb, block, sb as usize)? * be.sm_count();
+                    Some(SerialSegPair {
+                        flash: (fa, ga, sa),
+                        gemm: (fb, grid, block, sb),
+                        _m_flash: ma,
+                        _m_gemm: mb,
+                    })
+                } else {
+                    None
+                };
                 if inferred_policy.pure_mode == 3
                     && be.module_global_u32(
                         &m2,
@@ -11960,6 +12189,16 @@ impl GpuEngine {
                 } else {
                     None
                 };
+                let moe_w4a4_pf = if be
+                    .module_global_u32(&m1, &format!("plow_moe_w4a4_pf_abi{seg_global_suffix}"))?
+                    == Some(1)
+                {
+                    let f = be.get_function(&m1, &format!("plow_moe_w4a4_pf{seg_global_suffix}"))?;
+                    be.set_max_dynamic_smem(f, s1)?;
+                    Some(f)
+                } else {
+                    None
+                };
                 let sp = SegPf {
                     glu_quant_cached,
                     glu_quant_cached_q,
@@ -11969,7 +12208,9 @@ impl GpuEngine {
                     norm_rms_pf,
                     norm_rms_row_grid: norm_rms_abi == Some(2),
                     rope_pf,
+                    moe_w4a4_pf,
                     masked_padding,
+                    serial,
                     f_flash: f1,
                     smem_flash: s1,
                     grid_flash: g1,
@@ -12412,6 +12653,16 @@ impl GpuEngine {
             } else {
                 Vec::new()
             };
+            let moe_w4a4_function = seg_pf.as_ref().and_then(|sp| sp.moe_w4a4_pf);
+            let moe_w4a4_segments =
+                if moe_w4a4_function.is_some() && seg_mode && qwen_segments.is_empty() {
+                    cublaslt::prefill_moe_w4a4_segments(g)
+                        .into_iter()
+                        .filter(|(seg, _)| packet_role_index(&packet_segment_roles, *seg).is_none())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
             let light_instructions: Vec<(usize, usize)> = light_segments
                 .iter()
                 .chain(&qwen_light)
@@ -12422,6 +12673,7 @@ impl GpuEngine {
                         .chain(&plain_quant_segments)
                         .chain(&norm_rms_segments)
                         .chain(&rope_segments)
+                        .chain(&moe_w4a4_segments)
                         .flat_map(|(seg, insts)| insts.iter().map(move |&i| (*seg, i))),
                 )
                 .chain(moe_instructions.iter().copied())
@@ -12431,6 +12683,7 @@ impl GpuEngine {
                 && plain_quant_segments.is_empty()
                 && norm_rms_segments.is_empty()
                 && rope_segments.is_empty()
+                && moe_w4a4_segments.is_empty()
                 && moe_instructions.is_empty()
                 && qwen_light.is_empty()
                 && attention_gemm_segments.iter().all(Option::is_none)
@@ -12617,7 +12870,17 @@ impl GpuEngine {
             let mut qwen_conv = Vec::new();
             let mut qwen_rope = Vec::new();
             for (ix, inst) in g.insts.iter().enumerate() {
-                if inst.op == DevOp::QwenGdnConvPrefill as u16 && inst.i[2] == g.t {
+                // Padded-prefill ops (packet::slots::rows_imm `bucket`: the Qwen3.5 GDN conv, the
+                // Nemotron-H Mamba-2 conv and chunk scan) take the real rows and the bucket per
+                // chunk; pad rows are the identity on the conv history and the recurrent state.
+                if DevOp::from_u16(inst.op)
+                    .and_then(packet::slots::rows_imm)
+                    .is_some_and(|r| {
+                        r.bucket.is_some()
+                            && r.prefill.is_none_or(|f| inst.i[f] != 0)
+                            && inst.i[r.rows] == g.t
+                    })
+                {
                     qwen_conv.push(ix);
                 }
                 if inst.op == DevOp::QwenHeadNormRope as u16 && inst.i[4] != 0 {
@@ -12659,13 +12922,14 @@ impl GpuEngine {
                     && inst.i[0] == 1
                 {
                     lmhead.push(ix);
-                } else if inst.op == DevOp::Gemv as u16
+                } else if (inst.op == DevOp::Gemv as u16 || inst.op == DevOp::GemvFp8 as u16)
                     && inst.i[0] == 1
                     && g.t > 1
                     && inst.i[4] == g.t - 1
                 {
-                    // Qwen3.5 prefill head (devgen qwen35.rs): one GEMV row at the bucket's
-                    // last row. A padded chunk must read its last REAL row instead.
+                    // Qwen3.5 / Nemotron-H prefill head (devgen qwen35.rs, nemotron_h.rs): one
+                    // GEMV row at the bucket's last row. A padded chunk must read its last REAL
+                    // row instead.
                     lmhead.push(ix);
                 }
             }
@@ -12775,6 +13039,28 @@ impl GpuEngine {
                     );
                 }
             }
+            if let (Some(function), Some(sp)) = (moe_w4a4_function, seg_pf.as_ref()) {
+                for (seg, insts) in &moe_w4a4_segments {
+                    if light_routes.len() <= *seg {
+                        light_routes.resize_with(seg + 1, || None);
+                    }
+                    light_routes[*seg] = Some(cublaslt::prefill_moe_w4a4_route(
+                        be,
+                        function,
+                        kernarg,
+                        g,
+                        insts,
+                        sp.smem_flash,
+                    ));
+                }
+                if !moe_w4a4_segments.is_empty() {
+                    tracing::info!(
+                        bucket = g.t,
+                        segments = moe_w4a4_segments.len(),
+                        "prefill W4A4 MoE routes"
+                    );
+                }
+            }
             if !light_segments.is_empty() {
                 tracing::info!(
                     bucket = g.t,
@@ -12831,6 +13117,11 @@ impl GpuEngine {
                 qwen_rope_sites: qwen_rope,
                 fp8_kv,
                 batch_patched: false,
+                tail_discarded: false,
+                mtp_shift: blob
+                    .tensors
+                    .iter()
+                    .position(|t| t.name == format!("in.mtp.shift.{}", g.t)),
                 d_ctr,
                 ctr_bytes,
                 _tables: vec![
@@ -12921,8 +13212,7 @@ impl GpuEngine {
             return Ok(());
         }
         for &ix in &b.qwen_conv_sites {
-            b.h_inst[ix].i[2] = rows;
-            b.h_inst[ix].i[3] = b.t;
+            set_padded_rows(&mut b.h_inst[ix], rows, b.t);
         }
         let lo = *b.qwen_conv_sites.iter().min().expect("non-empty");
         let hi = *b.qwen_conv_sites.iter().max().expect("non-empty") + 1;
@@ -13116,7 +13406,7 @@ impl GpuEngine {
         // state on it bounds the table at `top_rung / smallest_rung` entries
         // (64 for the shipped 128…8192 ladder).
         let unit = (self.prefill[smallest].t as usize).max(1);
-        let chunk_cost = PF_CHUNK_COST_ROWS;
+        let chunk_cost = self.pf_chunk_cost_rows();
         let goal = rem.div_ceil(unit);
         // best[s] = (cost of consuming s units, first rung of that plan)
         let mut best = vec![(usize::MAX, smallest); goal + 1];
@@ -13142,9 +13432,55 @@ impl GpuEngine {
         best[goal].1
     }
 
+    /// `(ms per row, fixed ms)` of a serial prefill launch: [`launch_fit`] over each measured
+    /// bucket's fastest launch.
+    fn pf_launch_fit(&self) -> Option<(f64, f64)> {
+        let pts: smallvec::SmallVec<[(f64, f64); 16]> = self
+            .prefill
+            .iter()
+            .zip(&self.pf_launch_min_ms)
+            .filter(|(_, ms)| ms.is_finite())
+            .map(|(b, &ms)| (f64::from(b.t), ms))
+            .collect();
+        launch_fit(&pts)
+    }
+
+    /// A launch's fixed cost in rows for [`Self::pick_prefill_bucket`]: the measured fit's fixed
+    /// ms over its ms per row, never below [`PF_CHUNK_COST_ROWS`] nor above the widest bucket. A
+    /// packet whose launch streams most of its weights whatever the rows pays far more than 512
+    /// rows: Nemotron-H NVFP4 on GB10 ran 128 rows in 300 ms and 1024 in 580 ms, ~800 rows.
+    fn pf_chunk_cost_rows(&self) -> usize {
+        let top = self.prefill.last().map_or(0, |b| b.t as usize);
+        self.pf_launch_fit().map_or(PF_CHUNK_COST_ROWS, |(slope, fixed)| {
+            ((fixed / slope) as usize).clamp(PF_CHUNK_COST_ROWS, top.max(PF_CHUNK_COST_ROWS))
+        })
+    }
+
+    /// Expected wall ms of a serial prefill launch of `rows` rows (the bucket holding them, the
+    /// widest when none does): the bucket's fastest measured launch, else the fit, else the one
+    /// measured bucket scaled by rows (an overestimate above it); `None` before any launch.
+    pub fn pf_launch_ms(&self, rows: usize) -> Option<f64> {
+        let t = self.pf_cover_rows(rows);
+        let i = self.prefill.iter().position(|b| b.t as usize == t)?;
+        let ms = self.pf_launch_min_ms.get(i).copied().unwrap_or(f64::INFINITY);
+        if ms.is_finite() {
+            return Some(ms);
+        }
+        if let Some((slope, fixed)) = self.pf_launch_fit() {
+            return Some(fixed + slope * t as f64);
+        }
+        self.prefill
+            .iter()
+            .zip(&self.pf_launch_min_ms)
+            .find(|(_, ms)| ms.is_finite())
+            .map(|(b, &ms)| ms * t as f64 / f64::from(b.t))
+    }
+
     /// Slot `b`'s immutable prefill tensor table (built once at load).
     fn tens_slot_base(&self, b: usize) -> u64 {
-        if b == 0 {
+        // A packet with no per-slot tensors (a stateless block: no KV, no recurrent state, e.g.
+        // a lone MoE layer) builds no shifted tables: every slot runs on the shared one.
+        if b == 0 || self.d_tens_slots.is_empty() {
             self.d_tens.base
         } else {
             self.d_tens_slots[b - 1].base
@@ -13186,6 +13522,68 @@ impl GpuEngine {
         })
     }
 
+    /// Stage bucket `bi`'s MTP drafter shift for a launch of consecutive requests of `lens` rows
+    /// from row 0 (riders' verify spans included): row `r` takes the next row's id inside its
+    /// request and its own id at the request's last row and on pad rows, never a foreign
+    /// request's (or a pad row's) token. Packed and lone launches of a request thus write the
+    /// same drafter rows (a chunk's last row stays approximate, as in a lone launch).
+    fn upload_mtp_shift(&mut self, bi: usize, lens: impl Iterator<Item = usize>) -> Result<()> {
+        let Some(t) = self.prefill[bi].mtp_shift else {
+            return Ok(());
+        };
+        let tc = self.prefill[bi].t as usize;
+        self.pf_shift.clear();
+        self.pf_shift.extend(0..tc as i32);
+        let mut row0 = 0;
+        for len in lens {
+            for r in row0..(row0 + len).min(tc).saturating_sub(1) {
+                self.pf_shift[r] = r as i32 + 1;
+            }
+            row0 += len;
+        }
+        // SAFETY: pf_shift lives on self; the tensor holds `t` i32 rows.
+        unsafe {
+            self.be.memcpy_htod_async(
+                self.devp[t].base,
+                bytemuck::cast_slice(&self.pf_shift),
+                &self.stream,
+            )
+        }
+    }
+
+    /// Stage the decode rungs' drafter shift for a launch of consecutive spans of `lens` rows
+    /// from row 0 (empty: every row is its own span, a plain step): row `r` takes the next row's
+    /// id inside its span and its own id at a span's last row and on every other row, never a
+    /// foreign span's or a row the launch did not embed. Uploaded only when the layout changes.
+    fn stage_mtp_dshift(&mut self, lens: &[u32]) -> Result<()> {
+        let Some(t) = self.mtp_dshift else {
+            return Ok(());
+        };
+        if self.mtp_dshift_lens.as_deref() == Some(lens) {
+            return Ok(());
+        }
+        let n = (self.devp[t].len / 4) as usize;
+        let mut table: Vec<i32> = (0..n as i32).collect();
+        let mut row0 = 0;
+        for &len in lens {
+            let end = (row0 + len as usize).min(n);
+            for r in row0..end.saturating_sub(1) {
+                table[r] = r as i32 + 1;
+            }
+            row0 += len as usize;
+        }
+        // SAFETY: a pageable source is staged before the call returns; the tensor holds `n` rows.
+        unsafe {
+            self.be.memcpy_htod_async(
+                self.devp[t].base,
+                bytemuck::cast_slice(&table),
+                &self.stream,
+            )?;
+        }
+        self.mtp_dshift_lens = Some(lens.to_vec());
+        Ok(())
+    }
+
     fn run_one_prefill_chunk(
         &mut self,
         f_pf: KernelFn,
@@ -13224,12 +13622,17 @@ impl GpuEngine {
             v.ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
         }
 
+        let discard = self.pf_lone;
+        if self.packed_prefill.is_some() && self.prefill[bi].tail_discarded != discard {
+            let bucket = &mut self.prefill[bi];
+            if let Some(terminal) = &self.packed_terminal {
+                terminal.patch_discarded_tail(bucket, discard);
+            }
+            bucket.tail_discarded = discard;
+        }
         if self.packed_prefill.is_some() && self.prefill[bi].batch_patched {
             let pack = self.packed_prefill.as_ref().unwrap();
             let bucket = &mut self.prefill[bi];
-            if let Some(terminal) = &self.packed_terminal {
-                terminal.patch_discarded_tail(bucket, false);
-            }
             for &pc in &bucket.rope_sites {
                 pack.bind_request(&mut bucket.h_inst[pc], false);
             }
@@ -13260,8 +13663,7 @@ impl GpuEngine {
                 b.h_inst[ix].i[4] = (real - 1) as u32;
             }
             for &ix in &b.qwen_conv_sites {
-                b.h_inst[ix].i[2] = real as u32;
-                b.h_inst[ix].i[3] = tc as u32;
+                set_padded_rows(&mut b.h_inst[ix], real as u32, tc as u32);
             }
             if !b.inst_range.is_empty() {
                 let bytes = pod_bytes(&b.h_inst[b.inst_range.clone()]);
@@ -13304,6 +13706,7 @@ impl GpuEngine {
             self.be
                 .memcpy_htod_async(self.devp[self.t_kvlen].base, &kvlen_bytes, &self.stream)?;
         }
+        self.upload_mtp_shift(bi, std::iter::once(real))?;
 
         let (ctr_base, ctr_bytes, mut arg) = {
             let bkt = &self.prefill[bi];
@@ -13331,7 +13734,11 @@ impl GpuEngine {
         }
         // All uploads/memsets are enqueued on the engine stream — the launch
         // follows them in stream order (no context sync needed).
+        let t_launch = std::time::Instant::now();
         self.launch_prefill_chain(bi, arg, f_pf, b, c0, n, tc, true)?;
+        if let Some(min) = self.pf_launch_min_ms.get_mut(bi) {
+            *min = min.min(t_launch.elapsed().as_secs_f64() * 1e3);
+        }
         self.buckets.record(self.prefill_family, real, tc, None);
         Ok(real)
     }
@@ -13349,7 +13756,11 @@ impl GpuEngine {
                 .expect("validated packet role object");
             return Ok((role.function, role.grid, role.block, role.smem));
         }
+        let serial = sp.serial.as_ref().filter(|_| !self.prefill[bi].batch_patched);
         if class == 4 {
+            if let Some(&(function, grid, smem)) = serial.map(|s| &s.flash) {
+                return Ok((function, grid, BLOCK, smem));
+            }
             return Ok((sp.f_flash, sp.grid_flash, BLOCK, sp.smem_flash));
         }
         if class == 2 {
@@ -13363,6 +13774,9 @@ impl GpuEngine {
                 RuntimeError::Device("class-3 segment without the HD256/GQA2 object".into())
             })?;
             return Ok((function, grid, BLOCK, smem));
+        }
+        if let Some(s) = serial {
+            return Ok(s.gemm);
         }
         let (function, grid, block, smem) =
             sp.gemm(self.prefill[bi].small_gemm_segments.get(seg) == Some(&true));
@@ -13685,6 +14099,12 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// Bit of the `seg_graphs` key's `end` for a chain on the unpacked pair (see `SegPf::serial`).
+    fn seg_graph_serial_bit(&self, bi: usize) -> usize {
+        let serial = self.seg_pf.as_ref().is_some_and(|s| s.serial.is_some());
+        usize::from(serial && !self.prefill[bi].batch_patched) << 29
+    }
+
     fn ensure_seg_graph(
         &mut self,
         bi: usize,
@@ -13735,7 +14155,7 @@ impl GpuEngine {
             bi,
             arg.tensors as u64,
             range.start,
-            range.end | (usize::from(riders) << 31),
+            range.end | (usize::from(riders) << 31) | self.seg_graph_serial_bit(bi),
         );
         if self.seg_graphs.contains_key(&key) {
             return Ok(());
@@ -14625,11 +15045,17 @@ impl GpuEngine {
                 false
             };
             let mut routed_index = 0;
-            if !seg_time_probe && rt.nv.pf_seg_graph {
+            let span_riding = self.span_riders.as_ref().is_some_and(|r| r.armed());
+            if !seg_time_probe && rt.nv.pf_seg_graph && !span_riding {
                 let tensors = arg.tensors as u64;
                 if riding && !routed {
                     let range = self.pf_seg_window.clone().unwrap_or(0..seg_class.len());
-                    let key = (bi, tensors, range.start, range.end | (1 << 31));
+                    let key = (
+                        bi,
+                        tensors,
+                        range.start,
+                        range.end | (1 << 31) | self.seg_graph_serial_bit(bi),
+                    );
                     self.ensure_seg_graph_with(bi, &arg, range, true)?;
                     let graph = self.seg_graphs.get(&key).expect("built");
                     self.be.graph_launch(graph, &self.stream)?;
@@ -14670,7 +15096,7 @@ impl GpuEngine {
                     self.ensure_seg_graph(bi, &arg, start..end)?;
                     let graph = self
                         .seg_graphs
-                        .get(&(bi, tensors, start, end))
+                        .get(&(bi, tensors, start, end | self.seg_graph_serial_bit(bi)))
                         .expect("built");
                     self.be.graph_launch(graph, &self.stream)?;
                     if riding {
@@ -14713,6 +15139,10 @@ impl GpuEngine {
                 if riding && seg > window.start && seg <= window.end {
                     let riders = self.riders.as_ref().expect("riding");
                     riders.launch_after(&self.be, bi, seg, &self.stream)?;
+                }
+                if span_riding && window.contains(&seg) {
+                    let riders = self.span_riders.as_ref().expect("span riding");
+                    riders.launch_before(&self.be, bi, seg, &self.stream)?;
                 }
                 if !window.contains(&seg) {
                     continue;
@@ -14961,6 +15391,7 @@ impl GpuEngine {
             if let Some(terminal) = &self.packed_terminal {
                 terminal.patch_discarded_tail(b, true);
             }
+            b.tail_discarded = true;
             let h_req_attn = self.pf_batch.as_ref().map(|pb| pb.h_req_attn);
             for &pc in b.rope_sites.iter().chain(&b.flash_sites) {
                 let stage = b.stage_of.get(pc).copied().flatten();
@@ -14980,6 +15411,25 @@ impl GpuEngine {
             }
             for &pc in b.qwen_rope_sites.iter().chain(&b.qwen_conv_sites) {
                 pack.bind_request(&mut b.h_inst[pc], true);
+            }
+            // Span riders leave the Mamba chain's table as they leave the attention's (the two
+            // tables are equal without riders).
+            if let Some(h) = h_req_attn {
+                for &pc in &b.qwen_conv_sites {
+                    let d = &mut b.h_inst[pc];
+                    if matches!(
+                        DevOp::from_u16(d.op),
+                        Some(
+                            DevOp::Mamba2Conv
+                                | DevOp::Mamba2ChunkState
+                                | DevOp::Mamba2ChunkPass
+                                | DevOp::Mamba2ChunkOut
+                        )
+                    ) && d.t[7] != TENSOR_NONE16
+                    {
+                        d.t[7] = h as u16;
+                    }
+                }
             }
             for &pc in &b.lmhead_sites {
                 b.h_inst[pc].i[4] = 0;
@@ -15056,7 +15506,55 @@ impl GpuEngine {
         r
     }
 
+    /// A one-request pack on a Mamba packed packet runs as a serial launch on the unpacked pair
+    /// (the serial packet's objects and tensor table) with the head tail Nop'ed for the packed
+    /// terminal: the cap under which `run_one_prefill_chunk` takes all its rows in one launch,
+    /// `None` when it would not (the pack then launches packed).
+    fn pf_lone_cap(&self, r: &PfBatchReq) -> Option<usize> {
+        if !self.mamba_packs()
+            || self.f_pf.is_none()
+            || self.pf_riders != 0
+            || self.mm_spans
+            || !self.seg_pf.as_ref().is_some_and(|s| s.serial.is_some())
+            || r.slot >= self.batch
+            || r.len == 0
+            || r.c0 != self.pos[r.slot] as usize
+            || r.c0 + r.len > r.prompt.len().min(self.max_ctx)
+        {
+            return None;
+        }
+        let room = self.max_ctx - r.c0;
+        let cover = self.prefill.iter().map(|b| b.t as usize).find(|&t| t >= r.len)?;
+        let cap = cover.min(room);
+        (self.prefill[self.pick_prefill_bucket(r.len, cap)].t as usize >= r.len).then_some(cap)
+    }
+
     fn prefill_batched_unchecked(&mut self, reqs: &[PfBatchReq]) -> Result<()> {
+        if let Some((r, cap)) = reqs
+            .first()
+            .filter(|_| reqs.len() == 1)
+            .and_then(|r| Some((r, self.pf_lone_cap(r)?)))
+        {
+            let f_pf = self.f_pf.expect("checked by pf_lone_cap");
+            self.tb_launched = true;
+            self.pf_lone = true;
+            let real =
+                self.run_one_prefill_chunk(f_pf, r.slot, &r.prompt[..r.c0 + r.len], r.c0, cap);
+            self.pf_lone = false;
+            if real? != r.len {
+                return Err(RuntimeError::Device("one-request pack split its rows".into()));
+            }
+            if pf_packlog_on() {
+                eprintln!("PACKLOG R=1 rows={} bucket={} chunks=[{}] serial", r.len, cap, r.len);
+            }
+        } else {
+            self.prefill_batched_packed(reqs)?;
+        }
+        self.prefill_batched_done(reqs);
+        Ok(())
+    }
+
+    fn prefill_batched_packed(&mut self, reqs: &[PfBatchReq]) -> Result<()> {
         let chunks =
             reqs.iter()
                 .map(|r| {
@@ -15075,7 +15573,10 @@ impl GpuEngine {
                     })
                 })
                 .collect::<Result<smallvec::SmallVec<[_; 16]>>>()?;
-        self.packed_token_body(&chunks)?;
+        self.packed_token_body(&chunks)
+    }
+
+    fn prefill_batched_done(&mut self, reqs: &[PfBatchReq]) {
         for r in reqs {
             self.pos[r.slot] = (r.c0 + r.len) as u32;
             if crate::config::RuntimeConfig::get().nv.pf_trace_log {
@@ -15101,7 +15602,6 @@ impl GpuEngine {
                 self.vmm_prefill_done(r.slot);
             }
         }
-        Ok(())
     }
 
     fn packed_token_body(&mut self, reqs: &[PackedTokenReq<'_>]) -> Result<()> {
@@ -15235,9 +15735,27 @@ impl GpuEngine {
             }
         }
         self.ensure_batch_patch(bi)?;
+        // Trailing verify spans riding through `span_riders`: the Mamba chain and the attention
+        // run only the rows before them.
+        let span = self.pf_span.take();
+        let span_rows = span
+            .as_ref()
+            .map_or(0, |(_, s)| s.iter().map(|x| x.rows as usize).sum::<usize>());
+        if let Some((row0, spans)) = &span {
+            let riders = self.span_riders.as_ref();
+            if request_plan.is_none()
+                || !riders.is_some_and(|r| r.serves(bi) && span_rows <= r.max_rows() as usize)
+                || *row0 as usize + span_rows != total
+                || spans.len() >= reqs.len()
+            {
+                return Err(RuntimeError::Rejected(
+                    "span riders do not fit this launch".into(),
+                ));
+            }
+        }
         // Packed rows are contiguous from row 0, so the first `total` rows are the real ones.
         self.patch_moe_rows(bi, total as u32)?;
-        self.patch_qwen_conv(bi, total as u32)?;
+        self.patch_qwen_conv(bi, (total - span_rows) as u32)?;
         let tc = self.prefill[bi].t as usize;
         let riding = std::mem::take(&mut self.pf_riders);
         let decode_rows = if riding > 0
@@ -15326,6 +15844,24 @@ impl GpuEngine {
                 pb.req_attn_buf.drain(1..1 + 4 * riding);
                 pb.req_attn_buf[0] -= riding as i32;
             }
+            if let Some((row0, spans)) = &span {
+                let keep = pb.req_attn_buf.len() - 4 * spans.len();
+                pb.req_attn_buf.truncate(keep);
+                pb.req_attn_buf[0] -= spans.len() as i32;
+                self.span_riders.as_mut().expect("checked").arm(
+                    &self.be,
+                    &self.devp,
+                    self.d_tens.base,
+                    bi,
+                    *row0,
+                    spans,
+                    self.nv_nsplit.as_ref().map(|ns| {
+                        let kv = spans.iter().map(|s| s.kv_end).max().unwrap_or(1);
+                        (ns.baked, crate::exec::kvrow::nv_dense_live_nsplit(ns.baked, kv))
+                    }),
+                    &self.stream,
+                )?;
+            }
             if let Some(riders) = self.riders.as_mut() {
                 riders.arm(
                     &self.be,
@@ -15404,6 +15940,7 @@ impl GpuEngine {
                     }
                 }
             }
+            self.upload_mtp_shift(bi, reqs.iter().map(|r| r.tokens.len()))?;
             // Rows whose token only the device knows, overwritten after the staged upload.
             let parked = !synchronize;
             if !device_ids.is_empty() {
@@ -15439,6 +15976,9 @@ impl GpuEngine {
             if let Some(riders) = self.riders.as_mut() {
                 riders.disarm();
             }
+            if let Some(riders) = self.span_riders.as_mut() {
+                riders.disarm();
+            }
             let _ = self.be.stream_synchronize(&self.stream);
             return Err(error);
         }
@@ -15452,7 +15992,7 @@ impl GpuEngine {
             let mut q0 = 0u32;
             for (i, r) in reqs.iter().enumerate() {
                 let len = r.tokens.len() as u32;
-                if i >= riding {
+                if i >= riding && q0 as usize + len as usize <= total - span_rows {
                     self.attention_requests
                         .push([q0, len, r.slot as u32, r.c0 as u32 + len]);
                 }
@@ -15482,6 +16022,7 @@ impl GpuEngine {
                 // The Qwen chain's leading decode rows take the GDN step kernel instead of the
                 // scan, whether or not they also ride the attention through `Riders`.
                 self.qwen_ride = decode_rows;
+                let t_launch = std::time::Instant::now();
                 let chain = self.launch_prefill_chain(
                     bi,
                     arg,
@@ -15492,6 +16033,13 @@ impl GpuEngine {
                     tc,
                     synchronize,
                 );
+                // A synchronous packed launch prices its bucket like a serial one: the cost model
+                // (`pf_chunk_cost_rows`) is per launch, whatever the requests in it (Mamba packs).
+                if synchronize && chain.is_ok() && self.recurrent_packs && self.recurrent_initstate.is_none() {
+                    if let Some(min) = self.pf_launch_min_ms.get_mut(bi) {
+                        *min = min.min(t_launch.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
                 self.pf_seg_window = None;
                 chain
             } else {
@@ -15507,6 +16055,9 @@ impl GpuEngine {
             }
         })();
         if let Some(riders) = self.riders.as_mut() {
+            riders.disarm();
+        }
+        if let Some(riders) = self.span_riders.as_mut() {
             riders.disarm();
         }
         if let Err(error) = launched {
@@ -16128,12 +16679,14 @@ impl GpuEngine {
         Ok(())
     }
 
-    /// The main decode object, then the routed and wide-rung objects a rung may launch instead.
+    /// The main decode object, then the routed, wide-rung and row-slot objects a rung may launch
+    /// instead.
     fn decode_trace_modules(&self) -> Vec<&Module> {
         let mut v: Vec<&Module> = vec![&self.module];
         if let Some(r) = &self._routed_object {
             v.push(r.module());
         }
+        v.extend(self.row_slot_twin.iter().map(|(full, _)| full.module()));
         v.extend(
             self.gemv_wide_modules
                 .iter()

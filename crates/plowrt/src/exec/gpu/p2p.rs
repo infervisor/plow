@@ -74,9 +74,9 @@ impl Probe {
         let profile = interpreter_profile(cc)
             .ok_or_else(|| RuntimeError::Rejected("P2P probe: unsupported interpreter".into()))?;
         let partial_f32 = rank::validate_partial_f32(&blob)?;
-        if partial_f32 && cc != (12, 0) {
+        if partial_f32 && !hwspec::IsaLevel::from_nvidia_cc(cc).is_some_and(hwspec::IsaLevel::is_sm12x) {
             return Err(RuntimeError::Rejected(
-                "FP32 peer partials require sm_120a".into(),
+                "FP32 peer partials require sm_120a or sm_121a".into(),
             ));
         }
         let resolve = |role| {

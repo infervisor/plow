@@ -328,7 +328,7 @@ pub(crate) fn plan(m: &Manifest, slot: u32, n: u32) -> Result<(Vec<ImageSpan>, u
     let mut spans = Vec::new();
     let mut image = 0u64;
     for c in &m.caches {
-        let elem = if c.scales.is_some() { 1 } else { 2 };
+        let elem = c.elem_bytes();
         let lo = if c.window == 0 {
             0
         } else {
@@ -424,6 +424,7 @@ mod tests {
             window,
             mask: if window == 0 { u32::MAX } else { stride - 1 },
             layout: LAYOUT_HEAD_MAJOR,
+            e4m3: false,
         }
     }
 

@@ -14,6 +14,17 @@
 `gemma4_dspark` (DSpark block drafter) is emit-only so far: its packet carries the context tail in
 every target program and the drafter's KV layers, not yet a draft program, so `serve` stays false.
 
+`qwen3_5_mtp` and `nemotron_h_mtp` draft with the target checkpoint's own `mtp.*` layers: no
+drafter dir, revision, shard pin or FP8 twin (the checkpoint pin covers it), only `kind`, `k_max`,
+`rows`, `emit`, `serve`.
+
+    [spec]
+    kind = "qwen3_5_mtp"
+    k_max = 3                            # also the recurrent rollback depth (snapshots per slot)
+    rows = [1, 2, 4, 8]
+    emit = true
+    serve = false
+
 The table is the one place these are stated: `campaign.py build` derives the emit knobs and the
 serve default from it, `render_recipe.py` renders them and the re-key command, and
 `check_recipe.py` checks the table and the knobs the build recorded against it.
@@ -28,6 +39,9 @@ KINDS = {
     "gemma4_assistant": ("scripts/gemma4_mtp_rekey.py", "model-mtp.safetensors", "scripts/gemma4_mtp_fp8.py"),
     "gemma4_dspark": ("scripts/gemma4_dspark_rekey.py", "model-dspark.safetensors", "scripts/gemma4_dspark_fp8.py"),
 }
+# kind with the drafter inside the target checkpoint
+IN_CHECKPOINT = {"qwen3_5_mtp", "nemotron_h_mtp"}
+KINDS.update({k: (None, None, None) for k in IN_CHECKPOINT})
 DEFAULT_KIND = "gemma4_assistant"
 EMIT_ONLY = {"gemma4_dspark"}
 EMIT_KNOBS = (
@@ -42,6 +56,7 @@ EMIT_KNOBS = (
 )
 FIELDS = {"kind", "draft_dir", "draft_revision", "shard_sha256", "k_max", "rows", "emit", "serve"}
 OPTIONAL = {"draft_fp8"}
+DRAFTER_FIELDS = {"draft_dir", "draft_revision", "shard_sha256", "draft_fp8"}
 
 
 def table(recipe: dict) -> dict | None:
@@ -55,18 +70,21 @@ def errors(recipe: dict) -> list[str]:
     out = []
     if not isinstance(s, dict):
         return ["[spec] must be a table"]
-    if extra := sorted(set(s) - FIELDS - OPTIONAL):
-        out.append(f"[spec] unknown field(s) {extra}")
-    if missing := sorted(FIELDS - set(s)):
+    inside = s.get("kind") in IN_CHECKPOINT
+    fields = FIELDS - DRAFTER_FIELDS if inside else FIELDS
+    if extra := sorted(set(s) - fields - (set() if inside else OPTIONAL)):
+        out.append(f"[spec] unknown field(s) {extra}" + (" (the drafter is in the checkpoint)" if inside else ""))
+    if missing := sorted(fields - set(s)):
         out.append(f"[spec] missing field(s) {missing}")
     if s.get("kind") not in KINDS:
         out.append(f"[spec] kind {s.get('kind')!r}: one of {sorted(KINDS)}")
-    if not isinstance(s.get("draft_dir"), str) or not s.get("draft_dir"):
-        out.append("[spec] draft_dir must name the drafter directory")
-    if not isinstance(s.get("draft_revision"), str) or not s.get("draft_revision"):
-        out.append("[spec] draft_revision must pin the drafter revision")
-    if not re.fullmatch(r"[0-9a-f]{64}", str(s.get("shard_sha256", ""))):
-        out.append("[spec] shard_sha256 must be 64 lowercase hex")
+    if not inside:
+        if not isinstance(s.get("draft_dir"), str) or not s.get("draft_dir"):
+            out.append("[spec] draft_dir must name the drafter directory")
+        if not isinstance(s.get("draft_revision"), str) or not s.get("draft_revision"):
+            out.append("[spec] draft_revision must pin the drafter revision")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(s.get("shard_sha256", ""))):
+            out.append("[spec] shard_sha256 must be 64 lowercase hex")
     k = s.get("k_max")
     if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= 15:
         out.append(f"[spec] k_max {k!r}: an integer in 1..=15")
@@ -100,6 +118,14 @@ def emit_env(recipe: dict) -> dict[str, str]:
     s = table(recipe)
     if not s or s.get("emit") is not True:
         return {}
+    if s["kind"] in IN_CHECKPOINT:
+        return {
+            "PLOW_EMIT_SPAN_VERIFY": "1",
+            "PLOW_EMIT_SPEC": "1",
+            "PLOW_SPEC_KMAX": str(s["k_max"]),
+            "PLOW_SPEC_ROWS": ",".join(str(r) for r in s["rows"]),
+            "PLOW_SPEC_KIND": str(s["kind"]),
+        }
     return {
         "PLOW_EMIT_SPAN_VERIFY": "1",
         "PLOW_EMIT_SPEC": "1",
@@ -136,7 +162,7 @@ def prepare_commands(recipe: dict) -> list[str]:
 
 def rekey_command(recipe: dict) -> str | None:
     s = table(recipe)
-    if not s or s.get("kind") not in KINDS:
+    if not s or s.get("kind") not in KINDS or s.get("kind") in IN_CHECKPOINT:
         return None
     draft = re.sub(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}", r'"$\1"', str(s["draft_dir"]))
     return f"python3 {KINDS[s['kind']][0]} {draft} \"$CKPT\""
@@ -181,6 +207,19 @@ def self_test() -> None:
     ]
     assert errors({"spec": dict(ds["spec"], serve=True)})
     assert errors({**ds, "emit": {"env": {"PLOW_SPEC_KIND": "gemma4_dspark"}}})
+    qm = {"spec": {"kind": "qwen3_5_mtp", "k_max": 3, "rows": [1, 2, 4, 8], "emit": True, "serve": False}}
+    assert errors(qm) == [], errors(qm)
+    assert emit_env(qm) == {
+        "PLOW_EMIT_SPAN_VERIFY": "1",
+        "PLOW_EMIT_SPEC": "1",
+        "PLOW_SPEC_KMAX": "3",
+        "PLOW_SPEC_ROWS": "1,2,4,8",
+        "PLOW_SPEC_KIND": "qwen3_5_mtp",
+    }
+    assert prepare_commands(qm) == [] and rekey_command(qm) is None and shard(qm) is None
+    assert errors({"spec": dict(qm["spec"], draft_dir="{env:D}")}), "in-checkpoint drafter takes no dir"
+    assert errors({"spec": dict(qm["spec"], draft_fp8="all")})
+    assert errors({"spec": {k: v for k, v in qm["spec"].items() if k != "k_max"}})
 
 
 if __name__ == "__main__":

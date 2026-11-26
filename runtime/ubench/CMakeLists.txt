@@ -145,8 +145,74 @@ if(PLOW_ROCM)
 endif()
 
 # ============================================================================
-# NVIDIA / CUDA path (future)
+# NVIDIA / CUDA path (sm_12x; GB10 = sm_121a via -DPLOW_CUBIN_ARCH=sm_121a)
+#   ceiling_<arch>.cubin   : single-SM ceilings + harness utilities (fill, flush, digest)
+#   fp4_tile_<arch>.cubin  : single-SM NVFP4 MMA tile loops (--fp4-tile)
+#   ubench_cu_roofline_nv  : host driver (bench_cu_roofline.c -DPLOW_CUDA, driver API backend)
+#   ubench_ops_<arch>.cubin: bench_cu_sm120.cu (= interp_sm120.cu + ubench_exec), only with
+#                            -DPLOW_CUBIN_CONFIG=<assets>/plow_config.h and
+#                            -DPLOW_UBENCH_OBJECT_DEFS="<the object's plowc define list>"
+# run_ubench_cu.sh --nv does the same from a plowc build log.
 # ============================================================================
 if(PLOW_CUDA)
-    message(STATUS "μBench: NVIDIA path uses the same abstraction — create bench_cu_sm120.cu")
+    find_package(CUDAToolkit REQUIRED)
+    set(_ub_nvcc bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/nvcc_cubin.sh ${PLOW_CUBIN_NVCC})
+    set(UBENCH_CEIL_CUBIN ${CMAKE_CURRENT_BINARY_DIR}/ceiling_${PLOW_CUBIN_ARCH}.cubin)
+    add_custom_command(
+        OUTPUT ${UBENCH_CEIL_CUBIN}
+        COMMAND ${_ub_nvcc} ${UBENCH_CEIL_CUBIN} ceil_mma required
+                -arch=${PLOW_CUBIN_ARCH} -O3 -cubin ${CMAKE_CURRENT_SOURCE_DIR}/ceiling_sm120.cu
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ceiling_sm120.cu
+        COMMENT "μBench: single-SM ceiling cubin"
+        VERBATIM)
+    add_custom_target(ubench_nv_ceiling_cubin ALL DEPENDS ${UBENCH_CEIL_CUBIN})
+    set(UBENCH_FP4_CUBIN ${CMAKE_CURRENT_BINARY_DIR}/fp4_tile_${PLOW_CUBIN_ARCH}.cubin)
+    add_custom_command(
+        OUTPUT ${UBENCH_FP4_CUBIN}
+        COMMAND ${_ub_nvcc} ${UBENCH_FP4_CUBIN} ft_chain2 required
+                -arch=${PLOW_CUBIN_ARCH} -O3 -cubin ${CMAKE_CURRENT_SOURCE_DIR}/fp4_tile_sm120.cu
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/fp4_tile_sm120.cu
+        COMMENT "μBench: single-SM NVFP4 tile-loop cubin"
+        VERBATIM)
+    add_custom_target(ubench_nv_fp4_tile_cubin ALL DEPENDS ${UBENCH_FP4_CUBIN})
+
+    add_executable(ubench_cu_roofline_nv bench_cu_roofline.c ../nvidia/cuda_backend.c)
+    target_include_directories(ubench_cu_roofline_nv PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_definitions(ubench_cu_roofline_nv PRIVATE PLOW_CUDA=1)
+    target_link_libraries(ubench_cu_roofline_nv PRIVATE CUDA::cuda_driver m)
+    add_dependencies(ubench_cu_roofline_nv ubench_nv_ceiling_cubin)
+
+    set(PLOW_UBENCH_OBJECT_DEFS "" CACHE STRING
+        "define list plowc used for the measured interpreter object (its build.log 'nvcc <object>.cubin (...)' line)")
+    if(PLOW_CUBIN_CONFIG AND PLOW_UBENCH_OBJECT_DEFS)
+        get_filename_component(_ub_cfg_dir "${PLOW_CUBIN_CONFIG}" DIRECTORY)
+        set(UBENCH_OPS_CUBIN ${CMAKE_CURRENT_BINARY_DIR}/ubench_ops_${PLOW_CUBIN_ARCH}.cubin)
+        add_custom_command(
+            OUTPUT ${UBENCH_OPS_CUBIN}
+            COMMAND ${_ub_nvcc} ${UBENCH_OPS_CUBIN} ubench_exec required
+                    -arch=${PLOW_CUBIN_ARCH} -O3 -cubin
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/../common -I ${CMAKE_CURRENT_SOURCE_DIR}/../nvidia
+                    -I ${_ub_cfg_dir} ${PLOW_UBENCH_OBJECT_DEFS}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/bench_cu_sm120.cu
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/bench_cu_sm120.cu ${PLOW_CUBIN_CONFIG} ${_cubin_headers}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../nvidia/interp_sm120.cu
+            COMMENT "μBench: ops cubin (interp_sm120.cu + ubench_exec)"
+            VERBATIM)
+        add_custom_target(ubench_nv_ops_cubin ALL DEPENDS ${UBENCH_OPS_CUBIN})
+    endif()
+
+    add_custom_target(ubench_nv_ceilings
+        COMMAND $<TARGET_FILE:ubench_cu_roofline_nv> --base ${UBENCH_CEIL_CUBIN} --ceilings
+        DEPENDS ubench_cu_roofline_nv
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "μBench: GB10 / sm_12x single-SM ceilings")
+    add_custom_target(ubench_nv_fp4_tile
+        COMMAND $<TARGET_FILE:ubench_cu_roofline_nv> --base ${UBENCH_CEIL_CUBIN} --fp4-tile ${UBENCH_FP4_CUBIN}
+        DEPENDS ubench_cu_roofline_nv ubench_nv_fp4_tile_cubin
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "μBench: single-SM NVFP4 tile loops")
 endif()

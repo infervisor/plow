@@ -109,6 +109,9 @@ fn segment_roles(m: &Model) -> Option<packet::devbuild::SectionData> {
 
 use packet::dev::FP8_BLOCK_GROUP as BLOCK_FP8_GROUP;
 
+#[path = "qwen35_mtp.rs"]
+mod mtp;
+
 struct Config {
     hidden: u32,
     inter: u32,
@@ -133,6 +136,12 @@ struct Config {
     /// `weight_scale_inv`): projections bind the hub tensors byte for byte, and the modules the
     /// checkpoint keeps in BF16 (`modules_to_not_convert`) stay BF16 projections.
     block_fp8: Option<std::collections::HashSet<String>>,
+    /// The sm_90a-only arms: TMA-mapped prefill GEMMs and the W8A8 decode GEMM. Without them
+    /// (the sm_120 interpreter) W8A8 prefill runs the unmapped mma.sync GEMM and FP8 decode the
+    /// per-channel GEMV over the same `fp8/` weights.
+    sm90: bool,
+    /// The target ISA: its cuBLASLt FP8 scale modes pick the unit-scale prefill route.
+    isa: hwspec::IsaLevel,
 }
 
 /// The hub's FP8 `quantization_config`: `Some(BF16 modules)` for the block-scaled format this
@@ -234,6 +243,8 @@ impl Config {
             tied: v["tie_word_embeddings"].as_bool().unwrap_or(false),
             block: None,
             block_fp8,
+            sm90: true,
+            isa: hwspec::IsaLevel::Sm90a,
         };
         assert!(c.hk > 0 && c.hv % c.hk == 0 && c.kv_heads > 0 && c.heads % c.kv_heads == 0);
         assert_eq!(
@@ -261,6 +272,9 @@ struct Emitter<'a> {
     batch: u32,
     decode_slots: u32,
     decode_cublaslt: bool,
+    /// sm_12x PLOW_EMIT_PREFILL_CUBLASLT: eligible per-row FP8 projections emit unscaled
+    /// (`FP8_UNIT_SCALE`) plus a `RowColScale` (segment_roles::cublaslt_prefill_fp8_unit).
+    lt_unit: bool,
     fuse_ab: bool,
     ab_blocks: u32,
     projection_dag: bool,
@@ -280,6 +294,10 @@ struct Emitter<'a> {
     kvlen: u32,
     cos: u32,
     sin: u32,
+    /// Span-mode verify (PLOW_EMIT_SPAN_VERIFY) on a decode rung: `in.rowslot`, else TENSOR_NONE.
+    rowslot: u32,
+    /// Verify rollback depth: snapshot rows per slot of every recurrent buffer.
+    spec_depth: u32,
 }
 
 /// PLOW_QWEN_FOLD_NORM: the residual add and the RMSNorm feeding a decode projection run as that
@@ -311,61 +329,8 @@ impl Fold {
     }
 }
 
-thread_local! {
-    /// The `cat/` tensors this thread's emits declared, by label: [`derived_section`] writes
-    /// the ones a model binds into `derived_weights.json`.
-    static DERIVED: std::cell::RefCell<
-        std::collections::BTreeMap<String, plow_asset::derived_weights::DerivedTensor>,
-    > = Default::default();
-}
-
-/// The label of checkpoint tensors `sources` concatenated along axis 0 (widened to f32 when
-/// `widen_f32`), recorded for [`derived_section`].
-fn derive<S: AsRef<str>>(sources: &[S], widen_f32: bool) -> String {
-    let sources: Vec<String> = sources.iter().map(|s| s.as_ref().to_string()).collect();
-    let name = packet::names::concat_label(&sources[0]);
-    DERIVED.with(|d| {
-        let spec = plow_asset::derived_weights::DerivedTensor {
-            name: name.clone(),
-            sources,
-            widen_f32,
-        };
-        let prev = d.borrow_mut().insert(name.clone(), spec.clone());
-        assert!(prev.is_none_or(|p| p == spec), "{name}: two derivations");
-    });
-    name
-}
-
-/// `derived_weights.json` for the `cat/` tensors `m` declares.
-fn derived_section(m: &Model) -> Option<packet::devbuild::SectionData> {
-    use plow_asset::derived_weights::{DerivedWeights, SECTION, VERSION};
-    let tensors: Vec<_> = DERIVED.with(|d| {
-        let d = d.borrow();
-        m.tensors
-            .iter()
-            .filter(|t| t.name.starts_with(packet::names::CONCAT_PREFIX))
-            .map(|t| d.get(&t.name).cloned().expect("undeclared cat/ tensor"))
-            .collect()
-    });
-    (!tensors.is_empty()).then(|| packet::devbuild::SectionData {
-        kind: packet::devbuild::SECT_METADATA,
-        name: SECTION.into(),
-        data: serde_json::to_vec(&DerivedWeights {
-            version: VERSION,
-            tensors,
-        })
-        .expect("derived weights json"),
-    })
-}
-
-/// The checkpoint tensors a declared tensor reads: a `cat/` tensor's sources, an `f32/`
-/// view's source, otherwise itself.
-fn checkpoint_sources(name: &str) -> Vec<String> {
-    if name.starts_with(packet::names::CONCAT_PREFIX) {
-        return DERIVED.with(|d| d.borrow()[name].sources.clone());
-    }
-    vec![name.strip_prefix("f32/").unwrap_or(name).to_string()]
-}
+use crate::derived::{checkpoint_sources, cols as derive_cols, section as derived_section};
+use crate::spec::span_verify;
 
 impl Emitter<'_> {
     fn proj_fold(
@@ -448,7 +413,7 @@ impl Emitter<'_> {
                 (leaf.to_string(), format!("f32/{leaf}_scale_inv"))
             } else {
                 let grids: Vec<String> = leaves.iter().map(|l| format!("{l}_scale_inv")).collect();
-                (derive(leaves, false), derive(&grids, true))
+                (crate::derived::concat(leaves, false), crate::derived::concat(&grids, true))
             };
             (
                 DevOp::GemvFp8,
@@ -504,14 +469,14 @@ impl Emitter<'_> {
                     }
                 })
             };
-            let input_map = if self.prefill && !block {
+            let input_map = if self.prefill && !block && self.c.sm90 {
                 let g = GenTensor::tmap_e4m3(xq, rows, k, 128);
                 self.b
                     .tensor_gen(&format!("tmap.fp8.pf.x{xq}.m{rows}"), g.byte_len(), g)
             } else {
                 0
             };
-            let weight_map = if block {
+            let weight_map = if block || !self.c.sm90 {
                 0
             } else if self.prefill {
                 let g = GenTensor::tmap_e4m3(w, n, k, 128);
@@ -523,6 +488,25 @@ impl Emitter<'_> {
             } else {
                 0
             };
+            if self.lt_unit
+                && !block
+                && plow_asset::segment_roles::cublaslt_prefill_fp8_unit(
+                    self.c.isa.arch_flag(),
+                    rows,
+                    n,
+                    k,
+                )
+            {
+                let raw = self.b.emit(DevOp::GemmFp8, self.b.all(), &[dq], |d| {
+                    d.t[..3].copy_from_slice(&[out, xq, w]);
+                    d.i[..3].copy_from_slice(&[rows, n, k]);
+                    d.i[5] = packet::dev::FP8_UNIT_SCALE;
+                });
+                return self.b.emit(DevOp::RowColScale, self.b.all(), &[raw], |d| {
+                    d.t[..4].copy_from_slice(&[out, out, ascale, scale]);
+                    d.i[..2].copy_from_slice(&[rows, n]);
+                });
+            }
             let done = self.b.emit(DevOp::GemmFp8, self.b.all(), &[dq], |d| {
                 d.t[..5].copy_from_slice(&[out, xq, w, ascale, scale]);
                 d.i[..3].copy_from_slice(&[rows, n, k]);
@@ -648,6 +632,21 @@ impl Emitter<'_> {
             &format!("state.qwen.{layer}.gdn"),
             u64::from(self.decode_slots) * c.hv as u64 * c.dv as u64 * c.dk as u64 * 4,
         );
+        // Span verify: the state after every non-final span row, `[slot][depth]` (see
+        // plow_asset::recurrent_state::VerifyRollback).
+        let snaps = (self.rowslot != TENSOR_NONE).then(|| {
+            let depth = u64::from(self.decode_slots) * u64::from(self.spec_depth);
+            (
+                self.b.tensor(
+                    &format!("state.qwen.{layer}.conv.snap"),
+                    depth * channels as u64 * (c.conv - 1) as u64 * 2,
+                ),
+                self.b.tensor(
+                    &format!("state.qwen.{layer}.gdn.snap"),
+                    depth * c.hv as u64 * c.dv as u64 * c.dk as u64 * 4,
+                ),
+            )
+        });
         let cw = self.weight(
             &format!("{p}.conv1d.weight"),
             channels as u64 * c.conv as u64,
@@ -692,6 +691,9 @@ impl Emitter<'_> {
             d.t[..5].copy_from_slice(&[conv, raw, cw, history, self.active]);
             d.i[..3].copy_from_slice(&[channels, c.conv, self.batch]);
             d.j[1] = raw_source;
+            if let Some((conv_snap, _)) = snaps {
+                span_verify::bind(d, self.rowslot, Some((conv_snap, self.spec_depth)));
+            }
         });
         let (z, z_source) = match qkvz {
             Some((t, width)) => (t, width | (channels << 16)),
@@ -860,6 +862,9 @@ impl Emitter<'_> {
                 d.i[..5].copy_from_slice(&[c.hk, c.hv, c.dk, c.dv, self.batch]);
                 d.f[0] = 1.0 / (c.dk as f32).sqrt();
                 d.f[1] = 1e-6;
+                if let Some((_, gdn_snap)) = snaps {
+                    span_verify::bind(d, self.rowslot, Some((gdn_snap, self.spec_depth)));
+                }
             });
             // PLOW_QWEN_GDN_ISOLATE: the step gets its own segment on rungs from this many rows,
             // so the runtime can launch it at its own occupancy (gen_decode.rs) instead of inside
@@ -938,6 +943,9 @@ impl Emitter<'_> {
                     normalize as u32,
                 ]);
                 d.i[6] = self.prefill as u32;
+                if cache {
+                    span_verify::bind(d, self.rowslot, None);
+                }
                 d.i[7] = if cache && emit_config::active().qwen_kv_interleave {
                     plow_asset::live_kv::LAYOUT_ROW_INTERLEAVED
                 } else {
@@ -1073,8 +1081,15 @@ impl Emitter<'_> {
                     crate::gen_kernels::parse(list)
                         .is_ok_and(|entries| entries.iter().any(|(e, _)| e.decode))
                 });
+        // sm_12x prefill with a 64-row query tile per SM already (tiles x heads >= SMs): one split
+        // with the bf16 epilogue fused (t5 = at, no FlashMerge), as the generated role does. No
+        // f32 partials go out and back, and the causal tiles balance over the blocks.
+        let fused_pf = self.prefill
+            && !gen_attention
+            && c.isa.is_sm12x()
+            && self.batch.div_ceil(64) * c.heads >= self.b.n_cu();
         // HD256 uses the slide GF selector in the Hopper interpreter even for full attention.
-        let ns = if gen_attention {
+        let ns = if gen_attention || fused_pf {
             1
         } else if self.prefill {
             self.b
@@ -1119,7 +1134,7 @@ impl Emitter<'_> {
         let da = if self.prefill {
             self.b.emit(DevOp::FlashPrefill, self.b.all(), &[dv], |d| {
                 d.t[..5].copy_from_slice(&[opart, mlpart, q, kc, vc]);
-                if gen_attention {
+                if gen_attention || fused_pf {
                     d.t[5] = at;
                 }
                 if let Some(h) = fa_tm {
@@ -1134,6 +1149,7 @@ impl Emitter<'_> {
             self.b
                 .emit(DevOp::FlashDecode, self.b.all(), &attention_deps, |d| {
                     d.t[..6].copy_from_slice(&[opart, mlpart, q, kc, vc, self.kvlen]);
+                    span_verify::bind(d, self.rowslot, None);
                     d.i.copy_from_slice(&[
                         self.batch,
                         c.heads,
@@ -1149,6 +1165,8 @@ impl Emitter<'_> {
         };
         let dm = if gen_attention {
             self.b.isolate(da);
+            da
+        } else if fused_pf {
             da
         } else {
             self.b.emit(
@@ -1168,7 +1186,9 @@ impl Emitter<'_> {
                     || emit_config::active().attention_pf_role))
         {
             self.b.isolate(da);
-            self.b.isolate(dm);
+            if dm != da {
+                self.b.isolate(dm);
+            }
         }
         let dg = self
             .b
@@ -1300,6 +1320,15 @@ fn phase(
     } else {
         active
     };
+    // Span-mode verify: row r of a decode rung reads and writes slot `rowslot[r] & !NO_STORE`
+    // (plowrt exec/gpu/spec.rs); plain launches upload the identity map.
+    let rowslot = if !prefill && emit_config::active().span_verify {
+        b.tensor("in.rowslot", u64::from(decode_slots) * 4)
+    } else {
+        TENSOR_NONE
+    };
+    let mtp_kv = (mtp::enabled() && c.block.is_none())
+        .then(|| mtp::declare_kv(&mut b, c, decode_slots, ctx));
     let [gc, gs] = GenTensor::rope_pair(ctx, c.rotary, c.theta, 1.0, RopeScale::None);
     let cos = b.tensor_gen("in.cos_full", gc.byte_len(), gc);
     let sin = b.tensor_gen("in.sin_full", gs.byte_len(), gs);
@@ -1331,7 +1360,7 @@ fn phase(
         ab_blocks > 0 && ab_blocks <= n_cu,
         "Qwen a/b blocks must fit the compiled grid"
     );
-    let w8a8 = emit_config::active().w8a8;
+    let w8a8 = emit_config::active().w8a8 && (prefill || c.sm90);
     assert!(
         !emit_config::active().qwen_fp8_m1_tma || w8a8,
         "Qwen FP8 M1 TMA maps require W8A8"
@@ -1344,7 +1373,10 @@ fn phase(
         );
     }
     let share_quant = emit_config::active().qwen_share_quant;
-    assert!(!share_quant || w8a8, "Qwen quant sharing requires W8A8");
+    assert!(
+        !share_quant || emit_config::active().w8a8,
+        "Qwen quant sharing requires W8A8"
+    );
     assert!(
         !w8a8
             || (fp8
@@ -1369,6 +1401,11 @@ fn phase(
         batch,
         decode_slots,
         decode_cublaslt,
+        lt_unit: prefill
+            && w8a8
+            && !c.sm90
+            && c.block_fp8.is_none()
+            && emit_config::active().prefill_cublaslt,
         fuse_ab,
         ab_blocks,
         projection_dag,
@@ -1389,6 +1426,12 @@ fn phase(
         kvlen,
         cos,
         sin,
+        rowslot,
+        spec_depth: if rowslot == TENSOR_NONE {
+            0
+        } else {
+            crate::spec::verify_depth()
+        },
     };
     let x = e.act("x", c.hidden);
     // The folded residual stream alternates between x and x2 (see `Fold`); `pending` is the
@@ -1420,8 +1463,11 @@ fn phase(
     let fu = e.act("fu", c.inter);
     let logits =
         e.b.tensor("act.logits", u64::from(decode_slots) * c.vocab as u64 * 2);
+    // One partial per block, never more blocks than executors: a wrapped cu id would run two
+    // argmax slices back to back on one block.
+    let amax_blocks = AMAX_BLOCKS.min(n_cu);
     let amax =
-        e.b.tensor("act.amax", u64::from(decode_slots) * AMAX_BLOCKS as u64 * 8);
+        e.b.tensor("act.amax", u64::from(decode_slots) * amax_blocks as u64 * 8);
     let mut dep = if c.block.is_some() {
         e.b.emit(DevOp::Nop, vec![0], &[], |_| {})
     } else {
@@ -1570,6 +1616,8 @@ fn phase(
     if c.block.is_some() {
         dep = e.flush_residual(dep);
     }
+    // Instructions reading `in.ids` that the terminal ArgmaxFin (which overwrites it) follows.
+    let mut ids_readers = Vec::new();
     if c.block.is_none() {
         let head = if c.tied {
             format!("{}embed_tokens.weight", c.prefix)
@@ -1587,6 +1635,10 @@ fn phase(
             dep = e.proj_fold(logits, hn, &head, c.vocab, c.hidden, &f, dep);
         } else {
             dep = e.norm(hn, x, &format!("{}norm.weight", c.prefix), dep);
+            if let (true, Some(kv)) = (prefill, mtp_kv) {
+                let (reads_ids, _) = e.mtp_prefill_tail(hn, kv, ids, dep);
+                ids_readers.push(reads_ids);
+            }
             if prefill {
                 let w = e.weight(&head, c.vocab as u64 * c.hidden as u64);
                 // A packed packet's compact terminal re-runs the head over the gathered last
@@ -1628,14 +1680,15 @@ fn phase(
             }
         }
         dep =
-            e.b.emit(DevOp::Argmax, (0..AMAX_BLOCKS).collect(), &[dep], |d| {
+            e.b.emit(DevOp::Argmax, (0..amax_blocks).collect(), &[dep], |d| {
                 d.t[..2].copy_from_slice(&[amax, logits]);
                 d.i[0] = c.vocab;
                 d.i[1] = slots;
             });
-        e.b.emit(DevOp::ArgmaxFin, vec![0], &[dep], |d| {
+        ids_readers.push(dep);
+        e.b.emit(DevOp::ArgmaxFin, vec![0], &ids_readers, |d| {
             d.t[..2].copy_from_slice(&[ids, amax]);
-            d.i[0] = AMAX_BLOCKS;
+            d.i[0] = amax_blocks;
             d.i[1] = slots;
         });
     }
@@ -1751,50 +1804,81 @@ fn refuse_unimplemented_target(arch: &str, gpu: &str) {
     );
 }
 
+/// The sm_120 interpreter (sm_120a, sm_121a) runs every Qwen op natively except these sm_90a
+/// routes: their objects are Hopper cubins (TMA/WGMMA) or cuBLASLt FP8 vector scales, and the
+/// row-interleaved KV layout traps in every interpreter flash-prefill body.
+fn refuse_sm90_routes(arch: &str, ec: &emit_config::EmitConfig) {
+    let routes = [
+        (ec.qwen_kv_interleave, "PLOW_QWEN_KV_INTERLEAVE"),
+        (ec.gen_kernels.is_some(), "PLOW_EMIT_GEN_KERNELS"),
+        (ec.attn_library, "PLOW_EMIT_ATTN_LIBRARY"),
+        (ec.decode_fp8_block, "PLOW_EMIT_DECODE_FP8_BLOCK"),
+        (ec.fp8_pf_gemm_role, "PLOW_FP8_PF_GEMM_ROLE"),
+        (ec.attention_pf_role, "PLOW_ATTENTION_PF_ROLE"),
+        (ec.tma_gemm, "PLOW_TMA_GEMM"),
+        (ec.qwen_fp8_m1_tma, "PLOW_QWEN_FP8_M1_TMA"),
+        // The packed contract needs prefill attention in its own segment; on this target the
+        // emit fails "attention must occupy its complete segment" and the attention object
+        // that segment would run on (PLOW_ATTENTION_PF_ROLE) is a Hopper cubin.
+        (
+            ec.emit_packed_prefill == Some(true),
+            "PLOW_EMIT_PACKED_PREFILL",
+        ),
+    ];
+    let set: Vec<&str> = routes.iter().filter(|r| r.0).map(|r| r.1).collect();
+    assert!(
+        set.is_empty(),
+        "qwen3_5 on {arch}: {set:?} are sm_90a-only routes"
+    );
+}
+
+/// Span verify (PLOW_EMIT_SPAN_VERIFY) runs the GDN chain's span arms inside the decode
+/// interpreter (op_qwen_gdn.cuh `_span`); the drafter (PLOW_EMIT_SPEC) is the checkpoint's own
+/// MTP layer. Routes that move those sites elsewhere are refused by name.
+fn refuse_spec_routes(ec: &emit_config::EmitConfig, c: &Config) {
+    if ec.emit_spec {
+        assert!(
+            mtp::enabled(),
+            "qwen3_5 drafts only with PLOW_SPEC_KIND={} (got {:?})",
+            mtp::FAMILY,
+            ec.spec_kind
+        );
+        assert!(
+            ec.span_verify,
+            "PLOW_EMIT_SPEC: the drafter's spans verify on the decode rungs; set PLOW_EMIT_SPAN_VERIFY"
+        );
+        assert!(
+            ec.fp8 || !ec.qwen_fold_norm,
+            "PLOW_EMIT_SPEC: the drafter reads the final-norm rows (act.hn), which              PLOW_QWEN_FOLD_NORM folds into the head"
+        );
+    }
+    if ec.span_verify {
+        assert!(
+            c.block.is_none(),
+            "PLOW_EMIT_SPAN_VERIFY: block packets do not verify"
+        );
+        assert!(
+            !ec.decode_cublaslt && ec.qwen_gdn_isolate.is_none(),
+            "PLOW_EMIT_SPAN_VERIFY: the GDN span arms run inside the decode interpreter;              PLOW_EMIT_DECODE_CUBLASLT and PLOW_QWEN_GDN_ISOLATE move the conv/step elsewhere"
+        );
+    }
+}
+
 /// The RECURRENT STATE section (`plow_asset::recurrent_state`): every `state.qwen.*` buffer,
 /// the active mask and the packed-prefill initstate scratch, slot-major over the decode slots.
 fn recurrent_state_section(m: &Model, slots: u32) -> packet::devbuild::SectionData {
-    use plow_asset::recurrent_state::{Buffer, Manifest, TensorFacts, SECTION, VERSION};
-    let buffer = |index: usize| {
-        let t = &m.tensors[index];
-        assert!(
-            t.bytes % u64::from(slots) == 0,
-            "{} is not slot-major",
-            t.name
-        );
-        Buffer {
-            tensor: u16::try_from(index).expect("tensor handle"),
-            slot_bytes: u32::try_from(t.bytes / u64::from(slots)).expect("slot bytes"),
-        }
-    };
-    let position = |name: &str| m.tensors.iter().position(|t| t.name == name);
-    let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
-    let manifest = Manifest {
-        version: VERSION,
+    crate::recurrent::section(
+        m,
         slots,
-        buffers: (0..m.tensors.len())
-            .filter(|&i| m.tensors[i].name.starts_with("state.qwen."))
-            .map(buffer)
-            .collect(),
-        active: u16::try_from(position("in.active").expect("in.active")).expect("tensor handle"),
-        prefill_initstate: position("act.gdn.initstate").map(buffer),
-        prefill_updates_state: m.progs[..dec_lo]
-            .iter()
-            .all(|p| p.insts.iter().any(|i| i.op == DevOp::QwenGdnPrefill as u16)),
-    };
-    manifest
-        .validate(slots, |h| {
-            m.tensors.get(h as usize).map(|t| TensorFacts {
-                bytes: t.bytes,
-                initialized: t.init.is_some(),
-            })
-        })
-        .unwrap_or_else(|error| panic!("recurrent state: {error}"));
-    packet::devbuild::SectionData {
-        kind: packet::devbuild::SECT_METADATA,
-        name: SECTION.into(),
-        data: serde_json::to_vec(&manifest).expect("recurrent state"),
-    }
+        &crate::recurrent::Family {
+            prefix: "state.qwen.",
+            prefill_op: DevOp::QwenGdnPrefill,
+            stateless_prefill_updates: false,
+            initstate: Some("act.gdn.initstate"),
+            step_seed: false,
+            replay: false,
+        },
+    )
 }
 
 pub(super) fn run(
@@ -1810,23 +1894,41 @@ pub(super) fn run(
     verify: Option<&VerifyHook>,
 ) {
     refuse_unimplemented_target(arch, gpu);
-    assert_eq!(
-        arch, "sm_90a",
-        "qwen3_5 native CUDA path currently requires sm_90a"
+    let sm90 = arch == "sm_90a";
+    assert!(
+        sm90 || hwspec::IsaLevel::arch_is_sm12x(arch),
+        "qwen3_5 native CUDA path requires sm_90a or the sm_120 interpreter (sm_120a, sm_121a)"
     );
     assert_eq!(tp, 1, "qwen3_5 tensor parallelism is not implemented");
-    let fp8 = emit_config::active().fp8;
+    let ec = emit_config::active();
+    assert!(
+        !ec.fp8_kv,
+        "qwen3_5 has no FP8 KV route: QwenHeadNormRope writes bf16 KV and no FP8 hd256 flash arm is wired"
+    );
+    if !sm90 {
+        refuse_sm90_routes(arch, ec);
+    }
+    let fp8 = ec.fp8;
     // `[decode_batch]`, or the PLOW_DECODE_BATCH_LADDER rungs (one decode program each).
-    let rungs = emit_config::active().decode_rungs();
+    let rungs = ec.decode_rungs();
     let batch = *rungs.last().expect("decode rungs");
-    assert!(ctx >= batch && n_cu >= AMAX_BLOCKS);
+    assert!(ctx >= batch);
     let root: Value =
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
             .expect("Qwen config JSON");
     let mut c = Config::parse(&root);
+    c.sm90 = sm90;
+    c.isa = hwspec::IsaLevel::from_arch_flag(arch).expect("a CUDA arch");
+    assert!(
+        sm90 || c.block_fp8.is_none() || !fp8,
+        "the block-scaled FP8 checkpoint runs on cuBLASLt with sm_90a vector scales; {arch} has no \
+         block-scaled interpreter GEMM. Emit the BF16 checkpoint (per-row FP8 re-quantization: \
+         PLOW_FP8=1 PLOW_W8A8=1 PLOW_QWEN_W8A8_PREFILL=1)"
+    );
     if let Some(spec) = block {
         c.block = Some(crate::block::parse_block(spec, c.layers.len()));
     }
+    refuse_spec_routes(ec, &c);
     let target = packet::devbuild::gpu_fingerprint(gpu);
     let _target = EmitAmdGuard::set(false);
     let mut m = match emit_config::active().qwen_prefill.as_deref() {
@@ -1848,6 +1950,13 @@ pub(super) fn run(
             let buckets = crate::with_always_rung(buckets, ctx);
             ladder(&c, ctx, n_cu, target, fp8, &buckets, &rungs)
         }
+    };
+    // The draft programs extend the tensor table: built before anything digests it.
+    let spec_sections = if mtp::enabled() {
+        let shard = mtp::check_checkpoint(dir, &root, &c);
+        mtp::sections(&mut m, &c, ctx, shard)
+    } else {
+        Vec::new()
     };
     let shipped = crate::checkpoint::shipped_names(dir);
     validate_coverage(
@@ -1884,6 +1993,7 @@ pub(super) fn run(
         sections.push(section);
     }
     sections.extend(derived_section(&m));
+    sections.extend(spec_sections);
     // PLOW_EMIT_PREFILL_CUBLASLT: the dense projections of every prefill bucket as isolated
     // cuBLASLt segments (the Gemma route; shapes in segment_roles::CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES).
     // The ordinary Qwen prefill otherwise runs every GEMM on the generic interpreter object.
@@ -2008,6 +2118,17 @@ pub(super) fn run(
             data: serde_json::to_vec(&live).expect("serialize LIVE KV manifest"),
         });
     }
+    // The sm_120 interpreter has no packed-request route (refuse_sm90_routes), but a long
+    // context still needs per-slot KV commit: 256K x 16 slots of bf16 KV is 256 GiB flat.
+    if !sm90 && c.block.is_none() {
+        let live = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
+            .unwrap_or_else(|error| panic!("compiled LIVE KV geometry: {error}"));
+        sections.push(packet::devbuild::SectionData {
+            kind: packet::devbuild::SECT_METADATA,
+            name: plow_asset::live_kv::SECTION.into(),
+            data: serde_json::to_vec(&live).expect("serialize LIVE KV manifest"),
+        });
+    }
     crate::object_requirements::append(&m, &mut sections)
         .unwrap_or_else(|error| panic!("object requirements: {error}"));
     sections.push(recurrent_state_section(&m, batch));
@@ -2107,8 +2228,10 @@ pub(super) fn run(
         "qwen3_5: {} layers, {} full, {} batch{batch} decode -> {}",
         c.layers.len(),
         c.layers.iter().filter(|x| **x).count(),
-        if emit_config::active().w8a8 {
+        if emit_config::active().w8a8 && sm90 {
             "W8A8"
+        } else if emit_config::active().w8a8 {
+            "W8A8 prefill / W8A16"
         } else if fp8 {
             "W8A16"
         } else {
@@ -4345,6 +4468,416 @@ mod tests {
         assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, true, 129)).is_err());
         assert!(std::panic::catch_unwind(|| model(&c, 8192, 132, 0, false, 1)).is_err());
     }
+
+    /// The sm_120 interpreter route (GB10, 48 SMs): W8A8 prefill on the unmapped mma.sync GEMM,
+    /// decode on the per-channel FP8 GEMV over the same `fp8/` weights, argmax on <= n_cu blocks.
+    #[test]
+    fn sm120_route_runs_unmapped_w8a8_prefill_and_fp8_gemv_decode() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let mut cfg = restore.0.clone();
+        cfg.fp8 = true;
+        cfg.w8a8 = true;
+        cfg.qwen_w8a8_prefill = true;
+        // Prefill-only sharing: the GEMV decode rungs have no quant to share.
+        cfg.qwen_share_quant = true;
+        emit_config::install(cfg);
+        let mut c = Config::parse(&fixture());
+        c.sm90 = false;
+        c.isa = hwspec::IsaLevel::Sm121a;
+        let m = ladder(&c, 8192, 48, 0, true, &[128, 8192], &[1, 4]);
+        assert_eq!(m.prog_t, [128, 8192, 1, 4]);
+        let mut prefill_weights = std::collections::BTreeSet::new();
+        for g in &m.progs[..2] {
+            let gemms: Vec<_> = g
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::GemmFp8 as u16)
+                .collect();
+            assert_eq!(gemms.len(), 31);
+            for d in gemms {
+                assert_eq!((d.i[6], d.i[7]), (0, 0), "no TMA maps off sm_90a");
+                prefill_weights.insert(d.t[2]);
+            }
+            assert!(g.insts.iter().any(|d| d.op == DevOp::QuantFp8 as u16));
+            check_operand_dependencies(g);
+        }
+        assert!(m.gen.iter().all(|g| g.kind != packet::rope::GEN_TMAP_E4M3));
+        for (g, rows) in m.progs[2..].iter().zip([1, 4]) {
+            assert!(!g
+                .insts
+                .iter()
+                .any(|d| d.op == DevOp::GemmFp8 as u16 || d.op == DevOp::QuantFp8 as u16));
+            let gemvs: Vec<_> = g
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::GemvFp8 as u16)
+                .collect();
+            assert_eq!(gemvs.len(), 31);
+            for d in gemvs {
+                assert_eq!(d.i[0], rows);
+                assert!(
+                    prefill_weights.contains(&d.t[2]),
+                    "decode shares the fp8/ weights"
+                );
+                assert_eq!(m.tensors[d.t[5] as usize].bytes, u64::from(d.i[1]) * 4);
+            }
+            let argmax = g
+                .insts
+                .iter()
+                .find(|d| d.op == DevOp::Argmax as u16)
+                .unwrap();
+            assert_eq!(argmax.blocks, 48);
+            let fin = g
+                .insts
+                .iter()
+                .find(|d| d.op == DevOp::ArgmaxFin as u16)
+                .unwrap();
+            assert_eq!(fin.i[0], 48);
+            check_operand_dependencies(g);
+        }
+        let amax = m.tensors.iter().find(|t| t.name == "act.amax").unwrap();
+        assert_eq!(amax.bytes, 4 * 48 * 8);
+        let r = crate::object_requirements::manifest(&m, None);
+        use plow_asset::object_requirements as req;
+        assert_eq!(
+            r.prefill,
+            vec![
+                req::Requirement::new(req::GDN_PREFILL_ABI, 1),
+                req::Requirement::new(req::W8A8_ARMS, 1),
+            ]
+        );
+        assert!(r.decode.is_empty());
+        let man = manifest::build(&m, "sm_121a", &LeanReport::skipped("fixture"));
+        assert_eq!(man["features"]["w8a8"], true);
+        assert_eq!(man["features"]["fp8_gemv"], true);
+        // Attention: one fused split per prefill chunk (no FlashMerge).
+        for g in &m.progs[..2] {
+            assert!(!g.insts.iter().any(|d| d.op == DevOp::FlashMerge as u16));
+            for d in g.insts.iter().filter(|d| d.op == DevOp::FlashPrefill as u16) {
+                assert_eq!((d.i[6], d.i[7]), (256, 1));
+                assert_eq!(m.tensors[d.t[5] as usize].name, "act.at");
+            }
+        }
+        assert_eq!(man["tuning"]["fa2_pf256"], 1);
+        assert!(man["tuning"].get("fa_rgm").is_none());
+    }
+
+    #[test]
+    fn sm120_cublaslt_prefill_emits_unit_scale_gemms_and_their_row_col_scales() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        struct Restore(emit_config::EmitConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                emit_config::install(self.0.clone());
+            }
+        }
+        let restore = Restore(emit_config::active().clone());
+        let mut cfg = restore.0.clone();
+        cfg.fp8 = true;
+        cfg.w8a8 = true;
+        cfg.qwen_w8a8_prefill = true;
+        cfg.qwen_share_quant = true;
+        cfg.prefill_cublaslt = true;
+        emit_config::install(cfg);
+        let mut c = Config::parse(&fixture());
+        c.sm90 = false;
+        c.isa = hwspec::IsaLevel::Sm121a;
+        let mut m = ladder(&c, 8192, 48, 0, true, &[128, 8192], &[1, 4]);
+        for (g, rows) in m.progs[..2].iter().zip([128, 8192]) {
+            let gemms: Vec<_> = (0..g.insts.len())
+                .filter(|&i| g.insts[i].op == DevOp::GemmFp8 as u16)
+                .collect();
+            assert_eq!(gemms.len(), 31);
+            for i in gemms {
+                let (d, s) = (&g.insts[i], &g.insts[i + 1]);
+                assert_eq!(d.i[5], packet::dev::FP8_UNIT_SCALE);
+                assert!(d.t[3..].iter().all(|&t| t == TENSOR_NONE));
+                assert_eq!(s.op, DevOp::RowColScale as u16);
+                assert_eq!((s.t[0], s.t[1]), (d.t[0], d.t[0]));
+                assert_eq!(m.tensors[s.t[2] as usize].name, "act.fp8.scale");
+                assert!(m.tensors[s.t[3] as usize].name.ends_with("_scale"));
+                assert_eq!((s.i[0], s.i[1]), (rows, d.i[1]));
+            }
+            check_operand_dependencies(g);
+        }
+        for g in &m.progs[2..] {
+            assert!(!g.insts.iter().any(|d| d.op == DevOp::GemmFp8 as u16
+                || d.op == DevOp::RowColScale as u16));
+        }
+        let mut sections = Vec::new();
+        assert_eq!(
+            crate::dense_cublaslt::apply_prefill(&mut m, &mut sections, "sm_121a").unwrap(),
+            62
+        );
+        let roles = plow_asset::segment_roles::SegmentRoles::from_bytes(&sections[0].data).unwrap();
+        for program in &roles.programs {
+            let g = &m.progs[program.index];
+            for (segment, &role) in program.roles.iter().enumerate() {
+                let entry = g.gq_stream[g.gq_seg_ofs[segment] as usize];
+                let op = g.insts[entry.inst as usize].op;
+                assert_eq!(
+                    role == plow_asset::segment_roles::CUBLASLT,
+                    op == DevOp::GemmFp8 as u16,
+                    "segment {segment}"
+                );
+            }
+        }
+        // The vector-scale route stays sm_90a-only.
+        assert_eq!(
+            crate::dense_cublaslt::apply_prefill(&mut m, &mut Vec::new(), "sm90a").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "PLOW_QWEN_KV_INTERLEAVE")]
+    fn sm120_refuses_the_interleaved_kv_layout() {
+        let mut cfg = emit_config::active().clone();
+        cfg.qwen_kv_interleave = true;
+        refuse_sm90_routes("sm_121a", &cfg);
+    }
+
+    /// Installs `edit(cfg)` for the scope and restores the previous config on drop.
+    struct SpecCfg(emit_config::EmitConfig);
+    impl SpecCfg {
+        fn set(edit: impl FnOnce(&mut emit_config::EmitConfig)) -> Self {
+            let saved = emit_config::active().clone();
+            let mut cfg = saved.clone();
+            edit(&mut cfg);
+            emit_config::install(cfg);
+            SpecCfg(saved)
+        }
+    }
+    impl Drop for SpecCfg {
+        fn drop(&mut self) {
+            emit_config::install(self.0.clone());
+        }
+    }
+
+    // Span verify: every KV writer and reader of a decode rung takes `in.rowslot`, every GDN site
+    // its span operands and a `[slot][depth]` snapshot, and the recurrent section declares the
+    // rollback the runtime commits with; plain packets are untouched.
+    #[test]
+    fn span_verify_binds_the_row_map_and_declares_recurrent_rollback() {
+        let _env = crate::test_env::env_guard();
+        let c = Config::parse(&fixture());
+        let plain = ladder(&c, 8192, 132, 0, false, &[], &[1, 4]);
+        assert!(!plain
+            .tensors
+            .iter()
+            .any(|t| t.name == "in.rowslot" || t.name.ends_with(".snap")));
+        let section = recurrent_state_section(&plain, 4);
+        let manifest: plow_asset::recurrent_state::Manifest =
+            serde_json::from_slice(&section.data).unwrap();
+        assert!(manifest.verify.is_none());
+
+        let _cfg = SpecCfg::set(|cfg| {
+            cfg.span_verify = true;
+            cfg.spec_kmax = Some(2);
+        });
+        let m = ladder(&c, 8192, 132, 0, false, &[], &[1, 4]);
+        let handle = |name: &str| m.tensors.iter().position(|t| t.name == name).unwrap() as u32;
+        let rowslot = handle("in.rowslot");
+        assert_eq!(m.tensors[rowslot as usize].bytes, 4 * 4);
+        for layer in 0..3 {
+            let snap = |kind: &str| {
+                &m.tensors[handle(&format!("state.qwen.{layer}.{kind}.snap")) as usize]
+            };
+            assert_eq!(snap("conv").bytes, 4 * 2 * 10240 * 3 * 2);
+            assert_eq!(snap("gdn").bytes, 4 * 2 * 48 * 128 * 128 * 4);
+        }
+        for p in &m.progs {
+            for d in &p.insts {
+                if d.op == DevOp::QwenHeadNormRope as u16 && d.i[4] != 0 {
+                    assert_eq!(d.t[7], rowslot, "cache writer without the row map");
+                }
+                if d.op == DevOp::QwenHeadNormRope as u16 && d.i[4] == 0 {
+                    assert_eq!(d.t[7], TENSOR_NONE);
+                }
+                if d.op == DevOp::FlashDecode as u16 {
+                    assert_eq!(d.t[6], rowslot);
+                }
+                if d.op == DevOp::QwenGdnConv as u16 {
+                    assert_eq!((d.t[5], d.i[3]), (rowslot, 2));
+                    assert!(m.tensors[d.t[6] as usize].name.ends_with(".conv.snap"));
+                    assert_eq!(
+                        m.tensors[d.t[6] as usize].name,
+                        format!("{}.snap", m.tensors[d.t[3] as usize].name)
+                    );
+                }
+                if d.op == DevOp::QwenGdnStep as u16 {
+                    assert_eq!((d.j[1], d.i[7]), (rowslot, 2));
+                    assert_eq!(
+                        m.tensors[d.i[6] as usize].name,
+                        format!("{}.snap", m.tensors[d.t[6] as usize].name)
+                    );
+                }
+            }
+        }
+        let section = recurrent_state_section(&m, 4);
+        let manifest: plow_asset::recurrent_state::Manifest =
+            serde_json::from_slice(&section.data).unwrap();
+        let verify = manifest.verify.as_ref().unwrap();
+        assert_eq!(verify.depth, 2);
+        assert_eq!(manifest.buffers.len(), 6);
+        assert_eq!(verify.snapshots.len(), 6);
+        for s in &verify.snapshots {
+            assert_eq!(
+                m.tensors[s.tensor as usize].name,
+                format!("{}.snap", m.tensors[s.buffer as usize].name)
+            );
+        }
+        let live = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(live.row_slot, Some(rowslot as u16));
+        // The span arms ship in the row-slot twin objects on the sm_120 interpreter too.
+        let man = manifest::build(&m, "sm_121a", &LeanReport::skipped("fixture"));
+        assert_eq!(man["tuning"]["row_slot_twin"], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "PLOW_EMIT_DECODE_CUBLASLT")]
+    fn span_verify_refuses_routes_that_move_the_gdn_sites() {
+        let mut cfg = emit_config::active().clone();
+        cfg.span_verify = true;
+        cfg.decode_cublaslt = true;
+        refuse_spec_routes(&cfg, &Config::parse(&fixture()));
+    }
+
+    #[test]
+    #[should_panic(expected = "PLOW_SPEC_KIND=qwen3_5_mtp")]
+    fn spec_refuses_foreign_drafters() {
+        let _env = crate::test_env::env_guard();
+        let _cfg = SpecCfg::set(|cfg| {
+            cfg.span_verify = true;
+            cfg.emit_spec = true;
+            cfg.spec_kind = Some("gemma4_assistant".into());
+        });
+        refuse_spec_routes(emit_config::active(), &Config::parse(&fixture()));
+    }
+
+    // The MTP drafter: every prefill bucket fills the drafter cache for its rows, and each draft
+    // program chains `k` steps through it at the staged per-step positions, reading the target's
+    // final-norm rows, embeddings and head.
+    #[test]
+    fn mtp_draft_programs_chain_steps_through_the_drafter_cache() {
+        let _env = crate::test_env::env_guard();
+        let _target = EmitAmdGuard::set(false);
+        let _cfg = SpecCfg::set(|cfg| {
+            cfg.span_verify = true;
+            cfg.emit_spec = true;
+            cfg.spec_kind = Some(mtp::FAMILY.into());
+            cfg.spec_kmax = Some(2);
+            cfg.spec_rows = None;
+        });
+        let c = Config::parse(&fixture());
+        let mut m = model_prefill(&c, 8192, 48, 0, &[128], 4, false);
+        let handle = |m: &Model, name: &str| {
+            m.tensors
+                .iter()
+                .position(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name}")) as u32
+        };
+        let (kk, kv) = (handle(&m, "kv.mtp.k"), handle(&m, "kv.mtp.v"));
+        assert_eq!(m.tensors[kk as usize].bytes, 4 * 4 * 8192 * 256 * 2);
+        // Prefill tail: shifted ids, both halves of fc, the drafter K/V at the prompt rows.
+        let pf = &m.progs[0];
+        let shift = handle(&m, "in.mtp.shift.128");
+        assert!(pf
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::RowGather as u16 && d.t[2] == shift));
+        let writers: Vec<_> = pf
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::QwenHeadNormRope as u16 && (d.t[0] == kk || d.t[0] == kv))
+            .collect();
+        assert_eq!(writers.len(), 2);
+        assert!(writers.iter().all(|d| d.i[6] == 1 && d.i[4] == 8192));
+        // Decode rungs do not touch the drafter cache; it stays outside the live-KV caches.
+        assert!(!m.progs[1].insts.iter().any(|d| d.t.contains(&kk)));
+        let live = plow_asset::program::with_model(&m, plow_asset::live_kv::emit)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(live.caches.iter().all(|c| !c.pair.contains(&(kk as u16))));
+        let n_before = m.tensors.len();
+        let sections = mtp::sections(&mut m, &c, 8192, "model-mtp.safetensors".into());
+        assert!(m.tensors.len() > n_before);
+        let manifest: plow_asset::spec_draft::Manifest =
+            serde_json::from_slice(&sections[0].data).unwrap();
+        assert_eq!(manifest.family, "qwen3_5_mtp");
+        assert_eq!(manifest.kmax, 2);
+        let shape: Vec<_> = manifest.programs.iter().map(|p| (p.rows, p.k)).collect();
+        assert_eq!(shape, [(1, 1), (1, 2), (2, 1), (2, 2), (4, 1), (4, 2)]);
+        let t = &manifest.tensors;
+        assert_eq!(t.own_kv, [kk as u16, kv as u16]);
+        assert_eq!((t.step_position.len(), t.step_kv_len.len()), (1, 1));
+        assert_eq!(t.hidden, Some(handle(&m, "act.hn") as u16));
+        assert_eq!(t.hidden_rows, 4);
+        let section =
+            plow_asset::aux_program::parse(&sections[1].data, m.n_cu, m.tensors.len()).unwrap();
+        assert_eq!(section.programs.len(), 6);
+        let p = &section.programs[manifest.select(3, 2).unwrap().index as usize];
+        assert_eq!(p.rows, 4);
+        let count = |op: DevOp| p.insts.iter().filter(|d| d.op == op as u16).count();
+        assert_eq!((count(DevOp::Embed), count(DevOp::RowGather)), (2, 1));
+        assert_eq!((count(DevOp::FlashDecode), count(DevOp::ArgmaxFin)), (2, 2));
+        let gather = p
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::RowGather as u16)
+            .unwrap();
+        assert_eq!(
+            (gather.t[1], gather.t[2]),
+            (t.hidden.unwrap(), t.hidden_row.unwrap())
+        );
+        let flashes: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::FlashDecode as u16)
+            .collect();
+        assert_eq!(flashes[0].t[5], t.kv_len);
+        assert_eq!(flashes[1].t[5], t.step_kv_len[0]);
+        assert!(flashes
+            .iter()
+            .all(|d| d.t[3] == kk as u16 && d.t[6] == t.slot));
+        let stores: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::QwenHeadNormRope as u16 && d.i[4] != 0)
+            .collect();
+        assert_eq!(stores.len(), 4);
+        assert!(stores.iter().all(|d| d.t[7] == t.slot && d.i[6] == 0));
+        assert_eq!(
+            (stores[0].t[5], stores[2].t[5]),
+            (t.position, t.step_position[0])
+        );
+        let fins: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::ArgmaxFin as u16)
+            .collect();
+        assert_eq!((fins[0].t[0], fins[1].t[0]), (t.tokens[1], t.tokens[2]));
+        // fc runs over the two column blocks of mtp.fc.weight.
+        let derived: plow_asset::derived_weights::DerivedWeights =
+            serde_json::from_slice(&derived_section(&m).unwrap().data).unwrap();
+        let cols: Vec<_> = derived
+            .tensors
+            .iter()
+            .filter(|d| d.sources == ["mtp.fc.weight"])
+            .map(|d| d.cols.unwrap())
+            .collect();
+        assert_eq!(cols, [[0, 5120], [5120, 10240]]);
+    }
+
     #[test]
     #[should_panic(expected = "unsupported layer type")]
     fn rejects_unknown_hybrid_layer() {

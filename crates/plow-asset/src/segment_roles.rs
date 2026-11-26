@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use hwspec::{IsaLevel, LtFp8Scale};
+
 pub const SECTION: &str = "segment_roles.json";
 pub const INTERPRETER: u8 = 0;
 pub const FP8_PREFILL_GEMM: u8 = 1;
@@ -388,8 +390,37 @@ pub const CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES: [(u32, u32); 11] = [
     (16384, 5120),
 ];
 
+/// The ISA a route profile names: an interpreter profile tag (`sm90a`, `sm120`, `sm89`) or an
+/// `--arch` string.
+pub fn profile_isa(profile: &str) -> Option<IsaLevel> {
+    match profile {
+        "sm90a" => Some(IsaLevel::Sm90a),
+        "sm120" => Some(IsaLevel::Sm120a),
+        "sm89" => Some(IsaLevel::Sm89),
+        arch => IsaLevel::from_arch_flag(arch),
+    }
+}
+
+/// The profile routes FP8 matmuls through cuBLASLt with this scale mode ([`IsaLevel::lt_fp8_scales`]).
+pub fn lt_fp8_scale(profile: &str, scale: LtFp8Scale) -> bool {
+    profile_isa(profile).is_some_and(|isa| isa.lt_fp8_scales().contains(&scale))
+}
+
+/// Prefill rows the scalar-scale FP8 routes were measured at (GB10 Nemotron-H and Qwen3.8).
+const LT_FP8_SCALAR_ROWS: [u32; 4] = [128, 1024, 4096, 8192];
+/// The per-tensor route's rows: the scalar rows plus Nemotron-H's appended 1152 / 1536 / 2048 /
+/// 2176 / 16384 rungs (`PLOW_PF_LADDER_APPEND`), which the native W8A8 GEMM would otherwise take at
+/// ~30 TF. 16384 (GB10, cuBLASLt 13): the Mamba in / out projections run 1.64-1.75 ms vs 0.79-0.80 ms
+/// at 8192, the same rate; L6..8 block oracle at 16384 rows rel-L2 1.4e-2.
+const LT_FP8_TENSOR_ROWS: [u32; 9] = [128, 1024, 1152, 1536, 2048, 2176, 4096, 8192, 16384];
+
+/// A shape cuBLASLt's FP8 matmul takes: 16-element aligned N and K.
+fn lt_fp8_shape(n: u32, k: u32) -> bool {
+    n > 0 && k > 0 && n % 16 == 0 && k % 16 == 0
+}
+
 pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
-    matches!(profile, "sm90a" | "sm_90a")
+    lt_fp8_scale(profile, LtFp8Scale::Vector)
         && [64, 128, 256, 512, 1024, 1088, 1152, 2048, 2112, 2176, 4096, 4160, 4224, 8192].contains(&m)
         && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
             || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
@@ -411,6 +442,28 @@ pub fn cublaslt_prefill_fp8(profile: &str, m: u32, n: u32, k: u32) -> bool {
         && !(m == 2112 && [(3840, 4096), (3840, 8192)].contains(&(n, k)))
 }
 
+/// The unit-scale FP8 route ([`packet::dev::FP8_UNIT_SCALE`]): one scalar-scale cuBLASLt matmul
+/// whose output a `RowColScale` instruction scales, on a part without vector-scale FP8
+/// algorithms ([`LtFp8Scale::Unit`]). GB10: scale mode 0 runs 166-201 TF (cuBLASLt 13.1, M
+/// 1024-8192) vs ~30 TF for the native W8A8 GEMM. The emitter picks the scale mode from the
+/// checkpoint's per-row FP8 format; the route takes every aligned projection at the measured rows.
+pub fn cublaslt_prefill_fp8_unit(profile: &str, m: u32, n: u32, k: u32) -> bool {
+    lt_fp8_scale(profile, LtFp8Scale::Unit) && LT_FP8_SCALAR_ROWS.contains(&m) && lt_fp8_shape(n, k)
+}
+
+/// The per-tensor FP8 route ([`packet::dev::FP8_TENSOR_SCALE`]): one cuBLASLt matmul with scalar
+/// activation and weight scale pointers (SCALAR_32F, [`LtFp8Scale::Tensor`]), bf16 out — the
+/// peer's static per-tensor arithmetic (ModelOpt FP8 checkpoints), at the measured rows.
+pub fn cublaslt_prefill_fp8_tensor(profile: &str, m: u32, n: u32, k: u32) -> bool {
+    cublaslt_prefill_fp8_tensor_rows(profile, n, k).is_some_and(|rows| rows.contains(&m))
+}
+
+/// The rows at which [`cublaslt_prefill_fp8_tensor`] takes this shape on `profile`, `None` when
+/// it takes it at none.
+pub fn cublaslt_prefill_fp8_tensor_rows(profile: &str, n: u32, k: u32) -> Option<&'static [u32]> {
+    (lt_fp8_scale(profile, LtFp8Scale::Tensor) && lt_fp8_shape(n, k)).then_some(&LT_FP8_TENSOR_ROWS)
+}
+
 pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     // At M <= 512 the small set is the down projection (3840, 15360), the o projection
     // (3840, 8192) and the unfused gate/up (15360, 3840): measured on H100 2026-09-17, Lt
@@ -422,8 +475,8 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
     let rows = CUBLASLT_PREFILL_ROWS.contains(&m)
         || CUBLASLT_PREFILL_WIDE_ROWS.contains(&m)
         || CUBLASLT_PREFILL_SPEECH_ROWS.contains(&m);
-    match profile {
-        "sm90a" | "sm_90a" => {
+    match profile_isa(profile) {
+        Some(IsaLevel::Sm90a) => {
             rows && (CUBLASLT_PREFILL_GEMMA4_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_GEMMA4_26B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_GEMMA4_31B_SHAPES.contains(&(n, k))
@@ -435,7 +488,7 @@ pub fn cublaslt_prefill_bf16(profile: &str, m: u32, n: u32, k: u32) -> bool {
         // Ada and GB202 have no TMA/wgmma prefill GEMM: the speech LMs (ASR decoders, Llama TTS)
         // and Gemma 4 E4B (L40S cold TTFT at 3944 tokens 1121 ms on the interpreter GEMM) are
         // routed.
-        "sm89" | "sm_89" | "sm120" | "sm_120a" => {
+        Some(isa) if isa == IsaLevel::Sm89 || isa.is_sm12x() => {
             rows && (CUBLASLT_PREFILL_QWEN3_1_7B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_QWEN3_0_6B_SHAPES.contains(&(n, k))
                 || CUBLASLT_PREFILL_LLAMA_TTS_SHAPES.contains(&(n, k))
@@ -1176,12 +1229,37 @@ mod tests {
             for (n, k) in super::CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES {
                 assert!(super::cublaslt_prefill_fp8("sm90a", m, n, k));
                 assert!(!super::cublaslt_prefill_fp8("sm120", m, n, k));
+                for profile in ["sm120", "sm_120a", "sm_121a"] {
+                    assert!(super::cublaslt_prefill_fp8_unit(profile, m, n, k));
+                }
+                assert!(!super::cublaslt_prefill_fp8_unit("sm90a", m, n, k));
             }
         }
         for m in [64, 256, 512, 1088, 2048, 4160] {
             for (n, k) in super::CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES {
                 assert!(!super::cublaslt_prefill_fp8("sm90a", m, n, k));
+                assert!(!super::cublaslt_prefill_fp8_unit("sm_121a", m, n, k));
             }
+        }
+        assert!(!super::cublaslt_prefill_fp8_unit("sm_121a", 1024, 48, 5128));
+    }
+
+    /// The scalar-scale routes are a capability of the part, not a list of models: Nemotron-H's
+    /// per-tensor projections (mamba in/out, q/o, k/v) on every sm_12x profile, nowhere else.
+    #[test]
+    fn fp8_tensor_route_is_the_sm12x_scalar_scale_capability() {
+        for (n, k) in [(18560, 4096), (4096, 8192), (4096, 4096), (256, 4096)] {
+            for m in [128, 1024, 1152, 1536, 2048, 2176, 4096, 8192, 16384] {
+                for profile in ["sm120", "sm_120a", "sm_121a"] {
+                    assert!(super::cublaslt_prefill_fp8_tensor(profile, m, n, k));
+                }
+                for profile in ["sm90a", "sm_90a", "sm89", "gfx942"] {
+                    assert!(!super::cublaslt_prefill_fp8_tensor(profile, m, n, k));
+                    assert!(!super::cublaslt_prefill_fp8_unit(profile, m, n, k));
+                }
+            }
+            assert!(!super::cublaslt_prefill_fp8_tensor("sm_121a", 16, n, k));
+            assert!(!super::cublaslt_prefill_fp8("sm_121a", 1024, n, k));
         }
     }
 

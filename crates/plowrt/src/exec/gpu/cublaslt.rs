@@ -12,6 +12,12 @@ pub(super) struct DecodeSegment {
     pub(super) weight_bytes: u64,
     /// Block-scaled FP8 ([`packet::dev::FP8_BLOCK_GROUP`]): cuBLASLt runs `m` padded to 4.
     pub(super) block: bool,
+    /// Unscaled FP8 ([`packet::dev::FP8_UNIT_SCALE`], prefill only): a scalar-scale matmul; the
+    /// packet's following `RowColScale` instruction applies the scales.
+    pub(super) unit: bool,
+    /// Per-tensor FP8 ([`packet::dev::FP8_TENSOR_SCALE`], prefill only): scalar activation and
+    /// weight scale pointers (`t3`, `t4`, one f32 each).
+    pub(super) tensor: bool,
 }
 
 pub(super) struct CublasLtDecodeRoute {
@@ -1376,6 +1382,46 @@ pub(super) fn prefill_rope_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
         .collect()
 }
 
+/// Segments that are exactly one W4A4 MoE up (`MoeUpNvfp4Pf` i5 = 1) or down (`MoeDownNvfp4Pf`
+/// i6 = 1) instruction over all of its slices in order: `plow_moe_w4a4_pf` runs it with
+/// slice = blockIdx.x.
+pub(super) fn prefill_moe_w4a4_segments(g: &DevProg) -> Vec<(usize, Vec<usize>)> {
+    g.gq_seg_ofs
+        .windows(2)
+        .enumerate()
+        .filter_map(|(seg, w)| {
+            let entries = g.gq_stream.get(w[0] as usize..w[1] as usize)?;
+            let inst = entries.first()?.inst as usize;
+            let d = g.insts.get(inst)?;
+            let ok = d.blocks != 0
+                && entries.len() == usize::from(d.blocks)
+                && entries
+                    .iter()
+                    .enumerate()
+                    .all(|(slice, e)| e.inst as usize == inst && e.slice as usize == slice)
+                && ((d.op == DevOp::MoeUpNvfp4Pf as u16 && d.i[5] == 1)
+                    || (d.op == DevOp::MoeDownNvfp4Pf as u16 && d.i[6] == 1));
+            ok.then_some((seg, vec![inst]))
+        })
+        .collect()
+}
+
+/// One launch of the instruction's grid on the segment object's arena.
+pub(super) fn prefill_moe_w4a4_route(
+    be: &Arc<CudaBackend>,
+    function: KernelFn,
+    kernarg: DevProgram,
+    g: &DevProg,
+    insts: &[usize],
+    smem: u32,
+) -> LightRoute {
+    let mut route = prefill_light_route(be, function, kernarg, g, insts);
+    for launch in &mut route.launches {
+        launch.smem = smem;
+    }
+    route
+}
+
 /// One launch per HeadNormRope instruction, one warp per (token, head) item.
 pub(super) fn prefill_rope_route(
     be: &Arc<CudaBackend>,
@@ -2303,14 +2349,18 @@ pub(super) fn prepare_routes(
                     (segment.k / 128) * lt_m,
                     (segment.n / 128) * (segment.k / 128),
                 ]
+            } else if segment.tensor {
+                [1, 1]
             } else {
                 [segment.m, segment.n]
             };
             let mut scales = [0; 2];
-            for (index, (handle, elements)) in [(op.t[3], elements[0]), (op.t[4], elements[1])]
-                .into_iter()
-                .enumerate()
-            {
+            let scale_operands = if segment.unit {
+                Vec::new()
+            } else {
+                vec![(op.t[3], elements[0]), (op.t[4], elements[1])]
+            };
+            for (index, (handle, elements)) in scale_operands.into_iter().enumerate() {
                 let mem = devp
                     .get(handle as usize)
                     .ok_or_else(|| RuntimeError::Rejected("missing FP8 scale vector".into()))?;
@@ -2351,7 +2401,15 @@ pub(super) fn prepare_routes(
                     scales[1],
                     scales[0],
                     !decode && fast_k && !segment.block,
-                    segment.block,
+                    if segment.block {
+                        crate::device::cuda::lt::Fp8Scale::Block
+                    } else if segment.unit {
+                        crate::device::cuda::lt::Fp8Scale::Unit
+                    } else if segment.tensor {
+                        crate::device::cuda::lt::Fp8Scale::Tensor
+                    } else {
+                        crate::device::cuda::lt::Fp8Scale::Vector
+                    },
                 )?),
             };
             fp8_plans += 1;
@@ -2860,7 +2918,15 @@ fn projection_segments(
                     || (fp8 && roles[segment] == plow_asset::segment_roles::CUBLASLT)
             }
             ProjectionPhase::Prefill(profile) => {
-                if fp8 {
+                if fp8 && op.i[5] == packet::dev::FP8_UNIT_SCALE {
+                    plow_asset::segment_roles::cublaslt_prefill_fp8_unit(
+                        profile, op.i[0], op.i[1], op.i[2],
+                    )
+                } else if fp8 && op.i[5] == packet::dev::FP8_TENSOR_SCALE {
+                    plow_asset::segment_roles::cublaslt_prefill_fp8_tensor(
+                        profile, op.i[0], op.i[1], op.i[2],
+                    )
+                } else if fp8 {
                     plow_asset::segment_roles::cublaslt_prefill_fp8(
                         profile, op.i[0], op.i[1], op.i[2],
                     )
@@ -2875,14 +2941,21 @@ fn projection_segments(
             }
         };
         let block = fp8 && op.i[5] == packet::dev::FP8_BLOCK_GROUP;
+        // Unit scales are a prefill-only contract: their RowColScale follows in the packet.
+        let unit = fp8
+            && op.i[5] == packet::dev::FP8_UNIT_SCALE
+            && matches!(phase, ProjectionPhase::Prefill(_));
+        let tensor = fp8
+            && op.i[5] == packet::dev::FP8_TENSOR_SCALE
+            && matches!(phase, ProjectionPhase::Prefill(_));
         let end = match phase {
             ProjectionPhase::Decode => op.i.len(),
             ProjectionPhase::Prefill(_) => 6,
         };
-        let valid_immediates = (3..end).all(|j| op.i[j] == 0 || (block && j == 5))
+        let valid_immediates = (3..end).all(|j| op.i[j] == 0 || ((block || unit || tensor) && j == 5))
             && (!block || op.i[6..].iter().all(|&value| value == 0));
         if !valid_op
-            || op.t[if fp8 { 5 } else { 3 }..]
+            || op.t[if fp8 && !unit { 5 } else { 3 }..]
                 .iter()
                 .any(|&t| t != packet::dev::TENSOR_NONE16)
             || op.i[0] != rows
@@ -2914,7 +2987,11 @@ fn projection_segments(
         let output_bytes = bytes(lt_m, n)?;
         let input_bytes = bytes(lt_m, k)? / if fp8 { 2 } else { 1 };
         let weight_bytes = bytes(n, k)? / if fp8 { 2 } else { 1 };
-        if fp8 {
+        if unit {
+            if op.t[1] == op.t[2] {
+                return Err(fail());
+            }
+        } else if fp8 {
             if op.t[..5]
                 .iter()
                 .copied()
@@ -2929,6 +3006,8 @@ fn projection_segments(
                     (op.t[3], u64::from(k / 128) * u64::from(lt_m) * 4),
                     (op.t[4], u64::from(n / 128) * u64::from(k / 128) * 4),
                 ]
+            } else if tensor {
+                [(op.t[3], 4), (op.t[4], 4)]
             } else {
                 [(op.t[3], u64::from(m) * 4), (op.t[4], u64::from(n) * 4)]
             };
@@ -2965,6 +3044,8 @@ fn projection_segments(
             input_bytes,
             weight_bytes,
             block,
+            unit,
+            tensor,
         });
     }
     Ok(routes)
@@ -3332,6 +3413,26 @@ mod tests {
     }
 
     #[test]
+    fn prefill_moe_w4a4_takes_lone_complete_w4a4_up_and_down_segments() {
+        let (mut g, _) = fixture(128);
+        g.insts[1].op = DevOp::MoeUpNvfp4Pf as u16;
+        g.insts[1].i[5] = 1;
+        assert_eq!(prefill_moe_w4a4_segments(&g), vec![(1, vec![1])]);
+        g.insts[1].op = DevOp::MoeDownNvfp4Pf as u16;
+        assert!(prefill_moe_w4a4_segments(&g).is_empty());
+        g.insts[1].i[6] = 1;
+        assert_eq!(prefill_moe_w4a4_segments(&g), vec![(1, vec![1])]);
+        g.insts[1].blocks = 2;
+        assert!(prefill_moe_w4a4_segments(&g).is_empty());
+        g.insts[1].blocks = 1;
+        g.gq_stream[1].slice = 1;
+        assert!(prefill_moe_w4a4_segments(&g).is_empty());
+        g.gq_stream[1].slice = 0;
+        g.gq_seg_ofs = vec![0, 1, 3];
+        assert!(prefill_moe_w4a4_segments(&g).is_empty());
+    }
+
+    #[test]
     fn prefill_norm_rms_pairs_a_norm_residual_with_the_rmsnorm_reading_it() {
         let make = || {
             let (mut g, _) = fixture(128);
@@ -3475,6 +3576,8 @@ mod tests {
                         input_bytes: u64::from(batch) * 5120 * 2,
                         weight_bytes: 48 * 5120 * 2,
                         block: false,
+                        unit: false,
+                        tensor: false,
                     }),
                     None,
                 ]
@@ -3578,6 +3681,46 @@ mod tests {
                 assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
             }
         }
+    }
+
+    #[test]
+    fn fp8_unit_scale_prefill_is_sm12x_scale_free_and_mode_checked() {
+        for rows in [128, 1024, 4096, 8192] {
+            for &(n, k) in &plow_asset::segment_roles::CUBLASLT_PREFILL_QWEN3_8_27B_SHAPES {
+                let (mut program, mut tensors) = prefill_fixture(rows, n, k);
+                program.insts[1].op = DevOp::GemmFp8 as u16;
+                program.insts[1].i[5] = packet::dev::FP8_UNIT_SCALE;
+                tensors[1].bytes /= 2;
+                tensors[2].bytes /= 2;
+                for profile in ["sm120", "sm_121a"] {
+                    let route = prefill_segments(&program, &tensors, &roles(), profile).unwrap()[1]
+                        .unwrap();
+                    assert!(route.unit && !route.block);
+                    assert_eq!((route.m, route.n, route.k), (rows, n, k));
+                    assert_eq!(route.output_bytes, u64::from(rows) * u64::from(n) * 2);
+                }
+                assert!(prefill_segments(&program, &tensors, &roles(), "sm90a").is_err());
+                // Scale operands are the RowColScale's, never the matmul's.
+                program.insts[1].t[3] = 0;
+                assert!(prefill_segments(&program, &tensors, &roles(), "sm120").is_err());
+                program.insts[1].t[3] = packet::dev::TENSOR_NONE16;
+                for mode in [2, 64, 129] {
+                    program.insts[1].i[5] = mode;
+                    assert!(prefill_segments(&program, &tensors, &roles(), "sm120").is_err());
+                }
+                program.insts[1].i[5] = packet::dev::FP8_UNIT_SCALE;
+                program.insts[1].t[2] = program.insts[1].t[1];
+                assert!(prefill_segments(&program, &tensors, &roles(), "sm120").is_err());
+            }
+        }
+        // Unit scales are a prefill contract: a decode projection refuses them.
+        let (mut program, mut tensors) = prefill_fixture(32, 17408, 5120);
+        program.insts[1].op = DevOp::GemmFp8 as u16;
+        program.insts[1].i[5] = packet::dev::FP8_UNIT_SCALE;
+        program.insts[1].i[6..].fill(0);
+        tensors[1].bytes /= 2;
+        tensors[2].bytes /= 2;
+        assert!(decode_segments(&program, &tensors, &roles()).is_err());
     }
 
     #[test]

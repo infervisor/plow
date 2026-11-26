@@ -42,6 +42,10 @@ typedef struct {
     double      l2_bw_gbps;       /* L2 partition BW / CUs_per_partition */
     /* Derived */
     double      ridge_flops_per_byte; /* peak_tflops / hbm_bw => ridge point */
+    /* Low-precision matrix and shared-memory ceilings (0 = not recorded) */
+    double      peak_tflops_fp8;
+    double      peak_tflops_fp4;
+    double      smem_bw_gbps;
 } BenchSpec;
 
 /* Pre-built specs. */

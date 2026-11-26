@@ -326,7 +326,8 @@ def cmd_nv_block_ab(a: argparse.Namespace) -> None:
     import nv_block_ab
 
     env = dict(kv.split("=", 1) for kv in (a.env or []))
-    out = nv_block_ab.prepare(a.control, a.treatment, a.block_run, a.plowrt, a.out, a.verb, a.args, env, a.note)
+    out = nv_block_ab.prepare(a.control, a.treatment, a.block_run, a.plowrt, a.out, a.verb, a.args, env, a.note,
+                              a.control_block_run)
     score = [sys.executable, str(REPO / "scripts/campaign/nv_block_ab.py"), "score", str(out)]
     for flag, value in (("--ceilings", a.ceilings), ("--router-table", a.router_table)):
         if value:
@@ -382,7 +383,7 @@ def cmd_serve_bench(a: argparse.Namespace) -> None:
     env.update(dict(item.split("=", 1) for item in (a.env or [])))
     env.update(PB_VLLM=str(out / "vllm029-client.sh"), PB_TOKENIZER=str(raw),
                PB_SEED=str(bench.get("seed", 8193)), HSA_DISABLE_COREDUMP_ON_EXCEPTION="1")
-    doctor_env = dict(os.environ, **env, PB_VLLM_ROCM_LIB=os.environ["ROCM_PATH"] + "/lib")
+    doctor_env = dict(os.environ, **env, PB_VLLM_ROCM_LIB=os.environ.get("ROCM_PATH", "") + "/lib")
     rc = run([str(REPO / "scripts/bench/plowbench-doctor.sh"), str(out / "assets"),
               str(out / "objects"), str(out / "plowrt"), cell["arch"]], doctor_env, out / "doctor.log")
     if rc not in (0, 2):
@@ -2409,6 +2410,8 @@ def main() -> None:
     nb.add_argument("--args", required=True, help='block_run arguments, e.g. "--batch 1,8 --ctx 4096 --iters 200"')
     nb.add_argument("--env", action="append", metavar="K=V", help="exported for every arm; recorded")
     nb.add_argument("--block-run", default=str(Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release/examples/block_run"))
+    nb.add_argument("--control-block-run", help="production block_run for the control arms (a runtime "
+                    "candidate: same packet, --block-run is the candidate binary)")
     nb.add_argument("--plowrt", default=str(Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target")) / "release/plowrt"),
                     help="plowrt used for the treatment packet's disassembly (floor)")
     nb.add_argument("--ceilings", help="calibrate_ceilings.py output (else registry, marked NOT calibrated)")

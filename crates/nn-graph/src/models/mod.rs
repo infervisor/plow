@@ -18,6 +18,7 @@ mod kimi;
 mod kimi_k3;
 mod llama;
 mod muse_spark;
+mod nemotron_h;
 mod qwen3;
 mod qwen3_5;
 mod qwen3_asr;
@@ -79,6 +80,7 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
         ModelConfig::KimiK3(c) => kimi_k3::build(c)?,
         ModelConfig::Llama(c) => llama::build(c),
         ModelConfig::MuseSpark(c) => muse_spark::build(c),
+        ModelConfig::NemotronH(c) => nemotron_h::build(c),
         ModelConfig::Qwen3(c) => qwen3::build(c),
         ModelConfig::Qwen3Asr(c) => qwen3_asr::build(c),
         ModelConfig::Qwen35(c) => qwen3_5::build(c),
@@ -132,6 +134,7 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::Glm(_) => "glm",
                 ModelConfig::Kimi(_) => "kimi",
                 ModelConfig::MuseSpark(_) => "muse_spark",
+                ModelConfig::NemotronH(_) => "nemotron_h",
                 ModelConfig::KimiK3(_) => "kimi_k3",
                 ModelConfig::DeepSeek(_) => "deepseek",
                 ModelConfig::DeepSeekV4(_) => "deepseek_v4",

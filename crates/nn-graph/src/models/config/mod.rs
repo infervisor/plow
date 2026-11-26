@@ -18,6 +18,7 @@ mod kimi;
 mod kimi_k3;
 mod llama;
 mod muse_spark;
+mod nemotron_h;
 mod qwen3;
 mod qwen3_5;
 mod qwen3_asr;
@@ -50,6 +51,10 @@ pub use llama::LlamaConfig;
 pub use muse_spark::{
     MuseSparkConfig, MuseSparkQuantizationConfig, MuseSparkRopeParameters, MUSE_SPARK_MXFP4_GROUP,
     MUSE_SPARK_RESIDUAL_GATE_EPS,
+};
+pub use nemotron_h::{
+    ModeloptKvCacheScheme, ModeloptLayerQuant, NemotronHConfig, NemotronHLayer,
+    NemotronHLinearQuant, NemotronHQuantizationConfig, NEMOTRON_H_NVFP4_GROUP,
 };
 pub use qwen3::Qwen3Config;
 pub use qwen3_5::Qwen35Config;
@@ -90,6 +95,10 @@ pub enum ModelConfig {
     /// residuals, pooled 256-expert MoE. TEXT tower only (vLLM
     /// `--language-model-only`); vision/audio towers are not modeled.
     MuseSpark(MuseSparkConfig),
+    /// Nemotron-H (NVIDIA): Mamba-2 / NoPE GQA / latent relu² MoE hybrid, ModelOpt
+    /// FP8 + NVFP4. TEXT tower only; the omni wrapper's vision/sound towers and
+    /// the MTP draft layers are not modeled.
+    NemotronH(NemotronHConfig),
     /// Qwen3 / Qwen2.5: GQA + SwiGLU (dense).
     Qwen3(Qwen3Config),
     /// Qwen3-ASR: Audio encoder (2D conv + transformer) + Qwen3 thinker text decoder.
@@ -298,9 +307,11 @@ impl ModelConfig {
                  refusing generic attention/MoE lowering)"
                     .to_string(),
             )),
-            "nemotron_h" | "nemotron3" | "nemotron" => Err(ConfigError::Unsupported(format!(
-                "{mt} (Nemotron Mamba-2 hybrid is not implemented in the nn-graph packet path; \
-                 the devblob backend currently supports only explicit single-block emission)"
+            "nemotron_h_omni" => parse_nemotron_h_omni(&v),
+            "nemotron_h" => parse_nemotron_h(v, String::new(), Vec::new()),
+            "nemotron3" | "nemotron" => Err(ConfigError::Unsupported(format!(
+                "{mt} (only the Nemotron-H Mamba-2 hybrid, model_type nemotron_h / \
+                 nemotron_h_omni, is implemented)"
             ))),
             "snac" => Ok(ModelConfig::Snac(serde_json::from_value(v)?)),
             "chatterbox_s3gen" | "s3gen" => Ok(ModelConfig::S3Gen(serde_json::from_value(v)?)),
@@ -383,6 +394,53 @@ fn parse_muse_spark(
     Ok(ModelConfig::MuseSpark(cfg))
 }
 
+/// The omni wrapper nests the language model under `llm_config` (no
+/// `text_config` key on disk); its tensors live under `language_model.`.
+fn parse_nemotron_h_omni(v: &serde_json::Value) -> Result<ModelConfig, ConfigError> {
+    let llm_type = v
+        .get("llm_config")
+        .filter(|c| c.is_object())
+        .ok_or_else(|| ConfigError::Unsupported("nemotron_h_omni without llm_config".into()))?
+        .get("model_type")
+        .and_then(serde_json::Value::as_str);
+    if llm_type.is_some_and(|t| t != "nemotron_h") {
+        return Err(ConfigError::Unsupported(format!(
+            "nemotron_h_omni llm_config model_type {llm_type:?} (only nemotron_h)"
+        )));
+    }
+    let omitted = [
+        (
+            "vision_config",
+            "vision_config (RADIO vision tower + mlp1 projector)",
+        ),
+        (
+            "sound_config",
+            "sound_config (Parakeet sound encoder + projection)",
+        ),
+    ]
+    .into_iter()
+    .filter(|(k, _)| v.get(*k).is_some_and(|c| !c.is_null()))
+    .map(|(_, what)| what.to_string())
+    .collect();
+    parse_nemotron_h(
+        sub_config(v, "llm_config"),
+        "language_model.".into(),
+        omitted,
+    )
+}
+
+fn parse_nemotron_h(
+    v: serde_json::Value,
+    weight_prefix: String,
+    omitted: Vec<String>,
+) -> Result<ModelConfig, ConfigError> {
+    let mut cfg: NemotronHConfig = serde_json::from_value(v)?;
+    cfg.weight_prefix = weight_prefix;
+    cfg.omitted = omitted;
+    cfg.validate()?;
+    Ok(ModelConfig::NemotronH(cfg))
+}
+
 fn parse_glm5_next(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     let cfg: Glm5NextConfig = serde_json::from_value(v)?;
     cfg.validate()?;
@@ -452,6 +510,8 @@ fn model_type(v: &serde_json::Value) -> Option<String> {
         a if a.starts_with("Qwen3") => "qwen3",
         a if a.starts_with("Qwen2.5") => "qwen2_5",
         a if a.starts_with("MuseSpark") => "muse_spark",
+        a if a.starts_with("NemotronH_Omni") => "nemotron_h_omni",
+        a if a.starts_with("NemotronH") => "nemotron_h",
         a if a.starts_with("Siglip") => "siglip",
         a if a.starts_with("Qwen2_5_VL") => "qwen2_5_vl",
         a if a.starts_with("Qwen2VL") => "qwen2_vl",

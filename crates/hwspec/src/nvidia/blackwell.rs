@@ -168,3 +168,35 @@ pub const RTX_6000_PRO: GpuSpec = GpuSpec {
     clock_boost: Hertz::from_mhz(2617),
     soc: None,
 };
+
+/// GB10 (DGX Spark) — Grace-Blackwell superchip GPU, SM 12.1. Per-SM limits as GB202
+/// (measured: 101376 B opt-in smem/block, 100 KiB/SM, 1536 threads, 64K regs). The GPU
+/// shares one coherent LPDDR5X pool (256-bit, 8533 MT/s) with the Grace CPU: `capacity`
+/// is that whole pool, not a dedicated framebuffer. Cubins must target `sm_121a`
+/// (an `sm_120a` image does not load on 12.1). `soc` stays `None`: `SocSpec` drives CPU/ANE
+/// partitioning, which this part does not use; unified memory is detected from the device.
+pub const GB10: GpuSpec = GpuSpec {
+    name: "GB10",
+    vendor: Vendor::Nvidia,
+    arch: Arch::Blackwell,
+    compute_cap: (12, 1),
+    sm_count: 48,
+    sm: CONSUMER_BLACKWELL_SM,
+    dsm: None,
+    l2: Bytes::mib(24),
+    mem: MemorySpec {
+        kind: MemKind::Lpddr5x,
+        capacity: Bytes::gib(128),
+        bandwidth: GBps(273.0),
+        // Measured (calibrate_ceilings, 2026-11-21): bf16 read-reduce over 8 GiB, median of 30
+        // (copy: 242 GB/s).
+        bandwidth_measured: Some(GBps(238.0)),
+        bus_width_bits: 256,
+    },
+    copy_engines: 2,
+    interconnect: None,
+    chiplet: None,
+    l2_partitioning: None,
+    clock_boost: Hertz::from_mhz(2418),
+    soc: None,
+};

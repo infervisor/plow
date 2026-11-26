@@ -128,6 +128,12 @@ impl Manifest {
             // Qwen3.5: the KV writer's per-row slot table, the conv prefill's request table.
             Some(DevOp::QwenHeadNormRope) => d.t[7] = slot,
             Some(DevOp::QwenGdnConvPrefill) => d.t[5] = request,
+            // Nemotron-H: the Mamba-2 prefill chain walks each request's rows from its slot's
+            // conv history and SSM state (op_mamba_pf.cuh), the request table in t7.
+            Some(DevOp::Mamba2Conv) if d.i[4] != 0 => d.t[7] = request,
+            Some(DevOp::Mamba2ChunkState | DevOp::Mamba2ChunkPass | DevOp::Mamba2ChunkOut) => {
+                d.t[7] = request
+            }
             Some(DevOp::FlashPrefill) => {
                 d.t[6] = request;
                 for map in &self.maps {
@@ -318,6 +324,7 @@ impl Manifest {
         for (pi, g) in p.programs.iter().enumerate() {
             let mut flash_sites = 0usize;
             let mut slot_writers = 0usize;
+            let mut mamba_sites = 0usize;
             if pi < p.prefill_count {
                 need(
                     self.programs[pi] == live_kv::program_digest(g),
@@ -436,12 +443,21 @@ impl Manifest {
                 if op == DevOp::QwenGdnConvPrefill {
                     need(d.t[5] == TENSOR_NONE16, "existing request table")?;
                 }
+                if matches!(
+                    op,
+                    DevOp::Mamba2ChunkState | DevOp::Mamba2ChunkPass | DevOp::Mamba2ChunkOut
+                ) || (op == DevOp::Mamba2Conv && d.i[4] != 0)
+                {
+                    need(d.t[7] == TENSOR_NONE16, "existing Mamba-2 request table")?;
+                    mamba_sites += 1;
+                }
             }
             if pi < p.prefill_count {
                 need(
                     flash_sites > 0 && slot_writers > 0,
                     "request-aware attention and KV writer required",
                 )?;
+                need(mamba_sites % 4 == 0, "Mamba-2 prefill chain incomplete")?;
             }
         }
         Ok(())
@@ -887,6 +903,43 @@ mod tests {
                 .unwrap_err()
                 .contains("duplicate")
         );
+    }
+
+    #[test]
+    fn mamba2_prefill_chain_binds_the_request_table_at_t7() {
+        let manifest = Manifest {
+            version: 1,
+            max_request_rows: Some(1024),
+            stage_rows: None,
+            stages: Vec::new(),
+            slot: 40,
+            request: 41,
+            maps: vec![],
+            programs: vec![],
+        };
+        let inst = |op: DevOp, prefill: u32| {
+            let mut d = DevInst64 {
+                op: op as u16,
+                t: [TENSOR_NONE16; 8],
+                ..Default::default()
+            };
+            d.i[4] = prefill;
+            d
+        };
+        for (op, prefill, bound) in [
+            (DevOp::Mamba2Conv, 1, true),
+            (DevOp::Mamba2Conv, 0, false),
+            (DevOp::Mamba2ChunkState, 0, true),
+            (DevOp::Mamba2ChunkPass, 0, true),
+            (DevOp::Mamba2ChunkOut, 0, true),
+            (DevOp::Mamba2GatedNorm, 0, false),
+        ] {
+            let mut d = inst(op, prefill);
+            manifest.bind_request(&mut d, true);
+            assert_eq!(d.t[7], if bound { 41 } else { TENSOR_NONE16 }, "{op:?}");
+            manifest.bind_request(&mut d, false);
+            assert_eq!(d.t[7], TENSOR_NONE16, "{op:?}");
+        }
     }
 
     #[test]

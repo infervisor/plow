@@ -509,7 +509,7 @@ fn prefix_share_layout(model: &CpuModel, batch: usize) -> (Vec<(usize, u32, u32,
     let mut kv: Vec<(usize, u32, u32, usize)> = Vec::new();
     for c in &m.caches {
         let identity = c.mask == u32::MAX || (c.stride.is_power_of_two() && c.mask == c.stride - 1);
-        if c.scales.is_some() || !identity {
+        if c.elem_bytes() != 2 || !identity {
             return (Vec::new(), 0);
         }
         let row = c.hd as usize * 2;

@@ -31,6 +31,17 @@ class FloorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no decode rung B=8"):
             block_roofline.decode_floor(self.progs, 8, 4096, CEIL, 2, 2, None)
 
+    def test_decode_between_rungs_prices_real_rows_on_the_covering_rung(self):
+        progs = block_roofline.op_roof.parse(DISASM.replace("program T=1  3 insts", "program T=1  3 insts").replace(
+            "===== program T=1  3 insts", "===== program T=4  3 insts").replace("M=1 ", "M=4 ").replace("n_batch=1", "n_batch=4"))
+        real, pad, rung, _ = block_roofline.padded_decode_floor(progs, 3, 4096, CEIL, 2, 2, None)
+        full, _ = block_roofline.decode_floor(progs, 4, 4096, CEIL, 2, 2, None)
+        self.assertEqual(rung, 4)
+        self.assertAlmostEqual(real + pad, full)
+        self.assertGreater(pad, 0)
+        with self.assertRaisesRegex(ValueError, "no decode rung B=5"):
+            block_roofline.padded_decode_floor(progs, 5, 4096, CEIL, 2, 2, None)
+
     def test_packed_attention_is_charged_per_request_at_its_prefix(self):
         one, _, _ = block_roofline.packed_floor(self.progs, 1, 64, 4096, 0, 0, CEIL, 2, 2, None)
         two, _, _ = block_roofline.packed_floor(self.progs, 2, 64, 4096, 0, 0, CEIL, 2, 2, None)
@@ -67,6 +78,8 @@ class FloorTests(unittest.TestCase):
                                          plow, current, {}, CEIL, 2, 2, None)
         self.assertEqual([r["point"] for r in rows], ["decode B=1, ctx 4096",
                                                   "prefill 1x64 rows, prior 0 (bucket 128: 64 pad rows, +0.001 ms floor)"])
+        self.assertEqual([r["phase"] for r in rows], ["decode", "prefill"])
+        self.assertAlmostEqual(rows[0]["efficiency"], rows[0]["floor_ms"] / 0.1)
         text = block_roofline.table(rows)
         self.assertIn("| L3 full_attn+dense_ffn, decode B=1, ctx 4096 | 0.100 ms |", text)
         self.assertIn("-0.025 ms (-20.0%)", text)
@@ -109,6 +122,25 @@ class AbTests(unittest.TestCase):
             (root / "treat2" / "sweep.json").write_text(json.dumps(bad))
             with self.assertRaisesRegex(ValueError, "treat2: measured packet"):
                 nv_block_ab.score(root)
+
+    def test_runtime_candidate_control_arms_run_the_control_binary(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            for name in ("control", "treatment"):
+                (root / name).mkdir()
+                (root / name / "model.pkt").write_bytes(b"same")
+                (root / name / "block.json").write_text("{}")
+            for name in ("new", "old", "plowrt"):
+                (root / name).write_bytes(name.encode())
+            out = nv_block_ab.prepare(root / "control", root / "treatment", root / "new", root / "plowrt",
+                                      root / "ab", "bench", "--batch 1", {}, "runtime", root / "old")
+            run = (out / "run.sh").read_text().splitlines()
+            ctl = next(l for l in run if "ctl.log" in l)
+            treat = next(l for l in run if "treat.log" in l)
+            self.assertIn(str(out / "block_run_control"), ctl)
+            self.assertTrue(treat.startswith(str(out / "block_run") + " "))
+            self.assertEqual(nv_block_ab.arm_binary(out, "ctl2").read_bytes(), b"old")
+            self.assertEqual(nv_block_ab.arm_binary(out, "treat2").read_bytes(), b"new")
 
 
 if __name__ == "__main__":

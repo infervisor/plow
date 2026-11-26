@@ -57,9 +57,11 @@ pub use builder::Nn;
 pub use dim::{Dim, SymId, SymbolTable};
 pub use dtype::DType;
 pub use graph::{
-    ExpertLayerBinding, ExpertProjectionBinding, Graph, GraphBuilder, Node, NodeId, Origin,
-    RoutedExpertBinding, TensorId, TensorInfo, WeightSpec,
+    ExpertLayerBinding, ExpertProjectionBinding, Graph, GraphBuilder, LinearQuantFormat, Node,
+    NodeId, Origin, QuantLinearBinding, RoutedExpertBinding, TensorId, TensorInfo, WeightSpec,
 };
 pub use infer::{infer_shapes, InferError};
-pub use op::{ActKind, EwKind, LinearAttnKind, MoeGroups, MoeScoring, Op, PadMode, ReduceKind};
+pub use op::{
+    ActKind, EwKind, LinearAttnKind, MoeExpertAct, MoeGroups, MoeScoring, Op, PadMode, ReduceKind,
+};
 pub use shape::Shape;

@@ -343,6 +343,18 @@ async fn chat_completions_with(
     // it (accept, read, JSON decode) is axum's and shows up as UNACCOUNTED.
     let t_arrive = std::time::Instant::now();
     crate::obs::ttft::reset();
+    // Route to the per-model muxer. Tokens stream back as `StreamChunk`s over
+    // an mpsc — the muxer produces one per generated token, ending with `Done`.
+    // A data-parallel model picks its rank after tokenizing (the prefix probe needs the ids).
+    let dp = state.dp_set(&req.model);
+    let direct = if dp.is_some() {
+        None
+    } else {
+        state.mux(&req.model)
+    };
+    // Counted from here, before the template and the tokenizer: a cold-start hold waits for the
+    // rest of a burst while it is still rendering (`ModelMux::ingress`).
+    let ingress = direct.as_ref().map(|m| m.ingress());
 
     // Models served by the GPU engine get their real chat template (the
     // tokenizer resolves the markers through `added_tokens`); the CPU
@@ -511,22 +523,12 @@ async fn chat_completions_with(
         }
     };
 
-    // Route to the per-model muxer. Tokens stream back as `StreamChunk`s over
-    // an mpsc — the muxer produces one per generated token, ending with `Done`.
-    // A data-parallel model picks its rank after tokenizing (the prefix probe needs the ids).
-    let dp = state.dp_set(&req.model);
-    let direct = if dp.is_some() {
-        None
-    } else {
-        state.mux(&req.model)
-    };
     let (true, Ok(bundle)) = (
         dp.is_some() || direct.is_some(),
         state.registry.get(&req.model),
     ) else {
         return crate::serve::models::unrouted(&state, &req.model);
     };
-    let ingress = direct.as_ref().map(|m| m.ingress());
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
     // The packet's reasoning markers (`<think>` for a legacy packet): the splitter's own
