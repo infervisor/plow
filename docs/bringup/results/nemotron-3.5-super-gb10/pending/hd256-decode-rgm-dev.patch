@@ -1,0 +1,1084 @@
+diff -ruN '--exclude=target' '--exclude=.git' -x step_bench.rs ctl-tree/crates/devgen/src/knob_spec.rs /home/ifv/plow-hd256/crates/devgen/src/knob_spec.rs
+--- ctl-tree/crates/devgen/src/knob_spec.rs	2026-11-25 01:12:00.870338987 +0000
++++ /home/ifv/plow-hd256/crates/devgen/src/knob_spec.rs	2026-11-25 00:55:34.075976644 +0000
+@@ -2356,6 +2356,7 @@
+     KnobSpec::new("def.PLOW_NV_MAMBA_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_MAMBA_SCAN_FUSE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_FA2_PF128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
++    KnobSpec::new("def.PLOW_NV_FA2_PF256", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_W4A4_BM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_W4A4_STAGES64", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_W4A4_V2", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+diff -ruN '--exclude=target' '--exclude=.git' -x step_bench.rs ctl-tree/crates/devgen/src/manifest.rs /home/ifv/plow-hd256/crates/devgen/src/manifest.rs
+--- ctl-tree/crates/devgen/src/manifest.rs	2026-11-25 01:12:00.869338982 +0000
++++ /home/ifv/plow-hd256/crates/devgen/src/manifest.rs	2026-11-25 01:08:47.084286277 +0000
+@@ -498,6 +498,9 @@
+     /// A prefill `FlashPrefill` in the FA2 hd128 body's contract (op_flash_pf128.cuh): hd 128,
+     /// window 0, nsplit 1, fused epilogue (t5).
+     pf_flash_fa2: bool,
++    /// A prefill `FlashPrefill` in the FA2 hd256 body's contract (op_flash_pf256.cuh): hd 256,
++    /// single request (no packed table in t6, no encoder span in i7).
++    pf_flash_fa2_hd256: bool,
+ }
+ 
+ /// Was this opcode emitted anywhere in the packet?
+@@ -601,6 +604,11 @@
+                         && !decode
+                         && inst.i[5..8] == [0, 128, 1]
+                         && inst.t[5] != packet::TENSOR_NONE;
++                    s.pf_flash_fa2_hd256 |= op == DevOp::FlashPrefill
++                        && !decode
++                        && inst.i[6] == 256
++                        && inst.i[7] >> 16 == 0
++                        && inst.t[6] == packet::TENSOR_NONE;
+                     s.hd.insert(inst.i[6]);
+                     s.kv_heads.insert(inst.i[3]);
+                     s.kv_dtype
+@@ -1164,6 +1172,13 @@
+     }
+ }
+ 
++/// sm_12x hd256 decode with a whole GQA group per work item: the group fits the 8 real rows of
++/// the mma item's m16 tile (op_attention.cuh `fa_decode_rgm_item`) and is a `PLOW_NV_FA_GF_HD256`
++/// value. The emitter sizes the decode nsplit for one item per (row, KV head).
++pub(crate) fn sm12x_kv_head_decode(isa: IsaLevel, hd: u32, gqa: u32) -> bool {
++    isa.is_sm12x() && hd == 256 && matches!(gqa, 4 | 6)
++}
++
+ /// Performance constants derived by RULE from the shapes, never hardcoded. Both
+ /// rules below are measured, and both correspond to a failure that has happened:
+ ///
+@@ -1245,6 +1260,12 @@
+     {
+         t.insert("fa2_pf128".into(), json!(1));
+     }
++    // * `fa2_pf256`: the same for the hd256 sites (op_flash_pf256.cuh: split-D warp pairs, causal or
++    //   window, any nsplit; packed requests keep d_flash_prefill). Measured on the Qwen3.8-27B GB10
++    //   8192-row chunk (nemotron-3.5-super-gb10/comparison.md "hd256 attention").
++    if IsaLevel::arch_is_sm12x(arch) && s.pf_flash_fa2_hd256 && s.max_chunk >= 1024 {
++        t.insert("fa2_pf256".into(), json!(1));
++    }
+     // TILE PROVENANCE. Written because its absence made a real regression unauditable: for
+     // several days every AMD compile selected GEMM tiles from the ANALYTICAL MODEL (both tuning
+     // cells were wholly stale against the current build digest) and nothing in the emitted
+@@ -1588,6 +1609,18 @@
+     if sm90a && s.gqa_hd256 != u32::MAX && s.gqa_hd256 % 4 == 0 && s.gqa_hd256 > 0 {
+         t.insert("gf256".into(), json!(4));
+     }
++    // * `fa_rgm` + `gf256` = the GQA group (sm_12x, hd256-only packets, bf16 KV): decode attention
++    //   on the row-group mma item with one work item per (row, KV head), so each KV byte is read
++    //   once per step instead of gqa / 2 times on the GF 2 tile body (`sm12x_kv_head_decode`).
++    if IsaLevel::from_arch_flag(arch).is_some_and(|isa| sm12x_kv_head_decode(isa, 256, s.gqa_hd256))
++        && s.hd.iter().all(|&h| h == 256)
++        && s.kv_dtype.get(&256) != Some(&"e4m3")
++    {
++        t.insert("fa_rg".into(), json!(1));
++        t.insert("fa_rg_wide".into(), json!(1));
++        t.insert("fa_rgm".into(), json!(1));
++        t.insert("gf256".into(), json!(s.gqa_hd256));
++    }
+     if s.full_kv_heads == 1 && s.gqa > 0 {
+         // The template is instantiated at 1|2|4|8; 16 (the whole Gemma-4-12B group, one K/V
+         // stream for all 16 heads) only when the emit asks for it, on the wide-reduction arm.
+@@ -3816,6 +3849,11 @@
+                 "#if PLOW_NV_PREFILL && !PLOW_NV_SPEECH\n#ifndef PLOW_NV_FA2_PF128\n#define PLOW_NV_FA2_PF128 1\n#endif\n#endif\n",
+             );
+         }
++        if t.get("fa2_pf256").is_some() {
++            out.push_str(
++                "#if PLOW_NV_PREFILL && !PLOW_NV_SPEECH\n#ifndef PLOW_NV_FA2_PF256\n#define PLOW_NV_FA2_PF256 1\n#endif\n#endif\n",
++            );
++        }
+         if let Some(v) = t.get("gf256").and_then(Value::as_u64) {
+             out.push_str(&format!(
+                 "#ifndef PLOW_NV_FA_GF_HD256\n#define PLOW_NV_FA_GF_HD256 {v}\n#endif\n"
+@@ -3863,6 +3901,15 @@
+         if t.get("fa_rg_wide").is_some() {
+             out.push_str("#ifndef PLOW_NV_FA_RG_WIDE\n#define PLOW_NV_FA_RG_WIDE 1\n#endif\n");
+         }
++        // sm_90a emits `fa_rgm` with its decode set below; sm_12x carries it for the hd256 item.
++        if t.get("fa_rgm").is_some()
++            && manifest
++                .get("arch")
++                .and_then(Value::as_str)
++                .is_some_and(IsaLevel::arch_is_sm12x)
++        {
++            out.push_str("#ifndef PLOW_NV_FA_RGM\n#define PLOW_NV_FA_RGM 1\n#endif\n");
++        }
+         if let Some(u) = t.get("fa_rg_u").and_then(Value::as_u64) {
+             out.push_str(&format!(
+                 "#ifndef PLOW_NV_FA_RG_U\n#define PLOW_NV_FA_RG_U {u}\n#endif\n"
+@@ -4150,15 +4197,48 @@
+         for arch in ["sm_90a", "sm_89"] {
+             assert!(!tuning(&shapes, arch).contains_key("fa2_pf128"));
+         }
++        assert!(!tune.contains_key("fa2_pf256"));
++        shapes.pf_flash_fa2_hd256 = true;
++        let tune = tuning(&shapes, "sm_121a");
++        assert_eq!(tune.get("fa2_pf256"), Some(&json!(1)));
++        let header = config_header(&json!({"arch": "sm_121a", "tuning": tune}));
++        assert!(header.contains("#if PLOW_NV_PREFILL && !PLOW_NV_SPEECH\n#ifndef PLOW_NV_FA2_PF256\n"));
++        assert!(!tuning(&shapes, "sm_90a").contains_key("fa2_pf256"));
+         shapes.gqa = 2;
+         shapes.max_chunk = 512;
+         let tune = tuning(&shapes, "sm_120a");
+         assert!(!tune.contains_key("fa_rg") && !tune.contains_key("fa2_pf128"));
++        assert!(!tune.contains_key("fa2_pf256"));
+         assert_eq!(crate::hybrid_decode_gf(16, 128, false), 4);
+         assert_eq!(crate::hybrid_decode_gf(16, 128, true), 16);
+         assert_eq!(crate::hybrid_decode_gf(6, 256, false), 2);
+     }
+ 
++    /// sm_12x hd256-only packets with a GQA-6 group decode one item per KV head on the mma item.
++    #[test]
++    fn sm12x_hd256_decode_takes_the_kv_head_mma_item() {
++        let _guard = held_env();
++        let mut shapes = Shapes::default();
++        shapes.hd.insert(256);
++        shapes.gqa_hd256 = 6;
++        shapes.kv_dtype.insert(256, "bf16");
++        let tune = tuning(&shapes, "sm_121a");
++        assert_eq!((tune.get("fa_rgm"), tune.get("gf256")), (Some(&json!(1)), Some(&json!(6))));
++        assert_eq!((tune.get("fa_rg"), tune.get("fa_rg_wide")), (Some(&json!(1)), Some(&json!(1))));
++        let header = config_header(&json!({"arch": "sm_121a", "tuning": tune}));
++        assert!(header.contains("#ifndef PLOW_NV_FA_RGM\n#define PLOW_NV_FA_RGM 1\n"));
++        assert!(header.contains("#define PLOW_NV_FA_GF_HD256 6\n"));
++        assert!(!tuning(&shapes, "sm_90a").contains_key("fa_rgm"));
++        shapes.kv_dtype.insert(256, "e4m3");
++        assert!(!tuning(&shapes, "sm_121a").contains_key("fa_rgm"));
++        shapes.kv_dtype.insert(256, "bf16");
++        shapes.hd.insert(512);
++        assert!(!tuning(&shapes, "sm_121a").contains_key("fa_rgm"));
++        assert!(sm12x_kv_head_decode(IsaLevel::Sm121a, 256, 4));
++        assert!(!sm12x_kv_head_decode(IsaLevel::Sm121a, 256, 2));
++        assert!(!sm12x_kv_head_decode(IsaLevel::Sm90a, 256, 6));
++    }
++
+     #[test]
+     fn fp8_tc64_is_an_explicit_wide_object_request() {
+         let _guard = held_env();
+diff -ruN '--exclude=target' '--exclude=.git' -x step_bench.rs ctl-tree/crates/devgen/src/qwen35.rs /home/ifv/plow-hd256/crates/devgen/src/qwen35.rs
+--- ctl-tree/crates/devgen/src/qwen35.rs	2026-11-25 01:12:00.869853720 +0000
++++ /home/ifv/plow-hd256/crates/devgen/src/qwen35.rs	2026-11-25 01:09:10.139411571 +0000
+@@ -1081,14 +1081,25 @@
+                     crate::gen_kernels::parse(list)
+                         .is_ok_and(|entries| entries.iter().any(|(e, _)| e.decode))
+                 });
++        // sm_12x prefill with a 64-row query tile per SM already (tiles x heads >= SMs): one split
++        // with the bf16 epilogue fused (t5 = at, no FlashMerge), as the generated role does. No
++        // f32 partials go out and back, and the causal tiles balance over the blocks.
++        let fused_pf = self.prefill
++            && !gen_attention
++            && c.isa.is_sm12x()
++            && self.batch.div_ceil(64) * c.heads >= self.b.n_cu();
+         // HD256 uses the slide GF selector in the Hopper interpreter even for full attention.
+-        let ns = if gen_attention {
++        let ns = if gen_attention || fused_pf {
+             1
+         } else if self.prefill {
+             self.b
+                 .n_cu()
+                 .div_ceil(self.batch.div_ceil(64) * c.heads)
+                 .max(2)
++        } else if crate::manifest::sm12x_kv_head_decode(c.isa, c.hd, c.heads / c.kv_heads) {
++            // one work item per (row, KV head): complete waves over the SMs
++            let items = self.batch * c.kv_heads;
++            self.b.n_cu() / crate::gcd(items, self.b.n_cu())
+         } else {
+             let fallback = self.b.n_cu().div_ceil(c.heads / 2).max(1);
+             let ns = crate::attention_decode_ns(
+@@ -1127,7 +1138,7 @@
+         let da = if self.prefill {
+             self.b.emit(DevOp::FlashPrefill, self.b.all(), &[dv], |d| {
+                 d.t[..5].copy_from_slice(&[opart, mlpart, q, kc, vc]);
+-                if gen_attention {
++                if gen_attention || fused_pf {
+                     d.t[5] = at;
+                 }
+                 if let Some(h) = fa_tm {
+@@ -1159,6 +1170,8 @@
+         let dm = if gen_attention {
+             self.b.isolate(da);
+             da
++        } else if fused_pf {
++            da
+         } else {
+             self.b.emit(
+                 DevOp::FlashMerge,
+@@ -1177,7 +1190,9 @@
+                     || emit_config::active().attention_pf_role))
+         {
+             self.b.isolate(da);
+-            self.b.isolate(dm);
++            if dm != da {
++                self.b.isolate(dm);
++            }
+         }
+         let dg = self
+             .b
+@@ -4547,6 +4562,23 @@
+         let man = manifest::build(&m, "sm_121a", &LeanReport::skipped("fixture"));
+         assert_eq!(man["features"]["w8a8"], true);
+         assert_eq!(man["features"]["fp8_gemv"], true);
++        // Attention: one fused split per prefill chunk (no FlashMerge), decode split for one item
++        // per (row, KV head) in complete waves over the 48 SMs.
++        for g in &m.progs[..2] {
++            assert!(!g.insts.iter().any(|d| d.op == DevOp::FlashMerge as u16));
++            for d in g.insts.iter().filter(|d| d.op == DevOp::FlashPrefill as u16) {
++                assert_eq!((d.i[6], d.i[7]), (256, 1));
++                assert_eq!(m.tensors[d.t[5] as usize].name, "act.at");
++            }
++        }
++        for (g, ns) in m.progs[2..].iter().zip([12, 3]) {
++            let flash = g.insts.iter().find(|d| d.op == DevOp::FlashDecode as u16).unwrap();
++            assert_eq!(flash.i[5], ns);
++            assert!(g.insts.iter().any(|d| d.op == DevOp::FlashMerge as u16 && d.i[2] == ns));
++        }
++        assert_eq!(man["tuning"]["fa2_pf256"], 1);
++        assert_eq!(man["tuning"]["fa_rgm"], 1);
++        assert_eq!(man["tuning"]["gf256"], 6);
+     }
+ 
+     #[test]
+diff -ruN '--exclude=target' '--exclude=.git' -x step_bench.rs ctl-tree/runtime/nvidia/interp_sm120.cu /home/ifv/plow-hd256/runtime/nvidia/interp_sm120.cu
+--- ctl-tree/runtime/nvidia/interp_sm120.cu	2026-11-25 01:12:00.865338960 +0000
++++ /home/ifv/plow-hd256/runtime/nvidia/interp_sm120.cu	2026-11-25 04:56:25.533458885 +0000
+@@ -366,6 +366,7 @@
+ #include "op_mamba.cuh"      /* Nemotron-3 Mamba-2 SSD mixer (UNVERIFIED on GPU; nvcc-compile only) */
+ #include "op_mamba_pf.cuh"   /* its chunked-prefill bodies on tensor cores (prefill object, PLOW_NV_MAMBA_PF) */
+ #include "op_flash_pf128.cuh" /* hd128 causal prefill, FA2 body (PLOW_NV_FA2_PF128) */
++#include "op_flash_pf256.cuh" /* hd256 prefill, FA2 split-D body (PLOW_NV_FA2_PF256) */
+ #include "op_mamba_span.cuh" /* their speculative-verify span bodies (row-slot objects) */
+ #if PLOW_NV_NVFP4_MOE
+ #include "op_moe_nvfp4.cuh"  /* Nemotron-3.5 NVFP4 latent MoE (router, decode GEMV, grouped GEMM) */
+@@ -866,6 +867,11 @@
+ #ifndef PLOW_NV_FA2_PF128
+ #define PLOW_NV_FA2_PF128 0
+ #endif
++/* hd256 FlashPrefill on the FA2 split-D body (op_flash_pf256.cuh): prefill objects whose packet's
++ * tuning asks for it (`fa2_pf256`); packed requests and encoder spans keep d_flash_prefill. */
++#ifndef PLOW_NV_FA2_PF256
++#define PLOW_NV_FA2_PF256 0
++#endif
+ #ifndef PLOW_NV_DSA
+ #define PLOW_NV_DSA 1
+ #endif
+@@ -1078,8 +1084,15 @@
+ #define PLOW_NV_SLIDE_ARENA 0
+ #else
+ #define PLOW_NV_FULL_ARENA FA_DEC_SMEM_FLOATS(512, PLOW_NV_FA_GF_FULL)
++#if PLOW_SM12X && FA_DEC_RGM_TAKES(256, PLOW_NV_FA_GF_HD256)
++/* sm_12x: the hd256 mma item's warp rings join the launch claim only (PLOW_NV_ARENA_FLOATS0), so
++ * the base arena, and with it the GEMV staging capacity, stays what it was without them. */
++#define PLOW_NV_SLIDE_ARENA FA_DEC_SMEM_FLOATS1(256, PLOW_NV_FA_GF_HD256)
++#define FA_RGM256_LAUNCH_FLOATS FA_RGM_SMEM_FLOATS(256)
++#else
+ #define PLOW_NV_SLIDE_ARENA FA_DEC_SMEM_FLOATS(256, PLOW_NV_FA_GF_HD256)
+ #endif
++#endif
+ /* MLA latent decode (P1/P2). The GF ladder instantiates GF={2,4,8} unconditionally (GF=8 is the
+  * emitter default for ctx>4096, 1.5-1.9x faster — P2 §7), so the arena must cover the GF=8 claim
+  * (MLA_DEC_SMEM_FLOATS(512,64,8) = 6416 f = 25.1 KiB). Still dwarfed by the DSA score tile. */
+@@ -1152,11 +1165,16 @@
+ #ifndef PLOW_NV_ARENA_MIN_BYTES
+ #define PLOW_NV_ARENA_MIN_BYTES 0
+ #endif
+-/* E4M3 FA2 prefill: the bf16 K/V ring plus one raw e4m3 tile. */
++/* E4M3 FA2 prefill: the bf16 K/V ring plus one raw e4m3 tile; hd256 FA2: its ring and score swap. */
+ #if PLOW_NV_FA2_PF128 && PLOW_NV_KV_E4M3
+-#define PLOW_NV_FA2_ARENA_BYTES FP2_SMEM8_BYTES
++#define PLOW_NV_FA2_ARENA128 FP2_SMEM8_BYTES
++#else
++#define PLOW_NV_FA2_ARENA128 0
++#endif
++#if PLOW_NV_FA2_PF256
++#define PLOW_NV_FA2_ARENA_BYTES (F256_SMEM_BYTES > PLOW_NV_FA2_ARENA128 ? F256_SMEM_BYTES : PLOW_NV_FA2_ARENA128)
+ #else
+-#define PLOW_NV_FA2_ARENA_BYTES 0
++#define PLOW_NV_FA2_ARENA_BYTES PLOW_NV_FA2_ARENA128
+ #endif
+ #define PLOW_NV_ARENA_FLOOR_BYTES                                                              \
+     (PLOW_NV_ARENA_MIN_BYTES > PLOW_NV_FA2_ARENA_BYTES ? PLOW_NV_ARENA_MIN_BYTES : PLOW_NV_FA2_ARENA_BYTES)
+@@ -1233,8 +1251,13 @@
+ #else
+ #define PLOW_NV_RG8S_ARENA_FLOATS 0u
+ #endif
+-#define PLOW_NV_ARENA_FLOATS0_                                                                \
++#ifndef FA_RGM256_LAUNCH_FLOATS
++#define FA_RGM256_LAUNCH_FLOATS 0u
++#endif
++#define PLOW_NV_ARENA_FLOATS0__                                                               \
+     (PLOW_NV_ARENA_FLOATS00 > PLOW_NV_K8_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS00 : PLOW_NV_K8_ARENA_FLOATS)
++#define PLOW_NV_ARENA_FLOATS0_                                                                \
++    (PLOW_NV_ARENA_FLOATS0__ > FA_RGM256_LAUNCH_FLOATS ? PLOW_NV_ARENA_FLOATS0__ : FA_RGM256_LAUNCH_FLOATS)
+ #define PLOW_NV_ARENA_FLOATS0                                                                 \
+     (PLOW_NV_ARENA_FLOATS0_ > PLOW_NV_RG8S_ARENA_FLOATS ? PLOW_NV_ARENA_FLOATS0_ : PLOW_NV_RG8S_ARENA_FLOATS)
+ #if PLOW_NV_SPEECH
+@@ -2030,6 +2053,16 @@
+             /* t7 (sm_90a TMA only): GEN_TMAP_KV_PAIR blob for the wgmma arm's K/V stager;
+              * TENSOR_NONE -> nullptr -> cp.async staging, packets stay byte-compatible. */
+             /* i7 = nsplit | span handle << 16 (an encoder's bidirectional rows; 0 = causal). */
++#if PLOW_NV_FA2_PF256
++            if (!TEN(6) && !(in->i[7] >> 16)) {
++                KV_ILV_TRAP();
++                d_flash_pf256((float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
++                              (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4),
++                              (__nv_bfloat16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3],
++                              in->i[4], in->i[5], in->i[7], in->fj[1].u, in->fj[2].u, in->fj[0].f,
++                              slice, nblk, arena);
++            } else
++#endif
+             d_flash_prefill_mux<256, 64, PLOW_NV_FA256_BKV>(
+                 (const int*)TEN(6), (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
+diff -ruN '--exclude=target' '--exclude=.git' -x step_bench.rs ctl-tree/runtime/nvidia/op_attention.cuh /home/ifv/plow-hd256/runtime/nvidia/op_attention.cuh
+--- ctl-tree/runtime/nvidia/op_attention.cuh	2026-11-25 01:12:00.867338971 +0000
++++ /home/ifv/plow-hd256/runtime/nvidia/op_attention.cuh	2026-11-25 10:54:54.682398847 +0000
+@@ -199,7 +199,10 @@
+      (GF) >= 2 && (GF) <= 4)
+ #define FA_DEC_RGM_TAKES(D, GF)                                                                \
+     (PLOW_NV_FA_RGM && PLOW_NV_FA_RG && ((D) == 128 || (PLOW_NV_FA_RG_WIDE && (D) == 256)) &&     \
+-     (GF) >= 2 && (GF) <= 4)
++     (GF) >= 2 && (GF) <= FA_RGM_GF_MAX(D))
++/* hd256 on the mma item takes a whole GQA group up to the 8 real rows of its m16 tile (Qwen3.8:
++ * 6 query heads per KV head, so each KV byte is read once per step). */
++#define FA_RGM_GF_MAX(D) ((D) == 256 ? 8 : 4)
+ #define FA_DEC_SMEM_FLOATS1(D, GF)                                                             \
+     (FA_DEC_RGT_TAKES(D, GF) && FA_RGT_SMEM_FLOATS(D) > FA_DEC_SMEM_FLOATS0(D, GF)            \
+          ? FA_RGT_SMEM_FLOATS(D)                                                               \
+@@ -1760,8 +1763,20 @@
+  * so O^T costs hd/16 x 4 f32 per lane. P is rounded to bf16 for the second product (as the
+  * prefill bodies do); scores, m, l and O stay f32. Same (Opart, mlpart) / fold contract. */
+ /* Stages per warp ring: ~128 KiB in flight per SM either way (4 x 4.3 KiB at hd128, 2 x 8.4 KiB at
+- * hd256); a third hd256 stage does not fit next to the interpreter's static smem. */
++ * hd256); a third hd256 stage does not fit next to the interpreter's static smem. sm_12x (99 KiB
++ * per block): half of that, 8 warps x 8.4 KiB in flight. */
++#if PLOW_SM12X
++#define FA_RGM_NSTG(D) ((D) <= 128 ? 2u : 1u)
++#else
+ #define FA_RGM_NSTG(D) ((D) <= 128 ? 4u : 2u)
++#endif
++/* Stage fill: 0 = one 512 B bulk copy per padded row; 1 = cp.async, 16 B per lane, each lane
++ * arriving on the stage barrier (count 32, .noinc); 2 = one bulk copy per K / V half (8 unpadded
++ * rows, split at a ring wrap). On sm_12x the per-request cost of the bulk engine held one SM at
++ * ~10 GB/s with 16 requests per stage. */
++#ifndef FA_RGM_STAGE
++#define FA_RGM_STAGE (PLOW_SM12X ? 2 : 0)
++#endif
+ #define FA_RGM_RB(D) ((unsigned)(D) * 2u + 16u)          /* padded smem row bytes */
+ #define FA_RGM_STAGE_BYTES(D) (16u * FA_RGM_RB(D))        /* 8 K rows + 8 V rows */
+ #define FA_RGM_FOLD_FLOATS(D) (((PLOW_NV_WARPS * ((D) + 2u)) + 31u) / 32u * 32u)
+@@ -1781,7 +1796,7 @@
+     if (lane == 0) {
+ #pragma unroll
+         for (int s = 0; s < FA_RGM_NSTG(D); s++)
+-            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(bars + 8u * s));
++            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bars + 8u * s), "r"(FA_RGM_STAGE == 1 ? 32u : 1u));
+         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+     }
+@@ -1822,7 +1837,8 @@
+     unsigned nlo, unsigned nhi, unsigned& pre) {
+     static_assert(D == 128 || D == 256, "rgm: hd128 / hd256");
+     static_assert(GF >= 1 && GF <= 8, "rgm: heads are the 8 real rows of the m16 tile");
+-    constexpr unsigned RB = FA_RGM_RB(D), SB = FA_RGM_STAGE_BYTES(D), NSTG = FA_RGM_NSTG(D);
++    constexpr unsigned RB = FA_RGM_STAGE == 2 ? D * 2u : FA_RGM_RB(D), SB = FA_RGM_STAGE_BYTES(D),
++                       NSTG = FA_RGM_NSTG(D);
+     constexpr int KS = D / 16, MT = D / 16;
+     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+     const unsigned gid = lane >> 2, tig = lane & 3u;
+@@ -1867,6 +1883,32 @@
+         const unsigned s = (seq + k) % NSTG;
+         const unsigned r0 = (cur ? wlo : nwlo) + j * 8u, nr = min(8u, (cur ? whi : nwhi) - r0);
+         const unsigned bar = bars + 8u * s;
++#if FA_RGM_STAGE == 2
++        if (lane == 0) {
++            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar),
++                         "r"(2u * nr * D * 2u) : "memory");
++            const __nv_bfloat16* kb = cur ? kbase : nkbase;
++            const __nv_bfloat16* vb = cur ? vbase : nvbase;
++            const unsigned kd = ring + s * SB, vd = kd + 8u * RB, p0 = r0 & kv_mask;
++            const unsigned n1 = (kv_mask != 0xFFFFFFFFu && p0 + nr > kv_mask + 1u) ? kv_mask + 1u - p0 : nr;
++            fa_rgt_bulk(kd, kb + (size_t)p0 * D, n1 * D * 2u, bar);
++            fa_rgt_bulk(vd, vb + (size_t)p0 * D, n1 * D * 2u, bar);
++            if (n1 < nr) {
++                fa_rgt_bulk(kd + n1 * D * 2u, kb, (nr - n1) * D * 2u, bar);
++                fa_rgt_bulk(vd + n1 * D * 2u, vb, (nr - n1) * D * 2u, bar);
++            }
++        }
++        __syncwarp();
++#elif FA_RGM_STAGE == 1
++        constexpr unsigned CPR = D / 8u; /* 16 B chunks per row */
++        for (unsigned i = lane; i < 2u * nr * CPR; i += 32u) {
++            const unsigned rr = i / CPR, c = i % CPR, v = rr >= nr, r = v ? rr - nr : rr;
++            const __nv_bfloat16* base = cur ? (v ? vbase : kbase) : (v ? nvbase : nkbase);
++            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(ring + s * SB + (v * 8u + r) * RB + c * 16u),
++                         "l"(base + (size_t)((r0 + r) & kv_mask) * D + c * 8u) : "memory");
++        }
++        asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(bar) : "memory");
++#else
+         if (lane == 0)
+             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar),
+                          "r"(2u * nr * D * 2u) : "memory");
+@@ -1877,6 +1919,7 @@
+             const __nv_bfloat16* base = cur ? (v ? vbase : kbase) : (v ? nvbase : nkbase);
+             fa_rgt_bulk(ring + s * SB + (v * 8u + r) * RB, base + src, D * 2u, bar);
+         }
++#endif
+     };
+     unsigned issued = pre;
+     auto top_up = [&](unsigned consumed) {
+@@ -2401,8 +2444,9 @@
+ #else
+                                     const FaNrf* __restrict__ nrf = nullptr) {
+ #endif
++    constexpr bool RGM8 = PLOW_NV_FA_RGM && D == 256; /* the mma item takes GF <= 8 at hd256 */
+     constexpr bool RG = PLOW_NV_FA_RG && (D == 128 || (PLOW_NV_FA_RG_WIDE && (D == 256 || D == 512))) &&
+-                        GF >= 2 && GF <= 4 && !FP8KV && !SZKV;
++                        GF >= 2 && GF <= (RGM8 ? 8 : 4) && !FP8KV && !SZKV;
+     /* The RG fold's [NGRP][D] + 2 * NGRP floats (fa_decode_rg_item: NGRP = warps * 32 / lanes
+      * per row) must fit the op's arena claim; hd512 GF2 wide RG needs 4112 of a 3088 claim. The
+      * FP8 twin guards this at its call site. */
+@@ -2580,6 +2624,7 @@
+                 continue;
+             }
+ #endif
++            if constexpr (GF <= 4) {
+ #if PLOW_NV_FA_RGT
+             fa_decode_rgt_item<D, GF>(Opart, mlpart, out, Q, kbase, vbase, b, n_head, h0, nsplit,
+                                       sp, lo, hi, kv_mask, scale, lds,
+@@ -2590,6 +2635,7 @@
+                                           sp, lo, hi, kv_mask, scale, lds,
+                                           merge_ctr ? merge_ctr + b * n_grp + hg : nullptr, kv_rs, qs);
+ #endif
++            }
+             continue;
+         }
+         /* FP8 KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bytes) + a PER-ROW f32 scale, in
+diff -ruN '--exclude=target' '--exclude=.git' -x step_bench.rs ctl-tree/runtime/nvidia/op_flash_pf256.cuh /home/ifv/plow-hd256/runtime/nvidia/op_flash_pf256.cuh
+--- ctl-tree/runtime/nvidia/op_flash_pf256.cuh	1970-01-01 00:00:00.000000000 +0000
++++ /home/ifv/plow-hd256/runtime/nvidia/op_flash_pf256.cuh	2026-11-25 00:53:20.740252023 +0000
+@@ -0,0 +1,256 @@
++/* Causal / sliding flash prefill at hd 256 for the sm_120 interpreter, FA2 form with split-D warp
++ * pairs. A 64-row item is 4 row groups x 2 D halves: warp w owns query rows 16 * (w & 3) .. +15
++ * and head dims 128 * (w >> 2) .. +127. Each warp keeps its half of Q as mma A fragments and its
++ * half of O as f32 accumulators in registers (32 + 64 per lane; the full-D FA2 tile would need 192).
++ * Per 32-key tile both warps of a pair compute the partial S over their D half, swap it through
++ * shared memory (one 64-thread named barrier) and add it (lo + hi, commutative, so both hold the
++ * same S), then run the same online softmax and P.V over their own D half with P in registers.
++ * K/V go through a 2-stage cp.async ring, one block barrier per tile. Items run heaviest first
++ * (last query tile first), heads fastest, so the heads of a KV group stream the same tiles.
++ *
++ * Contract of d_flash_prefill's single-request path (req == nullptr): bf16 Q/K/V, f32 scores and
++ * accumulation, exp2 with the log2e-folded scale, P rounded to bf16 for P.V, l summed from the f32
++ * P; window (sliding) masks per row; nsplit 1 normalises into O (bf16), nsplit > 1 writes the
++ * (Opart, mlpart) partials FlashMerge folds. When the grid already has an item per block without
++ * splitting (q tiles x heads >= nblk), split 0 covers the whole KV range and the other splits are
++ * written empty (m = FA_NEG_INF, l = 0, O = 0): the merge result is the same and the causal items
++ * no longer pin every block to one (head, split) pair. */
++#pragma once
++#include "op_flash_pf128.cuh" /* fp2_* mma / ldmatrix / cp.async helpers */
++
++#define F256_HD 256
++#define F256_BQ 64
++#define F256_BKV 32
++#define F256_LD (F256_HD + 8) /* 528 B rows: conflict-free ldmatrix phases */
++#define F256_RING_BYTES (4 * F256_BKV * F256_LD * 2) /* K and V, 2 stages each */
++#define F256_XCH_BYTES (8 * 4 * 32 * 16)            /* per warp: 16 x 32 partial scores */
++#define F256_SMEM_BYTES (F256_RING_BYTES + F256_XCH_BYTES)
++
++#ifndef F256_INLINE
++#define F256_INLINE __noinline__
++#endif
++
++static __device__ F256_INLINE void d_flash_pf256(float* __restrict__ Opart, float* __restrict__ mlpart,
++                                                 const __nv_bfloat16* __restrict__ Q,
++                                                 const __nv_bfloat16* __restrict__ K,
++                                                 const __nv_bfloat16* __restrict__ V,
++                                                 __nv_bfloat16* __restrict__ O, unsigned seq_q,
++                                                 unsigned seq_kv, unsigned n_head,
++                                                 unsigned n_kv_head, unsigned q_pos0,
++                                                 unsigned window, unsigned nsplit,
++                                                 unsigned kv_stride, unsigned kv_mask, float scale,
++                                                 unsigned slice, unsigned nblk, float* lds) {
++    constexpr int HD = F256_HD, BQ = F256_BQ, BKV = F256_BKV, LD = F256_LD, HH = HD / 2;
++    if (blockDim.x != 256u || n_kv_head == 0u || n_head % n_kv_head || nsplit == 0u) {
++        __trap();
++        return;
++    }
++    __nv_bfloat16* Ks = reinterpret_cast<__nv_bfloat16*>(lds); /* [2][BKV][LD] */
++    __nv_bfloat16* Vs = Ks + 2 * BKV * LD;                     /* [2][BKV][LD] */
++    float4* Xs = reinterpret_cast<float4*>(Vs + 2 * BKV * LD); /* [8 warps][BKV / 8][32 lanes] */
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int g = lane >> 2, t4 = lane & 3, rg = warp & 3, dh = warp >> 2;
++    const unsigned gqa = n_head / n_kv_head;
++    const float lscale = scale * 1.4426950408889634f;
++
++    const unsigned nqt = (seq_q + BQ - 1) / BQ;
++    const bool collapse = nsplit > 1u && nqt * n_head >= nblk;
++    const unsigned nsw = collapse ? 1u : nsplit;
++    const unsigned n_work = nqt * n_head * nsw;
++
++    for (unsigned w = slice; w < n_work; w += nblk) {
++        const unsigned h = w % n_head, rest = w / n_head, sp = rest % nsw;
++        const unsigned q0 = (nqt - 1u - rest / nsw) * BQ;
++        const unsigned hkv = h / gqa;
++        const __nv_bfloat16* Kb = K + (size_t)hkv * kv_stride * HD;
++        const __nv_bfloat16* Vb = V + (size_t)hkv * kv_stride * HD;
++        const unsigned per = (seq_kv + nsw - 1) / nsw;
++        const unsigned lo = sp * per < seq_kv ? sp * per : seq_kv;
++        const unsigned hi = lo + per < seq_kv ? lo + per : seq_kv;
++        const unsigned qend = q0 + BQ < seq_q ? q0 + BQ : seq_q;
++        const unsigned kcap = q_pos0 + qend; /* causal: no key past the tile's newest row */
++        const unsigned kend = kcap < hi ? kcap : hi;
++        unsigned kbeg = lo;
++        if (window && q_pos0 + q0 + 1u > window) {
++            const unsigned wlo = q_pos0 + q0 + 1u - window; /* oldest key the first row sees */
++            if (wlo > kbeg) kbeg = wlo;
++        }
++        const int nt = kend > kbeg ? (int)((kend - kbeg + BKV - 1) / BKV) : 0;
++
++        auto stage = [&](int tile, int b) {
++            const unsigned kv0 = kbeg + (unsigned)tile * BKV;
++            __nv_bfloat16* kd = Ks + b * BKV * LD;
++            __nv_bfloat16* vd = Vs + b * BKV * LD;
++#pragma unroll
++            for (int i = 0; i < BKV * (HD / 8) / 256; i++) {
++                const int L = tid + i * 256, row = L >> 5, c8 = (L & 31) * 8;
++                const unsigned kv = kv0 + (unsigned)row;
++                const bool in = kv < kend;
++                const size_t off = (size_t)(kv & kv_mask) * HD + c8;
++                fp2_cp16(kd + row * LD + c8, in ? Kb + off : Kb, in ? 16 : 0);
++                fp2_cp16(vd + row * LD + c8, in ? Vb + off : Vb, in ? 16 : 0);
++            }
++            asm volatile("cp.async.commit_group;\n" ::);
++        };
++
++        __syncthreads(); /* the previous item's last tile is read out before the ring restages */
++        if (nt > 0) stage(0, 0);
++
++        const unsigned ra = q0 + (unsigned)rg * 16u + (unsigned)g, rb = ra + 8u;
++        const bool va = ra < seq_q, vb = rb < seq_q;
++        const __nv_bfloat16* Qa = Q + ((size_t)ra * n_head + h) * HD + dh * HH;
++        const __nv_bfloat16* Qb = Q + ((size_t)rb * n_head + h) * HD + dh * HH;
++        unsigned qf[HH / 16][4];
++#pragma unroll
++        for (int kf = 0; kf < HH / 16; kf++) {
++            const int c = kf * 16 + 2 * t4;
++            qf[kf][0] = va ? *reinterpret_cast<const unsigned*>(Qa + c) : 0u;
++            qf[kf][1] = vb ? *reinterpret_cast<const unsigned*>(Qb + c) : 0u;
++            qf[kf][2] = va ? *reinterpret_cast<const unsigned*>(Qa + c + 8) : 0u;
++            qf[kf][3] = vb ? *reinterpret_cast<const unsigned*>(Qb + c + 8) : 0u;
++        }
++        const unsigned abs_a = q_pos0 + ra, abs_b = q_pos0 + rb;
++        const unsigned warp_lo = q_pos0 + q0 + (unsigned)rg * 16u; /* oldest row of this warp */
++        float o[HH / 8][4];
++#pragma unroll
++        for (int j = 0; j < HH / 8; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
++        float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
++        float4* xme = Xs + warp * (BKV / 8) * 32 + lane;
++        const float4* xpa = Xs + (warp ^ 4) * (BKV / 8) * 32 + lane;
++
++        for (int t = 0; t < nt; t++) {
++            const int buf = t & 1;
++            asm volatile("cp.async.wait_group 0;\n" ::);
++            __syncthreads(); /* tile t landed for all; tile t-1's buffer and the swap slots are free */
++            if (t + 1 < nt) stage(t + 1, buf ^ 1);
++            const unsigned kv0 = kbeg + (unsigned)t * BKV;
++            const __nv_bfloat16* Kt = Ks + buf * BKV * LD + dh * HH;
++            const __nv_bfloat16* Vt = Vs + buf * BKV * LD + dh * HH;
++
++            float s[BKV / 8][4];
++#pragma unroll
++            for (int j = 0; j < BKV / 8; j++) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
++#pragma unroll
++            for (int kf = 0; kf < HH / 16; kf++) {
++#pragma unroll
++                for (int np = 0; np < BKV / 16; np++) {
++                    unsigned b[4];
++                    fp2_ldsm_x4(b, Kt + (np * 16 + (lane & 7) + ((lane >> 4) << 3)) * LD + kf * 16 +
++                                       ((lane >> 3) & 1) * 8);
++                    fp2_mma(s[2 * np], qf[kf], b[0], b[1]);
++                    fp2_mma(s[2 * np + 1], qf[kf], b[2], b[3]);
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < BKV / 8; j++) xme[j * 32] = make_float4(s[j][0], s[j][1], s[j][2], s[j][3]);
++            asm volatile("bar.sync %0, 64;\n" ::"r"(1 + rg) : "memory");
++#pragma unroll
++            for (int j = 0; j < BKV / 8; j++) {
++                const float4 x = xpa[j * 32];
++                s[j][0] += x.x;
++                s[j][1] += x.y;
++                s[j][2] += x.z;
++                s[j][3] += x.w;
++            }
++            /* edge tile for this warp: past hi (zero-filled rows), the causal diagonal or the window */
++            if (kv0 + BKV > hi || kv0 + BKV - 1u > warp_lo ||
++                (window && warp_lo + 15u - kv0 >= window)) {
++#pragma unroll
++                for (int j = 0; j < BKV / 8; j++)
++#pragma unroll
++                    for (int e = 0; e < 4; e++) {
++                        const unsigned kv = kv0 + (unsigned)(j * 8 + 2 * t4 + (e & 1));
++                        const unsigned qa = e < 2 ? abs_a : abs_b;
++                        if (kv >= hi || kv > qa || (window && qa - kv >= window)) s[j][e] = -INFINITY;
++                    }
++            }
++            float x0 = s[0][0], x1 = s[0][2];
++#pragma unroll
++            for (int j = 0; j < BKV / 8; j++) {
++                x0 = fmaxf(x0, fmaxf(s[j][0], s[j][1]));
++                x1 = fmaxf(x1, fmaxf(s[j][2], s[j][3]));
++            }
++            x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 1));
++            x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 2));
++            x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 1));
++            x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 2));
++            const float n0 = fmaxf(m0, x0 * lscale), n1 = fmaxf(m1, x1 * lscale);
++            /* a row with no live key yet keeps m = -inf: shift by 0 so every term is ex2(-inf) = 0 */
++            const float z0 = n0 == -INFINITY ? 0.f : n0, z1 = n1 == -INFINITY ? 0.f : n1;
++            const float c0 = fp2_ex2(m0 - z0), c1 = fp2_ex2(m1 - z1);
++            m0 = n0;
++            m1 = n1;
++            float p0 = 0.f, p1 = 0.f;
++#pragma unroll
++            for (int j = 0; j < BKV / 8; j++) {
++                s[j][0] = fp2_ex2(fmaf(s[j][0], lscale, -z0));
++                s[j][1] = fp2_ex2(fmaf(s[j][1], lscale, -z0));
++                s[j][2] = fp2_ex2(fmaf(s[j][2], lscale, -z1));
++                s[j][3] = fp2_ex2(fmaf(s[j][3], lscale, -z1));
++                p0 += s[j][0] + s[j][1];
++                p1 += s[j][2] + s[j][3];
++            }
++            l0 = l0 * c0 + p0;
++            l1 = l1 * c1 + p1;
++#pragma unroll
++            for (int j = 0; j < HH / 8; j++) {
++                o[j][0] *= c0;
++                o[j][1] *= c0;
++                o[j][2] *= c1;
++                o[j][3] *= c1;
++            }
++#pragma unroll
++            for (int kk = 0; kk < BKV / 16; kk++) {
++                const unsigned pa[4] = {fp2_pack(s[2 * kk][0], s[2 * kk][1]),
++                                        fp2_pack(s[2 * kk][2], s[2 * kk][3]),
++                                        fp2_pack(s[2 * kk + 1][0], s[2 * kk + 1][1]),
++                                        fp2_pack(s[2 * kk + 1][2], s[2 * kk + 1][3])};
++#pragma unroll
++                for (int dp = 0; dp < HH / 16; dp++) {
++                    unsigned b[4];
++                    fp2_ldsm_x4_t(b, Vt + (kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * LD +
++                                         dp * 16 + (lane >> 4) * 8);
++                    fp2_mma(o[2 * dp], pa, b[0], b[1]);
++                    fp2_mma(o[2 * dp + 1], pa, b[2], b[3]);
++                }
++            }
++        }
++        l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
++        l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
++        l1 += __shfl_xor_sync(0xffffffffu, l1, 1);
++        l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
++        if (nsplit == 1u) {
++            const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
++            __nv_bfloat16* Oa = O + ((size_t)ra * n_head + h) * HD + dh * HH;
++            __nv_bfloat16* Ob = O + ((size_t)rb * n_head + h) * HD + dh * HH;
++#pragma unroll
++            for (int j = 0; j < HH / 8; j++) {
++                const int c = j * 8 + 2 * t4;
++                if (va) *reinterpret_cast<unsigned*>(Oa + c) = fp2_pack(o[j][0] * i0, o[j][1] * i0);
++                if (vb) *reinterpret_cast<unsigned*>(Ob + c) = fp2_pack(o[j][2] * i1, o[j][3] * i1);
++            }
++            continue;
++        }
++        /* partials: [row][head][split][hd] and [row][head][split][2] (m, l in the log2 domain) */
++        const unsigned s_hi = collapse ? nsplit : sp + 1u;
++        for (unsigned s2 = sp; s2 < s_hi; s2++) {
++            const bool own = s2 == sp;
++            float* Pa = Opart + (((size_t)ra * n_head + h) * nsplit + s2) * HD + dh * HH;
++            float* Pb = Opart + (((size_t)rb * n_head + h) * nsplit + s2) * HD + dh * HH;
++#pragma unroll
++            for (int j = 0; j < HH / 8; j++) {
++                const int c = j * 8 + 2 * t4;
++                if (va) *reinterpret_cast<float2*>(Pa + c) = own ? make_float2(o[j][0], o[j][1]) : make_float2(0.f, 0.f);
++                if (vb) *reinterpret_cast<float2*>(Pb + c) = own ? make_float2(o[j][2], o[j][3]) : make_float2(0.f, 0.f);
++            }
++            if (dh == 0 && t4 == 0) {
++                if (va)
++                    *reinterpret_cast<float2*>(mlpart + (((size_t)ra * n_head + h) * nsplit + s2) * 2) =
++                        own ? make_float2(m0 == -INFINITY ? FA_NEG_INF : m0, l0) : make_float2(FA_NEG_INF, 0.f);
++                if (vb)
++                    *reinterpret_cast<float2*>(mlpart + (((size_t)rb * n_head + h) * nsplit + s2) * 2) =
++                        own ? make_float2(m1 == -INFINITY ? FA_NEG_INF : m1, l1) : make_float2(FA_NEG_INF, 0.f);
++            }
++        }
++    }
++}
+diff -ruN '--exclude=target' '--exclude=.git' -x step_bench.rs ctl-tree/runtime/tests/flashdec_hd256_sm120.cu /home/ifv/plow-hd256/runtime/tests/flashdec_hd256_sm120.cu
+--- ctl-tree/runtime/tests/flashdec_hd256_sm120.cu	1970-01-01 00:00:00.000000000 +0000
++++ /home/ifv/plow-hd256/runtime/tests/flashdec_hd256_sm120.cu	2026-11-25 09:07:44.399917847 +0000
+@@ -0,0 +1,159 @@
++/* flashdec_hd256_sm120.cu — oracle + timing for the hd256 flash decode (FlashDecode + FlashMerge)
++ * on sm_120/121 at the Qwen3.8-27B full-attention geometry (24 q-heads / 4 kv-heads, bf16 KV):
++ * d_flash_decode<256, GF> as the interpreter instantiates it, GF 2 (the shipped work item) or 6
++ * (a whole GQA group per item). Built twice: plain (the tile / row bodies) and -DDEC_RGM=1 (the
++ * row-group mma item, PLOW_NV_FA_RG/RG_WIDE/RGM). `rows` decode rows either share slot 0 at
++ * lengths ctx .. ctx + rows - 1 (mode mtp: a speculative verify span) or own a slot each at ctx
++ * (mode batch). Checks every row against an f64 host reference on 4 heads; prints us, the GB/s of
++ * unique KV bytes and, with sm1 = s, the time of slice s of the 48-block grid alone on one SM.
++ *
++ * Build (inside nix develop):
++ *   nvcc -std=c++17 -arch=sm_121a -O3 [-DDEC_RGM=1] -I runtime/common -I runtime/nvidia \
++ *     -include cstdint runtime/tests/flashdec_hd256_sm120.cu -o flashdec_hd256
++ * Run: flashdec_hd256 [rows=4] [ctx=32768] [mode=mtp|batch] [gf=2] [nsplit=4] [iters=5] [sm1=-1]
++ * Exit 1 when a rel-L2 against the reference exceeds 2e-2. */
++#ifndef DEC_RGM
++#define DEC_RGM 0
++#endif
++#if DEC_RGM
++#define PLOW_NV_FA_RG 1
++#define PLOW_NV_FA_RG_WIDE 1
++#define PLOW_NV_FA_RGM 1
++#endif
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "sm120_common.cuh" /* pulls op_attention.cuh (d_flash_decode, d_flash_merge) */
++
++typedef __nv_bfloat16 bf16;
++
++#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
++    printf("CUDA ERROR %s at %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_)); \
++    exit(2); } } while (0)
++
++static const unsigned NH = 24, NKV = 4, HD = 256;
++
++struct Geo { unsigned rows, stride, ns, slice, nblk; float scale; };
++
++template <int GF>
++__global__ void __launch_bounds__(256, 1)
++k_dec(float* Op, float* ml, const bf16* Q, const bf16* K, const bf16* V, const int* len, const int* slot, Geo g) {
++    extern __shared__ float arena[];
++    const unsigned s = g.nblk ? g.slice : blockIdx.x, n = g.nblk ? g.nblk : gridDim.x;
++    d_flash_decode<256, GF, false, false, true>(Op, ml, Q, K, V, len, g.rows, NH, NKV, g.stride, 0, g.scale,
++                                                g.ns, 0xFFFFFFFFu, s, n, arena, 0, nullptr, nullptr, slot);
++}
++__global__ void __launch_bounds__(256, 1)
++k_merge(bf16* O, const float* Op, const float* ml, unsigned rows, unsigned ns) {
++    d_flash_merge<256>(O, Op, ml, rows, NH, ns, blockIdx.x, gridDim.x);
++}
++__global__ void k_fill(bf16* p, size_t n, uint32_t seed, float amp) {
++    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
++        uint32_t x = (uint32_t)i * 2654435761u ^ seed;
++        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
++        p[i] = __float2bfloat16(amp * ((float)(int32_t)x / 2147483648.0f));
++    }
++}
++/* arena bytes as the device pass sizes them (FA_RGM_NSTG keys on PLOW_SM12X, 0 on the host pass) */
++__device__ unsigned g_smem[2] = {FA_DEC_SMEM_FLOATS(256, 2) * 4u, FA_DEC_SMEM_FLOATS(256, 6) * 4u};
++static float b2f(bf16 v) { uint16_t u; memcpy(&u, &v, 2); uint32_t w = (uint32_t)u << 16; float f; memcpy(&f, &w, 4); return f; }
++
++int main(int argc, char** argv) {
++    const unsigned R = argc > 1 ? (unsigned)atoi(argv[1]) : 4u;
++    const unsigned C = argc > 2 ? (unsigned)atoi(argv[2]) : 32768u;
++    const bool mtp = !(argc > 3 && std::string(argv[3]) == "batch");
++    const int GF = argc > 4 ? atoi(argv[4]) : 2;
++    const unsigned NS = argc > 5 ? (unsigned)atoi(argv[5]) : 4u;
++    const int iters = argc > 6 ? atoi(argv[6]) : 5;
++    const int sm1 = argc > 7 ? atoi(argv[7]) : -1;
++    cudaDeviceProp p; CK(cudaGetDeviceProperties(&p, 0));
++    const int grid = p.multiProcessorCount;
++    const unsigned slots = mtp ? 1u : R, stride = C + R;
++    std::vector<int> hl(R), hs(R);
++    for (unsigned r = 0; r < R; r++) { hl[r] = (int)(mtp ? C + r : C); hs[r] = (int)(mtp ? 0 : r); }
++    const size_t nq = (size_t)R * NH * HD, nk = (size_t)slots * NKV * stride * HD;
++    bf16 *Q, *K, *V, *O; float *Op, *ml; int *len, *slot;
++    CK(cudaMalloc(&Q, nq * 2)); CK(cudaMalloc(&K, nk * 2)); CK(cudaMalloc(&V, nk * 2)); CK(cudaMalloc(&O, nq * 2));
++    CK(cudaMalloc(&Op, nq * 4 * NS)); CK(cudaMalloc(&ml, (size_t)R * NH * NS * 8));
++    CK(cudaMalloc(&len, R * 4)); CK(cudaMalloc(&slot, R * 4));
++    CK(cudaMemcpy(len, hl.data(), R * 4, cudaMemcpyHostToDevice));
++    CK(cudaMemcpy(slot, hs.data(), R * 4, cudaMemcpyHostToDevice));
++    k_fill<<<1024, 256>>>(Q, nq, 11u, 1.0f);
++    k_fill<<<1024, 256>>>(K, nk, 23u, 1.0f);
++    k_fill<<<1024, 256>>>(V, nk, 37u, 1.0f);
++    CK(cudaDeviceSynchronize());
++    unsigned hsm[2];
++    CK(cudaMemcpyFromSymbol(hsm, g_smem, sizeof(hsm)));
++    auto kern = GF == 6 ? k_dec<6> : k_dec<2>;
++    const size_t smem = hsm[GF == 6];
++    CK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
++    /* an L2-sized scrub buffer: every timed launch reads its KV from DRAM */
++    char* scrub; const size_t scrub_n = 64u << 20; CK(cudaMalloc(&scrub, scrub_n));
++    Geo g{R, stride, NS, sm1 >= 0 ? (unsigned)sm1 : 0u, sm1 >= 0 ? (unsigned)grid : 0u, 1.f / sqrtf((float)HD)};
++    cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
++    std::vector<float> t;
++    for (int it = 0; it < iters + 1; it++) {
++        CK(cudaMemset(scrub, it, scrub_n));
++        CK(cudaEventRecord(e0));
++        kern<<<sm1 >= 0 ? 1 : grid, 256, smem>>>(Op, ml, Q, K, V, len, slot, g);
++        CK(cudaEventRecord(e1));
++        if (sm1 < 0) k_merge<<<grid, 256>>>(O, Op, ml, R, NS);
++        CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
++        float x; CK(cudaEventElapsedTime(&x, e0, e1)); if (it) t.push_back(x);
++    }
++    CK(cudaDeviceSynchronize());
++    std::sort(t.begin(), t.end());
++    const double us = 1e3 * t[t.size() / 2];
++    double kvb = 0; /* unique KV bytes: one slot's rows once (mtp), every slot (batch) */
++    if (mtp) kvb = 2.0 * NKV * (C + R - 1) * HD * 2; else kvb = 2.0 * NKV * (double)C * HD * 2 * R;
++    printf("rows %u ctx %u %s gf %d nsplit %u smem %zu%s: %9.1f us  %6.1f GB/s", R, C, mtp ? "mtp" : "batch", GF, NS,
++           smem, DEC_RGM ? " rgm" : "", us, kvb / us / 1e3);
++    if (sm1 >= 0) {
++        /* streamed bytes: every (row, GF-head group) item reads its row's K and V once; the
++         * slice's share is 1/grid of that when the items split evenly over the grid */
++        double st = 0;
++        for (unsigned r = 0; r < R; r++) st += 2.0 * (NH / GF) * (double)hl[r] * HD * 2;
++        printf("  (slice %d of %d on one SM: %.1f GB/s of its 1/%d streamed share)\n", sm1, grid,
++               st / grid / us / 1e3, grid);
++        return 0;
++    }
++    std::vector<bf16> hq(nq), ho(nq);
++    CK(cudaMemcpy(hq.data(), Q, nq * 2, cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(ho.data(), O, nq * 2, cudaMemcpyDeviceToHost));
++    const unsigned heads[] = {0, 5, 6, 23};
++    std::vector<bf16> hk((size_t)stride * HD), hv((size_t)stride * HD);
++    double rd = 0, rn = 0;
++    for (unsigned r = 0; r < R; r++)
++        for (unsigned hh : heads) {
++            const unsigned kh = hh / (NH / NKV);
++            const size_t base = ((size_t)hs[r] * NKV + kh) * stride * HD;
++            CK(cudaMemcpy(hk.data(), K + base, (size_t)stride * HD * 2, cudaMemcpyDeviceToHost));
++            CK(cudaMemcpy(hv.data(), V + base, (size_t)stride * HD * 2, cudaMemcpyDeviceToHost));
++            const unsigned n = (unsigned)hl[r];
++            std::vector<double> s(n), acc(HD, 0.0);
++            double mx = -1e300;
++            for (unsigned k = 0; k < n; k++) {
++                double d = 0;
++                for (unsigned c = 0; c < HD; c++) d += (double)b2f(hq[((size_t)r * NH + hh) * HD + c]) * b2f(hk[(size_t)k * HD + c]);
++                s[k] = d * g.scale; mx = s[k] > mx ? s[k] : mx;
++            }
++            double l = 0;
++            for (unsigned k = 0; k < n; k++) { s[k] = exp(s[k] - mx); l += s[k];
++                for (unsigned c = 0; c < HD; c++) acc[c] += s[k] * b2f(hv[(size_t)k * HD + c]); }
++            for (unsigned c = 0; c < HD; c++) {
++                const double ref = acc[c] / l, x = b2f(ho[((size_t)r * NH + hh) * HD + c]);
++                rn += ref * ref; rd += (x - ref) * (x - ref);
++            }
++        }
++    const double rel = sqrt(rd / rn);
++    printf("  rel %.2e %s\n", rel, rel <= 2e-2 ? "PASS" : "FAIL");
++    return rel <= 2e-2 ? 0 : 1;
++}
+diff -ruN '--exclude=target' '--exclude=.git' -x step_bench.rs ctl-tree/runtime/tests/flashpre_hd256_sm120.cu /home/ifv/plow-hd256/runtime/tests/flashpre_hd256_sm120.cu
+--- ctl-tree/runtime/tests/flashpre_hd256_sm120.cu	1970-01-01 00:00:00.000000000 +0000
++++ /home/ifv/plow-hd256/runtime/tests/flashpre_hd256_sm120.cu	2026-11-25 00:54:12.458533089 +0000
+@@ -0,0 +1,200 @@
++/* flashpre_hd256_sm120.cu — oracle + timing for the hd256 flash prefill on sm_120/121:
++ * d_flash_prefill<256,64,32> (the shipped PIPE body) vs d_flash_pf256 (op_flash_pf256.cuh, FA2
++ * split-D form), one chunk of T query rows after a prefix of P cached rows. Default geometry is
++ * Qwen3.8-27B full attention (24 q-heads / 4 kv-heads, causal); `nh`, `nkv` and `window` cover the
++ * Gemma-4 sliding layers. nsplit > 1 runs FlashMerge (d_flash_merge<256>) after the prefill.
++ * Checks every arm against an f64 host reference on sampled (row, head) pairs and against `old`;
++ * prints ms, TFLOP/s and % of the BF16 ceiling. `sm1=s` instead times slice s of the 48-block grid
++ * alone on one SM (the ubench slice) for every arm and skips the checks.
++ *
++ * Build (inside nix develop):
++ *   nvcc -std=c++17 -arch=sm_121a -O3 -I runtime/common -I runtime/nvidia -include cstdint \
++ *     runtime/tests/flashpre_hd256_sm120.cu -o flashpre_hd256
++ * Run: flashpre_hd256 [T=8192] [priors=0,8192,24576] [iters=3] [bf16 TF=126.7] [arms=old,new]
++ *        [nsplit=1] [nh=24] [nkv=4] [window=0] [sm1=-1]
++ * Exit 1 when a rel-L2 exceeds 2e-2 (reference) or two kernels differ by more than 1e-2. */
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "sm120_common.cuh" /* pulls op_attention.cuh (d_flash_prefill, d_flash_merge) */
++#include "op_flash_pf256.cuh"
++
++typedef __nv_bfloat16 bf16;
++
++#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
++    printf("CUDA ERROR %s at %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_)); \
++    exit(2); } } while (0)
++
++static const unsigned HD = 256;
++
++struct Geo { unsigned sq, skv, nh, nkv, q0, window, ns, stride, slice, nblk; float scale; };
++
++__global__ void __launch_bounds__(256, 1)
++k_old(float* Opart, float* ml, const bf16* Q, const bf16* K, const bf16* V, bf16* O, Geo g) {
++    extern __shared__ float arena[];
++    const unsigned s = g.nblk ? g.slice : blockIdx.x, n = g.nblk ? g.nblk : gridDim.x;
++    d_flash_prefill<256, 64, 32>(Opart, ml, Q, K, V, O, g.sq, g.skv, g.nh, g.nkv, g.q0, g.window, g.ns,
++                                 g.stride, 0xFFFFFFFFu, g.scale, s, n, arena, nullptr);
++}
++__global__ void __launch_bounds__(256, 1)
++k_new(float* Opart, float* ml, const bf16* Q, const bf16* K, const bf16* V, bf16* O, Geo g) {
++    extern __shared__ float arena[];
++    const unsigned s = g.nblk ? g.slice : blockIdx.x, n = g.nblk ? g.nblk : gridDim.x;
++    d_flash_pf256(Opart, ml, Q, K, V, O, g.sq, g.skv, g.nh, g.nkv, g.q0, g.window, g.ns, g.stride,
++                  0xFFFFFFFFu, g.scale, s, n, arena);
++}
++__global__ void __launch_bounds__(256, 1)
++k_merge(bf16* O, const float* Opart, const float* ml, unsigned rows, unsigned nh, unsigned ns) {
++    d_flash_merge<256>(O, Opart, ml, rows, nh, ns, blockIdx.x, gridDim.x);
++}
++__global__ void k_fill(bf16* p, size_t n, uint32_t seed, float amp) {
++    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
++        uint32_t x = (uint32_t)i * 2654435761u ^ seed;
++        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
++        p[i] = __float2bfloat16(amp * ((float)(int32_t)x / 2147483648.0f));
++    }
++}
++
++static float b2f(bf16 v) { uint16_t u; memcpy(&u, &v, 2); uint32_t w = (uint32_t)u << 16; float f; memcpy(&f, &w, 4); return f; }
++
++int main(int argc, char** argv) {
++    const unsigned T = argc > 1 ? (unsigned)atoi(argv[1]) : 8192u;
++    std::vector<unsigned> priors;
++    {
++        std::string s = argc > 2 ? argv[2] : "0,8192,24576";
++        size_t a = 0;
++        while (a < s.size()) { size_t b = s.find(',', a); if (b == std::string::npos) b = s.size();
++            priors.push_back((unsigned)atoi(s.substr(a, b - a).c_str())); a = b + 1; }
++    }
++    const int iters = argc > 3 ? atoi(argv[3]) : 3;
++    const double tf_ceil = argc > 4 ? atof(argv[4]) : 126.7;
++    const std::string arms = std::string(",") + (argc > 5 ? argv[5] : "old,new") + ",";
++    const unsigned NS = argc > 6 ? (unsigned)atoi(argv[6]) : 1u;
++    const unsigned NH = argc > 7 ? (unsigned)atoi(argv[7]) : 24u;
++    const unsigned NKV = argc > 8 ? (unsigned)atoi(argv[8]) : 4u;
++    const unsigned WIN = argc > 9 ? (unsigned)atoi(argv[9]) : 0u;
++    const int sm1 = argc > 10 ? atoi(argv[10]) : -1;
++    constexpr int NA = 2;
++    const char* arm_name[NA] = {"old", "new"};
++    bool run[NA];
++    for (int a = 0; a < NA; a++) run[a] = arms.find(std::string(",") + arm_name[a] + ",") != std::string::npos;
++    int dev = 0; cudaDeviceProp p; CK(cudaGetDeviceProperties(&p, dev));
++    const int grid = p.multiProcessorCount;
++    printf("# %s, %d SMs; T=%u NH=%u NKV=%u HD=%u nsplit=%u window=%u%s\n", p.name, grid, T, NH, NKV, HD,
++           NS, WIN, sm1 >= 0 ? " (one slice on one SM)" : "");
++    const size_t smem_old = (size_t)FA_PRE_SMEM_FLOATS(256, 64, 32) * 4, smem_new = F256_SMEM_BYTES;
++    CK(cudaFuncSetAttribute(k_old, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_old));
++    CK(cudaFuncSetAttribute(k_new, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_new));
++    const float scale = 1.f / sqrtf((float)HD);
++    int fail = 0;
++    for (unsigned P : priors) {
++        const unsigned skv = P + T, stride = skv;
++        bf16 *Q, *K, *V, *O[NA]; float *Op, *ml;
++        const size_t nq = (size_t)T * NH * HD, nk = (size_t)NKV * stride * HD;
++        CK(cudaMalloc(&Q, nq * 2)); CK(cudaMalloc(&K, nk * 2)); CK(cudaMalloc(&V, nk * 2));
++        for (int a = 0; a < NA; a++) { CK(cudaMalloc(&O[a], nq * 2)); CK(cudaMemset(O[a], 0, nq * 2)); }
++        CK(cudaMalloc(&Op, nq * 4 * NS)); CK(cudaMalloc(&ml, (size_t)T * NH * 8 * NS));
++        k_fill<<<1024, 256>>>(Q, nq, 11u + P, 1.0f);
++        k_fill<<<1024, 256>>>(K, nk, 23u + P, 1.0f);
++        k_fill<<<1024, 256>>>(V, nk, 37u + P, 1.0f);
++        CK(cudaDeviceSynchronize());
++        cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
++        float ms[NA] = {};
++        for (int which = 0; which < NA; which++) {
++            if (!run[which]) continue;
++            Geo g{T, skv, NH, NKV, P, WIN, NS, stride, sm1 >= 0 ? (unsigned)sm1 : 0u, sm1 >= 0 ? (unsigned)grid : 0u, scale};
++            const int launch = sm1 >= 0 ? 1 : grid;
++            std::vector<float> t;
++            for (int it = 0; it < iters + 1; it++) {
++                CK(cudaEventRecord(e0));
++                if (which == 0) k_old<<<launch, 256, smem_old>>>(Op, ml, Q, K, V, O[0], g);
++                else k_new<<<launch, 256, smem_new>>>(Op, ml, Q, K, V, O[1], g);
++                if (NS > 1 && sm1 < 0) k_merge<<<grid, 256>>>(O[which], Op, ml, T, NH, NS);
++                CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
++                float x; CK(cudaEventElapsedTime(&x, e0, e1)); if (it) t.push_back(x);
++            }
++            std::sort(t.begin(), t.end());
++            ms[which] = t[t.size() / 2];
++        }
++        double flop = 0; /* exact causal / window key count */
++        for (unsigned r = 0; r < T; r++) {
++            const unsigned a = P + r, lo = WIN && a + 1 > WIN ? a + 1 - WIN : 0;
++            flop += 4.0 * NH * HD * (a + 1 - lo);
++        }
++        if (sm1 >= 0) {
++            printf("P=%-7u slice %d", P, sm1);
++            for (int a = 0; a < NA; a++)
++                if (run[a]) printf(" | %s %9.3f ms", arm_name[a], ms[a]);
++            printf("\n");
++        } else {
++            std::vector<bf16> hq(nq), h[NA];
++            CK(cudaMemcpy(hq.data(), Q, nq * 2, cudaMemcpyDeviceToHost));
++            for (int a = 0; a < NA; a++)
++                if (run[a]) { h[a].resize(nq); CK(cudaMemcpy(h[a].data(), O[a], nq * 2, cudaMemcpyDeviceToHost)); }
++            const unsigned rows[] = {0, 1, 15, 16, 63, 64, 127, T / 2, T - 65, T - 1};
++            std::vector<unsigned> heads = {0, NH / NKV - 1, NH / NKV, NH - 1};
++            std::vector<bf16> hk((size_t)skv * HD), hv((size_t)skv * HD);
++            double rd[NA] = {}, rn = 0;
++            for (unsigned hh : heads) {
++                const unsigned kh = hh / (NH / NKV);
++                CK(cudaMemcpy(hk.data(), K + (size_t)kh * stride * HD, (size_t)skv * HD * 2, cudaMemcpyDeviceToHost));
++                CK(cudaMemcpy(hv.data(), V + (size_t)kh * stride * HD, (size_t)skv * HD * 2, cudaMemcpyDeviceToHost));
++                for (unsigned r : rows) {
++                    if (r >= T) continue;
++                    const unsigned a = P + r, lo = WIN && a + 1 > WIN ? a + 1 - WIN : 0;
++                    std::vector<double> s(a + 1), acc(HD, 0.0);
++                    double mx = -1e300;
++                    for (unsigned k = lo; k <= a; k++) {
++                        double d = 0;
++                        for (unsigned c = 0; c < HD; c++) d += (double)b2f(hq[((size_t)r * NH + hh) * HD + c]) * b2f(hk[(size_t)k * HD + c]);
++                        s[k] = d * scale; mx = s[k] > mx ? s[k] : mx;
++                    }
++                    double l = 0;
++                    for (unsigned k = lo; k <= a; k++) { s[k] = exp(s[k] - mx); l += s[k];
++                        for (unsigned c = 0; c < HD; c++) acc[c] += s[k] * b2f(hv[(size_t)k * HD + c]); }
++                    for (unsigned c = 0; c < HD; c++) {
++                        const double ref = acc[c] / l;
++                        rn += ref * ref;
++                        for (int x = 0; x < NA; x++)
++                            if (run[x]) { const double y = b2f(h[x][((size_t)r * NH + hh) * HD + c]); rd[x] += (y - ref) * (y - ref); }
++                    }
++                }
++            }
++            printf("P=%-7u", P);
++            int base = 0;
++            while (base < NA && !run[base]) base++;
++            for (int a = 0; a < NA; a++) {
++                if (!run[a]) continue;
++                const double rel = sqrt(rd[a] / rn);
++                printf(" | %s %9.3f ms %5.1f TF/s %3.0f%% rel %.2e", arm_name[a], ms[a], flop / ms[a] / 1e9,
++                       100 * flop / ms[a] / 1e9 / tf_ceil, rel);
++                if (!(rel <= 2e-2)) fail = 1;
++                if (a == base) continue;
++                double dd = 0, dn = 0;
++                size_t diff = 0;
++                for (size_t i = 0; i < nq; i++) {
++                    const double x = b2f(h[base][i]), y = b2f(h[a][i]);
++                    dd += (x - y) * (x - y); dn += x * x;
++                    diff += memcmp(&h[base][i], &h[a][i], 2) != 0;
++                }
++                printf(" vs-%s %.2e (%zu bf16 differ)", arm_name[base], sqrt(dd / (dn + 1e-30)), diff);
++                if (!(sqrt(dd / (dn + 1e-30)) <= 1e-2)) fail = 1;
++            }
++            printf("\n");
++        }
++        fflush(stdout);
++        cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(Op); cudaFree(ml);
++        for (int a = 0; a < NA; a++) cudaFree(O[a]);
++        cudaEventDestroy(e0); cudaEventDestroy(e1);
++    }
++    printf(fail ? "FAIL\n" : "PASS\n");
++    return fail;
++}

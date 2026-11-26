@@ -1,0 +1,660 @@
+diff --git a/crates/plowrt/src/config.rs b/crates/plowrt/src/config.rs
+index 67efb6d1b..bd04532b0 100644
+--- a/crates/plowrt/src/config.rs
++++ b/crates/plowrt/src/config.rs
+@@ -727,6 +727,33 @@ pub struct RuntimeConfig {
+     #[arg(long = "pf-admit-overlap", env = "PLOW_PF_ADMIT_OVERLAP", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+     pub pf_admit_overlap: bool,
+ 
++    /// Cold-start burst hold: a dispatcher with no live slots holds the first request up to one
++    /// SLO for requests still rendering (template, tokenize) so a burst shares the first launch.
++    /// Requests are counted as pending from before their template instead of from tokenize.
++    #[arg(long = "pf-cold-burst", env = "PLOW_PF_COLD_BURST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
++    pub pf_cold_burst: bool,
++
++    /// With decoders live, a serial prefill tick (or Mamba pack pass) runs further chunks while it
++    /// stays within one widest launch's measured time, instead of one chunk per tick.
++    #[arg(long = "pf-tick-budget", env = "PLOW_PF_TICK_BUDGET", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
++    pub pf_tick_budget: bool,
++
++    /// The prefill planner's per-launch cost from the measured launch fit instead of a fixed
++    /// 512 rows.
++    #[arg(long = "pf-chunk-cost-fit", env = "PLOW_PF_CHUNK_COST_FIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
++    pub pf_chunk_cost_fit: bool,
++
++    /// Speculate after a prefill pass whose launch did not carry the decode rows (serial, or
++    /// packed without riders), instead of skipping every prefill tick.
++    #[arg(long = "spec-after-prefill", env = "PLOW_SPEC_AFTER_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
++    pub spec_after_prefill: bool,
++
++    /// Recurrent VMM prefix cache: capture a prompt end only when a later request is expected to
++    /// attach it (session, continuation, attached prompt). Always on for a packet with an MTP
++    /// drafter cache (`kv.mtp.k`).
++    #[arg(long = "vmm-prompt-end-expected", env = "PLOW_VMM_PROMPT_END_EXPECTED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
++    pub vmm_prompt_end_expected: bool,
++
+     /// Adaptive KV output token reservation cap: when nonzero, bounds initial output token
+     /// reservation against the KV budget to min(max_tokens, max(generated + 128, cap))
+     /// instead of locking down the full client `max_tokens` (e.g. 4096) upfront.
+diff --git a/crates/plowrt/src/exec/gpu.rs b/crates/plowrt/src/exec/gpu.rs
+index d40166e52..b316ace24 100644
+--- a/crates/plowrt/src/exec/gpu.rs
++++ b/crates/plowrt/src/exec/gpu.rs
+@@ -3025,6 +3025,10 @@ pub struct GpuEngine {
+     /// The slot's request is its session's last turn (`X-Session-End`): the prefix cache drops
+     /// the session's boundary to the cold band at retire ([`Self::retire_slot`]).
+     session_end: Vec<bool>,
++    /// A miss captures its prompt end only when a later request is expected to attach it
++    /// (`VmmKv::prompt_end_expected`): a packet with an MTP drafter cache, or
++    /// `PLOW_VMM_PROMPT_END_EXPECTED`. Else every prompt end is captured.
++    prompt_end_expected_only: bool,
+     /// The slot's client disconnected before the response completed (the mux's
+     /// `disconnected`): demoted the same way (predictive: the boundary stays attachable).
+     disconnected: Vec<bool>,
+@@ -8516,6 +8520,7 @@ impl GpuEngine {
+             prefix_needs_row_keys: blob.tensors.iter().any(|t| t.name == "in.encoder_overlay"),
+             publish_off: vec![false; batch],
+             session_end: vec![false; batch],
++            prompt_end_expected_only: false,
+             disconnected: vec![false; batch],
+             dump_kv_geo: RuntimeConfig::get()
+                 .nv
+@@ -8610,6 +8615,8 @@ impl GpuEngine {
+         engine.spec_upload_identity()?;
+         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
+         engine.mtp_dshift = engine.handle_of("in.mtp.dshift");
++        engine.prompt_end_expected_only = engine.handle_of("kv.mtp.k").is_some()
++            || crate::config::RuntimeConfig::get().vmm_prompt_end_expected;
+         engine.encoder = engine.handle_of("act.enc_out").is_some();
+         engine.packed_terminal = packed_terminal::PackedTerminal::load(&engine)?;
+         if blob.reserved_metadata(raw, "block.json")?.is_none() {
+@@ -13449,7 +13456,11 @@ impl GpuEngine {
+     /// ms over its ms per row, never below [`PF_CHUNK_COST_ROWS`] nor above the widest bucket. A
+     /// packet whose launch streams most of its weights whatever the rows pays far more than 512
+     /// rows: Nemotron-H NVFP4 on GB10 ran 128 rows in 300 ms and 1024 in 580 ms, ~800 rows.
++    /// `PLOW_PF_CHUNK_COST_FIT` only; else [`PF_CHUNK_COST_ROWS`].
+     fn pf_chunk_cost_rows(&self) -> usize {
++        if !crate::config::RuntimeConfig::get().pf_chunk_cost_fit {
++            return PF_CHUNK_COST_ROWS;
++        }
+         let top = self.prefill.last().map_or(0, |b| b.t as usize);
+         self.pf_launch_fit().map_or(PF_CHUNK_COST_ROWS, |(slope, fixed)| {
+             ((fixed / slope) as usize).clamp(PF_CHUNK_COST_ROWS, top.max(PF_CHUNK_COST_ROWS))
+diff --git a/crates/plowrt/src/exec/gpu/kv_blocks.rs b/crates/plowrt/src/exec/gpu/kv_blocks.rs
+index ed344d37e..4aca3e9ff 100644
+--- a/crates/plowrt/src/exec/gpu/kv_blocks.rs
++++ b/crates/plowrt/src/exec/gpu/kv_blocks.rs
+@@ -1235,8 +1235,9 @@ impl GpuEngine {
+     /// The next row past `c0` where slot `b`'s recurrent state must be captured, the only rows
+     /// another request can attach to: a whole-block checkpoint a request waits on
+     /// (`VmmKv::inflight_prefix`), the shared-prefix end (`VmmKv::share_rows`: a system prompt
+-    /// another prompt also sent), then the prompt-end boundary when a later request is expected
+-    /// to attach it (`VmmKv::prompt_end_expected`, not the session's last turn).
++    /// another prompt also sent), then the prompt-end boundary (with `prompt_end_expected_only`,
++    /// when a later request is expected to attach it: `VmmKv::prompt_end_expected`, not the
++    /// session's last turn).
+     fn state_capture_stop(
+         &self,
+         b: usize,
+@@ -1255,10 +1256,12 @@ impl GpuEngine {
+         let Some((_, kv)) = self.vmm_prefix() else {
+             return Some((p_a, Kind::PROMPT_END));
+         };
+-        // The cut costs a launch of its own (a full weight pass): a prompt end no later request
+-        // is expected to attach is captured only where a launch ends anyway.
+-        let mut stop = (!self.session_end[b] && kv.prompt_end_expected(b))
+-            .then_some((p_a, Kind::PROMPT_END));
++        // The cut costs a launch of its own (a full weight pass): with `prompt_end_expected_only`
++        // a prompt end no later request is expected to attach is captured only where a launch
++        // ends anyway.
++        let mut stop = (!self.prompt_end_expected_only
++            || (!self.session_end[b] && kv.prompt_end_expected(b)))
++        .then_some((p_a, Kind::PROMPT_END));
+         let share = kv.share_rows(b);
+         if share as usize > c0 && stop.is_none_or(|(rows, _)| share < rows) {
+             stop = Some((share, Kind::SHARED_END));
+diff --git a/crates/plowrt/src/knob_spec.rs b/crates/plowrt/src/knob_spec.rs
+index 9cff6cce5..f92922fff 100644
+--- a/crates/plowrt/src/knob_spec.rs
++++ b/crates/plowrt/src/knob_spec.rs
+@@ -70,6 +70,15 @@ const SESSION_TTL_CANDIDATE: Status = Status::Candidate {
+         "no effect without `X-Session-Id`; `=0` gives sessions no special retention",
+     ],
+ };
++/// Serving policies measured only on GB10 (sm_121a) Nemotron-H NVFP4: its recipes set them; every
++/// other target keeps the default-off behaviour until a run on that GPU.
++const GB10_SCHED_CANDIDATE: Status = Status::Candidate {
++    evidence: &[
++        "docs/bringup/results/nemotron-3.5-super-gb10/comparison.md (\"Speculative decode\", serial prefill scheduling): c8 MTP k=3 +3.4% tok/s/req, TTFT -8% (prefill ticks 31 -> 11-12)",
++        "docs/bringup/results/nemotron-3.5-super-gb10/comparison.md (\"Serve c4 levers\", \"Agentic / prefix cache\"): cold-start burst hold, prompt-end capture only where expected (7.8K prompt TTFT 2.15 -> 1.94 s)",
++        "`=0` is the rollback; not measured on any other GPU",
++    ],
++};
+ /// Default 50 ms above `rt.asr_encode_hold_inflight`; no checkpoint P certificate yet.
+ const ASR_ENCODE_HOLD_CANDIDATE: Status = Status::Candidate {
+     evidence: &[
+@@ -999,6 +1008,11 @@ pub const RUNTIME: &[KnobSpec] = &[
+     KnobSpec::new("rt.prefix_arm_end", Some("PLOW_PREFIX_ARM_END"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+     KnobSpec::new("rt.vmm_strict_publish", Some("PLOW_VMM_STRICT_PUBLISH"), Layer::Runtime, Domain::Bool, ON, DIAG),
+     KnobSpec::new("rt.pf_admit_overlap", Some("PLOW_PF_ADMIT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, DIAG),
++    KnobSpec::new("rt.pf_cold_burst", Some("PLOW_PF_COLD_BURST"), Layer::Runtime, Domain::Bool, OFF, GB10_SCHED_CANDIDATE),
++    KnobSpec::new("rt.pf_tick_budget", Some("PLOW_PF_TICK_BUDGET"), Layer::Runtime, Domain::Bool, OFF, GB10_SCHED_CANDIDATE),
++    KnobSpec::new("rt.pf_chunk_cost_fit", Some("PLOW_PF_CHUNK_COST_FIT"), Layer::Runtime, Domain::Bool, OFF, GB10_SCHED_CANDIDATE),
++    KnobSpec::new("rt.spec_after_prefill", Some("PLOW_SPEC_AFTER_PREFILL"), Layer::Runtime, Domain::Bool, OFF, GB10_SCHED_CANDIDATE),
++    KnobSpec::new("rt.vmm_prompt_end_expected", Some("PLOW_VMM_PROMPT_END_EXPECTED"), Layer::Runtime, Domain::Bool, OFF, GB10_SCHED_CANDIDATE),
+     KnobSpec::new("rt.kv_reserve_output_tokens", Some("PLOW_KV_RESERVE_OUTPUT_TOKENS"), Layer::Runtime, U32, Default::Static(Val::Nat(256)), DIAG),
+     KnobSpec::new("rt.kv_soft_reserve_output_tokens", Some("PLOW_KV_SOFT_RESERVE_OUTPUT_TOKENS"), Layer::Runtime, U32, Default::Static(Val::Nat(64)), DIAG),
+     KnobSpec::new("rt.shed_queue_depth", Some("PLOW_SHED_QUEUE_DEPTH"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
+diff --git a/crates/plowrt/src/serve/chat.rs b/crates/plowrt/src/serve/chat.rs
+index c23b7fd43..a9260328a 100644
+--- a/crates/plowrt/src/serve/chat.rs
++++ b/crates/plowrt/src/serve/chat.rs
+@@ -352,9 +352,12 @@ async fn chat_completions_with(
+     } else {
+         state.mux(&req.model)
+     };
+-    // Counted from here, before the template and the tokenizer: a cold-start hold waits for the
+-    // rest of a burst while it is still rendering (`ModelMux::ingress`).
+-    let ingress = direct.as_ref().map(|m| m.ingress());
++    // `PLOW_PF_COLD_BURST`: counted from here, before the template and the tokenizer: a cold-start
++    // hold waits for the rest of a burst while it is still rendering (`ModelMux::ingress`).
++    let mut ingress = direct
++        .as_ref()
++        .filter(|m| m.cold_burst())
++        .map(|m| m.ingress());
+ 
+     // Models served by the GPU engine get their real chat template (the
+     // tokenizer resolves the markers through `added_tokens`); the CPU
+@@ -529,6 +532,9 @@ async fn chat_completions_with(
+     ) else {
+         return crate::serve::models::unrouted(&state, &req.model);
+     };
++    if ingress.is_none() {
++        ingress = direct.as_ref().map(|m| m.ingress());
++    }
+     // Tokenize HERE, on the handler task — the dispatcher loop is the
+     // serialized decode critical path and must never encode a long prompt.
+     // The packet's reasoning markers (`<think>` for a legacy packet): the splitter's own
+@@ -795,6 +801,10 @@ async fn chat_completions_with(
+                     message: "model is not loaded; retry".into(),
+                 });
+             };
++            // An encode is not rendering: a cold-start burst does not wait for it.
++            if let Some(g) = ingress.as_mut() {
++                g.rendered();
++            }
+             match crate::serve::mm::encode(&mm, p).await {
+                 Ok(job) => Some(job),
+                 Err(e) => return mm_error(e),
+diff --git a/crates/plowrt/src/serve/mux.rs b/crates/plowrt/src/serve/mux.rs
+index 508588d7d..df3c5f753 100644
+--- a/crates/plowrt/src/serve/mux.rs
++++ b/crates/plowrt/src/serve/mux.rs
+@@ -1237,10 +1237,21 @@ pub const PREEMPTED: &str = "model preempted — retry";
+ struct Ingress {
+     count: std::sync::atomic::AtomicUsize,
+     idle: tokio::sync::Notify,
++    /// `PLOW_PF_COLD_BURST`: the dispatcher's cold start waits for [`Self::rendering`] requests,
++    /// and the chat handler counts itself from before its template.
++    cold_burst: bool,
++    /// Of `count`: requests still rendering (template, tokenize), not yet submitting nor in a slow
++    /// pre-submit stage (media encode). The rest of a burst a cold start waits for.
++    rendering: std::sync::atomic::AtomicUsize,
++    /// `rendering` reached zero.
++    rendered: tokio::sync::Notify,
+ }
+ 
+ impl Ingress {
+-    fn enter(&self) {
++    fn enter(&self, rendering: bool) {
++        if rendering {
++            self.rendering.fetch_add(1, Ordering::Relaxed);
++        }
+         self.count.fetch_add(1, Ordering::Relaxed);
+     }
+ 
+@@ -1250,13 +1261,33 @@ impl Ingress {
+         }
+     }
+ 
++    fn settle(&self) {
++        if self.rendering.fetch_sub(1, Ordering::AcqRel) == 1 {
++            self.rendered.notify_one();
++        }
++    }
++
+     fn pending(&self) -> usize {
+         self.count.load(Ordering::Acquire)
+     }
++
++    fn rendering(&self) -> usize {
++        self.rendering.load(Ordering::Acquire)
++    }
+ }
+ 
+-/// Holds one count in [`ModelMux::ingress`] until dropped.
+-pub struct IngressGuard<'a>(&'a Ingress);
++/// Holds one count in [`ModelMux::ingress`] until dropped; `.1` while it is still rendering.
++pub struct IngressGuard<'a>(&'a Ingress, bool);
++
++impl IngressGuard<'_> {
++    /// The request leaves its rendering stage (it submits now, or starts slow pre-submit work):
++    /// a cold-start burst stops waiting for it.
++    pub fn rendered(&mut self) {
++        if std::mem::take(&mut self.1) {
++            self.0.settle();
++        }
++    }
++}
+ 
+ /// [`IngressGuard`] that outlives the borrow: a request that works before it submits (an ASR
+ /// encode) holds it, so a graceful drain waits for its job instead of closing on it. A preempt
+@@ -1271,6 +1302,7 @@ impl Drop for OwnedIngress {
+ 
+ impl Drop for IngressGuard<'_> {
+     fn drop(&mut self) {
++        self.rendered();
+         self.0.leave();
+     }
+ }
+@@ -1386,14 +1418,19 @@ impl ModelMux {
+     }
+ 
+     pub fn ingress_owned(&self) -> OwnedIngress {
+-        self.ingress.enter();
++        self.ingress.enter(false);
+         OwnedIngress(Arc::clone(&self.ingress))
+     }
+ 
+     /// Count a request as pending before it tokenizes; hand the guard to `submit_arrived`.
+     pub fn ingress(&self) -> IngressGuard<'_> {
+-        self.ingress.enter();
+-        IngressGuard(&self.ingress)
++        self.ingress.enter(true);
++        IngressGuard(&self.ingress, true)
++    }
++
++    /// `PLOW_PF_COLD_BURST`: a chat request counts its ingress from before its template.
++    pub fn cold_burst(&self) -> bool {
++        self.ingress.cold_burst
+     }
+ 
+     /// [`Self::preempt`] has run: this dispatcher is gone or going, and serves nothing more.
+@@ -1457,7 +1494,7 @@ impl ModelMux {
+         &self,
+         job: Job,
+         arrived: Instant,
+-        ingress: Option<IngressGuard<'_>>,
++        mut ingress: Option<IngressGuard<'_>>,
+     ) -> std::result::Result<(), SubmitError> {
+         // A P/D decode leg continues a request its prefill rank already counted.
+         if job.opts.import.is_none() {
+@@ -1478,6 +1515,10 @@ impl ModelMux {
+         }
+         let urgent = job.opts.class != JobClass::Bulk;
+         trace_arrival(&job, arrived);
++        // A cold start that receives this job must not wait for its own guard.
++        if let Some(g) = ingress.as_mut() {
++            g.rendered();
++        }
+         match self.tx.try_send(MuxMsg::Job(job, arrived)) {
+             Ok(()) => {
+                 // Released only once the job is on the channel: a graceful drain held by this
+@@ -1517,11 +1558,14 @@ impl ModelMux {
+         &self,
+         job: Job,
+         arrived: Instant,
+-        ingress: Option<IngressGuard<'_>>,
++        mut ingress: Option<IngressGuard<'_>>,
+     ) -> std::result::Result<(), SubmitError> {
+         if job.opts.import.is_none() {
+             Metrics::inc(&self.metrics.requests);
+         }
++        if let Some(g) = ingress.as_mut() {
++            g.rendered();
++        }
+         if self.preempted() || self.tx.is_closed() {
+             crate::serve::pd::refuse(&job, &self.metrics.rejected);
+             return Err(SubmitError::Closed(job));
+@@ -1812,7 +1856,10 @@ fn spawn_scoped(
+     let preempt_wake = Arc::clone(&preempt_notify);
+     let arrival_notify = Arc::new(tokio::sync::Notify::new());
+     let arrival_wake = Arc::clone(&arrival_notify);
+-    let ingress = Arc::new(Ingress::default());
++    let ingress = Arc::new(Ingress {
++        cold_burst: crate::config::RuntimeConfig::get().pf_cold_burst,
++        ..Ingress::default()
++    });
+     let ingress_seen = Arc::clone(&ingress);
+     let metrics = state.model_metrics(&slug);
+     let handle_metrics = Arc::clone(&metrics);
+@@ -2276,43 +2323,42 @@ fn spawn_scoped(
+                         // first prompt prefills alone and stalls the others' decode by a launch
+                         // (Nemotron-H NVFP4 on GB10: 550-850 ms). Bounded by one SLO; a 4-prompt
+                         // burst of 1K-token chats on GB10 reached the mux 2-210 ms apart.
+-                        let cold_t = Instant::now();
+-                        let until = cold_t
+-                            + std::time::Duration::from_secs_f64(cfg.slo_ms.max(0.0) / 1000.0);
+-                        let pending_at = ingress_seen.pending();
+-                        while ingress_seen.pending() > 0 {
+-                            let remaining = until.saturating_duration_since(Instant::now());
+-                            if remaining.is_zero() {
+-                                break;
+-                            }
+-                            match tokio::time::timeout(remaining, rx.recv()).await {
+-                                Ok(Some(MuxMsg::Job(job, arrived))) => queue_arrival(
+-                                    job,
+-                                    arrived,
+-                                    &mut waiting,
+-                                    &mut load,
+-                                    &metrics,
+-                                    prefix_probe.as_ref(),
+-                                ),
+-                                Ok(Some(MuxMsg::Drain(done))) => {
++                        if ingress_seen.cold_burst {
++                            let cold_t = Instant::now();
++                            let pending_at = ingress_seen.rendering();
++                            let budget =
++                                std::time::Duration::from_secs_f64(cfg.slo_ms.max(0.0) / 1000.0);
++                            cold_burst_wait(&ingress_seen, &mut rx, budget, |msg| match msg {
++                                MuxMsg::Job(job, arrived) => {
++                                    queue_arrival(
++                                        job,
++                                        arrived,
++                                        &mut waiting,
++                                        &mut load,
++                                        &metrics,
++                                        prefix_probe.as_ref(),
++                                    );
++                                    true
++                                }
++                                MuxMsg::Drain(done) => {
+                                     note_drain(
+                                         done,
+                                         &mut draining,
+                                         &mut drain_done,
+                                         &mut late_drains,
+                                     );
+-                                    break;
++                                    false
+                                 }
+-                                Ok(None) | Err(_) => break,
++                            })
++                            .await;
++                            if packlog::on() && pending_at > 0 {
++                                eprintln!(
++                                    "PACKLOG COLD pending={pending_at} queued={} waited_us={}",
++                                    waiting.len(),
++                                    cold_t.elapsed().as_micros()
++                                );
+                             }
+                         }
+-                        if packlog::on() && pending_at > 0 {
+-                            eprintln!(
+-                                "PACKLOG COLD pending={pending_at} queued={} waited_us={}",
+-                                waiting.len(),
+-                                cold_t.elapsed().as_micros()
+-                            );
+-                        }
+                     }
+                     // No in-flight work: the drain check at the loop top finishes, after serving
+                     // any request that was past model lookup when the drain began.
+@@ -3172,6 +3218,38 @@ fn drain_channel(
+     jobs
+ }
+ 
++/// Cold-start burst hold (`PLOW_PF_COLD_BURST`): hand each message on `rx` to `take` while any
++/// request is still rendering ([`Ingress::rendering`]), for at most `budget`. Wakes on each
++/// message and when the last renderer settles (submits, leaves without submitting, or starts a
++/// media encode); stops when `take` returns `false` (a drain) or the channel closes.
++async fn cold_burst_wait(
++    ingress: &Ingress,
++    rx: &mut mpsc::Receiver<MuxMsg>,
++    budget: std::time::Duration,
++    mut take: impl FnMut(MuxMsg) -> bool,
++) {
++    let deadline = tokio::time::sleep(budget);
++    tokio::pin!(deadline);
++    loop {
++        let rendered = ingress.rendered.notified();
++        tokio::pin!(rendered);
++        rendered.as_mut().enable();
++        if ingress.rendering() == 0 {
++            return;
++        }
++        tokio::select! {
++            biased;
++            msg = rx.recv() => {
++                if !msg.is_some_and(&mut take) {
++                    return;
++                }
++            }
++            () = &mut rendered => {}
++            () = &mut deadline => return,
++        }
++    }
++}
++
+ fn queue_arrival(
+     mut job: Job,
+     arrived: Instant,
+@@ -4467,12 +4545,13 @@ fn run_one_tick(
+                         caps.iter().filter(|&&c| c > 0).count() as u64,
+                         Ordering::Relaxed,
+                     );
+-                    // A prefill pass whose launch did not carry the decode rows (serial, or packed
+-                    // without riders) is followed by this tick's decode launch: its rows still
+-                    // speculate. The token batch and the mixed step carry them themselves.
++                    // `PLOW_SPEC_AFTER_PREFILL`: a prefill pass whose launch did not carry the
++                    // decode rows (serial, or packed without riders) is followed by this tick's
++                    // decode launch: its rows still speculate. The token batch and the mixed step carry them themselves.
+                     // Span riders that rode left no feeds; any left over (refused) speculate.
+-                    let rows_rode =
+-                        (e.token_batch_enabled() && !e.span_riders_enabled()) || e.has_mixed_step();
++                    let rows_rode = !crate::config::RuntimeConfig::get().spec_after_prefill
++                        || (e.token_batch_enabled() && !e.span_riders_enabled())
++                        || e.has_mixed_step();
+                     let skip = if did_prefill && rows_rode {
+                         Some(crate::obs::serving::SpecSkip::PrefillTick)
+                     } else if obs.host.spec_backlog {
+@@ -5007,8 +5086,8 @@ fn run_one_tick(
+                     // time, so a mid-decode arrival stalls the running streams by about one
+                     // full chunk (not one whole prompt) and a burst of short prompts shares
+                     // ticks instead of each paying a decode launch in between; the decode
+-                    // launch below runs between ticks. `PLOW_PF_INTERLEAVE` (or no measured
+-                    // launch yet) keeps one chunk per tick.
++                    // launch below runs between ticks. Only with `PLOW_PF_TICK_BUDGET`;
++                    // `PLOW_PF_INTERLEAVE` (or no measured launch yet) keeps one chunk per tick.
+                     let prefilling_slots = slots
+                         .iter()
+                         .take(cap)
+@@ -5028,11 +5107,12 @@ fn run_one_tick(
+                     // Short serial-only prompts (speech) share one tick up to the interleave budget:
+                     // nothing packs them, and one per tick leaves the decode batch starved.
+                     let mut serial_rows = 0usize;
+-                    let tick_budget_ms =
+-                        (crate::config::RuntimeConfig::get().pf_interleave.is_none()
+-                            && !co_scheduled)
++                    let tick_budget_ms = {
++                        let rt = crate::config::RuntimeConfig::get();
++                        (rt.pf_tick_budget && rt.pf_interleave.is_none() && !co_scheduled)
+                             .then(|| e.pf_launch_ms(e.pf_max_rows()))
+-                            .flatten();
++                            .flatten()
++                    };
+                     let pf_tick = Instant::now();
+                     let mut owe_decode = false;
+                     loop {
+@@ -8262,7 +8342,9 @@ fn gpu_prefill_batched_pass(
+     // A Mamba pack with decoders live runs further packs while the tick stays within one widest
+     // launch's measured time, as the serial chunk loop does (`run_one_tick`): one pack per tick
+     // put a decode step between a prompt's [128, 1024] launches (c8 TTFT +0.2 s per prompt).
+-    let tick_budget_ms = (crate::config::RuntimeConfig::get().pf_interleave.is_none()
++    // `PLOW_PF_TICK_BUDGET` only.
++    let tick_budget_ms = (crate::config::RuntimeConfig::get().pf_tick_budget
++        && crate::config::RuntimeConfig::get().pf_interleave.is_none()
+         && e.mamba_packs()
+         && !bounded_tick
+         && !unified
+@@ -12675,6 +12757,85 @@ mod tests {
+         assert_eq!(source.serving.aborted.load(Ordering::Relaxed), 0);
+     }
+ 
++    /// The cold-start burst hold never waits for the request it is dispatching: `submit_arrived`
++    /// settles the guard before the job reaches the channel and drops it only after, so the
++    /// dispatcher can see the job while its guard still counts in `pending()`.
++    #[tokio::test]
++    async fn cold_burst_does_not_wait_for_the_dispatched_requests_own_guard() {
++        let (mux, mut rx) = queued_test_mux(Arc::new(Metrics::default()), 4);
++        let mut own = mux.ingress();
++        own.rendered();
++        assert!(mux.tx.try_send(MuxMsg::Job(test_job(), Instant::now())).is_ok());
++        let first = rx.try_recv();
++        assert!(matches!(first, Ok(MuxMsg::Job(..))));
++        assert_eq!(mux.ingress.pending(), 1, "its guard is still held");
++        let t = Instant::now();
++        cold_burst_wait(&mux.ingress, &mut rx, std::time::Duration::from_secs(5), |_| true).await;
++        assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
++        drop(own);
++    }
++
++    /// A request still rendering holds the cold start only until it leaves: without submitting
++    /// (400, client gone), into a media encode, or by submitting (its job joins the burst).
++    #[tokio::test]
++    async fn cold_burst_wakes_when_a_renderer_leaves_encodes_or_submits() {
++        #[derive(Clone, Copy, Debug)]
++        enum Leave {
++            Unsubmitted,
++            Encode,
++            Submit,
++        }
++        for how in [Leave::Unsubmitted, Leave::Encode, Leave::Submit] {
++            let (mux, mut rx) = queued_test_mux(Arc::new(Metrics::default()), 4);
++            assert!(mux
++                .submit_arrived(test_job(), Instant::now(), Some(mux.ingress()))
++                .is_ok());
++            assert!(matches!(rx.try_recv(), Ok(MuxMsg::Job(..))));
++            let mut other = Some(mux.ingress());
++            let mut jobs = 0;
++            let t = Instant::now();
++            let leave = async {
++                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++                match how {
++                    Leave::Unsubmitted => drop(other.take()),
++                    Leave::Encode => other.as_mut().unwrap().rendered(),
++                    Leave::Submit => assert!(mux
++                        .submit_arrived(test_job(), Instant::now(), other.take())
++                        .is_ok()),
++                }
++            };
++            let wait = cold_burst_wait(&mux.ingress, &mut rx, std::time::Duration::from_secs(5), |m| {
++                jobs += usize::from(matches!(m, MuxMsg::Job(..)));
++                true
++            });
++            tokio::join!(wait, leave);
++            let waited = t.elapsed();
++            assert!(
++                waited >= std::time::Duration::from_millis(50) && waited < std::time::Duration::from_secs(2),
++                "{how:?}: {waited:?}"
++            );
++            assert_eq!(jobs, usize::from(matches!(how, Leave::Submit)), "{how:?}");
++        }
++    }
++
++    /// A renderer that never settles holds the cold start for the budget only; a drain ends it.
++    #[tokio::test]
++    async fn cold_burst_is_bounded_and_stops_on_a_drain() {
++        let (mux, mut rx) = queued_test_mux(Arc::new(Metrics::default()), 4);
++        let _slow = mux.ingress();
++        let t = Instant::now();
++        cold_burst_wait(&mux.ingress, &mut rx, std::time::Duration::from_millis(100), |_| true).await;
++        assert!(t.elapsed() >= std::time::Duration::from_millis(100));
++        let (done, _ack) = tokio::sync::oneshot::channel();
++        assert!(mux.tx.try_send(MuxMsg::Drain(done)).is_ok());
++        let t = Instant::now();
++        cold_burst_wait(&mux.ingress, &mut rx, std::time::Duration::from_secs(5), |m| {
++            !matches!(m, MuxMsg::Drain(_))
++        })
++        .await;
++        assert!(t.elapsed() < std::time::Duration::from_millis(500));
++    }
++
+     #[tokio::test]
+     async fn bounded_ingress_reports_full_closed_and_depth() {
+         let metrics = Arc::new(Metrics::default());
+diff --git a/docs/flags-reference.md b/docs/flags-reference.md
+index e6096a753..33f803889 100644
+--- a/docs/flags-reference.md
++++ b/docs/flags-reference.md
+@@ -1126,6 +1126,11 @@ Removed (a set value is ignored with a startup warning; recipes and scripts may
+ | `PLOW_HOST_KVCACHE_SIZE=<n>MB\|<n>GB` / `--host-kvcache-size` | unset (sized by the host-reserve rule) | Pinned host memory for the KV cache's host tier on CUDA. Units are binary and case-insensitive (`64GB` = `65536MB` = 64 GiB); a bare number other than `0` is refused; `auto` = unset. Renamed from `PLOW_VMM_HOST_CACHE_MIB` (MiB): plowrt refuses to start with the old name set and prints the new spelling, and a packet emitted before the rename has its value carried over. The tier is the KV block store's second LRU level, where evicted boundaries spill (D2H, asynchronous) and from which a gather reads them in place. Unset = `MemAvailable` minus an eighth of RAM (at least 16 GiB), capped at a quarter of RAM (`memory::vmm::host_tier_default`), at start, growth frozen if that reserve would be touched; `0` = no host tier; a size = that size, under the same rule. Chunks are allocated ahead on a grower thread, never under the pool lock. AMD: the snapshot host tier of `docs/arch/22-kv-cache.md` §9, `0`/unset = off. |
+ | `PLOW_PF_ITL_BUDGET_MS=N` / `--pf-itl-budget-ms` | 0 (off; diagnostic, not qualified) | CUDA: a prefill launch that carries live decode rows takes the widest prefill rung whose measured launch time (per-engine EWMA keyed by the launched rung, `sched::ride::RideCost`) fits `N` ms, reserving the riders inside the rung; it skips a rung the riders would half fill and yields while the prefill backlog exceeds one full launch. Launches without decode rows are unchanged. |
+ | `PLOW_PF_ADMIT_OVERLAP=0/1` / `--pf-admit-overlap` | 0 (diagnostic, not qualified) | CUDA unified token batch: admit (begin_slot + prefix attach) the requests the next launch takes while the current prefill launch runs, when that launch is already full of admitted rows. |
++| `PLOW_PF_COLD_BURST=0/1` / `--pf-cold-burst` | 0 (candidate; set by the GB10 recipes) | A dispatcher with no live slots holds its first request up to one SLO (`slo_ms`) while other requests are still rendering (template, tokenize), so a burst shares the first launch; a chat request counts as pending from before its template. Wakes on each arrival and when the last renderer submits, leaves or starts a media encode. |
++| `PLOW_PF_TICK_BUDGET=0/1` / `--pf-tick-budget` | 0 (candidate; set by the GB10 recipes) | CUDA: with decoders live, a serial prefill tick (or a Mamba pack pass) runs further chunks while the tick stays within one widest launch's measured time, instead of one chunk per tick. Ignored with `PLOW_PF_INTERLEAVE` or co-scheduling. |
++| `PLOW_PF_CHUNK_COST_FIT=0/1` / `--pf-chunk-cost-fit` | 0 (candidate; set by the GB10 recipes) | CUDA serial prefill planner: price a launch at its measured fixed cost (least-squares fit over each bucket's fastest launch, 512 rows to the widest bucket) instead of a fixed 512 rows. |
++| `PLOW_SPEC_AFTER_PREFILL=0/1` / `--spec-after-prefill` | 0 (candidate; set by the GB10 recipes) | CUDA speculative decode: rows speculate in a tick whose prefill launch did not carry them (serial, or packed without riders), instead of every prefill tick running plain decode. |
++| `PLOW_VMM_PROMPT_END_EXPECTED=0/1` / `--vmm-prompt-end-expected` | 0 (candidate; set by the GB10 recipes; implied by an MTP drafter cache `kv.mtp.k`) | CUDA recurrent VMM prefix cache: a miss cuts its prefill launch at its prompt end only when a later request is expected to attach it (attached prompt, session other than its last turn, continuation of a recent prompt); other prompt ends are captured only where a launch ends anyway. |
+ | `PLOW_SHED_QUEUE_DEPTH=N` / `--shed-queue-depth` | 0 (off; diagnostic, not qualified) | Refuse a new request (429, `Retry-After: 1`) while `N` requests already wait for their first token (queued plus seated in prefill), so a load balancer spills it. A soft bound: the seated count refreshes once per dispatcher tick. |
+ | `PLOW_KV_ADMIT_HEADROOM=F` | 0.9 | **AMD** — fraction of the free-after-load device memory the mux may commit to admitted sequences' KV. Admission charges every live slot's reserved rows (prompt + `max_tokens`) at the packet's bytes-per-token and holds a request in the queue when it would not fit, instead of dispatching it into a device that cannot back it. Measured need: 20 x 70,000 rows wants 72.1 GiB where the load left 55.59 GiB free, which faulted the queue with `HSA_STATUS_ERROR_OUT_OF_RESOURCES`. A request larger than the whole budget is answered with a context-length error rather than queued forever. `0` is the rollback to slot-count-only admission. |
+ | `PLOW_KV_MEM_UTIL=F` / `--kv-mem-util` | 0 (off) | **CUDA** — caps the KV admission budget so the process, with KV fully admitted, holds at most `F` of device memory (vLLM's `--gpu-memory-utilization`). The budget is `min(headroom x free, F x total - used)` after load. |
+diff --git a/runtime/nvidia/op_gemv_fp8_tc.cuh b/runtime/nvidia/op_gemv_fp8_tc.cuh
+index 218223b84..d385a7757 100644
+--- a/runtime/nvidia/op_gemv_fp8_tc.cuh
++++ b/runtime/nvidia/op_gemv_fp8_tc.cuh
+@@ -55,9 +55,14 @@
+ #endif
+ /* fp8tc_tile: L2 prefetch of the next iteration's chunks (0 = off, the A/B control). One SM, GB10,
+  * Nemotron decode, slice us off -> on (bitwise equal): in_proj M=16 118 -> 75, out_proj M=16 56 ->
+- * 38, q / o M=4 23 -> 20, lm_head M=4 394 -> 323. */
++ * 38, q / o M=4 23 -> 20, lm_head M=4 394 -> 323. Default on GB10 (sm_121a) only: unmeasured on
++ * sm_90a / sm_120a. */
+ #ifndef PLOW_NV_FP8TC_PF
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
+ #define PLOW_NV_FP8TC_PF 1
++#else
++#define PLOW_NV_FP8TC_PF 0
++#endif
+ #endif
+ #define PLOW_FP8TC_ARENA_BYTES (PLOW_NV_WARPS * 32u * (PLOW_NV_FP8_DECODE_TC64 ? 64u : 32u) * 4u)
+ 
+diff --git a/scripts/campaign/recipes/nemotron-3.5-super.gb10.nvfp4.toml b/scripts/campaign/recipes/nemotron-3.5-super.gb10.nvfp4.toml
+index 5fdbd859f..286dbe205 100644
+--- a/scripts/campaign/recipes/nemotron-3.5-super.gb10.nvfp4.toml
++++ b/scripts/campaign/recipes/nemotron-3.5-super.gb10.nvfp4.toml
+@@ -103,6 +103,16 @@ PLOW_HOST_KVCACHE_SIZE = "0"
+ # 11.6 -> 18.1 tok/s/req; distinct-prompt serve unchanged (comparison.md, "Agentic / prefix cache").
+ PLOW_PREFIX_CACHE = "1"
+ PLOW_VMM_PREFIX = "1"
++# GB10-measured serving policies, default off on every other target (comparison.md, "Speculative
++# decode" serial prefill scheduling, "Serve c4 levers", "Agentic / prefix cache"): cold-start burst
++# hold, multi-chunk prefill ticks within one launch's time, the measured launch cost in the prefill
++# planner, speculation after a prefill tick, prompt-end capture only where expected (also implied
++# by the MTP drafter cache).
++PLOW_PF_COLD_BURST = "1"
++PLOW_PF_TICK_BUDGET = "1"
++PLOW_PF_CHUNK_COST_FIT = "1"
++PLOW_SPEC_AFTER_PREFILL = "1"
++PLOW_VMM_PROMPT_END_EXPECTED = "1"
+ 
+ [bench]
+ backend = "openai"
+diff --git a/scripts/campaign/recipes/qwen38-27b.gb10.fp8.toml b/scripts/campaign/recipes/qwen38-27b.gb10.fp8.toml
+index d34ba34a4..f3180d2ee 100644
+--- a/scripts/campaign/recipes/qwen38-27b.gb10.fp8.toml
++++ b/scripts/campaign/recipes/qwen38-27b.gb10.fp8.toml
+@@ -106,6 +106,14 @@ PLOW_PREFIX_CACHE = "1"
+ PLOW_VMM_PREFIX = "1"
+ # GB10 is integrated: a pinned host KV tier would only move KV within the same LPDDR5X pool.
+ PLOW_HOST_KVCACHE_SIZE = "0"
++# GB10 serving policies, default off on every other target (nemotron-3.5-super-gb10/comparison.md):
++# cold-start burst hold, multi-chunk prefill ticks, measured launch cost in the prefill planner,
++# speculation after a prefill tick, prompt-end capture only where expected.
++PLOW_PF_COLD_BURST = "1"
++PLOW_PF_TICK_BUDGET = "1"
++PLOW_PF_CHUNK_COST_FIT = "1"
++PLOW_SPEC_AFTER_PREFILL = "1"
++PLOW_VMM_PROMPT_END_EXPECTED = "1"
+ 
+ [bench]
+ backend = "openai"

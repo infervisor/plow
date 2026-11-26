@@ -1,0 +1,825 @@
+--- a/crates/devgen/src/components/nvfp4_moe.rs	2026-11-26 10:29:13.907044769 +0000
++++ b/crates/devgen/src/components/nvfp4_moe.rs	2026-11-25 22:25:48.063851730 +0000
+@@ -8,6 +8,7 @@
+ //! (`derived_weights` `cat`): W u8 `[E][n][k/2]`, S e4m3 `[E][n][k/16]`, gs f32 `[E]`.
+ use kernelcaps::arms::{Arms, MissingArm};
+ use packet::dev::{DevOp, TENSOR_NONE};
++use packet::rope::GenTensor;
+ use packet::typed_abi::{
+     MoeAlignNvfp4Args, MoeCombinePfArgs, MoeDownNvfp4Args, MoeDownNvfp4PfArgs, MoeQuantNvfp4Args,
+     MoeRouterLogitsF32Args, MoeRouterSigmoidTopkArgs, MoeUpNvfp4Args, MoeUpNvfp4PfArgs,
+@@ -213,9 +214,11 @@
+                     E: e,
+                     w4a4: 1,
+                     n2: e,
++                    tmaps: 0,
+                 },
+                 &[da, dq],
+             );
++            let tmaps = w4a4_tmaps(p, rows, fq, rows * k, down[0], e, kdim, inter);
+             p.emit(
+                 MoeDownNvfp4PfArgs {
+                     out: part,
+@@ -233,6 +236,7 @@
+                     E: e,
+                     mode: 2,
+                     w4a4: 1,
++                    tmaps,
+                 },
+                 &[du],
+             )
+@@ -356,6 +360,7 @@
+                 },
+                 &[d6],
+             );
++            let tmaps = w4a4_tmaps(p, rows, hq, rows, sup[0], 1, sinter, hidden);
+             let d7 = p.emit(
+                 MoeUpNvfp4PfArgs {
+                     fu_g: sfq,
+@@ -373,12 +378,14 @@
+                     E: 1,
+                     w4a4: 1,
+                     n2: 1,
++                    tmaps,
+                 },
+                 &[dq],
+             );
+             // Mode 3 folds `mixed = bf16(rout + bf16(shared))` into the shared down's epilogue
+             // (rout in the row_partidx slot), replacing the Residual pass below.
+             let radd = shared_radd();
++            let tmaps = w4a4_tmaps(p, rows, sfq, rows, sdown[0], 1, hidden, sinter);
+             let d8 = p.emit(
+                 MoeDownNvfp4PfArgs {
+                     out: if radd { mixed } else { sout },
+@@ -396,6 +403,7 @@
+                     E: 1,
+                     mode: if radd { 3 } else { 1 },
+                     w4a4: 1,
++                    tmaps,
+                 },
+                 &[d7],
+             );
+@@ -440,6 +448,48 @@
+     parts.map(|(suffix, bytes)| p.b.tensor(&format!("{module}.{suffix}"), bytes))
+ }
+ 
++/// Smaller chunks keep the cp.async feed: at <= 1024 rows an expert holds ~5-44 rows and the box /
++/// mbarrier overhead outweighs the saving (L1 1024 rows +1.4%).
++const W4A4_TMA_MIN_ROWS: u32 = 2048;
++
++/// A W4A4 walk's TMA feed (`i7` = A map | B map << 16, op_moe_nvfp4_pf.cuh `nf4v_tiled`): A =
++/// `a_rows` contiguous q rows of `a`, B = the `[e * n]` weight rows of `w`, both u8 rows of `k / 2`
++/// bytes, boxes of 64 / BN rows. 0 (cp.async feed) below `W4A4_TMA_MIN_ROWS` chunk rows or when the
++/// v2 tile width BN does not divide `n`.
++#[allow(clippy::too_many_arguments)]
++fn w4a4_tmaps(
++    p: &mut Program,
++    rows: u32,
++    a: u32,
++    a_rows: u32,
++    w: u32,
++    e: u32,
++    n: u32,
++    k: u32,
++) -> u32 {
++    if rows < W4A4_TMA_MIN_ROWS {
++        return 0;
++    }
++    let bn = match n {
++        n if n % 256 == 0 => 256,
++        n if n % 192 == 0 => 192,
++        _ => return 0,
++    };
++    let mut map = |target: u32, rows: u32, box_rows: u32| {
++        p.b.tensor_gen(
++            &format!("tmap.w4a4.{target}.{rows}"),
++            128,
++            GenTensor::tmap_u8_sw64(target, rows, k / 2, box_rows),
++        )
++    };
++    let (ha, hb) = (map(a, a_rows, 64), map(w, e * n, bn));
++    assert!(
++        ha != 0 && ha < 0xFFFF && hb < 0xFFFF,
++        "W4A4 tensor-map handles exceed u16"
++    );
++    ha | hb << 16
++}
++
+ /// Routed-expert NVFP4 tensors of `<module>.experts.<x>.<proj>` concatenated over the experts.
+ fn expert_weights(p: &mut Program, module: &str, proj: &str, e: u32, n: u32, k: u32) -> [u32; 3] {
+     let (n, k, e64) = (u64::from(n), u64::from(k), u64::from(e));
+--- a/crates/devgen/src/knob_spec.rs	2026-11-26 10:29:13.916044780 +0000
++++ b/crates/devgen/src/knob_spec.rs	2026-11-25 22:24:59.708128222 +0000
+@@ -2371,6 +2371,7 @@
+     KnobSpec::new("def.PLOW_NV_W4A4_V2_PP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_W4A4_V2_PP_MAXT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_W4A4_V2_STCS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
++    KnobSpec::new("def.PLOW_NV_W4A4_V2_TMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_MASKED_PADDING", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_MINBLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_MLA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+--- a/crates/devgen/src/nemotron_h.rs	2026-11-26 10:29:13.924044790 +0000
++++ b/crates/devgen/src/nemotron_h.rs	2026-11-25 22:24:59.708576240 +0000
+@@ -430,6 +430,7 @@
+     );
+     let mut tensors = None;
+     let mut progs = Vec::new();
++    let mut gen: Vec<packet::rope::GenTensor> = Vec::new();
+     let mut last = None;
+     let phases = buckets
+         .iter()
+@@ -442,11 +443,18 @@
+         let mut m = phase(c, ctx, n_cu, target, rows, slots, prefill, tensors);
+         tensors = Some(std::mem::take(&mut m.tensors));
+         progs.push(m.progs.remove(0));
++        // Adopting tensor declarations does not carry their generation recipes.
++        for recipe in std::mem::take(&mut m.gen) {
++            if !gen.iter().any(|g| g.tensor == recipe.tensor) {
++                gen.push(recipe);
++            }
++        }
+         last = Some(m);
+     }
+     let mut m = last.unwrap();
+     m.tensors = tensors.unwrap();
+     m.progs = progs;
++    m.gen = gen;
+     m.prog_t = buckets.iter().chain(rungs).copied().collect();
+     m
+ }
+--- a/crates/packet/src/dev.rs	2026-11-26 10:29:13.934044802 +0000
++++ b/crates/packet/src/dev.rs	2026-11-25 22:24:59.708753889 +0000
+@@ -2686,15 +2686,18 @@
+     /// `i0=T i1=E i2=k`.
+     MoeAlignNvfp4 = 236,
+     /// Prefill grouped up + relu^2 into sorted rows. `t0=fu_g t1=x t2=meta? t3=W t4=S t5=gs
+-    /// t6=row_token? t7=s2?` · `i0=T i1=k i2=I i3=K i4=E i5=w4a4 i6=n2`; meta NONE = dense E=1.
++    /// t6=row_token? t7=s2?` · `i0=T i1=k i2=I i3=K i4=E i5=w4a4 i6=n2 i7=tmaps?`; meta NONE =
++    /// dense E=1.
+     /// w4a4 = 1: x is the NVFP4 q tensor of [`DevOp::MoeQuantNvfp4`] and fu_g the q tensor of
+     /// relu^2 (T*k sorted rows, or T dense) quantized with 1 / max(s2[0..n2)) (the down
+-    /// projection's input_scales).
++    /// projection's input_scales). tmaps (dense only, 0 = none): the TMA feed's
++    /// `GEN_TMAP_U8_SW64` handles over x (low u16) and W (high u16).
+     MoeUpNvfp4Pf = 237,
+     /// Prefill grouped down. `t0=out t1=fu_g t2=meta? t3=W t4=S t5=gs t6=row_partidx? t7=row_gate?`
+-    /// · `i0=T i1=k i2=H i3=I i4=E i5=mode i6=w4a4` (as [`DevOp::MoeDownNvfp4`]); w4a4 = 1: fu_g
+-    /// is the up projection's q tensor. mode 2 (routed): `out[row_partidx]` = bf16 of the ungated
+-    /// expert output, for the bf16 [`DevOp::MoeCombinePf`] (`i5 = 1`).
++    /// · `i0=T i1=k i2=H i3=I i4=E i5=mode i6=w4a4 i7=tmaps?` (as [`DevOp::MoeDownNvfp4`]); w4a4 = 1:
++    /// fu_g is the up projection's q tensor; tmaps as [`DevOp::MoeUpNvfp4Pf`]'s, over fu_g and W.
++    /// mode 2 (routed): `out[row_partidx]` = bf16 of the ungated expert output, for the bf16
++    /// [`DevOp::MoeCombinePf`] (`i5 = 1`).
+     MoeDownNvfp4Pf = 238,
+     /// NVFP4 activation quant (W4A4 prefill arm). `t0=q t1=x t2=in_scale` · `i0=R i1=K i2=n`:
+     /// q = `[R][K/2]` e2m1 | `[R][K/16]` e4m3 | f32 alpha of x bf16 `[R][K]`, global scale
+--- a/crates/packet/src/devbuild.rs	2026-11-26 10:29:13.942044812 +0000
++++ b/crates/packet/src/devbuild.rs	2026-11-25 22:24:59.709337477 +0000
+@@ -4166,6 +4166,7 @@
+             assert!(
+                 g.kind != crate::rope::GEN_TMAP_BF16
+                     && g.kind != crate::rope::GEN_TMAP_E4M3
++                    && g.kind != crate::rope::GEN_TMAP_U8_SW64
+                     && g.kind != crate::rope::GEN_TMAP_KV_PAIR,
+                 "gen tensor {}: tensormap recipes cannot be baked into init (--no-rope-gen is \
+                  incompatible with TMA packets)",
+--- a/crates/packet/src/rope.rs	2026-11-26 10:29:13.950044822 +0000
++++ b/crates/packet/src/rope.rs	2026-11-25 22:24:59.709775143 +0000
+@@ -273,6 +273,10 @@
+ pub const GEN_AMD_ROPE_BF16_SIN: u32 = 8;
+ pub const GEN_AMD_ROPE_IDX_BF16_COS: u32 = 9;
+ pub const GEN_AMD_ROPE_IDX_BF16_SIN: u32 = 10;
++/// [`GenTensor::kind`]: as [`GEN_TMAP_E4M3`] over a u8 `[ctx rows][hd bytes]` K-major tensor,
++/// box {64, `scale`} with 64B swizzle — one k128 NVFP4 stage per box, landing in the W4A4 MoE
++/// walk's ring layout (16 B chunk ^ (row >> 1 & 3)). Same placeholder contract.
++pub const GEN_TMAP_U8_SW64: u32 = 11;
+ 
+ /// [`GenTensor::scale`]: no inv_freq rescaling (Gemma / Qwen / GLM).
+ pub const ROPE_SCALE_NONE: u32 = 0;
+@@ -348,7 +352,7 @@
+     /// Lets a caller declare the tensor without expanding it.
+     pub fn byte_len(&self) -> u64 {
+         match self.kind {
+-            GEN_TMAP_BF16 | GEN_TMAP_E4M3 => 128,
++            GEN_TMAP_BF16 | GEN_TMAP_E4M3 | GEN_TMAP_U8_SW64 => 128,
+             GEN_TMAP_KV_PAIR => 256,
+             _ => self.ctx as u64 * (self.hd as u64 / 2) * 4,
+         }
+@@ -363,7 +367,7 @@
+         // Placeholder, not the descriptor: encoding needs the target's DEVICE address
+         // (cuTensorMapEncodeTiled is host-driver work at bind time). The CUDA engine
+         // overwrites these bytes after the upload loop; see GEN_TMAP_BF16's doc.
+-        if self.kind == GEN_TMAP_BF16 || self.kind == GEN_TMAP_E4M3 {
++        if matches!(self.kind, GEN_TMAP_BF16 | GEN_TMAP_E4M3 | GEN_TMAP_U8_SW64) {
+             return Some(vec![0u8; 128]);
+         }
+         if self.kind == GEN_TMAP_KV_PAIR {
+@@ -388,7 +392,7 @@
+     /// `generate().is_some()`, without materialising the table.
+     pub fn is_readable(&self) -> bool {
+         match self.kind {
+-            GEN_TMAP_BF16 | GEN_TMAP_E4M3 | GEN_TMAP_KV_PAIR => true,
++            GEN_TMAP_BF16 | GEN_TMAP_E4M3 | GEN_TMAP_U8_SW64 | GEN_TMAP_KV_PAIR => true,
+             GEN_ROPE_COS | GEN_ROPE_SIN | GEN_ROPE_IDX_COS | GEN_ROPE_IDX_SIN => {
+                 self.rope_scale().is_some()
+             }
+@@ -499,6 +503,15 @@
+         ]
+     }
+ 
++    /// The recipe for a [`GEN_TMAP_U8_SW64`] descriptor over `target`, `rows` rows of
++    /// `row_bytes` bytes.
++    pub fn tmap_u8_sw64(target: u32, rows: u32, row_bytes: u32, box_rows: u32) -> GenTensor {
++        GenTensor {
++            kind: GEN_TMAP_U8_SW64,
++            ..Self::tmap_bf16(target, rows, row_bytes, box_rows)
++        }
++    }
++
+     /// The recipe for a [`GEN_TMAP_E4M3`] descriptor over `target`, a `[rows][k]` e4m3
+     /// K-major tensor.
+     pub fn tmap_e4m3(target: u32, rows: u32, k: u32, box_rows: u32) -> GenTensor {
+--- a/crates/packet/src/slots.rs	2026-11-26 10:29:13.958044832 +0000
++++ b/crates/packet/src/slots.rs	2026-11-25 22:24:59.709866583 +0000
+@@ -300,8 +300,8 @@
+     S { op: DevOp::MoeUpNvfp4, t: &["fu", "x", "table?", "W", "S", "gs"], i: &["T", "k", "I", "K", "E"], f: &[], j: &[] },
+     S { op: DevOp::MoeDownNvfp4, t: &["out", "fu", "table?", "W", "S", "gs"], i: &["T", "k", "H", "I", "E", "mode"], f: &[], j: &[] },
+     S { op: DevOp::MoeAlignNvfp4, t: &["meta", "table", "row_token", "row_partidx", "row_gate"], i: &["T", "E", "k"], f: &[], j: &[] },
+-    S { op: DevOp::MoeUpNvfp4Pf, t: &["fu_g", "x", "meta?", "W", "S", "gs", "row_token?", "s2?"], i: &["T", "k", "I", "K", "E", "w4a4", "n2"], f: &[], j: &[] },
+-    S { op: DevOp::MoeDownNvfp4Pf, t: &["out", "fu_g", "meta?", "W", "S", "gs", "row_partidx?", "row_gate?"], i: &["T", "k", "H", "I", "E", "mode", "w4a4"], f: &[], j: &[] },
++    S { op: DevOp::MoeUpNvfp4Pf, t: &["fu_g", "x", "meta?", "W", "S", "gs", "row_token?", "s2?"], i: &["T", "k", "I", "K", "E", "w4a4", "n2", "tmaps?"], f: &[], j: &[] },
++    S { op: DevOp::MoeDownNvfp4Pf, t: &["out", "fu_g", "meta?", "W", "S", "gs", "row_partidx?", "row_gate?"], i: &["T", "k", "H", "I", "E", "mode", "w4a4", "tmaps?"], f: &[], j: &[] },
+     S { op: DevOp::MoeQuantNvfp4, t: &["q", "x", "in_scale"], i: &["R", "K", "n"], f: &[], j: &[] },
+     S { op: DevOp::MoeGluMx, t: &["fu", "x", "table", "W_gu", "S_gu", "bias_gu?"], i: &["k", "I", "K", "n_exp", "layout", "act", "n_batch"], f: &["alpha", "limit"], j: &[] },
+     S { op: DevOp::MoeDownMx, t: &["part", "fu", "table", "W_d", "S_d", "bias_d?"], i: &["k", "H", "I", "n_exp", "", "", "n_batch"], f: &[], j: &[] },
+--- a/crates/packet/src/typed_abi.rs	2026-11-26 10:29:13.967044843 +0000
++++ b/crates/packet/src/typed_abi.rs	2026-11-25 22:24:59.709947624 +0000
+@@ -387,7 +387,7 @@
+ typed_op! {
+     MoeUpNvfp4PfArgs = MoeUpNvfp4Pf {
+         t fu_g = 0, t x = 1, t meta = 2, t W = 3, t S = 4, t gs = 5, t row_token = 6, t s2 = 7,
+-        i T = 0, i k = 1, i I = 2, i K = 3, i E = 4, i w4a4 = 5, i n2 = 6,
++        i T = 0, i k = 1, i I = 2, i K = 3, i E = 4, i w4a4 = 5, i n2 = 6, i tmaps = 7,
+     }
+ }
+ 
+@@ -395,7 +395,7 @@
+     MoeDownNvfp4PfArgs = MoeDownNvfp4Pf {
+         t out = 0, t fu_g = 1, t meta = 2, t W = 3, t S = 4, t gs = 5, t row_partidx = 6,
+         t row_gate = 7,
+-        i T = 0, i k = 1, i H = 2, i I = 3, i E = 4, i mode = 5, i w4a4 = 6,
++        i T = 0, i k = 1, i H = 2, i I = 3, i E = 4, i mode = 5, i w4a4 = 6, i tmaps = 7,
+     }
+ }
+ 
+--- a/crates/plow-asset/src/live_kv.rs	2026-11-26 10:29:13.974044852 +0000
++++ b/crates/plow-asset/src/live_kv.rs	2026-11-25 22:24:59.710031448 +0000
+@@ -373,7 +373,8 @@
+         let mut generated_maps = BTreeMap::new();
+         for g in packet.generated {
+             require(
+-                g.kind <= packet::rope::GEN_TMAP_KV_PAIR,
++                g.kind <= packet::rope::GEN_TMAP_KV_PAIR
++                    || g.kind == packet::rope::GEN_TMAP_U8_SW64,
+                 "unknown generator access contract",
+             )?;
+             require(
+@@ -408,7 +409,9 @@
+                 return Err("non-KV generator aliases a KV map".into());
+             } else if matches!(
+                 g.kind,
+-                packet::rope::GEN_TMAP_BF16 | packet::rope::GEN_TMAP_E4M3
++                packet::rope::GEN_TMAP_BF16
++                    | packet::rope::GEN_TMAP_E4M3
++                    | packet::rope::GEN_TMAP_U8_SW64
+             ) {
+                 require(
+                     !handles.iter().any(|&h| u32::from(h) == g.aux),
+@@ -857,6 +860,48 @@
+                 "multimodal row operands",
+             )?;
+         }
++        // W4A4 walk TMA feed (op_moe_nvfp4_pf.cuh nf4v_tiled): i7 = A map | B map << 16 over t1 /
++        // t3, u8 [rows][K / 2], box 64 B x 64 (A) / BN (B) rows. Up and down both carry N in i2
++        // and K in i3; the routed up gathers A and takes no maps.
++        DevOp::MoeUpNvfp4Pf | DevOp::MoeDownNvfp4Pf if d.i[7] != 0 => {
++            let up = op == DevOp::MoeUpNvfp4Pf;
++            let routed = d.t[2] != TENSOR_NONE16;
++            let [t, k, n, kd, e] = [d.i[0], d.i[1], d.i[2], d.i[3], d.i[4]].map(u64::from);
++            let bn = if n % 256 == 0 { 256 } else if n % 192 == 0 { 192 } else { 0 };
++            require(
++                d.i[if up { 5 } else { 6 }] == 1 && !(up && routed) && bn > 0 && kd % 128 == 0,
++                "W4A4 tensor maps on an unmapped walk",
++            )?;
++            let a_rows = if routed { t * k } else { t };
++            for (handle, source, rows, box_rows) in [
++                (d.i[7] & 0xFFFF, d.t[1], a_rows, 64),
++                (d.i[7] >> 16, d.t[3], e * n, bn),
++            ] {
++                let mut generators = packet.generated.iter().filter(|g| g.tensor == handle);
++                let g = generators.next().ok_or("missing W4A4 tensor-map operands")?;
++                require(
++                    handle != 0
++                        && handle < u32::from(TENSOR_NONE16)
++                        && handle != u32::from(source)
++                        && generators.next().is_none()
++                        && g.kind == packet::rope::GEN_TMAP_U8_SW64
++                        && g.aux == u32::from(source)
++                        && u64::from(g.hd) == kd / 2
++                        && rows > 0
++                        && rows <= u64::from(g.ctx)
++                        && u64::from(g.scale) == box_rows
++                        && packet
++                            .tensors
++                            .get(handle as usize)
++                            .is_some_and(|t| t.bytes == 128)
++                        && packet
++                            .tensors
++                            .get(source as usize)
++                            .is_some_and(|t| t.bytes >= u64::from(g.ctx) * u64::from(g.hd)),
++                    "W4A4 tensor-map operands disagree with direct operands",
++                )?;
++            }
++        }
+         _ => {}
+     }
+     require(
+@@ -921,6 +966,7 @@
+                 | DevOp::MoeUpNvfp4
+                 | DevOp::MoeDownNvfp4
+                 | DevOp::MoeAlignNvfp4
++                // The W4A4 walks' i7 tensor maps are bound to their own A / B operands above.
+                 | DevOp::MoeUpNvfp4Pf
+                 | DevOp::MoeDownNvfp4Pf
+                 | DevOp::MoeQuantNvfp4
+--- a/crates/plow-asset/src/logical_effects.rs	2026-11-26 10:29:13.983044863 +0000
++++ b/crates/plow-asset/src/logical_effects.rs	2026-11-25 22:24:59.710144009 +0000
+@@ -475,6 +475,10 @@
+             .filter(|&h| h != 0)
+             .map(|h| (h, false))
+             .collect(),
++        // W4A4 walk TMA descriptors over A (low u16) and B (high u16), 0 = absent.
++        Some(DevOp::MoeUpNvfp4Pf | DevOp::MoeDownNvfp4Pf) if d.i[7] != 0 => {
++            vec![(d.i[7] & 0xFFFF, false), (d.i[7] >> 16, false)]
++        }
+         _ => Vec::new(),
+     };
+     if accesses.iter().any(|&(h, _)| h >= TENSOR_NONE_I) {
+@@ -484,9 +488,10 @@
+ }
+ 
+ /// Tensor-map operands read their target through the map: each must be a generated map over the
+-/// instruction's own operand (GEMM i6 = A t1, i7 = B t2; flash-prefill t7 = K t3 / V t4).
++/// instruction's own operand (GEMM i6 = A t1, i7 = B t2; flash-prefill t7 = K t3 / V t4; W4A4
++/// MoE walk i7 = A t1 | B t3 << 16).
+ fn tmaps_bound(packet: &Packet<'_>, d: &DevInst64) -> Result<(), String> {
+-    use packet::rope::{GEN_TMAP_BF16, GEN_TMAP_E4M3, GEN_TMAP_KV_PAIR};
++    use packet::rope::{GEN_TMAP_BF16, GEN_TMAP_E4M3, GEN_TMAP_KV_PAIR, GEN_TMAP_U8_SW64};
+     let gen = |h: u32| packet.generated.iter().find(|g| g.tensor == h);
+     let ok = match DevOp::from_u16(d.op) {
+         Some(DevOp::Gemm | DevOp::GemmFp8) => [(d.i[6], d.t[1]), (d.i[7], d.t[2])]
+@@ -497,6 +502,13 @@
+                     matches!(g.kind, GEN_TMAP_BF16 | GEN_TMAP_E4M3) && g.aux == u32::from(target)
+                 })
+             }),
++        Some(DevOp::MoeUpNvfp4Pf | DevOp::MoeDownNvfp4Pf) if d.i[7] != 0 => {
++            [(d.i[7] & 0xFFFF, d.t[1]), (d.i[7] >> 16, d.t[3])]
++                .into_iter()
++                .all(|(h, target)| {
++                    gen(h).is_some_and(|g| g.kind == GEN_TMAP_U8_SW64 && g.aux == u32::from(target))
++                })
++        }
+         Some(DevOp::FlashPrefill) if d.t[7] != TENSOR_NONE16 => {
+             gen(u32::from(d.t[7])).is_some_and(|g| {
+                 g.kind == GEN_TMAP_KV_PAIR
+@@ -513,9 +525,13 @@
+ /// A generated tensor map is a load-time descriptor whose target `tmaps_bound` checks; a write
+ /// would let a reader reach a target outside its declared effects.
+ fn is_tmap(packet: &Packet<'_>, handle: u32) -> bool {
+-    use packet::rope::{GEN_TMAP_BF16, GEN_TMAP_E4M3, GEN_TMAP_KV_PAIR};
++    use packet::rope::{GEN_TMAP_BF16, GEN_TMAP_E4M3, GEN_TMAP_KV_PAIR, GEN_TMAP_U8_SW64};
+     packet.generated.iter().any(|g| {
+-        g.tensor == handle && matches!(g.kind, GEN_TMAP_BF16 | GEN_TMAP_E4M3 | GEN_TMAP_KV_PAIR)
++        g.tensor == handle
++            && matches!(
++                g.kind,
++                GEN_TMAP_BF16 | GEN_TMAP_E4M3 | GEN_TMAP_U8_SW64 | GEN_TMAP_KV_PAIR
++            )
+     })
+ }
+ 
+--- a/crates/plow-asset/src/splitk.rs	2026-11-26 10:29:13.990044872 +0000
++++ b/crates/plow-asset/src/splitk.rs	2026-11-25 22:24:59.710332746 +0000
+@@ -248,7 +248,9 @@
+         )?;
+         let mut handles = vec![generated.tensor];
+         match generated.kind {
+-            packet::rope::GEN_TMAP_BF16 | packet::rope::GEN_TMAP_E4M3 => {
++            packet::rope::GEN_TMAP_BF16
++            | packet::rope::GEN_TMAP_E4M3
++            | packet::rope::GEN_TMAP_U8_SW64 => {
+                 handles.push(generated.aux)
+             }
+             packet::rope::GEN_TMAP_KV_PAIR => handles.extend([generated.aux, generated.scale]),
+--- a/crates/plowrt/src/device/cuda.rs	2026-11-26 10:29:13.997044880 +0000
++++ b/crates/plowrt/src/device/cuda.rs	2026-11-25 22:24:59.710501211 +0000
+@@ -1414,6 +1414,36 @@
+         self.encode_tmap(base, rows, k, box_rows, true)
+     }
+ 
++    /// `GEN_TMAP_U8_SW64`: rank-2 `[rows][row_bytes]` u8, box `{64, box_rows}`, 64 B swizzle
++    /// (the W4A4 MoE walk's ring layout), L2 128 B promotion, OOB zero-fill.
++    pub fn encode_tmap_u8_sw64(
++        &self,
++        base: u64,
++        rows: u32,
++        row_bytes: u32,
++        box_rows: u32,
++    ) -> Result<[u8; 128]> {
++        if row_bytes == 0 || row_bytes % 64 != 0 || !(1..=256).contains(&box_rows) {
++            return Err(RuntimeError::Rejected(format!(
++                "GEN_TMAP_U8_SW64: {row_bytes}-byte rows, box rows {box_rows}"
++            )));
++        }
++        // cuda.h: UINT8 = 0, INTERLEAVE_NONE = 0, SWIZZLE_64B = 2, L2_PROMOTION_L2_128B = 2,
++        // OOB_FILL_NONE = 0.
++        self.encode_tmap_tiled(
++            0,
++            base,
++            &[u64::from(row_bytes), u64::from(rows)],
++            &[u64::from(row_bytes)],
++            &[64, box_rows],
++            &[1, 1],
++            0,
++            2,
++            2,
++            0,
++        )
++    }
++
+     /// Any tiled tensor map (`cuTensorMapEncodeTiled`): `dims` / `boxes` / `elem_strides` of one
+     /// rank, `strides` (bytes) of rank - 1; enum arguments as in cuda.h.
+     #[allow(clippy::too_many_arguments)]
+--- a/crates/plowrt/src/exec/gpu.rs	2026-11-26 10:29:14.005044890 +0000
++++ b/crates/plowrt/src/exec/gpu.rs	2026-11-26 01:06:41.713009662 +0000
+@@ -2161,6 +2161,8 @@
+     rope_pf: Option<KernelFn>,
+     /// `plow_moe_w4a4_pf`: a W4A4 MoE up / down segment as its own launch (sm_12x NVFP4 MoE).
+     moe_w4a4_pf: Option<KernelFn>,
++    /// `plow_moe_w4a4_pf_tma`: the same for an instruction carrying tensor maps (i7 != 0).
++    moe_w4a4_pf_tma: Option<KernelFn>,
+     smem_flash: u32,
+     grid_flash: u32,
+     f_gemm: KernelFn,
+@@ -6043,7 +6045,12 @@
+         // the packet carries in i[6]/i[7] resolves to finished bytes. A TMA-bearing
+         // packet on a driver that cannot encode fails HERE, loudly, not on first prefill.
+         for g in blob.gen.iter().filter(|g| {
+-            g.kind == packet::rope::GEN_TMAP_BF16 || g.kind == packet::rope::GEN_TMAP_E4M3
++            matches!(
++                g.kind,
++                packet::rope::GEN_TMAP_BF16
++                    | packet::rope::GEN_TMAP_E4M3
++                    | packet::rope::GEN_TMAP_U8_SW64
++            )
+         }) {
+             let (map, tgt) = (g.tensor as usize, g.aux as usize);
+             if tgt >= devp.len() || map >= devp.len() {
+@@ -6060,10 +6067,10 @@
+             );
+             // TMA zero-fills only outside the map's extent: an extent past the target buffer
+             // reads whatever lies after it.
+-            let element = if g.kind == packet::rope::GEN_TMAP_E4M3 {
+-                1
+-            } else {
++            let element = if g.kind == packet::rope::GEN_TMAP_BF16 {
+                 2
++            } else {
++                1
+             };
+             if u64::from(g.ctx) * u64::from(g.hd) * element > devp[tgt].len {
+                 return Err(RuntimeError::Rejected(format!(
+@@ -6071,7 +6078,9 @@
+                     g.tensor, g.ctx, g.hd, devp[tgt].len
+                 )));
+             }
+-            let bytes = if g.kind == packet::rope::GEN_TMAP_E4M3 {
++            let bytes = if g.kind == packet::rope::GEN_TMAP_U8_SW64 {
++                be.encode_tmap_u8_sw64(devp[tgt].base, g.ctx, g.hd, g.scale)?
++            } else if g.kind == packet::rope::GEN_TMAP_E4M3 {
+                 be.encode_tmap_e4m3(devp[tgt].base, g.ctx, g.hd, g.scale)?
+             } else {
+                 be.encode_tmap_bf16(devp[tgt].base, g.ctx, g.hd, g.scale)?
+@@ -12199,6 +12208,19 @@
+                 } else {
+                     None
+                 };
++                let moe_w4a4_pf_tma = if moe_w4a4_pf.is_some()
++                    && be.module_global_u32(
++                        &m1,
++                        &format!("plow_moe_w4a4_pf_tma_abi{seg_global_suffix}"),
++                    )? == Some(1)
++                {
++                    let f =
++                        be.get_function(&m1, &format!("plow_moe_w4a4_pf_tma{seg_global_suffix}"))?;
++                    be.set_max_dynamic_smem(f, s1)?;
++                    Some(f)
++                } else {
++                    None
++                };
+                 let sp = SegPf {
+                     glu_quant_cached,
+                     glu_quant_cached_q,
+@@ -12209,6 +12231,7 @@
+                     norm_rms_row_grid: norm_rms_abi == Some(2),
+                     rope_pf,
+                     moe_w4a4_pf,
++                    moe_w4a4_pf_tma,
+                     masked_padding,
+                     serial,
+                     f_flash: f1,
+@@ -13044,6 +13067,10 @@
+                     if light_routes.len() <= *seg {
+                         light_routes.resize_with(seg + 1, || None);
+                     }
++                    let function = match sp.moe_w4a4_pf_tma {
++                        Some(f) if insts.iter().any(|&i| g.insts[i].i[7] != 0) => f,
++                        _ => function,
++                    };
+                     light_routes[*seg] = Some(cublaslt::prefill_moe_w4a4_route(
+                         be,
+                         function,
+--- a/runtime/nvidia/interp_sm120.cu	2026-11-26 10:29:14.013044900 +0000
++++ b/runtime/nvidia/interp_sm120.cu	2026-11-26 01:06:10.587720807 +0000
+@@ -6260,28 +6260,51 @@
+  * item); as this entry's callees they get the standalone allocation (none). */
+ #if PLOW_NV_PREFILL && PLOW_NV_SEGMENTS && !PLOW_NV_SEG_GEMM && !PLOW_NV_FA_ONLY && PLOW_NV_NVFP4_MOE && \
+     PLOW_HAS_MOE_UP_NVFP4_PF && PLOW_HAS_MOE_DOWN_NVFP4_PF && PLOW_NV_THREADS == 256
++#define MW_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : t[in->t[k]])
++#define MW_UP_ARGS                                                                                              \
++    (uint8_t*)MW_TEN(0), (const uint8_t*)MW_TEN(1), (const int*)MW_TEN(2), (const uint8_t*)MW_TEN(3),            \
++        (const uint8_t*)MW_TEN(4), (const float*)MW_TEN(5), (const unsigned*)MW_TEN(6), (const float*)MW_TEN(7), \
++        in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[6], slice, nblk, arena
++#define MW_DOWN_ARGS                                                                                            \
++    MW_TEN(0), (const uint8_t*)MW_TEN(1), (const int*)MW_TEN(2), (const uint8_t*)MW_TEN(3),                      \
++        (const uint8_t*)MW_TEN(4), (const float*)MW_TEN(5), (const unsigned*)MW_TEN(6), (const float*)MW_TEN(7), \
++        in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], slice, nblk, arena
+ extern "C" __device__ unsigned PLOW_SYM(plow_moe_w4a4_pf_abi) = 1;
+ extern "C" __global__ void __launch_bounds__(256, 1) PLOW_SYM(plow_moe_w4a4_pf)(PlowProgram prog, unsigned inst) {
+     extern __shared__ __align__(16) float arena[];
+     void* const* t = prog.tensors;
+     const PlowDevInst* in = prog.insts + inst;
+     const unsigned slice = blockIdx.x, nblk = gridDim.x;
+-#define MW_TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : t[in->t[k]])
+     if (in->op == PLOW_DOP_MOE_UP_NVFP4_PF && in->i[5] == 1u)
+-        d_moe_up_nvfp4_pf_w4a4((uint8_t*)MW_TEN(0), (const uint8_t*)MW_TEN(1), (const int*)MW_TEN(2),
+-                               (const uint8_t*)MW_TEN(3), (const uint8_t*)MW_TEN(4), (const float*)MW_TEN(5),
+-                               (const unsigned*)MW_TEN(6), (const float*)MW_TEN(7), in->i[0], in->i[1], in->i[2],
+-                               in->i[3], in->i[4], in->i[6], slice, nblk, arena);
++        d_moe_up_nvfp4_pf_w4a4(MW_UP_ARGS);
+     else if (in->op == PLOW_DOP_MOE_DOWN_NVFP4_PF && in->i[6] == 1u)
+-        d_moe_down_nvfp4_pf_w4a4(MW_TEN(0), (const uint8_t*)MW_TEN(1), (const int*)MW_TEN(2),
+-                                 (const uint8_t*)MW_TEN(3), (const uint8_t*)MW_TEN(4), (const float*)MW_TEN(5),
+-                                 (const unsigned*)MW_TEN(6), (const float*)MW_TEN(7), in->i[0], in->i[1],
+-                                 in->i[2], in->i[3], in->i[4], in->i[5], slice, nblk, arena);
++        d_moe_down_nvfp4_pf_w4a4(MW_DOWN_ARGS);
++    else
++        __trap();
++}
++#if PLOW_NV_W4A4_V2_TMA
++/* The same instruction with tensor maps in i7 (A / B GEN_TMAP_U8_SW64 handles, low / high u16): plowrt
++ * launches it for those, so the cp.async entry above keeps its own register allocation. */
++extern "C" __device__ unsigned PLOW_SYM(plow_moe_w4a4_pf_tma_abi) = 1;
++extern "C" __global__ void __launch_bounds__(256, 1) PLOW_SYM(plow_moe_w4a4_pf_tma)(PlowProgram prog, unsigned inst) {
++    extern __shared__ __align__(16) float arena[];
++    void* const* t = prog.tensors;
++    const PlowDevInst* in = prog.insts + inst;
++    const unsigned slice = blockIdx.x, nblk = gridDim.x;
++    const void* tma = in->i[7] ? t[in->i[7] & 0xFFFFu] : nullptr;
++    const void* tmb = in->i[7] ? t[in->i[7] >> 16] : nullptr;
++    if (in->op == PLOW_DOP_MOE_UP_NVFP4_PF && in->i[5] == 1u)
++        d_moe_up_nvfp4_pf_w4a4_tma(MW_UP_ARGS, tma, tmb);
++    else if (in->op == PLOW_DOP_MOE_DOWN_NVFP4_PF && in->i[6] == 1u)
++        d_moe_down_nvfp4_pf_w4a4_tma(MW_DOWN_ARGS, tma, tmb);
+     else
+         __trap();
+-#undef MW_TEN
+ }
+ #endif
++#undef MW_UP_ARGS
++#undef MW_DOWN_ARGS
++#undef MW_TEN
++#endif
+ 
+ #if PLOW_NV_SPEECH && defined(PLOW_NV_DEVICE_CONTROL) && PLOW_NV_DEVICE_CONTROL
+ #include "op_control_sample.cuh"
+--- a/runtime/nvidia/op_moe_nvfp4_pf.cuh	2026-11-26 10:29:14.021044910 +0000
++++ b/runtime/nvidia/op_moe_nvfp4_pf.cuh	2026-11-26 01:05:35.033695049 +0000
+@@ -46,6 +46,10 @@
+ #ifndef PLOW_NV_W4A4_V2_PFD
+ #define PLOW_NV_W4A4_V2_PFD 0u
+ #endif
++/* 0: no TMA entry, every walk keeps the cp.async feed (A/B control). */
++#ifndef PLOW_NV_W4A4_V2_TMA
++#define PLOW_NV_W4A4_V2_TMA 1
++#endif
+ /* Up epilogue: q rows staged in the free ring slot and written by bulk async copies under the
+  * next item's loads (0 = direct stores). */
+ #ifndef PLOW_NV_W4A4_V2_BULK
+@@ -75,8 +79,9 @@
+ #define NF4V_STAGE(BN) ((128u + (BN)) * 72u)
+ #define NF4V_EMAX 512u
+ /* After the ring (u32): tile prefix [EMAX + 1], 15 scan slots, rowoff [EMAX], cnt [EMAX], then per
+- * item parity 128 row ids (up: row_token) or 128 part indices + 128 gates (down). */
+-#define NF4V_META_U32 (3u * NF4V_EMAX + 16u + 3u * 256u)
++ * item parity 128 row ids (up: row_token) or 128 part indices + 128 gates (down), the up epilogue's
++ * scale table [256], then the ring slots' mbarriers [G][NST] (8 B each, TMA feed). */
++#define NF4V_META_U32 (3u * NF4V_EMAX + 16u + 3u * 256u + 16u)
+ #define NF4V_ARENA_BYTES (NF4V_NST * NF4V_STAGE(256u) + 4u * NF4V_META_U32)
+ /* Ring bytes of the widest tile in use (BM = 128 unless pinned to 64): the interpreter's arena floor. */
+ #if defined(PLOW_NV_W4A4_BM) && PLOW_NV_W4A4_BM == 64
+@@ -459,6 +464,27 @@
+ }
+ __device__ __forceinline__ void nf4v_fence_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+ 
++/* TMA feed: per ring slot one mbarrier; thread 0 expects the stage's box bytes and issues the 2-D boxes. */
++__device__ __forceinline__ void nf4v_mbar_init(unsigned a) {
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(a) : "memory");
++}
++__device__ __forceinline__ void nf4v_mbar_inval(unsigned a) {
++    asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" ::"r"(a) : "memory");
++}
++__device__ __forceinline__ void nf4v_mbar_expect(unsigned a, unsigned bytes) {
++    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(a), "r"(bytes) : "memory");
++}
++__device__ __forceinline__ void nf4v_mbar_wait(unsigned a, unsigned parity) {
++    asm volatile("{\n .reg .pred p;\n W: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
++                 " @!p bra W;\n}\n" ::"r"(a), "r"(parity) : "memory");
++}
++/* Box (64 B x rows) at (byte column c0, row c1) of a u8 [rows][K / 2] map with 64 B swizzle. */
++__device__ __forceinline__ void nf4v_tma2d(unsigned dst, const void* map, unsigned c0, unsigned c1, unsigned bar) {
++    asm volatile(
++        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
++        ::"r"(dst), "l"(map), "r"(c0), "r"(c1), "r"(bar) : "memory");
++}
++
+ __device__ __forceinline__ unsigned nf4v_swz(unsigned row, unsigned chunk) {
+     return row * 64u + ((chunk ^ ((row >> 1) & 3u)) << 4);
+ }
+@@ -483,7 +509,7 @@
+ 
+ /* Own register allocation: inlined into the v1 entry points it took them to 245 registers and a
+  * 1.3 KB interpreter stack, slowing the v1 path below MIN_T (1K TTFT +4%). */
+-template <int MODE, unsigned BN, unsigned G = 1u>
++template <int MODE, unsigned BN, unsigned G = 1u, bool TMA = false>
+ static __device__ __noinline__ void nf4v_tiled(void* __restrict__ out, const uint8_t* __restrict__ aq,
+                                   const int* __restrict__ meta, const uint8_t* __restrict__ W,
+                                   const uint8_t* __restrict__ S, const float* __restrict__ gs,
+@@ -492,7 +518,8 @@
+                                   const float* __restrict__ row_gate, const float* __restrict__ s2,
+                                   unsigned n2, unsigned arows, unsigned orows, unsigned T,
+                                   unsigned N, unsigned K, unsigned E, unsigned dmode,
+-                                  unsigned slice, unsigned nblk, uint8_t* arena) {
++                                  unsigned slice, unsigned nblk, uint8_t* arena, const void* tma_a = nullptr,
++                                  const void* tma_b = nullptr) {
+     /* G groups of NTH threads; group warps 2 (m) x WN (n), warp tile 64 x WT; loads RP rows per pass. */
+     constexpr unsigned NTH = 256u / G, WN = 4u / G, WT = BN / WN, NJ = WT / 8u, RP = NTH / 4u;
+     constexpr unsigned AH = 128u / RP, BR = BN / RP, SJ = (128u + BN + NTH - 1u) / NTH;
+@@ -501,7 +528,8 @@
+     constexpr bool UPB = MODE == 1 && (PLOW_NV_W4A4_V2_BULK & 1) && !(NF4V_DIAG & 6);
+     static_assert(!UPB || 128u * SRU <= STAGE, "up staging tile exceeds a ring slot");
+     static_assert(BN % RP == 0u && WT % 16u == 0u && (G == 1u || G == 2u), "tile shape");
+-    static_assert(G * NST * STAGE + 4u * (3u * NF4V_EMAX + 16u + 512u * G + 256u) <= NF4V_ARENA_BYTES, "arena");
++    static_assert(G * NST * STAGE + 4u * (3u * NF4V_EMAX + 16u + 512u * G + 256u) + 8u * G * NST <= NF4V_ARENA_BYTES,
++                  "arena");
+     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+     const unsigned grp = G == 1u ? 0u : tid / NTH, vt = tid - grp * NTH, vw = vt >> 5;
+     const unsigned wm = vw / WN, wn = vw % WN, g = lane >> 2, tq = lane & 3u;
+@@ -528,6 +556,22 @@
+         multab[tid] = v != 0.f ? 1.0f / (v * (1.0f / gs2)) : 0.f;
+         __syncthreads();
+     }
++    /* TMA feed (TMA: its own instantiation, the cp.async one keeps its codegen; G = 1, both maps given, A rows
++     * contiguous: not the routed up gather, where a B-only feed measured slower). Maps (GEN_TMAP_U8_SW64):
++     * u8 [rows][K / 2], box 64 B x 64 rows (A, one box per 64 rows of the item, as the cp.async feed loads) /
++     * BN rows (B), 64 B swizzle, which is on absolute smem address bits 7..8: every slot starts on a 512 B
++     * boundary. */
++    const bool tmb = TMA && G == 1u && tma_a != nullptr && tma_b != nullptr && !(MODE == 1 && meta) &&
++                     ((unsigned)__cvta_generic_to_shared(ring) & 511u) == 0u && STAGE % 512u == 0u;
++    const unsigned mbar = (unsigned)__cvta_generic_to_shared(pre + 3u * NF4V_EMAX + 16u + 512u * G + 256u) + 8u * NST * grp;
++    unsigned mph = 0u; /* bit q: parity of slot q's next completion */
++    if (tmb) {
++        if (vt == 0u) {
++            for (unsigned q = 0; q < NST; q++) nf4v_mbar_init(mbar + 8u * q);
++            nf4v_fence_async();
++        }
++        __syncthreads();
++    }
+     unsigned* roff = pre + NF4V_EMAX + 16u;
+     unsigned* rcnt = roff + NF4V_EMAX;
+     unsigned* rid = rcnt + NF4V_EMAX + 256u * grp; /* [G][2][128] row_token (up) / row_partidx (down) */
+@@ -684,12 +728,22 @@
+         uint8_t* Bs = base + 128u * 64u;
+         uint8_t* Ss = base + (128u + BN) * 64u;
+         const unsigned ko = ks * 64u;
++        /* TMA boxes land A's full 64-row blocks; a partial block's rows go by cp.async, which reads only the
++         * item's rows (zero fill past rc): a box would read up to 63 rows of other experts */
++        const unsigned afull = tmb ? c.rc & ~63u : 0u;
++        if (tmb && vt == 0u) {
++            const unsigned sb = (unsigned)__cvta_generic_to_shared(base), bar = mbar + 8u * slot;
++            nf4v_mbar_expect(bar, (afull + BN) * 64u);
++            for (unsigned q = 0; q < afull; q += 64u) nf4v_tma2d(sb + q * 64u, tma_a, ko, c.r0 + q, bar);
++            nf4v_tma2d(sb + 128u * 64u, tma_b, ko, c.e * N + c.n0, bar);
++        }
+ #pragma unroll
+         for (unsigned h = 0; h < AH; h++)
+-            if (RP * h < 64u || c.rc > 64u) nf4_cp16(base + nf4v_swz(ar + RP * h, ac), c.asrc[h] + ko, c.abytes[h]);
++            if (RP * h >= afull && (RP * h < 64u || c.rc > 64u))
++                nf4_cp16(base + nf4v_swz(ar + RP * h, ac), c.asrc[h] + ko, c.abytes[h]);
+ #pragma unroll
+         for (unsigned h = 0; h < BR; h++)
+-            nf4_cp16(Bs + nf4v_swz(ar + RP * h, ac), c.bsrc + (size_t)h * RP * kb + ko, 16u);
++            if (!tmb) nf4_cp16(Bs + nf4v_swz(ar + RP * h, ac), c.bsrc + (size_t)h * RP * kb + ko, 16u);
+ #pragma unroll
+         for (unsigned j = 0; j < SJ; j++)
+             if (c.ssrc[j]) nf4w_cp8(Ss + (vt + NTH * j) * 8u, c.ssrc[j] + ks * 8u, c.sbytes[j]);
+@@ -730,6 +784,11 @@
+                 NF4V_T(const unsigned long long c0 = clock64();)
+                 nf4w_cp_wait<NST - 2u>();
+                 if (UPB && ks == 0u && vt < 128u) nf4v_bulk_wait_read();
++                if (tmb) {
++                    const unsigned q = ks % NST;
++                    nf4v_mbar_wait(mbar + 8u * q, (mph >> q) & 1u);
++                    mph ^= 1u << q;
++                }
+                 bar();
+                 NF4V_T(const unsigned long long c1 = clock64(); st_w += c1 - c0;)
+                 if (!(NF4V_DIAG & 1) && ks + NST - 1u < nk) stage(cur, ks + NST - 1u, (ks + NST - 1u) % NST);
+@@ -886,6 +945,11 @@
+         if (cur.rc > 64u) body(nf4v_ic<4u>{});
+         else body(nf4v_ic<2u>{});
+     }
++    if (tmb) {
++        __syncthreads();
++        if (vt == 0u)
++            for (unsigned q = 0; q < NST; q++) nf4v_mbar_inval(mbar + 8u * q);
++    }
+     /* The next op reads what the bulk stores wrote (after the interpreter's grid barrier). */
+     if (UPB && vt < 128u) {
+         asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+@@ -1030,3 +1094,55 @@
+                           H, I, E, mode, slice, nblk, ar);
+ }
+ 
++
++#if PLOW_NV_W4A4_V2_TMA
++/* The TMA feed (packet maps in i7) as its own entries, launched as `plow_moe_w4a4_pf_tma`: in the
++ * cp.async entry's call graph the TMA instantiations made its walks spill (L1 1024 rows +1.8% on
++ * the cp.async feed). A shape the feed does not cover takes the cp.async walk. */
++static __device__ __noinline__ void d_moe_up_nvfp4_pf_w4a4_tma(uint8_t* fq, const uint8_t* xq, const int* meta,
++                                                               const uint8_t* W, const uint8_t* S, const float* gs,
++                                                               const unsigned* row_token, const float* s2,
++                                                               unsigned T, unsigned k, unsigned I, unsigned K,
++                                                               unsigned E, unsigned n2, unsigned slice,
++                                                               unsigned nblk, float* arena, const void* tma_a,
++                                                               const void* tma_b) {
++    const unsigned bn = T >= PLOW_NV_W4A4_V2_MIN_T ? nf4v_bn(I) : 0u;
++    if (meta || !bn || !tma_a || !tma_b || K % 128u || I % NF4W_BN || E != 1u || !s2 || n2 == 0u ||
++        blockDim.x != 256u) {
++        d_moe_up_nvfp4_pf_w4a4(fq, xq, meta, W, S, gs, row_token, s2, T, k, I, K, E, n2, slice, nblk, arena);
++        return;
++    }
++    uint8_t* ar = reinterpret_cast<uint8_t*>(arena);
++    if (bn == 256u)
++        nf4v_tiled<1, 256u, 1u, true>(fq, xq, nullptr, W, S, gs, row_token, nullptr, nullptr, s2, n2, T, T, T, I, K,
++                                      1u, 0u, slice, nblk, ar, tma_a, tma_b);
++    else
++        nf4v_tiled<1, 192u, 1u, true>(fq, xq, nullptr, W, S, gs, row_token, nullptr, nullptr, s2, n2, T, T, T, I, K,
++                                      1u, 0u, slice, nblk, ar, tma_a, tma_b);
++}
++
++static __device__ __noinline__ void d_moe_down_nvfp4_pf_w4a4_tma(void* out, const uint8_t* fq, const int* meta,
++                                                                 const uint8_t* W, const uint8_t* S, const float* gs,
++                                                                 const unsigned* row_partidx, const float* row_gate,
++                                                                 unsigned T, unsigned k, unsigned H, unsigned I,
++                                                                 unsigned E, unsigned mode, unsigned slice,
++                                                                 unsigned nblk, float* arena, const void* tma_a,
++                                                                 const void* tma_b) {
++    const unsigned bn = T >= PLOW_NV_W4A4_V2_MIN_T ? nf4v_bn(H) : 0u;
++    if (!bn || !tma_a || !tma_b || (meta && E > NF4V_EMAX) || I % 128u || H % NF4W_BN ||
++        (!meta && E != 1u) || (mode == 1u || mode == 3u) != (meta == nullptr) || mode > 3u ||
++        (meta && (!row_partidx || !row_gate)) || (mode == 3u && !row_partidx) || blockDim.x != 256u) {
++        d_moe_down_nvfp4_pf_w4a4(out, fq, meta, W, S, gs, row_partidx, row_gate, T, k, H, I, E, mode, slice, nblk,
++                                 arena);
++        return;
++    }
++    uint8_t* ar = reinterpret_cast<uint8_t*>(arena);
++    const unsigned arows = meta ? T * k : T;
++    if (bn == 256u)
++        nf4v_tiled<2, 256u, 1u, true>(out, fq, meta, W, S, gs, nullptr, row_partidx, row_gate, nullptr, 0u, arows,
++                                      0u, T, H, I, E, mode, slice, nblk, ar, tma_a, tma_b);
++    else
++        nf4v_tiled<2, 192u, 1u, true>(out, fq, meta, W, S, gs, nullptr, row_partidx, row_gate, nullptr, 0u, arows,
++                                      0u, T, H, I, E, mode, slice, nblk, ar, tma_a, tma_b);
++}
++#endif

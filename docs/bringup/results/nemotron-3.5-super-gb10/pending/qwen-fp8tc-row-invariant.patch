@@ -1,0 +1,207 @@
+--- a/runtime/tests/sm120_interp_op_test.cu
++++ b/runtime/tests/sm120_interp_op_test.cu
+@@ -711,6 +711,64 @@
+     cudaFree(dx);cudaFree(dC);cudaFree(dsg);cudaFree(dsu);cudaFree(dWg);cudaFree(dWu);
+ }
+ 
++__global__ void k_gemv_glu_fp8_arena(bf16* C, const bf16* x, const uint8_t* Wg, const uint8_t* Wu,
++                                     const float* sg, const float* su, unsigned M, unsigned N,
++                                     unsigned K, unsigned act) {
++    extern __shared__ __align__(16) unsigned char gemv_arena[];
++    d_gemv_glu_fp8(C, x, Wg, Wu, sg, su, M, N, K, act, blockIdx.x, gridDim.x, (bf16*)gemv_arena);
++}
++/* Row-count invariance of the decode FP8 GEMV as the interpreter runs it (arena overload, 48 CTAs):
++ * row m of every M-row call (M = 1..32) is bitwise equal to row m of the 32-row call over the same
++ * x rows, so a span verify reproduces plain decode at any other row count. Must hold from the TC
++ * rung on with PLOW_NV_FP8TC_ROW_INVARIANT; otherwise the differing M are only listed. act < 0 =
++ * single matrix, else GLU with that activation. */
++static void test_gemv_fp8_rows(const char* label, unsigned N, unsigned K, int act = -1) {
++    const unsigned MX = 32;
++    const bool glu = act >= 0;
++    uint64_t s = 0x9e3779b97f4a7c15ull ^ ((uint64_t)N << 20) ^ K;
++    auto bytes = [&](size_t n) {
++        std::vector<uint8_t> w(n);
++        for (size_t i = 0; i < n; i++) {
++            s = s * 6364136223846793005ull + 1442695040888963407ull;
++            uint8_t b = (uint8_t)(s >> 56);
++            w[i] = (b & 0x7f) == 0x7f ? (uint8_t)(b ^ 1u) : b; /* no e4m3 NaN */
++        }
++        return w;
++    };
++    seed(0x7000u + N * 3 + K);
++    std::vector<float> x = gen_bf16((size_t)MX * K, 1.0f), sg(N), su(N);
++    for (unsigned n = 0; n < N; n++) { sg[n] = (1.5f + rnd()) / 448.0f; su[n] = (1.5f + rnd()) / 448.0f; }
++    std::vector<uint8_t> Wg = bytes((size_t)N * K), Wu = glu ? bytes((size_t)N * K) : std::vector<uint8_t>();
++    bf16* dx = to_dev(x); bf16* dC = dev_bf((size_t)MX * N);
++    float* dsg = to_dev_f(sg); float* dsu = to_dev_f(su);
++    uint8_t *dWg, *dWu = nullptr;
++    CK(cudaMalloc(&dWg, (size_t)N * K)); CK(cudaMemcpy(dWg, Wg.data(), (size_t)N * K, cudaMemcpyHostToDevice));
++    if (glu) { CK(cudaMalloc(&dWu, (size_t)N * K)); CK(cudaMemcpy(dWu, Wu.data(), (size_t)N * K, cudaMemcpyHostToDevice)); }
++    const unsigned smem = PLOW_FP8TC_ARENA_BYTES > 2u * K ? PLOW_FP8TC_ARENA_BYTES : 2u * K;
++    auto run = [&](unsigned M) {
++        CK(cudaMemset(dC, 0x7f, (size_t)MX * N * sizeof(bf16)));
++        if (glu) k_gemv_glu_fp8_arena<<<48, 256, smem>>>(dC, dx, dWg, dWu, dsg, dsu, M, N, K, (unsigned)act);
++        else k_gemv_fp8_arena<<<48, 256, smem>>>(dC, dx, dWg, dsg, M, N, K);
++        CK(cudaDeviceSynchronize());
++        std::vector<uint16_t> h((size_t)M * N);
++        CK(cudaMemcpy(h.data(), dC, h.size() * 2, cudaMemcpyDeviceToHost));
++        return h;
++    };
++    const std::vector<uint16_t> full = run(MX);
++    char bad[256] = ""; size_t nb = 0; unsigned first_tc_bad = 0;
++    for (unsigned M = 1; M < MX; M++) {
++        const std::vector<uint16_t> got = run(M);
++        if (memcmp(got.data(), full.data(), got.size() * 2) == 0) continue;
++        if (M >= PLOW_NV_FP8_DECODE_TC && !first_tc_bad) first_tc_bad = M;
++        if (nb < sizeof(bad) - 8) nb += snprintf(bad + nb, sizeof(bad) - nb, " %u", M);
++    }
++    const bool must = PLOW_NV_FP8TC_ROW_INVARIANT != 0;
++    printf("  %-40s M=1..%u vs %u: %s%s%s\n", label, MX - 1, MX, nb ? "differ at M =" : "bitwise", bad,
++           first_tc_bad ? (must ? " -> FAIL" : " (TC rows; route not row-invariant)") : (nb ? " (below the TC rung)" : " -> PASS"));
++    if (must && first_tc_bad) g_fail = 1;
++    cudaFree(dx); cudaFree(dC); cudaFree(dsg); cudaFree(dsu); cudaFree(dWg); if (dWu) cudaFree(dWu);
++}
++
+ /* ==================== Gemma-4 26B-A4B bf16 MoE (decode) ================== */
+ static uint64_t* to_dev_u64(const std::vector<uint64_t>& h){ uint64_t* d=nullptr;
+     CK(cudaMalloc(&d,h.size()*8)); CK(cudaMemcpy(d,h.data(),h.size()*8,cudaMemcpyHostToDevice)); return d; }
+@@ -1817,6 +1875,22 @@
+     test_gemv_fp8("gemv_fp8 tc q_proj N4096 K4096 M=8", 4096, 4096, 8, true);
+     test_gemv_fp8("gemv_fp8 tc tiny N40 K128 M=4", 40, 128, 4, true);
+     test_gemv_fp8("gemv_fp8 tc N1000 K192 M=7", 1000, 192, 7, true);
++    /* Row-count invariance on every Qwen3.8-27B and Nemotron-3.5-Super decode FP8 GEMV shape. */
++    test_gemv_fp8_rows("rows qwen in_proj_qkv N10240 K5120", 10240, 5120);
++    test_gemv_fp8_rows("rows qwen in_proj_z N6144 K5120", 6144, 5120);
++    test_gemv_fp8_rows("rows qwen in_proj_a N48 K5120", 48, 5120);
++    test_gemv_fp8_rows("rows qwen in_proj_ab N96 K5120", 96, 5120);
++    test_gemv_fp8_rows("rows qwen out_proj/o_proj N5120 K6144", 5120, 6144);
++    test_gemv_fp8_rows("rows qwen q_proj N12288 K5120", 12288, 5120);
++    test_gemv_fp8_rows("rows qwen k/v_proj N1024 K5120", 1024, 5120);
++    test_gemv_fp8_rows("rows qwen down N5120 K17408", 5120, 17408);
++    test_gemv_fp8_rows("rows qwen gate/up silu N17408 K5120", 17408, 5120, PLOW_ACT_SILU_);
++    test_gemv_fp8_rows("rows nemo in_proj N18560 K4096", 18560, 4096);
++    test_gemv_fp8_rows("rows nemo out_proj N4096 K8192", 4096, 8192);
++    test_gemv_fp8_rows("rows nemo q/o_proj N4096 K4096", 4096, 4096);
++    test_gemv_fp8_rows("rows nemo k/v_proj N256 K4096", 256, 4096);
++    test_gemv_fp8_rows("rows nemo lm_head N131072 K4096", 131072, 4096);
++    test_gemv_fp8_rows("rows glu gelu N15360 K3840", 15360, 3840, PLOW_ACT_GELU_TANH_);
+     test_gemv_glu_fp8("gemv_glu_fp8 gelu N15360 K3840 M=2",  15360, 3840, PLOW_ACT_GELU_TANH_, 2);
+     test_gemv_glu_fp8("gemv_glu_fp8 gelu N15360 K3840 M=8",  15360, 3840, PLOW_ACT_GELU_TANH_, 8);
+     test_gemv_glu_fp8("gemv_glu_fp8 gelu N15360 K3840 M=32", 15360, 3840, PLOW_ACT_GELU_TANH_, 32);
+--- a/runtime/nvidia/op_gemv_fp8_tc.cuh
++++ b/runtime/nvidia/op_gemv_fp8_tc.cuh
+@@ -55,9 +55,10 @@
+ #endif
+ /* fp8tc_tile: L2 prefetch of the next iteration's chunks (0 = off, the A/B control). One SM, GB10,
+  * Nemotron decode, slice us off -> on (bitwise equal): in_proj M=16 118 -> 75, out_proj M=16 56 ->
+- * 38, q / o M=4 23 -> 20, lm_head M=4 394 -> 323. */
++ * 38, q / o M=4 23 -> 20, lm_head M=4 394 -> 323. Default on sm_12x only: unmeasured on sm_89 /
++ * sm_90a. */
+ #ifndef PLOW_NV_FP8TC_PF
+-#define PLOW_NV_FP8TC_PF 1
++#define PLOW_NV_FP8TC_PF PLOW_SM12X
+ #endif
+ #define PLOW_FP8TC_ARENA_BYTES (PLOW_NV_WARPS * 32u * (PLOW_NV_FP8_DECODE_TC64 ? 64u : 32u) * 4u)
+ 
+--- a/runtime/nvidia/op_gemm.cuh
++++ b/runtime/nvidia/op_gemm.cuh
+@@ -3538,6 +3538,12 @@
+ #else
+ #define PLOW_NV_FP8_DECODE_TC_ACTIVE 0
+ #endif
++/* sm_12x single-matrix route from the shape alone, so a row's f32 sum order does not depend on M
++ * (span verify bitwise equal to plain decode at another row count). 1 = stream-K at every M,
++ * 2 = the tile walk at every M on few-tile shapes; 0 = rows <= 4 on few-tile shapes walk tiles. */
++#ifndef PLOW_NV_FP8TC_ROW_INVARIANT
++#define PLOW_NV_FP8TC_ROW_INVARIANT 0
++#endif
+ 
+ #ifndef PLOW_NV_FP8_DECODE_WGMMA
+ #define PLOW_NV_FP8_DECODE_WGMMA 0
+@@ -3580,7 +3586,8 @@
+          * in_proj's 25 / out_proj's 6 tiles per CTA); rows <= 4 only on many-tile or K >= 8192
+          * shapes (in_proj, out_proj; q/k/v keep the tile walk). Hopper not measured. */
+         const unsigned sk_tiles = ((N + nblk - 1u) / nblk + 15u) / 16u;
+-        if (M > 4u || sk_tiles >= (blockDim.x >> 5) || K >= 8192u) {
++        if (PLOW_NV_FP8TC_ROW_INVARIANT == 1 || (PLOW_NV_FP8TC_ROW_INVARIANT == 0 && M > 4u) ||
++            sk_tiles >= (blockDim.x >> 5) || K >= 8192u) {
+             if (M <= 8) d_gemv_fp8_tc_sk<1>(C, x, W, scale, M, N, K, slice, nblk, (float*)arena);
+             else if (M <= 16) d_gemv_fp8_tc_sk_wide<2>(C, x, W, scale, M, N, K, slice, nblk, (float*)arena);
+             else if (M <= 32) d_gemv_fp8_tc_sk_wide<4>(C, x, W, scale, M, N, K, slice, nblk, (float*)arena);
+--- a/crates/devgen/src/knob_spec.rs
++++ b/crates/devgen/src/knob_spec.rs
+@@ -1515,6 +1515,7 @@
+     KnobSpec::new("emit.moe_dec_lt", Some("PLOW_EMIT_MOE_DEC_LT"), Layer::Emit, Domain::Bool, GEMMA4_MOE_DEC_LT_DEFAULT, MOE_LT_EMIT_QUALIFIED),
+     KnobSpec::new("emit.gemma_gemm_lt", Some("PLOW_GEMMA_GEMM_LT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+     KnobSpec::new("emit.fp8_decode_tc", Some("PLOW_FP8_DECODE_TC"), Layer::Emit, U32, UNSET, OPT_IN),
++    KnobSpec::new("emit.fp8_decode_tc_row_invariant", Some("PLOW_FP8_DECODE_TC_ROW_INVARIANT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+     KnobSpec::new("emit.decode_native_tc", Some("PLOW_EMIT_DECODE_NATIVE_TC"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+     KnobSpec::new("emit.qwen_fuse_ab", Some("PLOW_QWEN_FUSE_AB"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+     KnobSpec::new("emit.qwen_fuse_mlp", Some("PLOW_QWEN_FUSE_MLP"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+@@ -2325,6 +2326,7 @@
+     KnobSpec::new("def.PLOW_NV_FP8_PF_SCALE_WFIRST", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_FP8_RB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_FP8TC_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
++    KnobSpec::new("def.PLOW_NV_FP8TC_ROW_INVARIANT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_FUTURE_OP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_GATE_SLEEP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_KV_ILV", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+--- a/crates/devgen/src/manifest.rs
++++ b/crates/devgen/src/manifest.rs
+@@ -1211,6 +1211,9 @@
+         );
+         if !s.decode_fp8_gemv_rows.is_empty() && s.decode_batch >= rung {
+             t.insert("fp8_decode_tc".into(), json!(rung));
++            if crate::emit_config::active().fp8_decode_tc_row_invariant {
++                t.insert("fp8_decode_tc_row_invariant".into(), json!(true));
++            }
+         }
+     }
+     // * `fa_rg`: hd128 decode on the row-group flash body, which the merge fold requires
+@@ -3825,6 +3828,9 @@
+                 "#ifndef PLOW_NV_FP8_DECODE_TC_ON\n#define PLOW_NV_FP8_DECODE_TC_ON 1\n#endif\n\
+                  #ifndef PLOW_NV_FP8_DECODE_TC\n#define PLOW_NV_FP8_DECODE_TC {v}\n#endif\n"
+             ));
++            if t.get("fp8_decode_tc_row_invariant").and_then(Value::as_bool) == Some(true) {
++                out.push_str("#ifndef PLOW_NV_FP8TC_ROW_INVARIANT\n#define PLOW_NV_FP8TC_ROW_INVARIANT 1\n#endif\n");
++            }
+         }
+         if t.get("fa2_pf128").is_some() {
+             out.push_str(
+@@ -4149,6 +4155,14 @@
+         let header = config_header(&json!({"arch": "sm_121a", "tuning": tune}));
+         assert!(header.contains("#define PLOW_NV_FP8_DECODE_TC_ON 1\n"));
+         assert!(header.contains("#ifndef PLOW_NV_FP8_DECODE_TC\n#define PLOW_NV_FP8_DECODE_TC 4\n#endif\n"));
++        assert!(!header.contains("PLOW_NV_FP8TC_ROW_INVARIANT"));
++        {
++            let _ri = crate::test_env::EnvScope::set(&[("PLOW_FP8_DECODE_TC_ROW_INVARIANT", "1")]);
++            let tune = tuning(&shapes, "sm_121a");
++            assert_eq!(tune["fp8_decode_tc_row_invariant"], true);
++            let header = config_header(&json!({"arch": "sm_121a", "tuning": tune}));
++            assert!(header.contains("#ifndef PLOW_NV_FP8TC_ROW_INVARIANT\n#define PLOW_NV_FP8TC_ROW_INVARIANT 1\n#endif\n"));
++        }
+         shapes.decode_batch = 2;
+         assert!(!tuning(&shapes, "sm_121a").contains_key("fp8_decode_tc"));
+     }
+--- a/crates/devgen/src/emit_config.rs
++++ b/crates/devgen/src/emit_config.rs
+@@ -1835,6 +1835,11 @@
+     #[arg(long = "fp8-decode-tc", env = "PLOW_FP8_DECODE_TC")]
+     pub fp8_decode_tc: Option<u32>,
+ 
++    /// With `fp8_decode_tc`: route every row count of a shape alike (stream-K), so a span verify
++    /// row is bitwise equal to the same row decoded at another rung.
++    #[arg(long = "fp8-decode-tc-row-invariant", env = "PLOW_FP8_DECODE_TC_ROW_INVARIANT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
++    pub fp8_decode_tc_row_invariant: bool,
++
+     /// Isolate each layer's grouped MoE prefill GLU + DOWN pair as a packet-declared library
+     /// segment, which the CUDA runtime serves with cuBLASLt grouped matmuls under
+     /// `PLOW_MOE_PF_LT`. A runtime that leaves that knob unset runs the packet unchanged.
+@@ -2370,6 +2375,7 @@
+             prefill_cublaslt: env_bool("PLOW_EMIT_PREFILL_CUBLASLT"),
+             fp8_decode_tc64: env_bool("PLOW_FP8_DECODE_TC64"),
+             fp8_decode_tc: env_u32("PLOW_FP8_DECODE_TC"),
++            fp8_decode_tc_row_invariant: env_bool("PLOW_FP8_DECODE_TC_ROW_INVARIANT"),
+             moe_pf_lt: env_bool("PLOW_EMIT_MOE_PF_LT"),
+             moe_pf_lt_route: env_bool("PLOW_EMIT_MOE_PF_LT_ROUTE"),
+             moe_dec_lt: env_bool("PLOW_EMIT_MOE_DEC_LT"),

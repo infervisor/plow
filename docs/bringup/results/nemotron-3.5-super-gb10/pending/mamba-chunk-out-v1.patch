@@ -1,0 +1,269 @@
+diff --git a/crates/devgen/src/knob_spec.rs b/crates/devgen/src/knob_spec.rs
+index f9926f802..8a8a8ab96 100644
+--- a/crates/devgen/src/knob_spec.rs
++++ b/crates/devgen/src/knob_spec.rs
+@@ -2357,6 +2357,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
+     KnobSpec::new("def.PLOW_NV_MAMBA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_MAMBA_PF", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_MAMBA_SCAN_FUSE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
++    KnobSpec::new("def.PLOW_NV_MAMBA_OUT_GRP", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_FA2_PF128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_FA2_PF256", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+     KnobSpec::new("def.PLOW_NV_W4A4_BM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+diff --git a/runtime/nvidia/op_mamba_pf.cuh b/runtime/nvidia/op_mamba_pf.cuh
+index b817cb00d..dec620aae 100644
+--- a/runtime/nvidia/op_mamba_pf.cuh
++++ b/runtime/nvidia/op_mamba_pf.cuh
+@@ -12,8 +12,21 @@
+ 
+ #define MPF_SN 136u /* bf16 row stride of 128-wide tiles */
+ #define MPF_SP 72u  /* bf16 row stride of 64-wide tiles */
+-/* ChunkOut: C (or B) [128][136] + E [64][136] (or x [128][72]) bf16 + cum/dt f32. */
+-#define MAMBA_PF_ARENA_BYTES (2u * (128u * MPF_SN + 128u * MPF_SP) + 8u * MAMBA_L + 1024u)
++/* PLOW_NV_MAMBA_OUT_GRP (default 1): CHUNK_OUT with bf16 entering states runs
++ * d_mamba2_chunk_out_grp (C B^T once per group, head stages double-buffered), bit-identical. */
++#ifndef PLOW_NV_MAMBA_OUT_GRP
++#define PLOW_NV_MAMBA_OUT_GRP 1
++#endif
++/* d_mamba2_chunk_out_grp head stage: E [64][136] + x [128][72] bf16, cum [128] + dt [128] f32. */
++#define MPF_OG_STAGE (2u * (MAMBA_P * MPF_SN + MAMBA_L * MPF_SP) + 8u * MAMBA_L)
++/* ChunkOut: C (or B) [128][136] + E [64][136] (or x [128][72]) bf16 + cum/dt f32; the grouped
++ * body: two head stages (its C and B tiles alias them). */
++#define MPF_OUT_ARENA_TC (2u * (128u * MPF_SN + 128u * MPF_SP) + 8u * MAMBA_L + 1024u)
++#if PLOW_NV_MAMBA_OUT_GRP
++#define MAMBA_PF_ARENA_BYTES (2u * MPF_OG_STAGE > MPF_OUT_ARENA_TC ? 2u * MPF_OG_STAGE : MPF_OUT_ARENA_TC)
++#else
++#define MAMBA_PF_ARENA_BYTES MPF_OUT_ARENA_TC
++#endif
+ 
+ __device__ __forceinline__ void mpf_mma(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+     asm volatile(
+@@ -36,6 +49,11 @@ __device__ __forceinline__ unsigned mpf_bf2(float a, float b) {
+     __nv_bfloat162 r = __floats2bfloat162_rn(a, b);
+     return *reinterpret_cast<unsigned*>(&r);
+ }
++/* 16 B global -> smem, zero-filled when !ok (`g` must still be a valid address). */
++__device__ __forceinline__ void mpf_cp16(void* s, const void* g, bool ok) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"((unsigned)__cvta_generic_to_shared(s)),
++                 "l"(g), "r"(ok ? 16 : 0));
++}
+ /* 8 bf16 of a global row (16 B aligned) or zeros. */
+ __device__ __forceinline__ uint4 mpf_ld8(const __nv_bfloat16* p, bool ok) {
+     return ok ? *reinterpret_cast<const uint4*>(p) : make_uint4(0u, 0u, 0u, 0u);
+@@ -497,6 +515,189 @@ static __device__ __noinline__ void d_mamba2_chunk_scan_state_tc(float* __restri
+     }
+ }
+ 
++/* MAMBA2_CHUNK_OUT on bf16 entering states (`ebf`), PLOW_NV_MAMBA_OUT_GRP: block per (chunk, group,
++ * run of `hpi` heads of the group). C fragments and the causal C B^T blocks stay in registers for the
++ * run; each head's E / x / cum / dt land by cp.async one head ahead (two stages). Every output
++ * element takes the same mma sequence as d_mamba2_chunk_out_tc, so the result is bit-identical.
++ * Warp w owns rows [16 rb, 16 rb + 16), rb = w (w < 4) or 11 - w: warps w and w + 4 share an SM
++ * sub-partition and hold 9 of the 36 causal 16 x 16 blocks between them. `hpi` minimises
++ * rounds x (per-head + per-run cost) over the divisors of heads / groups. */
++template <bool PK>
++static __device__ __noinline__ void d_mamba2_chunk_out_grp(__nv_bfloat16* __restrict__ y,
++    const __nv_bfloat16* __restrict__ xbc, const __nv_bfloat16* __restrict__ Eb, const float* __restrict__ cum,
++    const float* __restrict__ dtv, const __nv_bfloat16* __restrict__ Dp, unsigned heads, unsigned rows,
++    unsigned tokens, unsigned groups, float* __restrict__ smem, unsigned slice, unsigned nblk,
++    const int* __restrict__ req) {
++    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, tq = lane & 3u;
++    const unsigned d_inner = heads * MAMBA_P, conv_dim = d_inner + 2u * groups * MAMBA_N, hpg = heads / groups;
++    const unsigned live = req ? mpf_nchunk(req) : (rows + MAMBA_L - 1) / MAMBA_L;
++    const unsigned nchunk = req ? live : tokens / MAMBA_L;
++    const size_t ts = req ? (size_t)tokens + (size_t)MAMBA_L * (unsigned)req[0] : tokens;
++    unsigned hpi = hpg, best = ~0u;
++    for (unsigned d = hpg; d >= 1u; d--) {
++        if (hpg % d) continue;
++        const unsigned runs = nchunk * groups * (hpg / d), cost = (runs + nblk - 1u) / nblk * (4u * d + 6u);
++        if (cost < best) best = cost, hpi = d;
++    }
++    const unsigned nsub = hpg / hpi;
++    unsigned char* arena = reinterpret_cast<unsigned char*>(smem);
++    __nv_bfloat16* Cs = reinterpret_cast<__nv_bfloat16*>(arena);
++    __nv_bfloat16* Bs = Cs + MAMBA_L * MPF_SN;
++    const unsigned rb = warp < 4u ? warp : 11u - warp, r0 = rb * 16u, ta = r0 + g, tb = ta + 8u;
++    for (unsigned item = slice; item < nchunk * groups * nsub; item += nblk) {
++        const unsigned c = item / (groups * nsub), rem = item - c * groups * nsub, grp = rem / nsub;
++        const unsigned h0 = grp * hpg + (rem - grp * nsub) * hpi;
++        if (c >= live) {
++            const unsigned t0 = c * MAMBA_L;
++            for (unsigned e = tid; e < MAMBA_L * hpi * (MAMBA_P / 8u); e += 256u) {
++                const unsigned r = e / (hpi * (MAMBA_P / 8u)), q = (e % (hpi * (MAMBA_P / 8u))) * 8u;
++                *reinterpret_cast<uint4*>(y + (size_t)(t0 + r) * d_inner + h0 * MAMBA_P + q) = make_uint4(0u, 0u, 0u, 0u);
++            }
++            continue;
++        }
++        unsigned t0, clen, slot;
++        mpf_chunk(req, c, rows, t0, clen, slot);
++        const size_t crow = d_inner + groups * MAMBA_N + grp * MAMBA_N, brow = d_inner + grp * MAMBA_N;
++#pragma unroll
++        for (unsigned it = 0; it < MAMBA_L * (MAMBA_N / 8u) / 256u; it++) {
++            const unsigned e = tid + it * 256u, r = e / (MAMBA_N / 8u), q = (e % (MAMBA_N / 8u)) * 8u;
++            const bool ok = r < clen;
++            const __nv_bfloat16* src = xbc + (size_t)(t0 + (ok ? r : 0u)) * conv_dim + q;
++            mpf_cp16(Cs + r * MPF_SN + q, src + crow, ok);
++            mpf_cp16(Bs + r * MPF_SN + q, src + brow, ok);
++        }
++        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
++        __syncthreads();
++        unsigned cf[8][4];
++#pragma unroll
++        for (int k = 0; k < 8; k++)
++            mpf_ldsm(cf[k], Cs + (r0 + (lane & 15u)) * MPF_SN + k * 16u + (lane >> 4) * 8u);
++        float cb[8][2][4];
++#pragma unroll
++        for (int j = 0; j < 8; j++) {
++#pragma unroll
++            for (int a = 0; a < 2; a++)
++#pragma unroll
++                for (int q = 0; q < 4; q++) cb[j][a][q] = 0.f;
++            if ((unsigned)j > rb) continue;
++#pragma unroll
++            for (int k = 0; k < 8; k++) {
++                unsigned bf[4];
++                mpf_ldsm(bf, Bs + (j * 16u + (lane & 7u) + ((lane >> 4) << 3)) * MPF_SN + k * 16u + ((lane >> 3) & 1u) * 8u);
++                mpf_mma(cb[j][0], cf[k], bf[0], bf[1]);
++                mpf_mma(cb[j][1], cf[k], bf[2], bf[3]);
++            }
++        }
++        __syncthreads(); /* C and B are dead: the head stages take the arena */
++        auto stage = [&](unsigned i) { return arena + (i & 1u) * MPF_OG_STAGE; };
++        auto load = [&](unsigned i) {
++            unsigned char* st = stage(i);
++            const unsigned h = h0 + i;
++            __nv_bfloat16* Es = reinterpret_cast<__nv_bfloat16*>(st);
++            __nv_bfloat16* xs = Es + MAMBA_P * MPF_SN;
++            float* sc = reinterpret_cast<float*>(xs + MAMBA_L * MPF_SP);
++            const __nv_bfloat16* E = Eb + ((size_t)c * heads + h) * MAMBA_P * MAMBA_N;
++#pragma unroll
++            for (unsigned it = 0; it < MAMBA_P * (MAMBA_N / 8u) / 256u; it++) {
++                const unsigned e = tid + it * 256u, p = e / (MAMBA_N / 8u), q = (e % (MAMBA_N / 8u)) * 8u;
++                mpf_cp16(Es + p * MPF_SN + q, E + (size_t)p * MAMBA_N + q, true);
++            }
++#pragma unroll
++            for (unsigned it = 0; it < MAMBA_L * (MAMBA_P / 8u) / 256u; it++) {
++                const unsigned e = tid + it * 256u, r = e / (MAMBA_P / 8u), q = (e % (MAMBA_P / 8u)) * 8u;
++                const bool ok = r < clen;
++                mpf_cp16(xs + r * MPF_SP + q, xbc + (size_t)(t0 + (ok ? r : 0u)) * conv_dim + h * MAMBA_P + q, ok);
++            }
++            if (tid < MAMBA_L / 2u) { /* cum then dt, 4 f32 per thread */
++                const float* src = (tid < MAMBA_L / 4u ? cum : dtv) + (size_t)h * ts + c * MAMBA_L + (tid % (MAMBA_L / 4u)) * 4u;
++                mpf_cp16(sc + tid * 4u, src, true);
++            }
++        };
++        load(0u);
++        asm volatile("cp.async.commit_group;\n" ::: "memory");
++        if (hpi > 1u) load(1u);
++        asm volatile("cp.async.commit_group;\n" ::: "memory");
++        for (unsigned i = 0; i < hpi; i++) {
++            const unsigned h = h0 + i;
++            const __nv_bfloat16* Es = reinterpret_cast<const __nv_bfloat16*>(stage(i));
++            const __nv_bfloat16* xs = Es + MAMBA_P * MPF_SN;
++            const float* s_cum = reinterpret_cast<const float*>(xs + MAMBA_L * MPF_SP);
++            const float* s_dt = s_cum + MAMBA_L;
++            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
++            __syncthreads();
++            float acc[8][4];
++#pragma unroll
++            for (int j = 0; j < 8; j++)
++#pragma unroll
++                for (int q = 0; q < 4; q++) acc[j][q] = 0.f;
++#pragma unroll
++            for (int k = 0; k < 8; k++) {
++#pragma unroll
++                for (int pp = 0; pp < 4; pp++) {
++                    unsigned bf[4];
++                    mpf_ldsm(bf, Es + (pp * 16u + (lane & 7u) + ((lane >> 4) << 3)) * MPF_SN + k * 16u +
++                                     ((lane >> 3) & 1u) * 8u);
++                    mpf_mma(acc[2 * pp], cf[k], bf[0], bf[1]);
++                    mpf_mma(acc[2 * pp + 1], cf[k], bf[2], bf[3]);
++                }
++            }
++            const float cta = s_cum[ta], ctb = s_cum[tb];
++            {
++                const float sa = __expf(cta), sb = __expf(ctb);
++#pragma unroll
++                for (int j = 0; j < 8; j++) {
++                    acc[j][0] *= sa;
++                    acc[j][1] *= sa;
++                    acc[j][2] *= sb;
++                    acc[j][3] *= sb;
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < 8; j++) {
++                if ((unsigned)j > rb) continue;
++                const unsigned s0 = j * 16u;
++                unsigned af[4];
++#pragma unroll
++                for (int a = 0; a < 2; a++) {
++                    const unsigned sa = s0 + a * 8u + 2u * tq, sb = sa + 1u;
++                    const float csa = s_cum[sa], csb = s_cum[sb], dsa = s_dt[sa], dsb = s_dt[sb];
++                    const float v0 = sa <= ta ? cb[j][a][0] * __expf(fminf(cta - csa, 0.f)) * dsa : 0.f;
++                    const float v1 = sb <= ta ? cb[j][a][1] * __expf(fminf(cta - csb, 0.f)) * dsb : 0.f;
++                    const float v2 = sa <= tb ? cb[j][a][2] * __expf(fminf(ctb - csa, 0.f)) * dsa : 0.f;
++                    const float v3 = sb <= tb ? cb[j][a][3] * __expf(fminf(ctb - csb, 0.f)) * dsb : 0.f;
++                    af[2 * a] = mpf_bf2(v0, v1);
++                    af[2 * a + 1] = mpf_bf2(v2, v3);
++                }
++#pragma unroll
++                for (int pp = 0; pp < 4; pp++) {
++                    unsigned bf[4];
++                    mpf_ldsm_t(bf, xs + (s0 + (lane & 15u)) * MPF_SP + pp * 16u + (lane >> 4) * 8u);
++                    mpf_mma(acc[2 * pp], af, bf[0], bf[1]);
++                    mpf_mma(acc[2 * pp + 1], af, bf[2], bf[3]);
++                }
++            }
++            const float Dh = mamba_bf(Dp, h);
++#pragma unroll
++            for (int j = 0; j < 8; j++) {
++                const unsigned p = j * 8u + 2u * tq;
++#pragma unroll
++                for (int hh = 0; hh < 2; hh++) {
++                    const unsigned t = hh ? tb : ta, tok = t0 + t;
++                    if (req && t >= clen) continue; /* the next request's rows */
++                    const __nv_bfloat16* xr = xs + t * MPF_SP + p;
++                    const float o0 = t < clen ? fmaf(Dh, __bfloat162float(xr[0]), acc[j][2 * hh]) : 0.f;
++                    const float o1 = t < clen ? fmaf(Dh, __bfloat162float(xr[1]), acc[j][2 * hh + 1]) : 0.f;
++                    *reinterpret_cast<unsigned*>(y + (size_t)tok * d_inner + h * MAMBA_P + p) = mpf_bf2(o0, o1);
++                }
++            }
++            __syncthreads(); /* stage i & 1 is free */
++            if (i + 2u < hpi) load(i + 2u);
++            asm volatile("cp.async.commit_group;\n" ::: "memory");
++        }
++    }
++    if (req) mpf_zero_rows(y, d_inner, mpf_real(req), tokens, slice, nblk);
++}
++
+ /* MAMBA2_CHUNK_OUT: block per (chunk, head); warp w owns rows t in [16w, 16w+16).
+  * y = bf16(exp(cum_t) C . bf16(E)^T + sum_{s<=t} bf16(CB exp(min(cum_t-cum_s,0)) dt_s) x_s + D x_t). */
+ template <bool PK = false>
+@@ -511,6 +712,13 @@ static __device__ __noinline__ void d_mamba2_chunk_out_tc(__nv_bfloat16* __restr
+         if (threadIdx.x == 0) __trap();
+         return;
+     }
++#if PLOW_NV_MAMBA_OUT_GRP
++    if (ebf) {
++        d_mamba2_chunk_out_grp<PK>(y, xbc, reinterpret_cast<const __nv_bfloat16*>(enter), cum, dtv, Dp, heads, rows,
++                                   tokens, groups, smem, slice, nblk, req);
++        return;
++    }
++#endif
+     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, g = lane >> 2, tq = lane & 3u;
+     const __nv_bfloat16* enter_bf = reinterpret_cast<const __nv_bfloat16*>(enter);
+     const unsigned d_inner = heads * MAMBA_P, conv_dim = d_inner + 2u * groups * MAMBA_N;
+diff --git a/runtime/tests/mamba2_oracle.py b/runtime/tests/mamba2_oracle.py
+index f2444e0ef..40c09c8fc 100644
+--- a/runtime/tests/mamba2_oracle.py
++++ b/runtime/tests/mamba2_oracle.py
+@@ -165,7 +165,7 @@ class Ops:
+         mod = ctypes.c_void_p()
+         assert self.cuda.cuModuleLoadData(ctypes.byref(mod), open(cubin, "rb").read()) == 0
+         self.fn = {}
+-        self.smem = 48 * 1024 if pf == "simt" else 55296
++        self.smem = 48 * 1024 if pf == "simt" else 73728  # MAMBA_PF_ARENA_BYTES
+         for k in ("conv", "step", "norm", "chunk_state", "chunk_pass", "chunk_out", "sr"):
+             sym = f"mamba2_{k}_tc_k" if pf == "tc" and k not in ("step", "norm", "sr") else f"mamba2_{k}_k"
+             f = ctypes.c_void_p()

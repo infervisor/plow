@@ -1,0 +1,576 @@
+diff --git a/scripts/gen_kernels/bench_lib_attn.py b/scripts/gen_kernels/bench_lib_attn.py
+index 671319801..19e8d365c 100644
+--- a/scripts/gen_kernels/bench_lib_attn.py
++++ b/scripts/gen_kernels/bench_lib_attn.py
+@@ -5,6 +5,22 @@ shapes, reading plowrt's own KV layout.
+   bench_lib_attn.py decode  CUBIN --classes H,KVH,B,CTX ... [--ilv] [--libs ...]
+   bench_lib_attn.py hd512   CUBIN --classes H,KVH,ROWS,PAST ... [--libs fa4,fa4_dq,fi2_dq]
+   bench_lib_attn.py vmm     CUBIN|- ARM H,KVH,B,CTX      one arm per process (a fault kills it)
++  bench_lib_attn.py gb10-build ASSETS BUILD_LOG OBJECT OUT.cubin --hd D --gf G   (inside nix develop)
++  bench_lib_attn.py gb10 CUBIN --classes H,KVH,D,B,QLEN,KVLEN ... [--fp8] [--libs ...]
++  bench_lib_attn.py selftest
++
++sm_120/121 (GB10): the attention bodies run inside the interpreter (no direct-entry role object),
++so `gb10-build` compiles the interpreter's own bodies (d_flash_pf128 / d_flash_pf256 /
++d_flash_decode + d_flash_merge) behind thin entries, with the define list plowc used for OBJECT
++(its build.log line plus the manifest's requires/recommends, as runtime/ubench/run_ubench_cu.sh
++derives it) and the packet's plow_config.h. Launch policy as in-model: 48 blocks (one per SM);
++decode nsplit = plowrt's live rule (exec/kvrow.rs nv_dense_live_nsplit) under the packet's baked
++split (--baked rows:ns,...), merge on --merge-blocks blocks. B sequences of QLEN query rows over
++KVLEN keys (row i at position KVLEN - QLEN + i); QLEN == KVLEN - past is prefill, QLEN 1 / 4 is
++decode / MTP verify (native: B*QLEN rows over a row-slot map). KV head-major
++[slot][kvh][stride][hd], E4M3 at unit scale with --fp8 (libraries reading E4M3 take it directly
++with unit descales, which is exact; bf16-only libraries time an E4M3 -> bf16 cast of the rows
++read, also exact).
+ 
+ Native = the packet's object through its direct entry, with the runtime's launch policy (hd256
+ wgmma template: attn_pf_hd256_sliding.py Kernel, TMA staging for bf16 KV as in-model; TileLang
+@@ -630,6 +646,520 @@ def cmd_vmm(a):
+     print(f"VMM {a.arm} {a.point} OK rel_l2 {c.reference():.2e}", flush=True)
+ 
+ 
++# ---- sm_120/121 (GB10) -------------------------------------------------------------------------
++
++GB10_SMS = 48
++GB10_BF16_TF = 126.7
++GB10_DRAM = 236e9
++GB10_LIBS = ["fi", "fid", "fidtc", "xqa", "xqac", "triton", "fa2", "fa4", "cudnn"]
++
++GB10_SRC = r'''
++#include <cstdint>
++#include "dev_isa.h"
++#include "mixed_step.h"
++#include PLOW_CONFIG
++#include "sm120_common.cuh"
++#if PLOW_NV_FA2_PF128
++#include "op_flash_pf128.cuh"
++#endif
++#if PLOW_NV_FA2_PF256
++#include "op_flash_pf256.cuh"
++#endif
++typedef __nv_bfloat16 bf16;
++struct LibAttnArgs {
++    float *opart, *ml;
++    const bf16 *q, *k, *v;
++    bf16* o;
++    const int *kv_len, *slot;
++    unsigned rows, skv, nh, nkv, q0, stride, nsplit, mask;
++    float scale;
++    unsigned pad;
++};
++extern "C" __device__ unsigned lib_kv_e4m3 = PLOW_NV_KV_E4M3;
++#if PLOW_NV_FA2_PF128
++extern "C" __device__ unsigned lib_pf128_smem = PLOW_NV_KV_E4M3 ? FP2_SMEM8_BYTES : FP2_SMEM_BYTES;
++extern "C" __global__ void __launch_bounds__(256, 1) lib_pf128(const __grid_constant__ LibAttnArgs a) {
++    extern __shared__ float arena[];
++    d_flash_pf128<0, PLOW_NV_KV_E4M3 != 0>(nullptr, a.q, a.k, a.v, a.o, a.rows, a.skv, a.nh, a.nkv, a.q0,
++                                           a.stride, a.mask, a.scale, blockIdx.x, gridDim.x, arena);
++}
++#endif
++#if PLOW_NV_FA2_PF256
++extern "C" __device__ unsigned lib_pf256_smem = F256_SMEM_BYTES;
++extern "C" __global__ void __launch_bounds__(256, 1) lib_pf256(const __grid_constant__ LibAttnArgs a) {
++    extern __shared__ float arena[];
++    d_flash_pf256(a.opart, a.ml, a.q, a.k, a.v, a.o, a.rows, a.skv, a.nh, a.nkv, a.q0, 0u, a.nsplit,
++                  a.stride, a.mask, a.scale, blockIdx.x, gridDim.x, arena);
++}
++#endif
++#if !PLOW_NV_PREFILL
++extern "C" __device__ unsigned lib_dec_smem = FA_DEC_SMEM_FLOATS(LIB_DEC_HD, LIB_DEC_GF) * 4u;
++extern "C" __device__ unsigned lib_dec_hd = LIB_DEC_HD;
++extern "C" __global__ void __launch_bounds__(256, 1) lib_dec(const __grid_constant__ LibAttnArgs a) {
++    extern __shared__ float arena[];
++    d_flash_decode<LIB_DEC_HD, LIB_DEC_GF>(a.opart, a.ml, a.q, a.k, a.v, a.kv_len, a.rows, a.nh, a.nkv,
++                                           a.stride, 0u, a.scale, a.nsplit, a.mask, blockIdx.x,
++                                           gridDim.x, arena, 0u, nullptr, nullptr, a.slot, nullptr,
++                                           nullptr);
++}
++#endif
++extern "C" __global__ void __launch_bounds__(256) lib_merge(const __grid_constant__ LibAttnArgs a) {
++    d_flash_merge<LIB_DEC_HD>(a.o, a.opart, a.ml, a.rows, a.nh, a.nsplit, blockIdx.x, gridDim.x);
++}
++'''
++
++REQUIRE_PREFIXES = ("PLOW_NV_FA_GF=", "PLOW_NV_QWEN_GDN=", "PLOW_NV_FP8_M1=", "PLOW_NV_FP8_M1_TMA=",
++                    "PLOW_NV_FP8_M1_XCACHE=", "PLOW_NV_FP8_M1_FAST_ACCUM=", "PLOW_NV_FP8_M1_BK1024=",
++                    "PLOW_NV_QUANT_FP8_VLLM=", "PLOW_NV_TMA_GEMM=", "PLOW_NV_FP8_PF_SCALE_WFIRST=",
++                    "PLOW_NV_GEMMA3=", "PLOW_NV_FA_PIPE=", "PLOW_NV_KV_E4M3=")
++
++
++def object_defines(build_log, obj):
++    """The -D list plowc compiled OBJECT with (run_ubench_cu.sh's derivation, kept in step)."""
++    import re
++    text = re.sub(r"\x1b\[[0-9;]*m", "", Path(build_log).read_text())
++    m = re.search(rf"nvcc {re.escape(obj)}\.cubin \((.*)\)$", text, re.M)
++    if not m:
++        raise SystemExit(f"no 'nvcc {obj}.cubin (...)' line in {build_log}")
++    defs = [d for d in m.group(1).split(";") if d]
++    man = re.search(r"building interpreter object from manifest.*$", text, re.M)
++    if not man:
++        raise SystemExit(f"no manifest line in {build_log}")
++    field = lambda k: re.findall(r'"([^"]*)"', (re.search(k + r"=\[([^]]*)\]", man.group(0))
++                                                or [None, ""])[1])
++    defs += ["-D" + d for d in field("requires") if d.startswith(REQUIRE_PREFIXES)]
++    defs += ["-D" + d for d in field("recommends") if not d.startswith("PLOW_NV_FA_GF_FULL=")]
++    return defs
++
++
++def cmd_gb10_build(a):
++    import subprocess
++    repo = Path(__file__).resolve().parents[2]
++    out = Path(a.out).resolve()
++    out.parent.mkdir(parents=True, exist_ok=True)
++    src = out.with_suffix(".cu")
++    src.write_text(GB10_SRC)
++    defs = object_defines(a.build_log, a.object) + [f"-DLIB_DEC_HD={a.hd}", f"-DLIB_DEC_GF={a.gf}"]
++    cmd = ["bash", str(repo / "runtime/cmake/nvcc_cubin.sh"), os.environ["PLOW_NVCC"], str(out),
++           "lib_merge", "required", "-arch=sm_121a", "-O3", "-cubin",
++           "-I", str(repo / "runtime/common"), "-I", str(repo / "runtime/nvidia"),
++           "-I", str(Path(a.assets).resolve())] + defs + [str(src)]
++    print(" ".join(cmd), flush=True)
++    sys.exit(subprocess.call(cmd))
++
++
++def live_nsplit(baked, kv_len):
++    """plowrt exec/kvrow.rs nv_dense_live_nsplit (tile 256, one split per 1024 keys, floor 4)."""
++    tiles = max(1, -(-kv_len // 256))
++    return max(1, min(max(1, min(max(kv_len // 1024, 4), tiles)), max(1, baked)))
++
++
++def baked_nsplit(spec, rows):
++    """--baked 'rung:ns,...': the decode program serving `rows` is the narrowest rung >= rows."""
++    table = sorted((int(r), int(n)) for r, n in (x.split(":") for x in spec.split(",")))
++    return next((n for r, n in table if r >= rows), table[-1][1])
++
++
++class GbCase:
++    """B sequences, each QLEN query rows over KVLEN keys; KV head-major [B][KVH][stride][D]."""
++
++    def __init__(self, torch, H, KVH, D, B, qlen, kvlen, fp8, seed):
++        g = torch.Generator(device="cuda").manual_seed(seed)
++        bf = torch.bfloat16
++        self.torch, self.H, self.KVH, self.D, self.B = torch, H, KVH, D, B
++        self.qlen, self.kvlen, self.fp8 = qlen, kvlen, fp8
++        self.stride = -(-kvlen // 256) * 256
++        self.scale = D ** -0.5
++        kv = lambda: torch.randn(B, KVH, self.stride, D, generator=g, device="cuda", dtype=bf)
++        self.k, self.v = kv(), kv()
++        if fp8:
++            self.k = self.k.to(torch.float8_e4m3fn)
++            self.v = self.v.to(torch.float8_e4m3fn)
++        self.q = torch.randn(B * qlen, H, D, generator=g, device="cuda", dtype=bf)
++        self.o = torch.zeros_like(self.q)
++        self.cu_q = torch.arange(0, B * qlen + 1, qlen, dtype=torch.int32, device="cuda")
++        self.seqused = torch.full((B,), kvlen, dtype=torch.int32, device="cuda")
++
++    def kv_bytes(self):
++        return 2 * self.B * self.KVH * self.kvlen * self.D * (1 if self.fp8 else 2)
++
++    def flop(self):
++        per = sum(self.kvlen - self.qlen + i + 1 for i in range(self.qlen))
++        return 4 * self.H * self.D * self.B * per
++
++    def reference_error(self, out=None, nrows=24):
++        torch = self.torch
++        out = self.o if out is None else out
++        G = self.H // self.KVH
++        idx = torch.unique(torch.linspace(0, self.qlen - 1, min(nrows, self.qlen),
++                                          device="cuda").round().long())
++        num = den = 0.0
++        for b in range(self.B):
++            rows = b * self.qlen + idx
++            pos = self.kvlen - self.qlen + idx
++            mask = torch.arange(self.kvlen, device="cuda")[None, :] > pos[:, None]
++            for kh in range(self.KVH):
++                K = self.k[b, kh, :self.kvlen].float()
++                V = self.v[b, kh, :self.kvlen].float()
++                q = self.q[rows, kh * G:(kh + 1) * G].float()
++                s = torch.einsum("ngd,kd->ngk", q, K) * self.scale
++                s.masked_fill_(mask[:, None, :], float("-inf"))
++                ref = torch.einsum("ngk,kd->ngd", torch.softmax(s, -1), V)
++                got = out[rows, kh * G:(kh + 1) * G].float()
++                num += float(((got - ref) ** 2).sum())
++                den += float((ref ** 2).sum())
++        return math.sqrt(num / den)
++
++
++class GbNative:
++    def __init__(self, drv, cubin, a):
++        self.drv, self.a = drv, a
++        self.mod = ctypes.c_void_p()
++        drv.check(drv.cu.cuModuleLoadData(ctypes.byref(self.mod), Path(cubin).read_bytes()), "load")
++        g = lambda n: hd256.Driver.global_u32(drv, self.mod, n)
++        self.e4m3 = g("lib_kv_e4m3")
++        self.fns = {}
++        for name, smem in (("lib_pf128", "lib_pf128_smem"), ("lib_pf256", "lib_pf256_smem"),
++                           ("lib_dec", "lib_dec_smem"), ("lib_merge", None)):
++            fn = ctypes.c_void_p()
++            if drv.cu.cuModuleGetFunction(ctypes.byref(fn), self.mod, name.encode()):
++                continue
++            s = g(smem) if smem else 0
++            drv.check(drv.cu.cuFuncSetAttribute(fn, 8, ctypes.c_int(s)), "smem")
++            self.fns[name] = (fn, s)
++
++    def args(self, c, opart, ml, lens, slot, rows, q0, nsplit):
++        p = lambda t: t.data_ptr() if t is not None else 0
++        return bc.pack_args([("p", p(opart)), ("p", p(ml)), ("p", p(c.q)), ("p", p(c.k)),
++                             ("p", p(c.v)), ("p", p(c.o)), ("p", p(lens)), ("p", p(slot)),
++                             ("u", rows), ("u", c.kvlen), ("u", c.H), ("u", c.KVH), ("u", q0),
++                             ("u", c.stride), ("u", nsplit), ("u", 0xFFFFFFFF), ("f", c.scale),
++                             ("u", 0)])
++
++    def prefill(self, c):
++        torch = c.torch
++        assert c.B == 1 and bool(self.e4m3) == c.fp8
++        name = "lib_pf128" if c.D == 128 else "lib_pf256"
++        fn, smem = self.fns[name]
++        dummy = torch.empty(1, device="cuda", dtype=torch.float32)
++        args = self.args(c, dummy, dummy, None, None, c.qlen, c.kvlen - c.qlen, 1)
++        return lambda: self.drv.launch(fn, GB10_SMS, 256, smem, args), 1
++
++    def decode(self, c):
++        torch = c.torch
++        rows = c.B * c.qlen
++        ns = live_nsplit(baked_nsplit(self.a.baked, rows), c.kvlen)
++        t = torch.arange(rows, device="cuda", dtype=torch.int32)
++        lens = (c.kvlen - c.qlen + 1 + t % c.qlen).to(torch.int32)
++        slot = (t // c.qlen).to(torch.int32)
++        opart = torch.empty(rows, c.H, ns, c.D, device="cuda", dtype=torch.float32)
++        ml = torch.empty(rows, c.H, ns, 2, device="cuda", dtype=torch.float32)
++        args = self.args(c, opart, ml, lens, slot, rows, 0, ns)
++        (fd, sd), (fm, _) = self.fns["lib_dec"], self.fns["lib_merge"]
++
++        def run():
++            self.drv.launch(fd, GB10_SMS, 256, sd, args)
++            self.drv.launch(fm, self.a.merge_blocks, 256, 0, args)
++        run._keep = (opart, ml, lens, slot)
++        return run, ns
++
++
++class GbLib:
++    """Library arms over one GbCase's memory (page table over the head-major slots)."""
++
++    def __init__(self, c, page, bf16_only):
++        torch = c.torch
++        self.c, self.page = c, page
++        self.adapt = lambda: None
++        k, v = c.k, c.v
++        if c.fp8 and bf16_only:
++            self.kb = torch.empty(c.k.shape, dtype=torch.bfloat16, device="cuda")
++            self.vb = torch.empty_like(self.kb)
++            L = c.kvlen
++
++            def adapt():
++                self.kb[:, :, :L].copy_(c.k[:, :, :L])
++                self.vb[:, :, :L].copy_(c.v[:, :, :L])
++            self.adapt = adapt
++            k, v = self.kb, self.vb
++        self.k, self.v = k, v
++        self.kp = page_view(k, False, c.KVH, c.stride, c.D, page)
++        self.vp = page_view(v, False, c.KVH, c.stride, c.D, page)
++        self.bt, self.flat, self.indptr, self.last = page_table(
++            [(b, c.kvlen) for b in range(c.B)], False, c.KVH, c.stride, 0xFFFFFFFF, page)
++
++    def dense(self):
++        """(B, S, KVH, D) views of the slots (no copy)."""
++        c = self.c
++        return (self.k.permute(0, 2, 1, 3)[:, :c.kvlen], self.v.permute(0, 2, 1, 3)[:, :c.kvlen])
++
++    def fi(self, decode_tc=None):
++        import flashinfer
++        torch = self.c.torch
++        c = self.c
++        ws = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
++        kvdt = c.k.dtype if self.k is c.k else torch.bfloat16
++        if decode_tc is None:
++            w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend="fa2")
++            plan = lambda: w.plan(c.cu_q, self.indptr, self.flat, self.last, c.H, c.KVH, c.D,
++                                  self.page, causal=True, q_data_type=torch.bfloat16,
++                                  kv_data_type=kvdt, o_data_type=torch.bfloat16, sm_scale=c.scale)
++        else:
++            w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", use_tensor_cores=decode_tc)
++            plan = lambda: w.plan(self.indptr, self.flat, self.last, c.H, c.KVH, c.D, self.page,
++                                  q_data_type=torch.bfloat16, kv_data_type=kvdt,
++                                  o_data_type=torch.bfloat16, sm_scale=c.scale)
++        plan()
++        t0 = time.perf_counter()
++        plan()
++        self.plan_us = (time.perf_counter() - t0) * 1e6
++
++        def run():
++            self.adapt()
++            w.run(c.q, (self.kp, self.vp), out=c.o)
++        run._keep = (ws, w)
++        return run
++
++    def xqa(self, contiguous=False):
++        """FlashInfer's XQA decode (TensorRT-LLM; SM90/SM12x), MTP rows under a causal draft
++        mask. `contiguous`: over a plain [page][P][kvh][D] copy built at setup (untimed), for a
++        kernel that ignores the view's head stride."""
++        from flashinfer.decode import xqa_batch_decode_with_kv_cache
++        torch = self.c.torch
++        c = self.c
++        kp, vp, bt = self.kp, self.vp, self.bt
++        if contiguous:
++            n = -(-c.kvlen // self.page)
++            pages = lambda t: (t[:, :, :n * self.page].reshape(c.B, c.KVH, n, self.page, c.D)
++                               .permute(0, 2, 3, 1, 4).reshape(c.B * n, self.page, c.KVH, c.D)
++                               .contiguous())
++            kp, vp = pages(self.k), pages(self.v)
++            bt = torch.arange(c.B * n, dtype=torch.int32, device="cuda").view(c.B, n)
++        ws = torch.zeros(256 << 20, dtype=torch.uint8, device="cuda")
++        mask = None
++        if c.qlen > 1:
++            bits = torch.tensor([(1 << (t + 1)) - 1 for t in range(c.qlen)], dtype=torch.int32,
++                                device="cuda")
++            mask = bits.view(1, c.qlen, 1).expand(c.B, c.qlen, 1).contiguous().view(torch.uint16)
++        self.plan_us = 0.0
++
++        def run():
++            self.adapt()
++            xqa_batch_decode_with_kv_cache(c.q, (kp, vp), ws, bt, c.seqused, c.kvlen,
++                                           bmm1_scale=c.scale, bmm2_scale=1.0, out=c.o,
++                                           kv_layout="NHD", q_len_per_req=c.qlen, mask=mask)
++        run._keep = (kp, vp, bt, ws, mask)
++        return run
++
++    def triton(self):
++        from vllm.v1.attention.ops.triton_unified_attention import unified_attention
++        from vllm.platforms import current_platform
++        torch = self.c.torch
++        c = self.c
++        # vLLM's TritonAttentionBackend metadata at the peer's settings (max-num-seqs 8, MTP k=3,
++        # capture sizes up to 32): 3D (split-KV) threshold, 16 or 64 softmax segments, scratch.
++        caps = [1, 2, 4, 8, 16, 24, 32]
++        thr = min(caps, key=lambda x: abs(x - 128 // c.KVH))
++        segs = 16
++        sms = torch.cuda.get_device_properties(0).multi_processor_count
++        if current_platform.is_device_capability((12, 0)) and c.B <= (sms - 1) // (16 * c.KVH):
++            segs = 64
++        rows3d = min(thr, 8) * 4
++        hp = 1 << (c.D - 1).bit_length()
++        so = torch.empty(rows3d, c.H, segs, hp, dtype=torch.float32, device="cuda")
++        sm = torch.empty(rows3d, c.H, segs, dtype=torch.float32, device="cuda")
++        se = torch.empty_like(sm)
++        ones = torch.ones(c.B, c.KVH, dtype=torch.float32, device="cuda")
++        fp8 = self.k.dtype == torch.float8_e4m3fn
++        self.plan_us = 0.0
++
++        def run():
++            self.adapt()
++            unified_attention(q=c.q, k=self.kp, v=self.vp, out=c.o, cu_seqlens_q=c.cu_q,
++                              max_seqlen_q=c.qlen, seqused_k=c.seqused, max_seqlen_k=c.kvlen,
++                              softmax_scale=c.scale, causal=True, window_size=(-1, -1),
++                              block_table=self.bt, softcap=0, q_descale=None,
++                              k_descale=ones if fp8 else None, v_descale=ones if fp8 else None,
++                              seq_threshold_3D=thr, num_par_softmax_segments=segs,
++                              softmax_segm_output=so, softmax_segm_max=sm, softmax_segm_expsum=se)
++        run._keep = (so, sm, se, ones)
++        return run
++
++    def fa2(self):
++        fi = fa(2)
++        c = self.c
++        self.plan_us = 0.0
++
++        def run():
++            self.adapt()
++            fi.flash_attn_varlen_func(c.q, self.kp, self.vp, c.qlen, c.cu_q, c.kvlen,
++                                      seqused_k=c.seqused, causal=True, softmax_scale=c.scale,
++                                      block_table=self.bt, out=c.o, fa_version=2)
++        return run
++
++    def fa4(self):
++        from vllm.vllm_flash_attn.cute.interface import flash_attn_func
++        c = self.c
++        k, v = self.dense()
++        q, o = c.q.view(c.B, c.qlen, c.H, c.D), c.o.view(c.B, c.qlen, c.H, c.D)
++        self.plan_us = 0.0
++
++        def run():
++            self.adapt()
++            flash_attn_func(q, k, v, softmax_scale=c.scale, causal=True, out=o)
++        return run
++
++    def cudnn(self):
++        import cudnn
++        torch = self.c.torch
++        c = self.c
++        k, v = (t.permute(0, 2, 1, 3) for t in self.dense())  # (B, KVH, S, D)
++        q = c.q.view(c.B, c.qlen, c.H, c.D).permute(0, 2, 1, 3)
++        o = c.o.view(c.B, c.qlen, c.H, c.D).permute(0, 2, 1, 3)
++        h = cudnn.create_handle()
++        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16,
++                          intermediate_data_type=cudnn.data_type.FLOAT,
++                          compute_data_type=cudnn.data_type.FLOAT, handle=h)
++        qg, kg, vg = g.tensor_like(q), g.tensor_like(k), g.tensor_like(v)
++        try:
++            og, _ = g.sdpa(name="sdpa", q=qg, k=kg, v=vg, generate_stats=False,
++                           attn_scale=c.scale, use_causal_mask_bottom_right=True)
++        except TypeError:
++            og, _ = g.sdpa(name="sdpa", q=qg, k=kg, v=vg, is_inference=True,
++                           attn_scale=c.scale, use_causal_mask_bottom_right=True)
++        og.set_output(True).set_dim(list(o.shape)).set_stride(list(o.stride()))
++        g.validate()
++        g.build_operation_graph()
++        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
++        g.check_support()
++        g.build_plans()
++        ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
++        self.plan_us = 0.0
++
++        def run():
++            self.adapt()
++            cudnn.set_stream(handle=h, stream=torch.cuda.current_stream().cuda_stream)
++            g.execute({qg: q, kg: k, vg: v, og: o}, ws, handle=h)
++        run._keep = (g, h, ws)
++        return run
++
++
++def gb10_time(torch, fns, reps=7):
++    """CUDA-graph median us per call; eager (events around the loop) when capture fails."""
++    t0 = time.time()
++    try:
++        us, mode = bc.graph_time(torch, fns, reps=reps), "graph"
++    except Exception:
++        torch.cuda.synchronize()
++        ts = []
++        for _ in range(reps):
++            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++            e0.record()
++            for f in fns:
++                f()
++            e1.record()
++            e1.synchronize()
++            ts.append(e0.elapsed_time(e1) * 1000 / len(fns))
++        us, mode = sorted(ts)[len(ts) // 2], "eager"
++    return us, mode, (round(t0, 1), round(time.time(), 1))
++
++
++def cmd_gb10(a):
++    drv = bc.Driver()
++    torch = drv.torch
++    nat = GbNative(drv, a.cubin, a) if a.cubin != "-" else None
++    out = {}
++    for spec in a.classes:
++        H, KVH, D, B, qlen, kvlen = [int(x) for x in spec.split(",")]
++        decode = qlen <= 8
++        per = 2 * B * KVH * kvlen * D * (1 if a.fp8 else 2) + 4 * B * qlen * H * D
++        n = max(2, min(6, math.ceil(160e6 / per)))
++        cases = [GbCase(torch, H, KVH, D, B, qlen, kvlen, a.fp8, s) for s in range(n)]
++        c0 = cases[0]
++        fl, by = c0.flop(), c0.kv_bytes()
++        floor_us = max(fl / GB10_BF16_TF / 1e6, by / GB10_DRAM * 1e6)
++        key = f"h{H}kv{KVH}d{D}_b{B}_q{qlen}_kv{kvlen}" + ("_e4m3" if a.fp8 else "")
++        res = {"floor_us": round(floor_us, 1), "gflop": round(fl / 1e9, 2), "kv_mb": round(by / 1e6, 1)}
++        windows = []
++
++        def record(name, fns, extra=None):
++            c0.o.fill_(float("nan"))
++            fns[0]()
++            torch.cuda.synchronize()
++            err = c0.reference_error()
++            us, mode, win = gb10_time(torch, fns)
++            windows.append(win)
++            r = {"us": round(us, 1), "rel_l2": float(f"{err:.2e}"), "pct_roof": round(100 * floor_us / us, 1)}
++            if decode:
++                r["gb_s"] = round(by / us / 1e3, 1)
++            else:
++                r["tflops"] = round(fl / us / 1e6, 1)
++            if mode != "graph":
++                r["timing"] = mode
++            r.update(extra or {})
++            res[name] = r
++
++        if nat is not None:
++            try:
++                built = [(nat.decode if decode else nat.prefill)(c) for c in cases]
++                record("native", [f for f, _ in built], {"nsplit": built[0][1]} if decode else None)
++            except Exception as e:
++                res["native"] = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
++        for lib in a.libs:
++            if lib in ("fid", "fidtc") and qlen != 1 or lib in ("xqa", "xqac") and not decode:
++                continue
++            try:
++                arms = [GbLib(c, a.page, lib in ("fa2", "fa4", "cudnn")) for c in cases]
++                make = {"fi": lambda x: x.fi(), "fid": lambda x: x.fi(False),
++                        "fidtc": lambda x: x.fi(True), "xqa": lambda x: x.xqa(),
++                        "xqac": lambda x: x.xqa(True), "triton": lambda x: x.triton(),
++                        "fa2": lambda x: x.fa2(), "fa4": lambda x: x.fa4(),
++                        "cudnn": lambda x: x.cudnn()}[lib]
++                fns = [make(x) for x in arms]
++                extra = {}
++                if getattr(arms[0], "plan_us", 0):
++                    extra["plan_host_us"] = round(arms[0].plan_us, 1)
++                if arms[0].k is not c0.k:
++                    extra["adapter_us"] = round(gb10_time(torch, [x.adapt for x in arms])[0], 1)
++                record(lib, fns, extra)
++                if "native" in res and "us" in res["native"]:
++                    res[lib]["ratio"] = round(res[lib]["us"] / res["native"]["us"], 2)
++                del arms, fns
++            except Exception as e:
++                res[lib] = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
++            torch.cuda.empty_cache()
++        res["timed_windows"] = windows
++        print(key, json.dumps(res), flush=True)
++        out[key] = res
++        del cases
++        torch.cuda.empty_cache()
++        if a.json:
++            Path(a.json).write_text(json.dumps(out, indent=1) + "\n")
++
++
++def cmd_selftest(_a):
++    import tempfile
++    for kv, want in [(1, 1), (256, 1), (512, 2), (1024, 4), (2048, 4), (4096, 4), (8192, 8),
++                     (16384, 16), (32768, 32), (65536, 64)]:
++        assert live_nsplit(64, kv) == want, (kv, live_nsplit(64, kv))
++    assert live_nsplit(32, 65536) == 32 and live_nsplit(16, 65536) == 16
++    assert live_nsplit(24, 131072) == 24 and live_nsplit(3, 1024) == 3
++    spec = "1:24,2:12,4:6,8:3,16:3,32:3"
++    assert [baked_nsplit(spec, r) for r in (1, 3, 4, 16, 32, 64)] == [24, 6, 6, 3, 3, 3]
++    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
++        f.write('\x1b[2mx\x1b[0m building interpreter object from manifest requires=["PLOW_NV_FA_GF=16", '
++                '"PLOW_NV_W8A8=1", "PLOW_NV_KV_E4M3=1"] recommends=["GV_MM_MAX=32", '
++                '"PLOW_NV_FA_GF_FULL=4"]\n[ 22%] nvcc interp_sm120_pf.cubin (-DPLOW_NV_W8A8=1;'
++                '-DPLOW_CONFIG="plow_config.h";-DPLOW_NV_PREFILL=1)\n')
++    assert object_defines(f.name, "interp_sm120_pf") == [
++        "-DPLOW_NV_W8A8=1", '-DPLOW_CONFIG="plow_config.h"', "-DPLOW_NV_PREFILL=1",
++        "-DPLOW_NV_FA_GF=16", "-DPLOW_NV_KV_E4M3=1", "-DGV_MM_MAX=32"], object_defines(f.name, "interp_sm120_pf")
++    os.unlink(f.name)
++    # Head-major page ids: slot 1, KVH 2, stride 512, page 64 -> first id (1*2*512)/64 = 16.
++    assert page_id(False, 2, 512, 64, 1, 0) == 16 and page_id(False, 2, 512, 64, 1, 128) == 18
++    print("selftest OK")
++
++
+ def main():
+     ap = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+@@ -660,8 +1190,26 @@ def main():
+     v.add_argument("arm")
+     v.add_argument("point")
+     v.add_argument("--page", type=int, default=64)
++    gb = sub.add_parser("gb10-build")
++    gb.add_argument("assets")
++    gb.add_argument("build_log")
++    gb.add_argument("object")
++    gb.add_argument("out")
++    gb.add_argument("--hd", type=int, required=True)
++    gb.add_argument("--gf", type=int, required=True)
++    g = sub.add_parser("gb10")
++    g.add_argument("cubin", help="gb10-build output, or - for libraries only")
++    g.add_argument("--classes", nargs="+", required=True)
++    g.add_argument("--fp8", action="store_true")
++    g.add_argument("--libs", type=libs_arg, default=GB10_LIBS)
++    g.add_argument("--page", type=int, default=64)
++    g.add_argument("--baked", default="1:1", help="decode rung:nsplit of the packet")
++    g.add_argument("--merge-blocks", type=int, default=GB10_SMS)
++    g.add_argument("--json")
++    sub.add_parser("selftest")
+     a = ap.parse_args()
+-    {"prefill": cmd_prefill, "hd512": cmd_hd512, "decode": cmd_decode, "vmm": cmd_vmm}[a.cmd](a)
++    {"prefill": cmd_prefill, "hd512": cmd_hd512, "decode": cmd_decode, "vmm": cmd_vmm,
++     "gb10-build": cmd_gb10_build, "gb10": cmd_gb10, "selftest": cmd_selftest}[a.cmd](a)
+ 
+ 
+ if __name__ == "__main__":
