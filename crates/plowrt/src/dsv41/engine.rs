@@ -167,7 +167,7 @@ impl Engine {
                 }
             }
         }
-        let prof_level = std::env::var("PLOW_DSV41_PROFILE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let prof_level = crate::config::RuntimeConfig::get().nv.dsv41_profile;
         // mirrors: a kv source whose consumers sit on a later stage
         let mut mirrors: Vec<Mirror> = Vec::new();
         for l in 0..cfg.n_layers {

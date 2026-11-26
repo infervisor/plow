@@ -1595,6 +1595,14 @@ pub struct NvidiaRuntimeConfig {
     )]
     pub decode_cublaslt_min_rows: u32,
 
+    /// DeepSeek V4.1: pin prefill GEMMs to the mma.sync kernels instead of wgmma (`dsv41_wg.cu`).
+    #[arg(long = "dsv41-no-wg", env = "PLOW_DSV41_NO_WG", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub dsv41_no_wg: bool,
+
+    /// DeepSeek V4.1 profiling: `1` per-stage milliseconds, `2` also per-kernel GPU time.
+    #[arg(long = "dsv41-profile", env = "PLOW_DSV41_PROFILE", hide = true, default_value_t = 0, global = true)]
+    pub dsv41_profile: u32,
+
     /// Speculative decoding with the packet's drafter (CUDA; packets emitted with
     /// `PLOW_EMIT_SPEC`): pure decode ticks of greedy rows draft and verify when the measured
     /// plan beats the plain step. Off by default.

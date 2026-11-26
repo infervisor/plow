@@ -242,7 +242,7 @@ impl Stage {
         let arena = Lanes { lanes, cur: Cell::new(0) };
         Ok(Stage {
             idx,
-            wg: std::env::var_os("PLOW_DSV41_NO_WG").is_none(),
+            wg: !crate::config::RuntimeConfig::get().nv.dsv41_no_wg,
             rope_w: (at(0), at(1)),
             rope_c: (at(2), at(3)),
             _rope_mem: rope_mem,

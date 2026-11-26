@@ -678,6 +678,7 @@ const ENGINE_FAMILIES: &[&str] = &[
     "PLOW_CPU_",
     "PLOW_DECODE_",
     "PLOW_DSA_",
+    "PLOW_DSV41_",
     "PLOW_GDN_",
     "PLOW_GEN_DECODE_",
     "PLOW_GLM_",
@@ -1066,6 +1067,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.tts_stream_windows", Some("PLOW_TTS_STREAM_WINDOWS"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_pipeline", Some("PLOW_DECODE_PIPELINE"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
     KnobSpec::new("rt.decode_cublaslt_min_rows", Some("PLOW_DECODE_CUBLASLT_MIN_ROWS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.dsv41_no_wg", Some("PLOW_DSV41_NO_WG"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.dsv41_profile", Some("PLOW_DSV41_PROFILE"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.spec", Some("PLOW_SPEC"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.spec_sampled", Some("PLOW_SPEC_SAMPLED"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.spec_sampled_kmax", Some("PLOW_SPEC_SAMPLED_KMAX"), Layer::Runtime, U32, Default::Static(Val::Nat(3)), PROMOTED),
@@ -1276,8 +1279,6 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
-    KnobSpec::new("env.PLOW_DSV41_NO_WG", Some("PLOW_DSV41_NO_WG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
-    KnobSpec::new("env.PLOW_DSV41_PROFILE", Some("PLOW_DSV41_PROFILE"), Layer::RawEnv, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("env.PLOW_PUBLISH_URL", Some("PLOW_PUBLISH_URL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PUBLISH_KEY", Some("PLOW_PUBLISH_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_READELF", Some("PLOW_READELF"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
