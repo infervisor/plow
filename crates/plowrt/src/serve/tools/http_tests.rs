@@ -777,6 +777,126 @@ impl Harness {
     }
 }
 
+/// `response_format`: the generation starts inside the object, the reply is the first JSON value
+/// and is checked against the schema; a failure is an error on both paths, a streamed reply is
+/// withheld until it validates, and vLLM's guided fields are refused.
+#[tokio::test]
+async fn response_format_json_is_validated_after_generation() {
+    let h = harness_for("gemma4-12b");
+    let format = json!({"type": "json_schema", "json_schema": {"name": "intent", "schema": {
+        "type": "object", "required": ["intent"], "additionalProperties": false,
+        "properties": {"intent": {"enum": ["book", "cancel"]}}}}});
+    let content = |frames: &[Value]| -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| f["choices"][0]["delta"]["content"].as_str())
+            .map(str::to_string)
+            .collect()
+    };
+
+    h.reply(&["\"intent\"", ": \"book\"", "}", "\n", "bye"]);
+    for format in [&format, &json!({"type": "json_object"})] {
+        let body = json!({"messages": user("x"), "response_format": format});
+        let (code, v) = h.json(body.clone()).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert!(h.last_prompt().ends_with('{'), "{}", h.last_prompt());
+        let choice = &v["choices"][0];
+        assert_eq!(choice["message"]["content"], "{\"intent\": \"book\"}");
+        assert_eq!(choice["finish_reason"], "stop");
+        let (frames, done) = h.sse(body).await;
+        assert!(done);
+        assert_eq!(content(&frames), ["{\"intent\": \"book\"}"]);
+    }
+
+    h.reply(&["\"intent\"", ": \"sing\"", "}"]);
+    let body = json!({"messages": user("x"), "response_format": format});
+    let (code, v) = h.json(body.clone()).await;
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["error"]["code"], "invalid_json_response");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("$.intent"),
+        "{v}"
+    );
+    let (frames, done) = h.sse(body.clone()).await;
+    assert!(!done);
+    assert_eq!(
+        frames.last().unwrap()["error"]["code"],
+        "invalid_json_response"
+    );
+    assert!(
+        content(&frames).is_empty(),
+        "nothing is sent before it validates"
+    );
+
+    h.reply(&["oops", " no", " json"]);
+    let (code, v) = h
+        .json(json!({"messages": user("x"), "response_format": {"type": "json_object"}}))
+        .await;
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["error"]["code"], "invalid_json_response");
+
+    // cut at `max_tokens`: an error, never the partial object
+    h.reply(&["\"intent\"", ": "]);
+    let mut cut = body.clone();
+    cut["max_tokens"] = json!(2);
+    let (code, v) = h.json(cut.clone()).await;
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["error"]["code"], "invalid_json_response");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_tokens"),
+        "{v}"
+    );
+    let (frames, done) = h.sse(cut).await;
+    assert!(!done && content(&frames).is_empty());
+    assert_eq!(
+        frames.last().unwrap()["error"]["code"],
+        "invalid_json_response"
+    );
+
+    for field in [
+        "guided_json",
+        "guided_regex",
+        "guided_grammar",
+        "guided_choice",
+        "structured_outputs",
+    ] {
+        let mut b = json!({"messages": user("x")});
+        b[field] = json!({"type": "object"});
+        let (code, v) = h.json(b).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{field}: {v}");
+        assert_eq!(v["error"]["code"], "unsupported_parameter");
+        assert_eq!(v["error"]["param"], field);
+    }
+    let mut both = body.clone();
+    both["tools"] = tools();
+    let (code, v) = h.json(both).await;
+    assert_eq!(
+        (code, v["error"]["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("unsupported_parameter"))
+    );
+    let (code, v) = h
+        .json(
+            json!({"messages": user("x"), "response_format": {"type": "json_schema",
+            "json_schema": {"name": "a", "schema": {"type": "array"}}}}),
+        )
+        .await;
+    assert_eq!(
+        (
+            code,
+            v["error"]["code"].as_str(),
+            v["error"]["param"].as_str()
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("invalid_value"),
+            Some("response_format")
+        )
+    );
+}
+
 /// Request-shape parity with vLLM: `max_tokens` and `max_completion_tokens` together (the
 /// latter wins), `response_format: text`, `reasoning_effort` turning Gemma 4's thinking on,
 /// schema errors as 400 with the error envelope, and `/v1/completions`' default of 16 tokens.
@@ -799,10 +919,6 @@ async fn request_fields_are_read_as_vllm_reads_them() {
         .json(json!({"messages": user("hi"), "response_format": {"type": "text"}}))
         .await;
     assert_eq!(code, StatusCode::OK, "{body}");
-    let (code, _) = h
-        .json(json!({"messages": user("hi"), "response_format": {"type": "json_object"}}))
-        .await;
-    assert_eq!(code, StatusCode::BAD_REQUEST);
 
     h.reply(&["ok"]);
     for (extra, thinks) in [

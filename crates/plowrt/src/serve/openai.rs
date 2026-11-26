@@ -259,6 +259,17 @@ pub struct ChatRequest {
     pub function_call: Option<serde_json::Value>,
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
+    /// vLLM's constrained-decoding fields: parsed only to be refused.
+    #[serde(default)]
+    pub guided_json: Option<serde_json::Value>,
+    #[serde(default)]
+    pub guided_regex: Option<serde_json::Value>,
+    #[serde(default)]
+    pub guided_grammar: Option<serde_json::Value>,
+    #[serde(default)]
+    pub guided_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub structured_outputs: Option<serde_json::Value>,
     /// vLLM's `include_reasoning`: `false` leaves the trace out of the response (it is still
     /// split from `content` and counted in `reasoning_tokens`).
     #[serde(default)]

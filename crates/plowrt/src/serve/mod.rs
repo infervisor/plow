@@ -40,6 +40,7 @@ pub mod portable;
 pub mod reasoning;
 pub mod reply_guard;
 pub mod residency_contract;
+pub mod response_format;
 pub mod session;
 #[cfg(all(test, any(feature = "hsa", feature = "cpu", feature = "cuda")))]
 mod step_lowering_tests;

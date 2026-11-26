@@ -153,8 +153,16 @@ the eos set came from the `config.json` fallback rather than `generation_config.
 - `/v1/completions` accepts all four OpenAI prompt forms; batches are refused explicitly.
 - `messages[].content` may be `null`, so an assistant tool-call turn can be replayed.
 - Malformed JSON returns the envelope, not axum's plain-text rejection.
+- `response_format` `json_object` and `json_schema` on `/v1/chat/completions`: the generation
+  starts inside the object, and the reply is the first JSON value, checked after generation
+  against the schema (the subset of `strict` tools; `pattern` and `format` unchecked). The sampler
+  is not constrained: output that fails is `500 {"error": {"type": "server_error", "code":
+  "invalid_json_response"}}`, an error frame and no `[DONE]` when streamed. A streamed reply is
+  sent as one delta once it validates. A reply cut at `max_tokens` before the JSON is complete
+  is the same error. Refused together with `tools`.
 - **Refused rather than silently dropped**: `n != 1`, `functions`, `function_call`,
-  `response_format`, `echo`, `suffix`, `best_of`, and `tools` wherever §2b cannot honor them.
+  `guided_json`, `guided_regex`, `guided_grammar`, `guided_choice`, `structured_outputs`,
+  `echo`, `suffix`, `best_of`, and `tools` wherever §2b cannot honor them.
   (`logprobs` / `top_logprobs` were on this list; they are served on the CUDA engine since
   2026-09-27, see below.) A silently dropped `tools` is a confidently wrong answer that scores
   as success.

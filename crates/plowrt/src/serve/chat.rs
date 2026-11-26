@@ -239,21 +239,39 @@ async fn chat_completions_with(
             );
         }
     }
-    // `{"type": "text"}` is the default format and asks for nothing; SDK wrappers send it.
-    if req
-        .response_format
-        .as_ref()
-        .is_some_and(|v| !v.is_null() && v.get("type").and_then(|t| t.as_str()) != Some("text"))
-    {
-        return crate::serve::api_error(
-            axum::http::StatusCode::BAD_REQUEST,
-            "`response_format` is not implemented by this server; it is refused rather than \
-             ignored, because ignoring it returns a confidently wrong answer",
-            "invalid_request_error",
-            Some("unsupported_parameter"),
-            Some("response_format".into()),
-        );
+    for (field, value) in [
+        ("guided_json", &req.guided_json),
+        ("guided_regex", &req.guided_regex),
+        ("guided_grammar", &req.guided_grammar),
+        ("guided_choice", &req.guided_choice),
+        ("structured_outputs", &req.structured_outputs),
+    ] {
+        if value.as_ref().is_some_and(|v| !v.is_null()) {
+            return crate::serve::api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "`{field}` is not implemented by this server; use `response_format` \
+                     (`json_schema` or `json_object`)"
+                ),
+                "invalid_request_error",
+                Some("unsupported_parameter"),
+                Some(field.into()),
+            );
+        }
     }
+    // `{"type": "text"}` is the default format and asks for nothing; SDK wrappers send it.
+    let json_format = match crate::serve::response_format::parse(req.response_format.as_ref()) {
+        Ok(f) => f,
+        Err(message) => {
+            return crate::serve::api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                Some("invalid_value"),
+                Some("response_format".into()),
+            )
+        }
+    };
     // TOOLS: served when the model's own template renders them and its call syntax is one
     // `serve::tools` parses; refused otherwise (see `tools::request::plan`).
     let tool_support = if state.chat_templated(&req.model) {
@@ -277,6 +295,25 @@ async fn chat_completions_with(
             )
         }
     };
+    // The JSON opener would land inside a tool call or harmony's channel framing.
+    if json_format.is_some()
+        && (tool_plan.parse.is_some()
+            || matches!(
+                tool_support,
+                Some(crate::serve::tools::ToolSupport::Format(
+                    crate::serve::tools::ToolFormat::Harmony
+                ))
+            ))
+    {
+        return crate::serve::api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "`response_format` is not served together with `tools`, or for this model's \
+             response framing",
+            "invalid_request_error",
+            Some("unsupported_parameter"),
+            Some("response_format".into()),
+        );
+    }
 
     // OpenAI's schema requires at least one message, and answering an empty
     // conversation means generating from a bare generation prompt: the model
@@ -547,11 +584,14 @@ async fn chat_completions_with(
     // A forced `tool_choice` writes the call's opener for the model, so the generation starts
     // inside the call (after closing a trace the prompt left open), and is validated at the end.
     let opener = tool_plan.parse.as_ref().and_then(|s| s.opener());
+    let prompt_opener = opener.as_deref().or(json_format
+        .as_ref()
+        .map(|_| crate::serve::response_format::OPENER));
     // A seeded trace: plow writes the trace's opening itself, so the split knows it is open.
     // After a tool result the template already opened it and only the seed text is added.
     if let (true, None, Some(prefix), Some((open, _))) = (
         thinking,
-        &opener,
+        prompt_opener,
         defaults.and_then(|d| d.thought_prefix.as_deref()),
         reasoning_mode.markers(),
     ) {
@@ -564,7 +604,7 @@ async fn chat_completions_with(
             reasoning_open = true;
         }
     }
-    if let Some(o) = &opener {
+    if let Some(o) = prompt_opener {
         if reasoning_open {
             prompt.push_str(reasoning_mode.close_marker().unwrap_or_default());
             reasoning_open = false;
@@ -908,19 +948,21 @@ async fn chat_completions_with(
         };
     }
 
-    let guard = defaults.filter(|d| d.reply_guard.is_some()).map(|d| {
-        let caller = req
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.text())
-            .unwrap_or_default();
-        crate::serve::reply_guard::ReplyGuard::new(
-            d.reply_guard_lines.as_ref(),
-            crate::serve::reply_guard::caller_script(&caller),
-        )
-    });
+    let guard = defaults
+        .filter(|d| d.reply_guard.is_some() && json_format.is_none())
+        .map(|d| {
+            let caller = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.text())
+                .unwrap_or_default();
+            crate::serve::reply_guard::ReplyGuard::new(
+                d.reply_guard_lines.as_ref(),
+                crate::serve::reply_guard::caller_script(&caller),
+            )
+        });
     let tally =
         crate::obs::serving::ReasoningTally::admitted(state.model_metrics(key), thinking, t_arrive);
     let request_id = request_id();
@@ -947,6 +989,7 @@ async fn chat_completions_with(
             tool_stream,
             guard,
             regen,
+            json_format,
             run,
             tally,
         );
@@ -967,6 +1010,7 @@ async fn chat_completions_with(
             tool_stream,
             guard,
             regen,
+            json_format,
             run,
             tally,
         )
@@ -1057,6 +1101,25 @@ fn tool_call_error(message: &str) -> crate::serve::openai::ApiErrorBody {
         Some("invalid_tool_call"),
         None,
     )
+}
+
+/// A `response_format` reply, validated: `Ok(None)` when the request asked for none.
+fn json_content(
+    json: Option<&crate::serve::response_format::JsonFormat>,
+    generated: &str,
+    finish: stream_mod::FinishReason,
+) -> Result<Option<String>, crate::serve::openai::ApiErrorBody> {
+    let Some(json) = json else { return Ok(None) };
+    json.finish(generated, !matches!(finish, stream_mod::FinishReason::Stop))
+        .map(Some)
+        .map_err(|e| {
+            crate::serve::openai::ApiErrorBody::new(
+                e,
+                "server_error",
+                Some("invalid_json_response"),
+                None,
+            )
+        })
 }
 
 fn mm_error(e: crate::serve::mm::MmError) -> Response {
@@ -1487,6 +1550,7 @@ async fn buffer_and_reply(
     mut tools: Option<crate::serve::tools::stream::ToolStream>,
     mut guard: Option<crate::serve::reply_guard::ReplyGuard>,
     regen: Option<Regen>,
+    json: Option<crate::serve::response_format::JsonFormat>,
     mut run: crate::serve::turns::StageRun,
     mut tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
@@ -1613,6 +1677,14 @@ async fn buffer_and_reply(
             let (r, c) = split.finish();
             reasoning_buf.push_str(&r.unwrap_or_default());
             answer_buf.push_str(&c.unwrap_or_default());
+        }
+    }
+    match json_content(json.as_ref(), &answer_buf, finish) {
+        Ok(Some(content)) => answer_buf = content,
+        Ok(None) => {}
+        Err(body) => {
+            tracing::warn!(%model, error = %body.error.message, "chat: response_format failed validation");
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
         }
     }
     // The guard reads the answer by its lines alone, so one pass over the whole of it is what
@@ -1854,6 +1926,7 @@ fn sse_response(
     tools: Option<crate::serve::tools::stream::ToolStream>,
     guard: Option<crate::serve::reply_guard::ReplyGuard>,
     regen: Option<Regen>,
+    json: Option<crate::serve::response_format::JsonFormat>,
     run: crate::serve::turns::StageRun,
     tally: crate::obs::serving::ReasoningTally,
 ) -> Response {
@@ -1888,6 +1961,9 @@ fn sse_response(
         regen: Option<Regen>,
         /// The generation's text, kept only for `regen`.
         raw: String,
+        /// `response_format`: content is withheld in `json_buf` and sent validated at the end.
+        json: Option<crate::serve::response_format::JsonFormat>,
+        json_buf: String,
     }
     let body = stream::unfold(
         SseState {
@@ -1917,6 +1993,8 @@ fn sse_response(
             gc: String::new(),
             regen,
             raw: String::new(),
+            json,
+            json_buf: String::new(),
         },
         move |mut st| {
             async move {
@@ -1981,12 +2059,16 @@ fn sse_response(
                         let frame = match st.tools.as_mut() {
                             Some(ts) => {
                                 let step = ts.push(&text);
-                                let step = match st.guard.as_mut() {
+                                let mut step = match st.guard.as_mut() {
                                     Some(g) => guard_step(g, step, &mut st.gr, &mut st.gc),
                                     None => step,
                                 };
                                 if step.content.is_some_and(|c| !c.trim().is_empty()) {
                                     st.tally.reply_started();
+                                }
+                                if st.json.is_some() {
+                                    st.json_buf
+                                        .push_str(step.content.take().unwrap_or_default());
                                 }
                                 let f = step.frame(
                                     &st.head,
@@ -2011,6 +2093,14 @@ fn sse_response(
                                 if content.as_deref().is_some_and(|c| !c.trim().is_empty()) {
                                     st.tally.reply_started();
                                 }
+                                let content = match st.json {
+                                    Some(_) => {
+                                        st.json_buf
+                                            .push_str(content.as_deref().unwrap_or_default());
+                                        None
+                                    }
+                                    None => content,
+                                };
                                 st.head.frame(&ChunkChoice {
                                     index: 0,
                                     delta: Delta {
@@ -2036,10 +2126,13 @@ fn sse_response(
                         let ts = st.tools.as_mut().expect("checked");
                         let tail = {
                             let s = ts.finish(!matches!(reason, stream_mod::FinishReason::Stop));
-                            let s = match st.guard.as_mut() {
+                            let mut s = match st.guard.as_mut() {
                                 Some(g) => guard_step(g, s, &mut st.gr, &mut st.gc),
                                 None => s,
                             };
+                            if st.json.is_some() {
+                                st.json_buf.push_str(s.content.take().unwrap_or_default());
+                            }
                             (!s.is_empty(st.include_reasoning))
                                 .then(|| s.frame(&st.head, None, None, st.include_reasoning, None))
                         };
@@ -2053,11 +2146,33 @@ fn sse_response(
                             r => r.as_openai(),
                         };
                         let trace_tokens = ts.split.trace_tokens;
+                        let calls = ts.calls();
                         st.tally.finished(trace_tokens, usage.think);
                         let mut frames: Vec<Bytes> = tail.into_iter().collect();
+                        match json_content(st.json.as_ref(), &st.json_buf, reason) {
+                            Ok(Some(content)) => frames.push(st.head.frame(&ChunkChoice {
+                                index: 0,
+                                delta: Delta {
+                                    role: None,
+                                    content: Some(content),
+                                    reasoning_content: crate::serve::openai::Reasoning(None),
+                                    tool_calls: None,
+                                },
+                                logprobs: None,
+                                finish_reason: None,
+                                x_plow_finish_reason: None,
+                                x_plow_thinking: None,
+                            })),
+                            Ok(None) => {}
+                            Err(body) => {
+                                tracing::warn!(model = %st.model, error = %body.error.message, "chat: response_format failed validation");
+                                st.done = true;
+                                return Some((sse_error(&body), st));
+                            }
+                        }
                         if let Some(g) = st.guard.as_mut() {
                             let (mut r, mut c) = (String::new(), String::new());
-                            if g.silent(ts.calls() > 0) {
+                            if g.silent(calls > 0) {
                                 if let Some((more, n)) = match &st.regen {
                                     Some(re) => re.reply(&st.raw).await,
                                     None => None,
@@ -2066,7 +2181,7 @@ fn sse_response(
                                     usage.completion_tokens += n;
                                 }
                             }
-                            let fallback = g.finish(ts.calls() > 0, &mut r, &mut c);
+                            let fallback = g.finish(calls > 0, &mut r, &mut c);
                             st.tally.guarded(g, fallback);
                             if !c.is_empty() || (st.include_reasoning && !r.is_empty()) {
                                 frames.push(st.head.frame(&ChunkChoice {
@@ -2152,6 +2267,18 @@ fn sse_response(
                             st.tally.guarded(g, fallback);
                             flushed_r = (!r.is_empty()).then_some(r);
                             flushed_c = (!c.is_empty()).then_some(c);
+                        }
+                        if st.json.is_some() {
+                            st.json_buf
+                                .push_str(flushed_c.as_deref().unwrap_or_default());
+                            match json_content(st.json.as_ref(), &st.json_buf, reason) {
+                                Ok(content) => flushed_c = content,
+                                Err(body) => {
+                                    tracing::warn!(model = %st.model, error = %body.error.message, "chat: response_format failed validation");
+                                    st.done = true;
+                                    return Some((sse_error(&body), st));
+                                }
+                            }
                         }
                         let ch = ChunkChoice {
                             index: 0,

@@ -11254,7 +11254,7 @@ fn handle_produced_token(
     slot.executed += exec;
     slot.step += 1;
     if let Some(seat) = slot.session.as_mut() {
-        seat.on_token(token);
+        seat.on_token(token, slot.cached_tokens);
     }
     *tokens_this_tick += 1;
 
@@ -16604,7 +16604,7 @@ mod session_tests {
     fn finish(slots: &mut [Option<Slot>], r: &mut Retention, i: usize) {
         let mut slot = slots[i].take().expect("live");
         if let Some(seat) = slot.session.as_mut() {
-            seat.on_token(99);
+            seat.on_token(99, 0);
         }
         drop(slot);
         r.collect(Instant::now());

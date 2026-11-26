@@ -573,6 +573,7 @@ pub struct Seat {
     /// `None`: the engine's prefix cache keeps the rows ([`Self::pin_ttl`]); nothing retires here.
     inbox: Option<RetireInbox>,
     pin: std::time::Duration,
+    admitted: Instant,
 }
 
 impl Seat {
@@ -594,6 +595,7 @@ impl Seat {
             last: None,
             inbox: Some(inbox),
             pin: Duration::ZERO,
+            admitted: Instant::now(),
         }
     }
 
@@ -609,6 +611,7 @@ impl Seat {
             last: None,
             inbox: None,
             pin: ttl,
+            admitted: Instant::now(),
         }
     }
 
@@ -617,8 +620,17 @@ impl Seat {
         self.inbox.is_none().then_some(self.pin)
     }
 
-    /// A token was produced: every row before it is in the cache.
-    pub fn on_token(&mut self, token: u32) {
+    /// A token was produced: every row before it is in the cache. `cached`: the prompt rows the
+    /// engine's prefix cache served, which a prefix-cache seat reports with its first token (they
+    /// are not known at admission).
+    pub fn on_token(&mut self, token: u32, cached: usize) {
+        if let Some(report) = self.ticket.report.take() {
+            let _ = report.send(CacheOutcome {
+                status: CacheStatus::Prefix,
+                rows: cached,
+                at: Some(self.admitted),
+            });
+        }
         if self.speech {
             self.valid = self.prompt_rows.saturating_sub(1);
             return;
@@ -930,13 +942,6 @@ impl Retention {
     ) -> Option<Seat> {
         let mut ticket = ticket?;
         if let Some(ttl) = self.prefix_pin {
-            if let Some(report) = ticket.report.take() {
-                let _ = report.send(CacheOutcome {
-                    status: CacheStatus::Prefix,
-                    rows: 0,
-                    at: Some(Instant::now()),
-                });
-            }
             return Some(Seat::pinned(ticket, slot, ttl));
         }
         let outcome = self.table.outcome(&ticket.session, resumed);
@@ -1173,6 +1178,24 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_cache_seat_reports_cached_rows_with_its_first_token() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let ticket = Box::new(SessionTicket {
+            session: "s".into(),
+            request: "r".into(),
+            keys: Vec::new(),
+            report: Some(tx),
+        });
+        let mut seat = Seat::pinned(ticket, 0, Duration::from_secs(1));
+        assert!(rx.try_recv().is_err(), "not known at admission");
+        seat.on_token(7, 2144);
+        seat.on_token(8, 2144);
+        let got = rx.try_recv().unwrap();
+        assert_eq!((got.status, got.rows), (CacheStatus::Prefix, 2144));
+        assert!(got.at.is_some());
+    }
+
+    #[test]
     fn seats_retain_prompt_rows_for_speech_and_prompt_plus_output_for_text() {
         let inbox: RetireInbox = Default::default();
         let ticket = |keys: &[u64]| {
@@ -1196,12 +1219,12 @@ mod tests {
         );
         let mut text = Seat::new(ticket(&[1, 2, 3]), 1, false, false, inbox.clone());
         for t in [10, 11, 12] {
-            text.on_token(t);
+            text.on_token(t, 0);
         }
         drop(text);
         let mut speech = Seat::new(ticket(&[1, 2, 3]), 2, true, true, inbox.clone());
-        speech.on_token(10);
-        speech.on_token(11);
+        speech.on_token(10, 0);
+        speech.on_token(11, 0);
         drop(speech);
         let got = std::mem::take(&mut *inbox.lock());
         assert_eq!(got[0].keys, [1, 2, 3, token_key(10), token_key(11)]);
