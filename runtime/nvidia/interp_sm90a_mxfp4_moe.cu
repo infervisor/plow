@@ -2,6 +2,7 @@
 
 #define PLOW_NV_MXFP4_PROJ 0
 #define PLOW_NV_MXFP4_MOE 1
+#define PLOW_NV_MXFP4_MOE_SMEM 0
 #define PLOW_NV_MOE_COMMON 0
 #include "sm120_common.cuh"
 #include "op_elementwise.cuh"
@@ -59,20 +60,20 @@ void plow_sm90a_mxfp4_moe(PlowProgram prog) {
 
     const PlowDevInst* const in = prog.insts + entry.inst;
     void* const* const tensors = prog.tensors;
-#define TEN(i) tensors[in->t[i]]
+#define TEN(i) (in->t[i] == PLOW_TENSOR_NONE ? nullptr : tensors[in->t[i]])
     switch (in->op) {
     case PLOW_DOP_MOE_GLU_MX:
         d_moe_glu_mx((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                      (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
                      (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
                      in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[6],
-                     in->fj[0].f, in->fj[1].f, blockIdx.x, gridDim.x);
+                     in->fj[0].f, in->fj[1].f, blockIdx.x, gridDim.x, in->i[7]);
         break;
     case PLOW_DOP_MOE_DOWN_MX:
         d_moe_down_mx((float*)TEN(0), (const __nv_bfloat16*)TEN(1),
                       (const unsigned char*)TEN(2), (const uint8_t*)TEN(3),
                       (const uint8_t*)TEN(4), (const __nv_bfloat16*)TEN(5), in->i[0],
-                      in->i[1], in->i[2], in->i[3], in->i[6], blockIdx.x, gridDim.x);
+                      in->i[1], in->i[2], in->i[3], in->i[6], blockIdx.x, gridDim.x, in->i[7]);
         break;
     default:
         __trap();

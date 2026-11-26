@@ -130,11 +130,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some((hidden, values)) = &input {
             engine.upload_activation("act.x", &values[step * hidden..(step + 1) * hidden])?;
         }
-        if step == start && prefill_prefix.is_some() {
+        let prefill_terminal_row = if step == start && prefill_prefix.is_some() {
             tokens.push(engine.prefill_slot(0, &ids[..step + 1])?);
+            Some(engine.prefill_terminal_row())
         } else {
             engine.step_slots(&[(0, id)], &mut tokens)?;
-        }
+            None
+        };
         let mut dumps = Vec::new();
         for (index, (name, bytes)) in tensors.iter().enumerate() {
             let mut raw = vec![0u8; usize::try_from(*bytes)?];
@@ -156,7 +158,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
         steps.push(serde_json::json!({"step": step, "input_token": id,
-            "argmax": tokens.first(), "tensors": dumps, "logits_f32": logits_file}));
+            "argmax": tokens.first(), "tensors": dumps, "logits_f32": logits_file,
+            "prefill_terminal_row": prefill_terminal_row}));
         std::fs::write(
             out.join("manifest.json"),
             serde_json::to_vec_pretty(
@@ -177,7 +180,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     if verify_lifecycle {
-        verify_reuse(&mut engine, &checkpoint, &out, &ids, &reference_rows)?;
+        verify_reuse(&mut engine, &assets, &checkpoint, &out, &ids, &reference_rows)?;
     }
     Ok(())
 }
@@ -458,24 +461,33 @@ fn snapshot_active_kv(
 #[cfg(feature = "cuda")]
 fn verify_reuse(
     engine: &mut plowrt::exec::gpu::GpuEngine,
+    assets: &std::path::Path,
     checkpoint: &std::path::Path,
     out: &std::path::Path,
     ids: &[u32],
     reference: &[Vec<f32>],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(checkpoint.join("config.json"))?)?;
-    let text = config.get("text_config").unwrap_or(&config);
-    let layers = text["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
-    let states: Vec<_> = (0..layers)
-        .flat_map(|l| {
-            [
-                format!("state.qwen.{l}.conv"),
-                format!("state.qwen.{l}.gdn"),
-            ]
-        })
-        .filter_map(|name| engine.tensor_bytes(&name).map(|bytes| (name, bytes)))
-        .collect();
+    use plow_asset::recurrent_state::{Manifest, SECTION};
+    use plowrt::asset::{devblob::DevBlob, packet_image::PacketImage};
+
+    let packet = DevBlob::find_in_dir(assets)?.ok_or("missing packet for lifecycle check")?;
+    let image = PacketImage::open(&packet)?;
+    let states: Vec<_> = if let Some(raw) = image.blob.reserved_metadata(&image.raw, SECTION)? {
+        let manifest: Manifest = serde_json::from_slice(raw)?;
+        manifest.buffers.iter().map(|buffer| {
+            let name = &image.blob.tensors[buffer.tensor as usize].name;
+            (name.clone(), u64::from(buffer.slot_bytes) * u64::from(manifest.slots))
+        }).collect()
+    } else {
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(checkpoint.join("config.json"))?)?;
+        let text = config.get("text_config").unwrap_or(&config);
+        let layers = text["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+        (0..layers)
+            .flat_map(|l| [format!("state.qwen.{l}.conv"), format!("state.qwen.{l}.gdn")])
+            .filter_map(|name| engine.tensor_bytes(&name).map(|bytes| (name, bytes)))
+            .collect()
+    };
     let batch = engine.batch();
     let mut runs = vec![0, 0];
     if batch > 1 {

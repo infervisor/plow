@@ -8,11 +8,36 @@ import op_roof
 
 
 class SweepTests(unittest.TestCase):
+    def test_fp32_router_prices_projection_output_and_topk_read(self):
+        self.assertEqual(op_roof.cost("GemmF32", {"M": 8, "N": 16, "K": 32}, 8, 0, 1, 2),
+                         (2048, 8192))
+        shape = {"n_exp": 16, "k": 2, "flags": 15}
+        self.assertEqual(op_roof.moe_cost("MoeRouterTopkPf", shape, 8, 2), (704, 0))
+        self.assertEqual(op_roof.moe_cost("MoeRouterTopkPf", {**shape, "flags": 7}, 8, 2), (448, 0))
+
     def test_roofline_rejects_unpriced_instructions(self):
         program = ("prefill", 128, [(1, "HeadNormRopeFp8", "", {})])
         priced = op_roof.price(program, 128, 2, 2, 3173, 989)
         with self.assertRaisesRegex(ValueError, "prefill T=128 has unpriced ops: HeadNormRopeFp8"):
             op_roof.require_priced(program, priced)
+
+    def test_cuda_residual_mix_prices_sources_query_and_output(self):
+        text = ("===== program T=8 =====\n"
+                "#0 AttnRes b=8 gamma<-weight res_b<-addend | "
+                "T=8 H=16 nb=1 push_row=2 nb_cap=8 cuda_mode=1\n")
+        _, _, [(idx, op, _, params)] = op_roof.parse(text)[0]
+        self.assertEqual(idx, 0)
+        self.assertEqual(op_roof.cost(op, params, 8, 8, 2, 2), (1472, 0))
+
+    def test_load_router_accepts_split_topk(self):
+        import struct
+
+        prog = ("prefill", 1, [(0, "MoeRouterTopkPf", "", {"k": 2})])
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "routing.bin"
+            path.write_bytes(struct.pack("<IfIf", 4, .5, 5, .5))
+            table = op_roof.load_router(path, [prog])
+        self.assertEqual(table.union(128, 2, 1), 2)
 
     def test_empty_sweep_is_not_treated_as_a_measurement(self):
         with tempfile.TemporaryDirectory() as root:
@@ -477,6 +502,37 @@ class MoeCostTests(unittest.TestCase):
         prog = ("decode", 1, [(0, "MoeExpertDownGemma", "", {"k": 8, "H": 2816, "I_moe": 704, "n_exp": 128})])
         with self.assertRaisesRegex(ValueError, "no preceding router"):
             op_roof.price(prog, 128, 2, 2, 3000, 989)
+
+    def test_nvfp4_gate_prices_one_fused_activation_and_block16_scales(self):
+        p = {"T": 2, "k": 2, "experts": 3, "I": 8, "K": 32, "mode": 2}
+        self.assertEqual(op_roof.moe_cost("MoeGluMx", p, 2, 2), (1056, 4096))
+
+    def test_mxfp4_decode_and_prefill_moe_are_priced(self):
+        decode_txt = ("===== program T=1 =====\n"
+                      "#10 MoeRouterTopkPf b=1 table<-act.tab logit<-act.logit atom_acc?<-— bias<-— | atom_h=0 n_exp=128 k=8 flags=0 T=1 shared_tail=0 route_scale=8.0 logit_scale?=—\n"
+                      "#11 MoeGluMx b=132 fu<-act.fu x<-act.xn2 table<-act.tab W_gu<-w13 S_gu<-s13 bias_gu?<-— | k=8 I=1152 K=2304 n_exp=128 layout=0 act=3 n_batch=1 alpha=1.0 limit=4.0\n"
+                      "#12 MoeDownMx b=132 part<-act.part fu<-act.fu table<-act.tab W_d<-w2 S_d<-s2 bias_d?<-— | k=8 H=2304 I=1152 n_exp=128 n_batch=1 alpha=1.0 limit=4.0\n"
+                      "#13 MoeCombinePf b=1 out<-act.moe residual?<-— shared?<-— part<-act.part | H=2304 k=8 T=1 t_row0=0 det=0\n")
+        prog = op_roof.parse(decode_txt)[0]
+        priced = op_roof.price(prog, 128, 2, 2, 3089.1, 774.2)
+        op_roof.require_priced(prog, priced)
+        self.assertEqual(priced[10][0], "MoeRouterTopkPf")
+        self.assertEqual(priced[11][0], "MoeGluMx")
+        self.assertEqual(priced[12][0], "MoeDownMx")
+        self.assertEqual(priced[13][0], "MoeCombinePf")
+
+        prefill_txt = ("===== program T=128 =====\n"
+                       "#10 MoeRouterTopkPf b=1 table<-act.tab logit<-act.logit atom_acc?<-— bias<-— | atom_h=0 n_exp=128 k=8 flags=0 T=128 shared_tail=0 route_scale=8.0 logit_scale?=—\n"
+                       "#11 MoeAlignPf b=1 meta<-act.meta table<-act.tab row_token<-act.rt row_partidx<-act.rp row_gate<-act.rg | T=128 n_exp=128 k=8\n"
+                       "#12 MoeGluMxPf b=132 fu_g<-act.fu xn2<-act.xn2 W_gu<-w13 S_gu<-s13 meta<-act.meta row_token<-act.rt bias_gu?<-— | I=1152 K=2304 n_exp=128 layout=0 act=3 alpha=1.0 limit=4.0\n"
+                       "#13 MoeDownMxPf b=132 part<-act.part fu_g<-act.fu W_d<-w2 S_d<-s2 meta<-act.meta bias_d?<-— row_partidx<-act.rp row_gate<-act.rg | H=2304 I=1152 n_exp=128\n"
+                       "#14 MoeCombinePf b=1 out<-act.moe residual?<-— shared?<-— part<-act.part | H=2304 k=8 T=128 t_row0=0 det=0\n")
+        prog_pf = op_roof.parse(prefill_txt)[0]
+        priced_pf = op_roof.price(prog_pf, 128, 2, 2, 3089.1, 774.2)
+        op_roof.require_priced(prog_pf, priced_pf)
+        self.assertEqual(priced_pf[11][0], "MoeAlignPf")
+        self.assertEqual(priced_pf[12][0], "MoeGluMxPf")
+        self.assertEqual(priced_pf[13][0], "MoeDownMxPf")
 
 
 class CeilingTests(unittest.TestCase):

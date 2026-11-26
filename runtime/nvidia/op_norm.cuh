@@ -406,10 +406,12 @@ static __device__ void d_layernorm_bias(__nv_bfloat16* __restrict__ out,
 static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16* resid,
                            const __nv_bfloat16* a, const __nv_bfloat16* __restrict__ b,
                            const __nv_bfloat16* __restrict__ gamma, unsigned rows, unsigned feat,
-                           float eps, unsigned slice, unsigned nblk, float* part) {
+                           float eps, unsigned slice, unsigned nblk, float* part, unsigned ksel = 0) {
     const bool fits = (feat <= RN_REG * PLOW_NV_THREADS) && ((feat & 7u) == 0);
+    const float* part_in = (ksel > 1) ? (const float*)b : nullptr;
     for (unsigned row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
+        const size_t part_base = (size_t)row * ksel * feat;
         if (fits) {
             bf16v8 av[RN_VEC], bv[RN_VEC], w[RN_VEC];
 #pragma unroll
@@ -420,20 +422,44 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
                 w[c] = bf16v8_zero();
                 if (i < feat) {
                     av[c] = ld_glob8(a + base + i);
-                    bv[c] = ld_glob8(b + base + i);
+                    if (ksel <= 1 && b) bv[c] = ld_glob8(b + base + i);
                     if (gamma) w[c] = ld_glob8(gamma + i);
                 }
             }
             float r[RN_VEC * 8];
             float ss = 0.0f;
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++)
+            for (int c = 0; c < RN_VEC; c++) {
+                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
+                float part_sum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                if (ksel > 1 && i < feat) {
+                    for (unsigned p = 0; p < ksel; p++) {
+                        const float* pp = part_in + part_base + (size_t)p * feat + i;
+                        float4 f0 = *(const float4*)(pp);
+                        float4 f1 = *(const float4*)(pp + 4);
+                        part_sum[0] += f0.x;
+                        part_sum[1] += f0.y;
+                        part_sum[2] += f0.z;
+                        part_sum[3] += f0.w;
+                        part_sum[4] += f1.x;
+                        part_sum[5] += f1.y;
+                        part_sum[6] += f1.z;
+                        part_sum[7] += f1.w;
+                    }
+                }
 #pragma unroll
                 for (int j = 0; j < 8; j++) {
-                    const float f = __bfloat162float(av[c].x[j]) + __bfloat162float(bv[c].x[j]);
+                    float b_val;
+                    if (ksel <= 1) {
+                        b_val = b ? __bfloat162float(bv[c].x[j]) : 0.0f;
+                    } else {
+                        b_val = __bfloat162float(__float2bfloat16(part_sum[j]));
+                    }
+                    const float f = __bfloat162float(av[c].x[j]) + b_val;
                     r[c * 8 + j] = f;
                     ss += f * f;
                 }
+            }
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
 #pragma unroll
             for (int c = 0; c < RN_VEC; c++) {
@@ -454,12 +480,28 @@ static __device__ void d_add_norm(__nv_bfloat16* __restrict__ out, __nv_bfloat16
         } else {
             float ss = 0.0f;
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
-                const float f = __bfloat162float(a[base + i]) + __bfloat162float(b[base + i]);
+                float b_val;
+                if (ksel <= 1) {
+                    b_val = b ? __bfloat162float(b[base + i]) : 0.0f;
+                } else {
+                    float sum_k = 0.0f;
+                    for (unsigned p = 0; p < ksel; p++) sum_k += part_in[part_base + (size_t)p * feat + i];
+                    b_val = __bfloat162float(__float2bfloat16(sum_k));
+                }
+                const float f = __bfloat162float(a[base + i]) + b_val;
                 ss += f * f;
             }
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
-                const float f = __bfloat162float(a[base + i]) + __bfloat162float(b[base + i]);
+                float b_val;
+                if (ksel <= 1) {
+                    b_val = b ? __bfloat162float(b[base + i]) : 0.0f;
+                } else {
+                    float sum_k = 0.0f;
+                    for (unsigned p = 0; p < ksel; p++) sum_k += part_in[part_base + (size_t)p * feat + i];
+                    b_val = __bfloat162float(__float2bfloat16(sum_k));
+                }
+                const float f = __bfloat162float(a[base + i]) + b_val;
                 const float g = gamma ? norm_weight(__bfloat162float(gamma[i])) : 1.0f;
                 resid[base + i] = __float2bfloat16(f);
                 out[base + i] = __float2bfloat16(f * inv * g);
@@ -982,6 +1024,186 @@ static __device__ __forceinline__ unsigned plow_hnr_next_live(const int* __restr
         if (m) return w + (unsigned)(__ffs(m) - 1) * step;
     }
     return total;
+}
+
+static __device__ __forceinline__ float plow_residual_source(
+    const __nv_bfloat16* stack, const __nv_bfloat16* last, const __nv_bfloat16* addend,
+    unsigned block, unsigned blocks, size_t stride, size_t col) {
+    if (block < blocks) return __bfloat162float(stack[block * stride + col]);
+    return __bfloat162float(last[col]) + (addend ? __bfloat162float(addend[col]) : 0.0f);
+}
+
+static __device__ __forceinline__ float plow_residual_mix_value(
+    const __nv_bfloat16* stack, const __nv_bfloat16* last, const __nv_bfloat16* addend,
+    const float* weights, unsigned blocks, size_t stride, size_t col) {
+    float sum = 0.0f;
+    for (unsigned b = 0; b <= blocks; ++b)
+        sum = fmaf(plow_residual_source(stack, last, addend, b, blocks, stride, col), weights[b], sum);
+    return sum;
+}
+
+static __device__ void d_normalized_residual_mix(
+    void* out, const __nv_bfloat16* last, const __nv_bfloat16* stack, const float* queries,
+    const __nv_bfloat16* gamma, const __nv_bfloat16* addend,
+    unsigned rows, unsigned width, unsigned blocks, unsigned count, unsigned stride_rows,
+    float eps, float norm_eps, unsigned slice, unsigned nblk) {
+    constexpr unsigned MAX_BLOCKS = 16;
+    __shared__ float part[PLOW_NV_WARPS], logits[MAX_BLOCKS + 1], rstd[MAX_BLOCKS + 1];
+    if (blocks > MAX_BLOCKS || width == 0 || (blocks && (!stack || stride_rows < rows))) {
+        __trap();
+        return;
+    }
+    const float inv_width = 1.0f / width, query_scale = rsqrtf((float)width);
+    const size_t stride = (size_t)stride_rows * width;
+    for (size_t work = slice; work < (size_t)rows * count; work += nblk) {
+        const size_t q = work / rows;
+        const size_t row_offset = (work % rows) * width;
+        for (unsigned b = 0; b <= blocks; ++b) {
+            float sq = 0.0f, dot = 0.0f;
+            for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+                const float x = plow_residual_source(stack, last, addend, b, blocks, stride, row_offset + c);
+                sq = fmaf(x, x, sq);
+                dot = fmaf(queries[q * width + c] * query_scale, x, dot);
+            }
+            const float inv = rsqrtf(fmaf(block_sum(sq, part), inv_width, eps));
+            const float score = block_sum(dot, part) * inv;
+            if (threadIdx.x == 0) { logits[b] = score; rstd[b] = inv; }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float highest = logits[0], sum = 0.0f;
+            for (unsigned b = 1; b <= blocks; ++b) highest = fmaxf(highest, logits[b]);
+            for (unsigned b = 0; b <= blocks; ++b) {
+                logits[b] = expf(logits[b] - highest);
+                sum += logits[b];
+            }
+            for (unsigned b = 0; b <= blocks; ++b) logits[b] = (logits[b] * rstd[b]) / sum;
+        }
+        __syncthreads();
+        float inv = 1.0f;
+        if (gamma) {
+            float sq = 0.0f;
+            for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+                const float x = plow_residual_mix_value(stack, last, addend, logits, blocks, stride, row_offset + c);
+                sq = fmaf(x, x, sq);
+            }
+            inv = rsqrtf(block_sum(sq, part) * inv_width + norm_eps);
+        }
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            const float x = plow_residual_mix_value(stack, last, addend, logits, blocks, stride, row_offset + c);
+            if (gamma) ((__nv_bfloat16*)out)[work * width + c] =
+                __float2bfloat16(x * inv * __bfloat162float(gamma[q * width + c]));
+            else ((float*)out)[work * width + c] = x;
+        }
+        __syncthreads();
+    }
+}
+
+static __device__ void d_residual_message_pair(
+    __nv_bfloat16* out, const float* dest, const float* message, unsigned rows,
+    unsigned width, float eps, unsigned slice, unsigned nblk) {
+    __shared__ float part[PLOW_NV_WARPS];
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * width;
+        float dest_sq = 0.0f, message_sq = 0.0f;
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            const float a = dest[base + c], b = message[base + c];
+            dest_sq = fmaf(a, a, dest_sq);
+            message_sq = fmaf(b, b, message_sq);
+        }
+        const float da = rsqrtf(block_sum(dest_sq, part) / width + eps);
+        const float db = rsqrtf(block_sum(message_sq, part) / width + eps);
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            out[2 * base + c] = __float2bfloat16(dest[base + c] * da);
+            out[2 * base + width + c] = __float2bfloat16(message[base + c] * db);
+        }
+        __syncthreads();
+    }
+}
+
+static __device__ __forceinline__ float plow_blend_message(float dest, float message, float gain, float forget) {
+    return (1.0f - tanhf(forget)) * dest + tanhf(gain) * message;
+}
+
+static __device__ void d_residual_message_blend(
+    __nv_bfloat16* out, const float* dest, const float* message, const float* gain,
+    const float* forget, const __nv_bfloat16* gamma, unsigned rows, unsigned width,
+    float eps, unsigned slice, unsigned nblk) {
+    __shared__ float part[PLOW_NV_WARPS];
+    for (unsigned row = slice; row < rows; row += nblk) {
+        const size_t base = (size_t)row * width;
+        float sq = 0.0f;
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            const size_t j = base + c;
+            const float value = plow_blend_message(dest[j], message[j], gain[j], forget[j]);
+            sq = fmaf(value, value, sq);
+        }
+        const float inv = rsqrtf(block_sum(sq, part) / width + eps);
+        for (unsigned c = threadIdx.x; c < width; c += blockDim.x) {
+            const size_t j = base + c;
+            const float value = plow_blend_message(dest[j], message[j], gain[j], forget[j]);
+            out[j] = __float2bfloat16(value * inv * __bfloat162float(gamma[c]));
+        }
+        __syncthreads();
+    }
+}
+
+static __device__ __forceinline__ float plow_log_position_scale(const uint32_t* params, int pos) {
+    return params ? 1.0f + __uint_as_float(params[1])
+        * logf(fmaxf(((float)pos + 1.0f) / params[0], 1.0f)) : 1.0f;
+}
+
+static __device__ void d_relative_logits16(
+    __nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* scale,
+    const __nv_bfloat16* proj, const uint32_t* tau, const int* pos,
+    unsigned rows, unsigned heads, unsigned extent, float eps, float threshold,
+    unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x & 31u, warps = blockDim.x / 32;
+    const unsigned tiles = extent / 32;
+    for (size_t work = slice * warps + threadIdx.x / 32;
+         work < (size_t)rows * heads * tiles; work += nblk * warps) {
+        const size_t h = work / tiles;
+        const unsigned distance = (work % tiles) * 32 + lane;
+        float r = lane < 16 ? __bfloat162float(x[h * 16 + lane])
+            * __bfloat162float(scale[(h % heads) * 16 + lane]) : 0.0f;
+        r *= fminf(threshold / (sqrtf(warp_sum32(r * r)) + eps), 1.0f);
+        r = __bfloat162float(__float2bfloat16(r));
+        if (tau) r = __bfloat162float(__float2bfloat16(r * plow_log_position_scale(tau, pos[h / heads])));
+        float sum = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < 16; ++i)
+            sum = fmaf(__shfl_sync(0xffffffffu, r, i), __bfloat162float(proj[(size_t)i * extent + distance]), sum);
+        out[h * extent + distance] = __float2bfloat16(sum);
+    }
+}
+
+template <unsigned HD>
+static __device__ void d_head_l2_clip(__nv_bfloat16* __restrict__ out,
+                                    const __nv_bfloat16* __restrict__ x,
+                                    const __nv_bfloat16* __restrict__ scale, const uint32_t* tau, const int* pos,
+                                    unsigned rows, unsigned heads, float eps, float threshold,
+                                    unsigned slice, unsigned nblk) {
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned warps = blockDim.x / 32;
+    for (size_t w = slice * warps + threadIdx.x / 32; w < (size_t)rows * heads; w += nblk * warps) {
+        const size_t offset = w * HD + lane;
+        const size_t scale_offset = (w % heads) * HD + lane;
+        float values[HD / 32];
+        float sum_sq = 0.0f;
+#pragma unroll
+        for (unsigned i = 0; i < HD / 32; ++i) {
+            values[i] = __bfloat162float(x[offset + i * 32])
+                      * (scale ? __bfloat162float(scale[scale_offset + i * 32]) : 1.0f);
+            sum_sq += values[i] * values[i];
+        }
+        const float factor = fminf(threshold / (sqrtf(warp_sum32(sum_sq)) + eps), 1.0f);
+#pragma unroll
+        for (unsigned i = 0; i < HD / 32; ++i) {
+            __nv_bfloat16 v = __float2bfloat16(values[i] * factor);
+            if (tau) v = __float2bfloat16(__bfloat162float(v) * plow_log_position_scale(tau, pos[w / heads]));
+            out[offset + i * 32] = v;
+        }
+    }
 }
 
 template <int HD, bool INTERLEAVE = false>

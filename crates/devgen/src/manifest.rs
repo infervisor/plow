@@ -541,7 +541,8 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
                     let (hd, nh, kvh, nb) = (inst.i[6], inst.i[1], inst.i[2], inst.i[0]);
                     s.hd.insert(hd);
-                    if op == DevOp::FlashDecode && inst.j[1] != 0 {
+                    if op == DevOp::FlashDecode && inst.j[1] != 0
+                        && inst.j[1] != packet::dev::FLASH_DECODE_RELATIVE {
                         s.flash_fold_hd = s.flash_fold_hd.max(hd);
                     }
                     s.kv_heads.insert(kvh);
@@ -1682,6 +1683,8 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("qwen_gdn") {
         req.push("PLOW_NV_QWEN_GDN=1".into());
+    }
+    if on("qwen_gdn") && s.gqa % 2 == 0 {
         req.push("PLOW_NV_FA_GF=2".into());
     } else if s.hd.iter().all(|&h| h <= 128) && s.gqa > 1 && s.gqa % 4 != 0 {
         // The hd128 flash-decode arm defaults to GF 4 and traps unless GF | gqa.
@@ -2879,6 +2882,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     }
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
+            && inst.i[7] != 1
             && (inst.t[6] != packet::TENSOR_NONE
                 || inst.t[7] != packet::TENSOR_NONE
                 || inst.i[5] != packet::dev::TENSOR_NONE_I)
@@ -3930,6 +3934,27 @@ pub fn config_header(manifest: &Value) -> String {
     }
     if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {
         out.push_str(&format!("#define PLOW_PACKET_GQA {gqa}\n"));
+    }
+    let nvcc_req: Vec<&str> = manifest
+        .pointer("/backends/nvcc/requires")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !nvcc_req.is_empty() {
+        let nv_gemma = nvcc_req.iter().any(|v| *v == "PLOW_NV_GEMMA=1");
+        out.push_str(&format!(
+            "#ifndef PLOW_NV_GEMMA\n#define PLOW_NV_GEMMA {}\n#endif\n",
+            if nv_gemma { 1 } else { 0 }
+        ));
+        for r in &nvcc_req {
+            if let Some(val) = r.strip_prefix("PLOW_NV_FA_GF=") {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_GF\n#define PLOW_NV_FA_GF {val}\n#endif\n"
+                ));
+            }
+        }
     }
 
     // What `scripts/build_gfx942.sh` reads under PLOW_HSACO_CONFIG: the AMD `requires` list,

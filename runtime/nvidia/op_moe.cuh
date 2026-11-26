@@ -40,6 +40,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#if defined(PLOW_NV_HOPPER)
+#include <mma.h>
+#endif
 
 #ifndef PLOW_NV_BF16_T
 #define PLOW_NV_BF16_T
@@ -3573,23 +3576,672 @@ static __device__ void d_moe_dec_group_glu_gemma(bf16* __restrict__ fug, const b
 #endif /* PGM_BM */
 
 #if PLOW_NV_MXFP4_MOE
-/* Generic flat-tensor MXFP4 MoE. These opcodes carry contiguous expert tensors rather than the
- * host-built pointer tables used by the older MoE families. Hopper expands e2m1 in registers;
- * every dot retains the packet reference's per-32-element scale/accumulation order. */
+/* Helper to compute the dot product of 8 MXFP4 weights packed in a 32-bit word
+ * with 8 bf16 activations packed in a 128-bit uint4. */
+__device__ __forceinline__ float plow_mxfp4_dot8(uint32_t w8, const uint4& x_raw) {
+    const __nv_bfloat162* x2 = (const __nv_bfloat162*)&x_raw;
+    float p = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const unsigned b = (w8 >> (i * 8)) & 0xffu;
+        const float w0 = plow_mxfp4_e2m1(b & 0x0fu);
+        const float w1 = plow_mxfp4_e2m1(b >> 4);
+        const float2 x_flt = __bfloat1622float2(x2[i]);
+        p = fmaf(w0, x_flt.x, p);
+        p = fmaf(w1, x_flt.y, p);
+    }
+    return p;
+}
+
+/* Helper to compute the dot product of 8 MXFP4 weights packed in a 32-bit word
+ * with 8 bf16 activations packed in four float2 vectors using pure register arithmetic. */
+__device__ __forceinline__ float plow_mxfp4_dot8(
+    uint32_t w8, float2 x0, float2 x1, float2 x2, float2 x3) {
+    const float w0 = plow_mxfp4_e2m1(w8 & 0x0fu);
+    const float w1 = plow_mxfp4_e2m1((w8 >> 4) & 0x0fu);
+    const float w2 = plow_mxfp4_e2m1((w8 >> 8) & 0x0fu);
+    const float w3 = plow_mxfp4_e2m1((w8 >> 12) & 0x0fu);
+    const float w4 = plow_mxfp4_e2m1((w8 >> 16) & 0x0fu);
+    const float w5 = plow_mxfp4_e2m1((w8 >> 20) & 0x0fu);
+    const float w6 = plow_mxfp4_e2m1((w8 >> 24) & 0x0fu);
+    const float w7 = plow_mxfp4_e2m1(w8 >> 28);
+    float p = 0.0f;
+    p = fmaf(w0, x0.x, p);
+    p = fmaf(w1, x0.y, p);
+    p = fmaf(w2, x1.x, p);
+    p = fmaf(w3, x1.y, p);
+    p = fmaf(w4, x2.x, p);
+    p = fmaf(w5, x2.y, p);
+    p = fmaf(w6, x3.x, p);
+    p = fmaf(w7, x3.y, p);
+    return p;
+}
+
+__device__ __forceinline__ float plow_mxfp4_dot8_lut(
+    uint32_t w8, float2 x0, float2 x1, float2 x2, float2 x3,
+    const float2* __restrict__ s_lut) {
+    const float2 w01 = s_lut[w8 & 0xffu];
+    const float2 w23 = s_lut[(w8 >> 8) & 0xffu];
+    const float2 w45 = s_lut[(w8 >> 16) & 0xffu];
+    const float2 w67 = s_lut[w8 >> 24];
+    float p = fmaf(w01.x, x0.x, 0.0f);
+    p = fmaf(w01.y, x0.y, p);
+    p = fmaf(w23.x, x1.x, p);
+    p = fmaf(w23.y, x1.y, p);
+    p = fmaf(w45.x, x2.x, p);
+    p = fmaf(w45.y, x2.y, p);
+    p = fmaf(w67.x, x3.x, p);
+    p = fmaf(w67.y, x3.y, p);
+    return p;
+}
+
+/* Vectorized MXFP4 row dot product:
+ * 32 threads in the warp process 512 elements (16 blocks of 32 elements) per chunk.
+ * Each lane loads 8 bytes of weights (uint2 = 16 weights) and 32 bytes of activations
+ * (two uint4 = 16 bf16 elements) using 128-bit aligned vector loads.
+ * Adjacent lanes (lane and lane ^ 1) form one 32-element scale block. A single
+ * __shfl_xor_sync combines their partials before multiplying by the block scale,
+ * preserving exact bit-for-bit scale accumulation order with only 1 shuffle per chunk. */
 __device__ __forceinline__ float plow_mxfp4_row_dot_nv(
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ s,
+    const bf16* __restrict__ x, unsigned K,
+    const float2* __restrict__ s_lut = nullptr) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nchunk = (K + 511u) >> 9;
+    const unsigned NB = (K + 31u) >> 5;
+    float acc = 0.0f;
+
+    uint2 cur_wv = make_uint2(0, 0);
+    uint4 cur_xa = make_uint4(0, 0, 0, 0);
+    uint4 cur_xb = make_uint4(0, 0, 0, 0);
+    uint8_t cur_s = 0;
+    bool cur_live = false;
+
+    if (nchunk > 0) {
+        const unsigned k = lane << 4;
+        cur_live = (k < K);
+        const unsigned b = cur_live ? (k >> 5) : (NB ? NB - 1u : 0u);
+        const unsigned kx = cur_live ? k : 0u;
+        const unsigned kw = kx >> 1;
+        cur_wv = __ldcs((const uint2*)(w + kw));
+        cur_xa = *(const uint4*)(x + kx);
+        cur_xb = *(const uint4*)(x + kx + 8);
+        if ((lane & 1u) == 0 && cur_live) cur_s = s[b];
+    }
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        uint2 next_wv = make_uint2(0, 0);
+        uint4 next_xa = make_uint4(0, 0, 0, 0);
+        uint4 next_xb = make_uint4(0, 0, 0, 0);
+        uint8_t next_s = 0;
+        bool next_live = false;
+
+        if (c + 1 < nchunk) {
+            const unsigned k = ((c + 1) << 9) + (lane << 4);
+            next_live = (k < K);
+            const unsigned b = next_live ? (k >> 5) : (NB ? NB - 1u : 0u);
+            const unsigned kx = next_live ? k : 0u;
+            const unsigned kw = kx >> 1;
+            next_wv = __ldcs((const uint2*)(w + kw));
+            next_xa = *(const uint4*)(x + kx);
+            next_xb = *(const uint4*)(x + kx + 8);
+            if ((lane & 1u) == 0 && next_live) next_s = s[b];
+        }
+
+        const __nv_bfloat162* x2a = (const __nv_bfloat162*)&cur_xa;
+        const float2 xa0 = __bfloat1622float2(x2a[0]);
+        const float2 xa1 = __bfloat1622float2(x2a[1]);
+        const float2 xa2 = __bfloat1622float2(x2a[2]);
+        const float2 xa3 = __bfloat1622float2(x2a[3]);
+
+        const __nv_bfloat162* x2b = (const __nv_bfloat162*)&cur_xb;
+        const float2 xb0 = __bfloat1622float2(x2b[0]);
+        const float2 xb1 = __bfloat1622float2(x2b[1]);
+        const float2 xb2 = __bfloat1622float2(x2b[2]);
+        const float2 xb3 = __bfloat1622float2(x2b[3]);
+
+        float p = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wv.x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wv.y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(cur_wv.x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(cur_wv.y, xb0, xb1, xb2, xb3));
+        p += __shfl_xor_sync(0xffffffffu, p, 1);
+
+        if ((lane & 1u) == 0 && cur_live) {
+            acc += p * plow_mxfp4_scale(cur_s);
+        }
+
+        cur_wv = next_wv;
+        cur_xa = next_xa;
+        cur_xb = next_xb;
+        cur_s = next_s;
+        cur_live = next_live;
+    }
+    return plow_warp_sum(acc);
+}
+
+/* NVFP4 row dot: block size 16 (1 UE8M0 scale per 16 weights).
+ * Vectorized with uint4 (32 weights per thread, 1024 weights per chunk). */
+__device__ __forceinline__ float plow_nvfp4_scale(uint8_t encoded) {
+    __nv_fp8_e4m3 value;
+    value.__x = encoded;
+    return float(value);
+}
+
+__device__ __forceinline__ float plow_nvfp4_row_dot_nv(
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ s,
+    const bf16* __restrict__ x, unsigned K,
+    const float2* __restrict__ s_lut = nullptr) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nchunk = (K + 1023u) >> 10;
+    const unsigned NB = (K + 15u) >> 4;
+    float acc = 0.0f;
+
+    uint4 cur_wv = make_uint4(0, 0, 0, 0);
+    uint4 cur_xa = make_uint4(0, 0, 0, 0), cur_xb = make_uint4(0, 0, 0, 0);
+    uint4 cur_xc = make_uint4(0, 0, 0, 0), cur_xd = make_uint4(0, 0, 0, 0);
+    uint8_t cur_s0 = 0, cur_s1 = 0;
+    bool cur_live0 = false, cur_live1 = false;
+
+    if (nchunk > 0) {
+        const unsigned k = lane << 5;
+        cur_live0 = (k < K);
+        cur_live1 = (k + 16u < K);
+        const unsigned kx = cur_live0 ? k : 0u;
+        const unsigned kw = kx >> 1;
+        const unsigned b = cur_live0 ? (k >> 4) : 0u;
+        cur_wv = __ldcs((const uint4*)(w + kw));
+        cur_xa = *(const uint4*)(x + kx);
+        cur_xb = *(const uint4*)(x + kx + 8);
+        cur_xc = *(const uint4*)(x + kx + 16);
+        cur_xd = *(const uint4*)(x + kx + 24);
+        if (cur_live0) {
+            if (b + 1u < NB) {
+                uint16_t s2 = *(const uint16_t*)(s + b);
+                cur_s0 = (uint8_t)(s2 & 0xff);
+                cur_s1 = (uint8_t)(s2 >> 8);
+            } else {
+                cur_s0 = s[b];
+            }
+        }
+    }
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        uint4 next_wv = make_uint4(0, 0, 0, 0);
+        uint4 next_xa = make_uint4(0, 0, 0, 0), next_xb = make_uint4(0, 0, 0, 0);
+        uint4 next_xc = make_uint4(0, 0, 0, 0), next_xd = make_uint4(0, 0, 0, 0);
+        uint8_t next_s0 = 0, next_s1 = 0;
+        bool next_live0 = false, next_live1 = false;
+
+        if (c + 1 < nchunk) {
+            const unsigned k = ((c + 1) << 10) + (lane << 5);
+            next_live0 = (k < K);
+            next_live1 = (k + 16u < K);
+            const unsigned kx = next_live0 ? k : 0u;
+            const unsigned kw = kx >> 1;
+            const unsigned b = next_live0 ? (k >> 4) : 0u;
+            next_wv = __ldcs((const uint4*)(w + kw));
+            next_xa = *(const uint4*)(x + kx);
+            next_xb = *(const uint4*)(x + kx + 8);
+            next_xc = *(const uint4*)(x + kx + 16);
+            next_xd = *(const uint4*)(x + kx + 24);
+            if (next_live0) {
+                if (b + 1u < NB) {
+                    uint16_t s2 = *(const uint16_t*)(s + b);
+                    next_s0 = (uint8_t)(s2 & 0xff);
+                    next_s1 = (uint8_t)(s2 >> 8);
+                } else {
+                    next_s0 = s[b];
+                }
+            }
+        }
+
+        const __nv_bfloat162* x2a = (const __nv_bfloat162*)&cur_xa;
+        const float2 xa0 = __bfloat1622float2(x2a[0]);
+        const float2 xa1 = __bfloat1622float2(x2a[1]);
+        const float2 xa2 = __bfloat1622float2(x2a[2]);
+        const float2 xa3 = __bfloat1622float2(x2a[3]);
+
+        const __nv_bfloat162* x2b = (const __nv_bfloat162*)&cur_xb;
+        const float2 xb0 = __bfloat1622float2(x2b[0]);
+        const float2 xb1 = __bfloat1622float2(x2b[1]);
+        const float2 xb2 = __bfloat1622float2(x2b[2]);
+        const float2 xb3 = __bfloat1622float2(x2b[3]);
+
+        float pa = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wv.x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wv.y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(cur_wv.x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(cur_wv.y, xb0, xb1, xb2, xb3));
+        if (cur_live0) {
+            acc += pa * plow_nvfp4_scale(cur_s0);
+        }
+
+        const __nv_bfloat162* x2c = (const __nv_bfloat162*)&cur_xc;
+        const float2 xc0 = __bfloat1622float2(x2c[0]);
+        const float2 xc1 = __bfloat1622float2(x2c[1]);
+        const float2 xc2 = __bfloat1622float2(x2c[2]);
+        const float2 xc3 = __bfloat1622float2(x2c[3]);
+
+        const __nv_bfloat162* x2d = (const __nv_bfloat162*)&cur_xd;
+        const float2 xd0 = __bfloat1622float2(x2d[0]);
+        const float2 xd1 = __bfloat1622float2(x2d[1]);
+        const float2 xd2 = __bfloat1622float2(x2d[2]);
+        const float2 xd3 = __bfloat1622float2(x2d[3]);
+
+        float pb = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wv.z, xc0, xc1, xc2, xc3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wv.w, xd0, xd1, xd2, xd3, s_lut))
+            : (plow_mxfp4_dot8(cur_wv.z, xc0, xc1, xc2, xc3) +
+               plow_mxfp4_dot8(cur_wv.w, xd0, xd1, xd2, xd3));
+        if (cur_live1) {
+            acc += pb * plow_nvfp4_scale(cur_s1);
+        }
+
+        cur_wv = next_wv;
+        cur_xa = next_xa;
+        cur_xb = next_xb;
+        cur_xc = next_xc;
+        cur_xd = next_xd;
+        cur_s0 = next_s0;
+        cur_s1 = next_s1;
+        cur_live0 = next_live0;
+        cur_live1 = next_live1;
+    }
+    return plow_warp_sum(acc);
+}
+
+/* MXFP8 row dot: 1 byte per FP8 E4M3 weight, block size 32 (1 UE8M0 scale per 32 weights). */
+__device__ __forceinline__ float plow_mxfp8_row_dot_nv(
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ s,
     const bf16* __restrict__ x, unsigned K) {
     const unsigned lane = threadIdx.x & 31u;
-    const unsigned nb = (K + 31u) >> 5;
+    const unsigned nchunk = (K + 511u) >> 9;
+    const unsigned NB = (K + 31u) >> 5;
     float acc = 0.0f;
-    for (unsigned b = 0; b < nb; b++) {
-        const unsigned k = (b << 5) + lane;
-        const uint8_t p = k < K ? w[k >> 1] : 0u;
-        const unsigned q = (k & 1u) ? p >> 4 : p & 15u;
-        const float part = k < K ? plow_mxfp4_e2m1(q) * __bfloat162float(x[k]) : 0.0f;
-        acc += plow_warp_sum(part) * plow_mxfp4_scale(s[b]);
+
+    uint4 cur_wv = make_uint4(0, 0, 0, 0);
+    uint4 cur_xa = make_uint4(0, 0, 0, 0);
+    uint4 cur_xb = make_uint4(0, 0, 0, 0);
+    uint8_t cur_s = 0;
+    bool cur_live = false;
+
+    if (nchunk > 0) {
+        const unsigned k = lane << 4;
+        cur_live = (k < K);
+        const unsigned b = cur_live ? (k >> 5) : (NB ? NB - 1u : 0u);
+        const unsigned kx = cur_live ? k : 0u;
+        cur_wv = __ldcs((const uint4*)(w + kx));
+        cur_xa = *(const uint4*)(x + kx);
+        cur_xb = *(const uint4*)(x + kx + 8);
+        if ((lane & 1u) == 0 && cur_live) cur_s = s[b];
     }
-    return acc;
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        uint4 next_wv = make_uint4(0, 0, 0, 0);
+        uint4 next_xa = make_uint4(0, 0, 0, 0);
+        uint4 next_xb = make_uint4(0, 0, 0, 0);
+        uint8_t next_s = 0;
+        bool next_live = false;
+
+        if (c + 1 < nchunk) {
+            const unsigned k = ((c + 1) << 9) + (lane << 4);
+            next_live = (k < K);
+            const unsigned b = next_live ? (k >> 5) : (NB ? NB - 1u : 0u);
+            const unsigned kx = next_live ? k : 0u;
+            next_wv = __ldcs((const uint4*)(w + kx));
+            next_xa = *(const uint4*)(x + kx);
+            next_xb = *(const uint4*)(x + kx + 8);
+            if ((lane & 1u) == 0 && next_live) next_s = s[b];
+        }
+
+        const uint2 w0 = make_uint2(cur_wv.x, cur_wv.y);
+        const uint2 w1 = make_uint2(cur_wv.z, cur_wv.w);
+        float p = dot8_fp8(w0, *(const bf16v8*)&cur_xa, 0.0f) +
+                  dot8_fp8(w1, *(const bf16v8*)&cur_xb, 0.0f);
+        p += __shfl_xor_sync(0xffffffffu, p, 1);
+
+        if ((lane & 1u) == 0 && cur_live) {
+            acc += p * plow_mxfp4_scale(cur_s);
+        }
+
+        cur_wv = next_wv;
+        cur_xa = next_xa;
+        cur_xb = next_xb;
+        cur_s = next_s;
+        cur_live = next_live;
+    }
+    return plow_warp_sum(acc);
+}
+
+/* Fused Gate + Up twin: loads activation x ONCE, and streams Gate and Up weights
+ * simultaneously for 2x memory-level parallelism. */
+__device__ __forceinline__ float2 plow_mxfp4_glu_dot_nv(
+    const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,
+    const uint8_t* __restrict__ sg, const uint8_t* __restrict__ su,
+    const bf16* __restrict__ x, unsigned K,
+    const float2* __restrict__ s_lut = nullptr) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nchunk = (K + 511u) >> 9;
+    const unsigned NB = (K + 31u) >> 5;
+    float acc_g = 0.0f, acc_u = 0.0f;
+
+    uint2 cur_wgv = make_uint2(0, 0), cur_wuv = make_uint2(0, 0);
+    uint4 cur_xa = make_uint4(0, 0, 0, 0), cur_xb = make_uint4(0, 0, 0, 0);
+    uint8_t cur_sg = 0, cur_su = 0;
+    bool cur_live = false;
+
+    if (nchunk > 0) {
+        const unsigned k = lane << 4;
+        cur_live = (k < K);
+        const unsigned b = cur_live ? (k >> 5) : (NB ? NB - 1u : 0u);
+        const unsigned kx = cur_live ? k : 0u;
+        const unsigned kw = kx >> 1;
+        cur_wgv = __ldcs((const uint2*)(wg + kw));
+        cur_wuv = __ldcs((const uint2*)(wu + kw));
+        cur_xa = *(const uint4*)(x + kx);
+        cur_xb = *(const uint4*)(x + kx + 8);
+        if ((lane & 1u) == 0 && cur_live) {
+            cur_sg = sg[b];
+            cur_su = su[b];
+        }
+    }
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        uint2 next_wgv = make_uint2(0, 0), next_wuv = make_uint2(0, 0);
+        uint4 next_xa = make_uint4(0, 0, 0, 0), next_xb = make_uint4(0, 0, 0, 0);
+        uint8_t next_sg = 0, next_su = 0;
+        bool next_live = false;
+
+        if (c + 1 < nchunk) {
+            const unsigned k = ((c + 1) << 9) + (lane << 4);
+            next_live = (k < K);
+            const unsigned b = next_live ? (k >> 5) : (NB ? NB - 1u : 0u);
+            const unsigned kx = next_live ? k : 0u;
+            const unsigned kw = kx >> 1;
+            next_wgv = __ldcs((const uint2*)(wg + kw));
+            next_wuv = __ldcs((const uint2*)(wu + kw));
+            next_xa = *(const uint4*)(x + kx);
+            next_xb = *(const uint4*)(x + kx + 8);
+            if ((lane & 1u) == 0 && next_live) {
+                next_sg = sg[b];
+                next_su = su[b];
+            }
+        }
+
+        const __nv_bfloat162* x2a = (const __nv_bfloat162*)&cur_xa;
+        const float2 xa0 = __bfloat1622float2(x2a[0]);
+        const float2 xa1 = __bfloat1622float2(x2a[1]);
+        const float2 xa2 = __bfloat1622float2(x2a[2]);
+        const float2 xa3 = __bfloat1622float2(x2a[3]);
+
+        const __nv_bfloat162* x2b = (const __nv_bfloat162*)&cur_xb;
+        const float2 xb0 = __bfloat1622float2(x2b[0]);
+        const float2 xb1 = __bfloat1622float2(x2b[1]);
+        const float2 xb2 = __bfloat1622float2(x2b[2]);
+        const float2 xb3 = __bfloat1622float2(x2b[3]);
+
+        float pg = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wgv.x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wgv.y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(cur_wgv.x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(cur_wgv.y, xb0, xb1, xb2, xb3));
+        float pu = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wuv.x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wuv.y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(cur_wuv.x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(cur_wuv.y, xb0, xb1, xb2, xb3));
+
+        pg += __shfl_xor_sync(0xffffffffu, pg, 1);
+        pu += __shfl_xor_sync(0xffffffffu, pu, 1);
+
+        if ((lane & 1u) == 0 && cur_live) {
+            acc_g += pg * plow_mxfp4_scale(cur_sg);
+            acc_u += pu * plow_mxfp4_scale(cur_su);
+        }
+
+        cur_wgv = next_wgv;
+        cur_wuv = next_wuv;
+        cur_xa = next_xa;
+        cur_xb = next_xb;
+        cur_sg = next_sg;
+        cur_su = next_su;
+        cur_live = next_live;
+    }
+    return make_float2(plow_warp_sum(acc_g), plow_warp_sum(acc_u));
+}
+
+/* Fused Gate + Up twin for NVFP4 (block size 16 scales).
+ * Vectorized with uint4 (32 weights per thread, 1024 weights per chunk). */
+__device__ __forceinline__ float2 plow_nvfp4_glu_dot_nv(
+    const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,
+    const uint8_t* __restrict__ sg, const uint8_t* __restrict__ su,
+    const bf16* __restrict__ x, unsigned K,
+    const float2* __restrict__ s_lut = nullptr) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nchunk = (K + 1023u) >> 10;
+    const unsigned NB = (K + 15u) >> 4;
+    float acc_g = 0.0f, acc_u = 0.0f;
+
+    uint4 cur_wgv = make_uint4(0, 0, 0, 0), cur_wuv = make_uint4(0, 0, 0, 0);
+    uint4 cur_xa = make_uint4(0, 0, 0, 0), cur_xb = make_uint4(0, 0, 0, 0);
+    uint4 cur_xc = make_uint4(0, 0, 0, 0), cur_xd = make_uint4(0, 0, 0, 0);
+    uint8_t cur_sg0 = 0, cur_sg1 = 0, cur_su0 = 0, cur_su1 = 0;
+    bool cur_live0 = false, cur_live1 = false;
+
+    if (nchunk > 0) {
+        const unsigned k = lane << 5;
+        cur_live0 = (k < K);
+        cur_live1 = (k + 16u < K);
+        const unsigned kx = cur_live0 ? k : 0u;
+        const unsigned kw = kx >> 1;
+        const unsigned b = cur_live0 ? (k >> 4) : 0u;
+        cur_wgv = __ldcs((const uint4*)(wg + kw));
+        cur_wuv = __ldcs((const uint4*)(wu + kw));
+        cur_xa = *(const uint4*)(x + kx);
+        cur_xb = *(const uint4*)(x + kx + 8);
+        cur_xc = *(const uint4*)(x + kx + 16);
+        cur_xd = *(const uint4*)(x + kx + 24);
+        if (cur_live0) {
+            if (b + 1u < NB) {
+                uint16_t s2g = *(const uint16_t*)(sg + b);
+                uint16_t s2u = *(const uint16_t*)(su + b);
+                cur_sg0 = (uint8_t)(s2g & 0xff);
+                cur_sg1 = (uint8_t)(s2g >> 8);
+                cur_su0 = (uint8_t)(s2u & 0xff);
+                cur_su1 = (uint8_t)(s2u >> 8);
+            } else {
+                cur_sg0 = sg[b];
+                cur_su0 = su[b];
+            }
+        }
+    }
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        uint4 next_wgv = make_uint4(0, 0, 0, 0), next_wuv = make_uint4(0, 0, 0, 0);
+        uint4 next_xa = make_uint4(0, 0, 0, 0), next_xb = make_uint4(0, 0, 0, 0);
+        uint4 next_xc = make_uint4(0, 0, 0, 0), next_xd = make_uint4(0, 0, 0, 0);
+        uint8_t next_sg0 = 0, next_sg1 = 0, next_su0 = 0, next_su1 = 0;
+        bool next_live0 = false, next_live1 = false;
+
+        if (c + 1 < nchunk) {
+            const unsigned k = ((c + 1) << 10) + (lane << 5);
+            next_live0 = (k < K);
+            next_live1 = (k + 16u < K);
+            const unsigned kx = next_live0 ? k : 0u;
+            const unsigned kw = kx >> 1;
+            const unsigned b = next_live0 ? (k >> 4) : 0u;
+            next_wgv = __ldcs((const uint4*)(wg + kw));
+            next_wuv = __ldcs((const uint4*)(wu + kw));
+            next_xa = *(const uint4*)(x + kx);
+            next_xb = *(const uint4*)(x + kx + 8);
+            next_xc = *(const uint4*)(x + kx + 16);
+            next_xd = *(const uint4*)(x + kx + 24);
+            if (next_live0) {
+                if (b + 1u < NB) {
+                    uint16_t s2g = *(const uint16_t*)(sg + b);
+                    uint16_t s2u = *(const uint16_t*)(su + b);
+                    next_sg0 = (uint8_t)(s2g & 0xff);
+                    next_sg1 = (uint8_t)(s2g >> 8);
+                    next_su0 = (uint8_t)(s2u & 0xff);
+                    next_su1 = (uint8_t)(s2u >> 8);
+                } else {
+                    next_sg0 = sg[b];
+                    next_su0 = su[b];
+                }
+            }
+        }
+
+        const __nv_bfloat162* x2a = (const __nv_bfloat162*)&cur_xa;
+        const float2 xa0 = __bfloat1622float2(x2a[0]);
+        const float2 xa1 = __bfloat1622float2(x2a[1]);
+        const float2 xa2 = __bfloat1622float2(x2a[2]);
+        const float2 xa3 = __bfloat1622float2(x2a[3]);
+
+        const __nv_bfloat162* x2b = (const __nv_bfloat162*)&cur_xb;
+        const float2 xb0 = __bfloat1622float2(x2b[0]);
+        const float2 xb1 = __bfloat1622float2(x2b[1]);
+        const float2 xb2 = __bfloat1622float2(x2b[2]);
+        const float2 xb3 = __bfloat1622float2(x2b[3]);
+
+        float pga = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wgv.x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wgv.y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(cur_wgv.x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(cur_wgv.y, xb0, xb1, xb2, xb3));
+        float pua = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wuv.x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wuv.y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(cur_wuv.x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(cur_wuv.y, xb0, xb1, xb2, xb3));
+
+        if (cur_live0) {
+            acc_g += pga * plow_nvfp4_scale(cur_sg0);
+            acc_u += pua * plow_nvfp4_scale(cur_su0);
+        }
+
+        const __nv_bfloat162* x2c = (const __nv_bfloat162*)&cur_xc;
+        const float2 xc0 = __bfloat1622float2(x2c[0]);
+        const float2 xc1 = __bfloat1622float2(x2c[1]);
+        const float2 xc2 = __bfloat1622float2(x2c[2]);
+        const float2 xc3 = __bfloat1622float2(x2c[3]);
+
+        const __nv_bfloat162* x2d = (const __nv_bfloat162*)&cur_xd;
+        const float2 xd0 = __bfloat1622float2(x2d[0]);
+        const float2 xd1 = __bfloat1622float2(x2d[1]);
+        const float2 xd2 = __bfloat1622float2(x2d[2]);
+        const float2 xd3 = __bfloat1622float2(x2d[3]);
+
+        float pgb = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wgv.z, xc0, xc1, xc2, xc3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wgv.w, xd0, xd1, xd2, xd3, s_lut))
+            : (plow_mxfp4_dot8(cur_wgv.z, xc0, xc1, xc2, xc3) +
+               plow_mxfp4_dot8(cur_wgv.w, xd0, xd1, xd2, xd3));
+        float pub = s_lut
+            ? (plow_mxfp4_dot8_lut(cur_wuv.z, xc0, xc1, xc2, xc3, s_lut) +
+               plow_mxfp4_dot8_lut(cur_wuv.w, xd0, xd1, xd2, xd3, s_lut))
+            : (plow_mxfp4_dot8(cur_wuv.z, xc0, xc1, xc2, xc3) +
+               plow_mxfp4_dot8(cur_wuv.w, xd0, xd1, xd2, xd3));
+
+        if (cur_live1) {
+            acc_g += pgb * plow_nvfp4_scale(cur_sg1);
+            acc_u += pub * plow_nvfp4_scale(cur_su1);
+        }
+
+        cur_wgv = next_wgv;
+        cur_wuv = next_wuv;
+        cur_xa = next_xa;
+        cur_xb = next_xb;
+        cur_xc = next_xc;
+        cur_xd = next_xd;
+        cur_sg0 = next_sg0;
+        cur_sg1 = next_sg1;
+        cur_su0 = next_su0;
+        cur_su1 = next_su1;
+        cur_live0 = next_live0;
+        cur_live1 = next_live1;
+    }
+    return make_float2(plow_warp_sum(acc_g), plow_warp_sum(acc_u));
+}
+
+/* Fused Gate + Up twin for MXFP8 (1 byte per weight, block size 32 scales). */
+__device__ __forceinline__ float2 plow_mxfp8_glu_dot_nv(
+    const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,
+    const uint8_t* __restrict__ sg, const uint8_t* __restrict__ su,
+    const bf16* __restrict__ x, unsigned K) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nchunk = (K + 511u) >> 9;
+    const unsigned NB = (K + 31u) >> 5;
+    float acc_g = 0.0f, acc_u = 0.0f;
+
+    uint4 cur_wgv = make_uint4(0, 0, 0, 0), cur_wuv = make_uint4(0, 0, 0, 0);
+    uint4 cur_xa = make_uint4(0, 0, 0, 0), cur_xb = make_uint4(0, 0, 0, 0);
+    uint8_t cur_sg = 0, cur_su = 0;
+    bool cur_live = false;
+
+    if (nchunk > 0) {
+        const unsigned k = lane << 4;
+        cur_live = (k < K);
+        const unsigned b = cur_live ? (k >> 5) : (NB ? NB - 1u : 0u);
+        const unsigned kx = cur_live ? k : 0u;
+        cur_wgv = __ldcs((const uint4*)(wg + kx));
+        cur_wuv = __ldcs((const uint4*)(wu + kx));
+        cur_xa = *(const uint4*)(x + kx);
+        cur_xb = *(const uint4*)(x + kx + 8);
+        if ((lane & 1u) == 0 && cur_live) {
+            cur_sg = sg[b];
+            cur_su = su[b];
+        }
+    }
+
+    for (unsigned c = 0; c < nchunk; c++) {
+        uint4 next_wgv = make_uint4(0, 0, 0, 0), next_wuv = make_uint4(0, 0, 0, 0);
+        uint4 next_xa = make_uint4(0, 0, 0, 0), next_xb = make_uint4(0, 0, 0, 0);
+        uint8_t next_sg = 0, next_su = 0;
+        bool next_live = false;
+
+        if (c + 1 < nchunk) {
+            const unsigned k = ((c + 1) << 9) + (lane << 4);
+            next_live = (k < K);
+            const unsigned b = next_live ? (k >> 5) : (NB ? NB - 1u : 0u);
+            const unsigned kx = next_live ? k : 0u;
+            next_wgv = __ldcs((const uint4*)(wg + kx));
+            next_wuv = __ldcs((const uint4*)(wu + kx));
+            next_xa = *(const uint4*)(x + kx);
+            next_xb = *(const uint4*)(x + kx + 8);
+            if ((lane & 1u) == 0 && next_live) {
+                next_sg = sg[b];
+                next_su = su[b];
+            }
+        }
+
+        const uint2 wg0 = make_uint2(cur_wgv.x, cur_wgv.y);
+        const uint2 wg1 = make_uint2(cur_wgv.z, cur_wgv.w);
+        const uint2 wu0 = make_uint2(cur_wuv.x, cur_wuv.y);
+        const uint2 wu1 = make_uint2(cur_wuv.z, cur_wuv.w);
+
+        float pg = dot8_fp8(wg0, *(const bf16v8*)&cur_xa, 0.0f) +
+                   dot8_fp8(wg1, *(const bf16v8*)&cur_xb, 0.0f);
+        float pu = dot8_fp8(wu0, *(const bf16v8*)&cur_xa, 0.0f) +
+                   dot8_fp8(wu1, *(const bf16v8*)&cur_xb, 0.0f);
+
+        pg += __shfl_xor_sync(0xffffffffu, pg, 1);
+        pu += __shfl_xor_sync(0xffffffffu, pu, 1);
+
+        if ((lane & 1u) == 0 && cur_live) {
+            acc_g += pg * plow_mxfp4_scale(cur_sg);
+            acc_u += pu * plow_mxfp4_scale(cur_su);
+        }
+
+        cur_wgv = next_wgv;
+        cur_wuv = next_wuv;
+        cur_xa = next_xa;
+        cur_xb = next_xb;
+        cur_sg = next_sg;
+        cur_su = next_su;
+        cur_live = next_live;
+    }
+    return make_float2(plow_warp_sum(acc_g), plow_warp_sum(acc_u));
 }
 
 __device__ __forceinline__ float plow_swiglu_oai(float g, float u, float alpha, float limit) {
@@ -3598,39 +4250,381 @@ __device__ __forceinline__ float plow_swiglu_oai(float g, float u, float alpha, 
     return g * (1.0f / (1.0f + __expf(-alpha * g))) * (u + 1.0f);
 }
 
+#ifndef PLOW_NV_MXFP4_MOE_SMEM
+#define PLOW_NV_MXFP4_MOE_SMEM 0
+#endif
+
+/* Register cache for decode NVFP4 MoE GLU activation x (K <= 2304).
+ * Eliminates all shared memory footprint, bank conflicts, and global memory re-reads. */
+struct PlowNvfp4RegCache {
+    uint4 c0[4];
+    uint4 c1[4];
+    uint4 c2[4];
+
+    __device__ __forceinline__ void load(const bf16* __restrict__ x, unsigned K) {
+        const unsigned lane = threadIdx.x & 31u;
+        const unsigned k0 = lane << 5;
+        if (k0 + 24u < K) {
+            c0[0] = *(const uint4*)(x + k0);
+            c0[1] = *(const uint4*)(x + k0 + 8);
+            c0[2] = *(const uint4*)(x + k0 + 16);
+            c0[3] = *(const uint4*)(x + k0 + 24);
+        } else {
+            c0[0] = make_uint4(0, 0, 0, 0);
+            c0[1] = make_uint4(0, 0, 0, 0);
+            c0[2] = make_uint4(0, 0, 0, 0);
+            c0[3] = make_uint4(0, 0, 0, 0);
+        }
+        const unsigned k1 = 1024u + (lane << 5);
+        if (k1 + 24u < K) {
+            c1[0] = *(const uint4*)(x + k1);
+            c1[1] = *(const uint4*)(x + k1 + 8);
+            c1[2] = *(const uint4*)(x + k1 + 16);
+            c1[3] = *(const uint4*)(x + k1 + 24);
+        } else {
+            c1[0] = make_uint4(0, 0, 0, 0);
+            c1[1] = make_uint4(0, 0, 0, 0);
+            c1[2] = make_uint4(0, 0, 0, 0);
+            c1[3] = make_uint4(0, 0, 0, 0);
+        }
+        const unsigned k2 = 2048u + (lane << 5);
+        if (k2 + 24u < K) {
+            c2[0] = *(const uint4*)(x + k2);
+            c2[1] = *(const uint4*)(x + k2 + 8);
+            c2[2] = *(const uint4*)(x + k2 + 16);
+            c2[3] = *(const uint4*)(x + k2 + 24);
+        } else {
+            c2[0] = make_uint4(0, 0, 0, 0);
+            c2[1] = make_uint4(0, 0, 0, 0);
+            c2[2] = make_uint4(0, 0, 0, 0);
+            c2[3] = make_uint4(0, 0, 0, 0);
+        }
+    }
+};
+
+/* Register cache for decode NVFP4 MoE Down activation fu (I <= 1152). */
+struct PlowNvfp4DownRegCache {
+    uint4 c0[4];
+    uint4 c1[4];
+
+    __device__ __forceinline__ void load(const bf16* __restrict__ fu, unsigned I) {
+        const unsigned lane = threadIdx.x & 31u;
+        const unsigned k0 = lane << 5;
+        if (k0 + 24u < I) {
+            c0[0] = *(const uint4*)(fu + k0);
+            c0[1] = *(const uint4*)(fu + k0 + 8);
+            c0[2] = *(const uint4*)(fu + k0 + 16);
+            c0[3] = *(const uint4*)(fu + k0 + 24);
+        } else {
+            c0[0] = make_uint4(0, 0, 0, 0);
+            c0[1] = make_uint4(0, 0, 0, 0);
+            c0[2] = make_uint4(0, 0, 0, 0);
+            c0[3] = make_uint4(0, 0, 0, 0);
+        }
+        const unsigned k1 = 1024u + (lane << 5);
+        if (k1 + 24u < I) {
+            c1[0] = *(const uint4*)(fu + k1);
+            c1[1] = *(const uint4*)(fu + k1 + 8);
+            c1[2] = *(const uint4*)(fu + k1 + 16);
+            c1[3] = *(const uint4*)(fu + k1 + 24);
+        } else {
+            c1[0] = make_uint4(0, 0, 0, 0);
+            c1[1] = make_uint4(0, 0, 0, 0);
+            c1[2] = make_uint4(0, 0, 0, 0);
+            c1[3] = make_uint4(0, 0, 0, 0);
+        }
+    }
+};
+
+__device__ __forceinline__ float2 plow_nvfp4_glu_dot_nv_reg(
+    const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,
+    const uint8_t* __restrict__ sg, const uint8_t* __restrict__ su,
+    const PlowNvfp4RegCache& x_reg, unsigned K,
+    const float2* __restrict__ s_lut = nullptr) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nchunk = (K + 1023u) >> 10;
+    const unsigned NB = (K + 15u) >> 4;
+    float acc_g = 0.0f, acc_u = 0.0f;
+
+    uint4 wgv[3];
+    uint4 wuv[3];
+    uint8_t sg0[3] = {0, 0, 0}, sg1[3] = {0, 0, 0};
+    uint8_t su0[3] = {0, 0, 0}, su1[3] = {0, 0, 0};
+
+    #pragma unroll
+    for (unsigned c = 0; c < 3; c++) {
+        if (c < nchunk) {
+            const unsigned k = (c << 10) + (lane << 5);
+            if (k < K) {
+                const unsigned kw = k >> 1;
+                const unsigned b = k >> 4;
+                wgv[c] = __ldcs((const uint4*)(wg + kw));
+                wuv[c] = __ldcs((const uint4*)(wu + kw));
+                if (b + 1u < NB) {
+                    uint16_t s2g = *(const uint16_t*)(sg + b);
+                    uint16_t s2u = *(const uint16_t*)(su + b);
+                    sg0[c] = (uint8_t)(s2g & 0xff);
+                    sg1[c] = (uint8_t)(s2g >> 8);
+                    su0[c] = (uint8_t)(s2u & 0xff);
+                    su1[c] = (uint8_t)(s2u >> 8);
+                } else {
+                    sg0[c] = sg[b];
+                    su0[c] = su[b];
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned c = 0; c < 3; c++) {
+        if (c >= nchunk) break;
+        const unsigned k = (c << 10) + (lane << 5);
+        if (k >= K) break;
+        const bool live1 = (k + 16u < K);
+
+        const uint4 xa = (c == 0) ? x_reg.c0[0] : ((c == 1) ? x_reg.c1[0] : x_reg.c2[0]);
+        const uint4 xb = (c == 0) ? x_reg.c0[1] : ((c == 1) ? x_reg.c1[1] : x_reg.c2[1]);
+        const uint4 xc = (c == 0) ? x_reg.c0[2] : ((c == 1) ? x_reg.c1[2] : x_reg.c2[2]);
+        const uint4 xd = (c == 0) ? x_reg.c0[3] : ((c == 1) ? x_reg.c1[3] : x_reg.c2[3]);
+
+        const __nv_bfloat162* x2a = (const __nv_bfloat162*)&xa;
+        const float2 xa0 = __bfloat1622float2(x2a[0]);
+        const float2 xa1 = __bfloat1622float2(x2a[1]);
+        const float2 xa2 = __bfloat1622float2(x2a[2]);
+        const float2 xa3 = __bfloat1622float2(x2a[3]);
+
+        const __nv_bfloat162* x2b = (const __nv_bfloat162*)&xb;
+        const float2 xb0 = __bfloat1622float2(x2b[0]);
+        const float2 xb1 = __bfloat1622float2(x2b[1]);
+        const float2 xb2 = __bfloat1622float2(x2b[2]);
+        const float2 xb3 = __bfloat1622float2(x2b[3]);
+
+        const float pga = s_lut
+            ? (plow_mxfp4_dot8_lut(wgv[c].x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(wgv[c].y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(wgv[c].x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(wgv[c].y, xb0, xb1, xb2, xb3));
+        const float pua = s_lut
+            ? (plow_mxfp4_dot8_lut(wuv[c].x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(wuv[c].y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(wuv[c].x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(wuv[c].y, xb0, xb1, xb2, xb3));
+
+        acc_g += pga * plow_nvfp4_scale(sg0[c]);
+        acc_u += pua * plow_nvfp4_scale(su0[c]);
+
+        if (live1) {
+            const __nv_bfloat162* x2c = (const __nv_bfloat162*)&xc;
+            const float2 xc0 = __bfloat1622float2(x2c[0]);
+            const float2 xc1 = __bfloat1622float2(x2c[1]);
+            const float2 xc2 = __bfloat1622float2(x2c[2]);
+            const float2 xc3 = __bfloat1622float2(x2c[3]);
+
+            const __nv_bfloat162* x2d = (const __nv_bfloat162*)&xd;
+            const float2 xd0 = __bfloat1622float2(x2d[0]);
+            const float2 xd1 = __bfloat1622float2(x2d[1]);
+            const float2 xd2 = __bfloat1622float2(x2d[2]);
+            const float2 xd3 = __bfloat1622float2(x2d[3]);
+
+            const float pgb = s_lut
+                ? (plow_mxfp4_dot8_lut(wgv[c].z, xc0, xc1, xc2, xc3, s_lut) +
+                   plow_mxfp4_dot8_lut(wgv[c].w, xd0, xd1, xd2, xd3, s_lut))
+                : (plow_mxfp4_dot8(wgv[c].z, xc0, xc1, xc2, xc3) +
+                   plow_mxfp4_dot8(wgv[c].w, xd0, xd1, xd2, xd3));
+            const float pub = s_lut
+                ? (plow_mxfp4_dot8_lut(wuv[c].z, xc0, xc1, xc2, xc3, s_lut) +
+                   plow_mxfp4_dot8_lut(wuv[c].w, xd0, xd1, xd2, xd3, s_lut))
+                : (plow_mxfp4_dot8(wuv[c].z, xc0, xc1, xc2, xc3) +
+                   plow_mxfp4_dot8(wuv[c].w, xd0, xd1, xd2, xd3));
+
+            acc_g += pgb * plow_nvfp4_scale(sg1[c]);
+            acc_u += pub * plow_nvfp4_scale(su1[c]);
+        }
+    }
+    return make_float2(plow_warp_sum(acc_g), plow_warp_sum(acc_u));
+}
+
+__device__ __forceinline__ float plow_nvfp4_row_dot_nv_reg(
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ s,
+    const PlowNvfp4DownRegCache& fu_reg, unsigned I,
+    const float2* __restrict__ s_lut = nullptr) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned nchunk = (I + 1023u) >> 10;
+    const unsigned NB = (I + 15u) >> 4;
+    float acc = 0.0f;
+
+    uint4 wv[2];
+    uint8_t s0[2] = {0, 0}, s1[2] = {0, 0};
+
+    #pragma unroll
+    for (unsigned c = 0; c < 2; c++) {
+        if (c < nchunk) {
+            const unsigned k = (c << 10) + (lane << 5);
+            if (k < I) {
+                const unsigned kw = k >> 1;
+                const unsigned b = k >> 4;
+                wv[c] = __ldcs((const uint4*)(w + kw));
+                if (b + 1u < NB) {
+                    uint16_t s2 = *(const uint16_t*)(s + b);
+                    s0[c] = (uint8_t)(s2 & 0xff);
+                    s1[c] = (uint8_t)(s2 >> 8);
+                } else {
+                    s0[c] = s[b];
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (unsigned c = 0; c < 2; c++) {
+        if (c >= nchunk) break;
+        const unsigned k = (c << 10) + (lane << 5);
+        if (k >= I) break;
+        const bool live1 = (k + 16u < I);
+
+        const uint4 xa = (c == 0) ? fu_reg.c0[0] : fu_reg.c1[0];
+        const uint4 xb = (c == 0) ? fu_reg.c0[1] : fu_reg.c1[1];
+        const uint4 xc = (c == 0) ? fu_reg.c0[2] : fu_reg.c1[2];
+        const uint4 xd = (c == 0) ? fu_reg.c0[3] : fu_reg.c1[3];
+
+        const __nv_bfloat162* x2a = (const __nv_bfloat162*)&xa;
+        const float2 xa0 = __bfloat1622float2(x2a[0]);
+        const float2 xa1 = __bfloat1622float2(x2a[1]);
+        const float2 xa2 = __bfloat1622float2(x2a[2]);
+        const float2 xa3 = __bfloat1622float2(x2a[3]);
+
+        const __nv_bfloat162* x2b = (const __nv_bfloat162*)&xb;
+        const float2 xb0 = __bfloat1622float2(x2b[0]);
+        const float2 xb1 = __bfloat1622float2(x2b[1]);
+        const float2 xb2 = __bfloat1622float2(x2b[2]);
+        const float2 xb3 = __bfloat1622float2(x2b[3]);
+
+        const float pa = s_lut
+            ? (plow_mxfp4_dot8_lut(wv[c].x, xa0, xa1, xa2, xa3, s_lut) +
+               plow_mxfp4_dot8_lut(wv[c].y, xb0, xb1, xb2, xb3, s_lut))
+            : (plow_mxfp4_dot8(wv[c].x, xa0, xa1, xa2, xa3) +
+               plow_mxfp4_dot8(wv[c].y, xb0, xb1, xb2, xb3));
+        acc += pa * plow_nvfp4_scale(s0[c]);
+
+        if (live1) {
+            const __nv_bfloat162* x2c = (const __nv_bfloat162*)&xc;
+            const float2 xc0 = __bfloat1622float2(x2c[0]);
+            const float2 xc1 = __bfloat1622float2(x2c[1]);
+            const float2 xc2 = __bfloat1622float2(x2c[2]);
+            const float2 xc3 = __bfloat1622float2(x2c[3]);
+
+            const __nv_bfloat162* x2d = (const __nv_bfloat162*)&xd;
+            const float2 xd0 = __bfloat1622float2(x2d[0]);
+            const float2 xd1 = __bfloat1622float2(x2d[1]);
+            const float2 xd2 = __bfloat1622float2(x2d[2]);
+            const float2 xd3 = __bfloat1622float2(x2d[3]);
+
+            const float pb = s_lut
+                ? (plow_mxfp4_dot8_lut(wv[c].z, xc0, xc1, xc2, xc3, s_lut) +
+                   plow_mxfp4_dot8_lut(wv[c].w, xd0, xd1, xd2, xd3, s_lut))
+                : (plow_mxfp4_dot8(wv[c].z, xc0, xc1, xc2, xc3) +
+                   plow_mxfp4_dot8(wv[c].w, xd0, xd1, xd2, xd3));
+            acc += pb * plow_nvfp4_scale(s1[c]);
+        }
+    }
+    return plow_warp_sum(acc);
+}
+
+static __shared__ float2 s_moe_mxfp4_lut[256];
+
+__device__ __forceinline__ const float2* plow_mxfp4_init_lut(float2* s_lut) {
+    const unsigned tid = threadIdx.x;
+    if (tid < 256u) {
+        const uint8_t byte = (uint8_t)tid;
+        s_lut[tid] = make_float2(plow_mxfp4_e2m1(byte & 0x0fu), plow_mxfp4_e2m1(byte >> 4));
+    }
+    __syncthreads();
+    return s_lut;
+}
+
+static __device__ __forceinline__ float plow_inkling_swiglu(
+    float g, float u, float gate_cap, float up_cap, float weight) {
+    g = __bfloat162float(__float2bfloat16(g));
+    u = __bfloat162float(__float2bfloat16(u));
+    const float sigmoid = 1.0f / (1.0f + __expf(-g));
+    const float gate = gate_cap > 0.0f ? gate_cap * tanhf(g / gate_cap) : g;
+    const float up = up_cap > 0.0f ? up_cap * tanhf(u / up_cap) : u;
+    return ((gate * sigmoid) * up) * weight;
+}
+
 static __device__ void d_moe_glu_mx(
     bf16* __restrict__ fu, const bf16* __restrict__ x, const unsigned char* __restrict__ table,
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ S,
     const bf16* __restrict__ bias, unsigned ksel, unsigned I, unsigned K, unsigned E,
     unsigned layout, unsigned act, unsigned B, float alpha, float limit,
-    unsigned slice, unsigned nblk) {
+    unsigned slice, unsigned nblk, unsigned mode = 0,
+    const float* amax = nullptr, const float* denominator = nullptr) {
+    const float2* s_lut = plow_mxfp4_init_lut(s_moe_mxfp4_lut);
+    const bool use_smem_x = false;
+
+    PlowNvfp4RegCache x_reg;
+    unsigned cached_tok = ~0u;
+    const bool use_reg_x = (mode == 2u) && (K <= 2304u) && ((K & 15u) == 0u);
+
     const unsigned warp = threadIdx.x >> 5;
     const unsigned nwarp = blockDim.x >> 5;
     const unsigned total = (B ? B : 1u) * ksel * I;
     const unsigned per = (total + nblk - 1u) / nblk;
     const unsigned lo = slice * per, hi = min(lo + per, total);
-    const size_t ldw = (K + 1u) >> 1, lds = (K + 31u) >> 5, N2 = 2u * I;
+    const size_t ldw = (mode == 1u) ? (size_t)K : (((size_t)K + 1u) >> 1);
+    const size_t lds = (mode == 2u) ? (((size_t)K + 15u) >> 4) : (((size_t)K + 31u) >> 5);
+    const size_t N2 = 2u * I;
     for (unsigned idx = lo + warp; idx < hi; idx += nwarp) {
         const unsigned slot = idx / I, n = idx - slot * I;
         const unsigned eid = *(const unsigned*)(table + (size_t)slot * 8u);
         if (eid >= E) continue;
-        const bf16* xr = x + (size_t)(slot / ksel) * K;
+        const unsigned tok = slot / ksel;
+        if (use_reg_x && tok != cached_tok) {
+            x_reg.load(x + (size_t)tok * K, K);
+            cached_tok = tok;
+        }
+        const bf16* xr = x + (size_t)tok * K;
         const unsigned rg = layout ? n : 2u * n;
         const unsigned ru = layout ? I + n : 2u * n + 1u;
         const uint8_t* We = W + (size_t)eid * N2 * ldw;
         const uint8_t* Se = S + (size_t)eid * N2 * lds;
-        float g = plow_mxfp4_row_dot_nv(We + (size_t)rg * ldw, Se + (size_t)rg * lds, xr, K);
-        float u = plow_mxfp4_row_dot_nv(We + (size_t)ru * ldw, Se + (size_t)ru * lds, xr, K);
+        float2 gu = (mode == 1u)
+            ? plow_mxfp8_glu_dot_nv(
+                We + (size_t)rg * ldw, We + (size_t)ru * ldw,
+                Se + (size_t)rg * lds, Se + (size_t)ru * lds, xr, K)
+            : ((mode == 2u)
+                ? (use_reg_x
+                    ? plow_nvfp4_glu_dot_nv_reg(
+                        We + (size_t)rg * ldw, We + (size_t)ru * ldw,
+                        Se + (size_t)rg * lds, Se + (size_t)ru * lds, x_reg, K, s_lut)
+                    : plow_nvfp4_glu_dot_nv(
+                        We + (size_t)rg * ldw, We + (size_t)ru * ldw,
+                        Se + (size_t)rg * lds, Se + (size_t)ru * lds, xr, K, s_lut))
+                : plow_mxfp4_glu_dot_nv(
+                    We + (size_t)rg * ldw, We + (size_t)ru * ldw,
+                    Se + (size_t)rg * lds, Se + (size_t)ru * lds, xr, K, s_lut));
+        float g = gu.x, u = gu.y;
+        if (mode == 2u && amax && denominator) {
+            const float scale = amax[eid] / *denominator;
+            g *= scale;
+            u *= scale;
+        }
         if (bias) {
             g += __bfloat162float(bias[(size_t)eid * N2 + rg]);
             u += __bfloat162float(bias[(size_t)eid * N2 + ru]);
         }
         if ((threadIdx.x & 31u) == 0) {
-            float v = act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
-                                : (act == 1u ? act_silu(g) : act_gelu_tanh(g)) * u;
+            float v;
+            if (act == 4u) {
+                v = plow_inkling_swiglu(g, u, alpha, limit, plow_moe_slot_gate(table, slot));
+            } else {
+                v = act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
+                              : (act == 1u ? act_silu(g) : act_gelu_tanh(g)) * u;
+            }
             fu[(size_t)slot * I + n] = __float2bfloat16(v);
         }
     }
+    __syncthreads();
 }
 
 static __device__ void d_moe_down_mx(
@@ -3638,65 +4632,313 @@ static __device__ void d_moe_down_mx(
     const unsigned char* __restrict__ table, const uint8_t* __restrict__ W,
     const uint8_t* __restrict__ S, const bf16* __restrict__ bias,
     unsigned ksel, unsigned H, unsigned I, unsigned E, unsigned B,
-    unsigned slice, unsigned nblk) {
+    unsigned slice, unsigned nblk, unsigned mode = 0,
+    const float* amax = nullptr, const float* denominator = nullptr,
+    bool preweighted = false) {
+    const float2* s_lut = plow_mxfp4_init_lut(s_moe_mxfp4_lut);
+    const bool use_smem_fu = false;
+
+    PlowNvfp4DownRegCache fu_reg;
+    unsigned cached_slot = ~0u;
+    const bool use_reg_fu = (mode == 2u) && (I <= 1152u) && ((I & 15u) == 0u);
+
     const unsigned warp = threadIdx.x >> 5;
     const unsigned nwarp = blockDim.x >> 5;
     const unsigned total = (B ? B : 1u) * ksel * H;
     const unsigned per = (total + nblk - 1u) / nblk;
     const unsigned lo = slice * per, hi = min(lo + per, total);
-    const size_t ldw = (I + 1u) >> 1, lds = (I + 31u) >> 5;
+    const size_t ldw = (mode == 1u) ? (size_t)I : (((size_t)I + 1u) >> 1);
+    const size_t lds = (mode == 2u) ? (((size_t)I + 15u) >> 4) : (((size_t)I + 31u) >> 5);
     for (unsigned idx = lo + warp; idx < hi; idx += nwarp) {
         const unsigned slot = idx / H, h = idx - slot * H;
         const unsigned eid = *(const unsigned*)(table + (size_t)slot * 8u);
         float v = 0.0f;
         if (eid < E) {
+            if (use_reg_fu && slot != cached_slot) {
+                fu_reg.load(fu + (size_t)slot * I, I);
+                cached_slot = slot;
+            }
             const uint8_t* wr = W + ((size_t)eid * H + h) * ldw;
             const uint8_t* sr = S + ((size_t)eid * H + h) * lds;
-            v = plow_mxfp4_row_dot_nv(wr, sr, fu + (size_t)slot * I, I);
+            const bf16* fur = fu + (size_t)slot * I;
+            v = (mode == 1u)
+                ? plow_mxfp8_row_dot_nv(wr, sr, fur, I)
+                : ((mode == 2u)
+                    ? (use_reg_fu
+                        ? plow_nvfp4_row_dot_nv_reg(wr, sr, fu_reg, I, s_lut)
+                        : plow_nvfp4_row_dot_nv(wr, sr, fur, I, s_lut))
+                    : plow_mxfp4_row_dot_nv(wr, sr, fur, I, s_lut));
+            if (mode == 2u && amax && denominator) v *= amax[eid] / *denominator;
             if (bias) v += __bfloat162float(bias[(size_t)eid * H + h]);
-            v *= *(const float*)(table + (size_t)slot * 8u + 4u);
+            if (!preweighted) v *= plow_moe_slot_gate(table, slot);
         }
         if ((threadIdx.x & 31u) == 0) part[(size_t)slot * H + h] = v;
     }
+    __syncthreads();
 }
 
 #endif
 #if PLOW_NV_MOE_COMMON
+/* --- op 40: ROUTER (PLOW_DOP_MOE_ROUTER) — ONE block ------------------------------
+ * table(out) = [k] of {u32 expert_id, f32 gate}. Runs on ONE block (slice == 0).
+ *   logit[e] = bf16_round(x . Wr[e])   (parallel over experts across warps)
+ *   score[e] = sigmoid|softmax(logit)
+ *   top-k via k-pass masked argmax, LOWEST-ID tie-break
+ *   if norm_topk: gate_j /= Σ gate ; gate_j *= route_scale ; write table
+ * `bias` (f32[n_exp], or NULL) is added for SELECTION RANKING ONLY — the gate value
+ * is the raw unbiased score.
+ * `score` is float[n_exp] scratch in shared memory / arena.
+ */
+static __device__ void d_moe_router_nv(
+    unsigned char* table, const bf16* x, const bf16* Wr, const float* bias,
+    unsigned H, unsigned n_exp, unsigned ksel, unsigned flags, float route_scale,
+    unsigned slice, unsigned nblk, float* score) {
+    (void)nblk;
+    if (slice != 0) return;
+    if (ksel > 16u || n_exp == 0u) { if (threadIdx.x == 0) __trap(); return; }
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+    const unsigned nw = blockDim.x >> 5;
+
+    __shared__ float s_warp_val[32];
+    __shared__ unsigned s_warp_idx[32];
+    __shared__ float s_sum;
+
+    for (unsigned e = warp; e < n_exp; e += nw) {
+        const bf16* we = Wr + (size_t)e * H;
+        float acc = 0.0f;
+        const unsigned nvec = H >> 3;
+        for (unsigned v = lane; v < nvec; v += 32) {
+            uint4 xv = *(const uint4*)(x + v * 8);
+            uint4 wv = *(const uint4*)(we + v * 8);
+            const bf16* xp = (const bf16*)&xv;
+            const bf16* wp = (const bf16*)&wv;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                acc = __fmaf_rn(__bfloat162float(xp[i]), __bfloat162float(wp[i]), acc);
+            }
+        }
+        for (unsigned i = (nvec << 3) + lane; i < H; i += 32) {
+            acc = __fmaf_rn(__bfloat162float(x[i]), __bfloat162float(we[i]), acc);
+        }
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            acc += __shfl_xor_sync(0xffffffff, acc, mask);
+        }
+        if (lane == 0) {
+            score[e] = (flags & 8u) ? acc : __bfloat162float(__float2bfloat16(acc));
+        }
+    }
+    __syncthreads();
+
+    if (flags & 1u) {
+        for (unsigned e = tid; e < n_exp; e += blockDim.x) {
+            score[e] = 1.0f / (1.0f + __expf(-score[e]));
+        }
+    } else {
+        float mx = -INFINITY;
+        for (unsigned e = tid; e < n_exp; e += blockDim.x) {
+            mx = fmaxf(mx, score[e]);
+        }
+        for (int mask = 16; mask > 0; mask >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, mask));
+        if (lane == 0) s_warp_val[warp] = mx;
+        __syncthreads();
+        if (warp == 0) {
+            float bmx = (lane < nw) ? s_warp_val[lane] : -INFINITY;
+            for (int mask = 16; mask > 0; mask >>= 1) bmx = fmaxf(bmx, __shfl_xor_sync(0xffffffff, bmx, mask));
+            if (lane == 0) s_warp_val[0] = bmx;
+        }
+        __syncthreads();
+        mx = s_warp_val[0];
+        float sum = 0.0f;
+        for (unsigned e = tid; e < n_exp; e += blockDim.x) {
+            float sc = __expf(score[e] - mx);
+            score[e] = sc;
+            sum += sc;
+        }
+        for (int mask = 16; mask > 0; mask >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, mask);
+        if (lane == 0) s_warp_val[warp] = sum;
+        __syncthreads();
+        if (warp == 0) {
+            float bsum = (lane < nw) ? s_warp_val[lane] : 0.0f;
+            for (int mask = 16; mask > 0; mask >>= 1) bsum += __shfl_xor_sync(0xffffffff, bsum, mask);
+            if (lane == 0) s_warp_val[0] = bsum;
+        }
+        __syncthreads();
+        const float inv_sum = 1.0f / s_warp_val[0];
+        for (unsigned e = tid; e < n_exp; e += blockDim.x) {
+            score[e] *= inv_sum;
+        }
+    }
+    if (tid == 0) s_sum = 0.0f;
+    __syncthreads();
+
+    for (unsigned j = 0; j < ksel; j++) {
+        float my_val = -INFINITY;
+        unsigned my_best = ~0u;
+        for (unsigned e = tid; e < n_exp; e += blockDim.x) {
+            const float v = score[e] + (bias ? bias[e] : 0.0f);
+            if (v > my_val || (v == my_val && e < my_best)) {
+                my_val = v;
+                my_best = e;
+            }
+        }
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, my_val, mask);
+            unsigned other_best = __shfl_xor_sync(0xffffffff, my_best, mask);
+            if (other_val > my_val || (other_val == my_val && other_best < my_best)) {
+                my_val = other_val;
+                my_best = other_best;
+            }
+        }
+        if (lane == 0) {
+            s_warp_val[warp] = my_val;
+            s_warp_idx[warp] = my_best;
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            float w_val = (lane < nw) ? s_warp_val[lane] : -INFINITY;
+            unsigned w_best = (lane < nw) ? s_warp_idx[lane] : ~0u;
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                float other_val = __shfl_xor_sync(0xffffffff, w_val, mask);
+                unsigned other_best = __shfl_xor_sync(0xffffffff, w_best, mask);
+                if (other_val > w_val || (other_val == w_val && other_best < w_best)) {
+                    w_val = other_val;
+                    w_best = other_best;
+                }
+            }
+            if (lane == 0) {
+                *(unsigned*)(table + j * 8u) = w_best;
+                *(float*)(table + j * 8u + 4u) = score[w_best];
+                s_sum += score[w_best];
+                score[w_best] = -INFINITY;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (unsigned j = tid; j < ksel; j += blockDim.x) {
+        float* gate = (float*)(table + j * 8u + 4u);
+        if ((flags & 2u) && s_sum != 0.0f) *gate /= s_sum;
+        *gate *= route_scale;
+    }
+    __syncthreads();
+}
+
 /* The common router/align/combine chain. GPT-OSS uses flat softmax top-k with no selection bias;
  * the optional f32 bias and generic sigmoid/norm flags remain supported by the packet contract. */
 static __device__ void d_moe_router_topk_pf_nv(
-    unsigned char* table, const bf16* logit, const float* bias, unsigned E, unsigned ksel,
+    unsigned char* table, const void* logit, const float* bias, unsigned E, unsigned ksel,
     unsigned flags, float route_scale, unsigned T, unsigned slice, unsigned nblk, float* score) {
     if (ksel > 16u || E == 0u) { if (threadIdx.x == 0) __trap(); return; }
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+    const unsigned nw = blockDim.x >> 5;
+
+    __shared__ float s_warp_val[32];
+    __shared__ unsigned s_warp_idx[32];
+    __shared__ float s_sum;
+
     for (unsigned tok = slice; tok < (T ? T : 1u); tok += nblk) {
-        if (threadIdx.x == 0) {
-            const bf16* lr = logit + (size_t)tok * E;
-            if (flags & 1u) {
-                for (unsigned e = 0; e < E; e++) score[e] = 1.0f / (1.0f + __expf(-__bfloat162float(lr[e])));
-            } else {
-                float mx = -INFINITY, sum = 0.0f;
-                for (unsigned e = 0; e < E; e++) mx = fmaxf(mx, __bfloat162float(lr[e]));
-                for (unsigned e = 0; e < E; e++) { score[e] = __expf(__bfloat162float(lr[e]) - mx); sum += score[e]; }
-                for (unsigned e = 0; e < E; e++) score[e] /= sum;
+        const size_t row = (size_t)tok * E;
+        auto load_logit = [&](unsigned e) {
+            return (flags & 8u) ? static_cast<const float*>(logit)[row + e]
+                                : __bfloat162float(static_cast<const bf16*>(logit)[row + e]);
+        };
+        if (flags & 1u) {
+            for (unsigned e = tid; e < E; e += blockDim.x) {
+                score[e] = 1.0f / (1.0f + __expf(-load_logit(e)));
             }
+        } else {
+            float mx = -INFINITY;
+            for (unsigned e = tid; e < E; e += blockDim.x) {
+                mx = fmaxf(mx, load_logit(e));
+            }
+            for (int mask = 16; mask > 0; mask >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, mask));
+            if (lane == 0) s_warp_val[warp] = mx;
+            __syncthreads();
+            if (warp == 0) {
+                float bmx = (lane < nw) ? s_warp_val[lane] : -INFINITY;
+                for (int mask = 16; mask > 0; mask >>= 1) bmx = fmaxf(bmx, __shfl_xor_sync(0xffffffff, bmx, mask));
+                if (lane == 0) s_warp_val[0] = bmx;
+            }
+            __syncthreads();
+            mx = s_warp_val[0];
             float sum = 0.0f;
-            for (unsigned j = 0; j < ksel; j++) {
-                unsigned best = 0;
-                float bv = -INFINITY;
-                for (unsigned e = 0; e < E; e++) {
-                    const float v = score[e] + (bias ? bias[e] : 0.0f);
-                    if (v > bv) { bv = v; best = e; }
+            for (unsigned e = tid; e < E; e += blockDim.x) {
+                float sc = __expf(load_logit(e) - mx);
+                score[e] = sc;
+                sum += sc;
+            }
+            for (int mask = 16; mask > 0; mask >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, mask);
+            if (lane == 0) s_warp_val[warp] = sum;
+            __syncthreads();
+            if (warp == 0) {
+                float bsum = (lane < nw) ? s_warp_val[lane] : 0.0f;
+                for (int mask = 16; mask > 0; mask >>= 1) bsum += __shfl_xor_sync(0xffffffff, bsum, mask);
+                if (lane == 0) s_warp_val[0] = bsum;
+            }
+            __syncthreads();
+            const float inv_sum = 1.0f / s_warp_val[0];
+            for (unsigned e = tid; e < E; e += blockDim.x) {
+                score[e] *= inv_sum;
+            }
+        }
+        if (tid == 0) s_sum = 0.0f;
+        __syncthreads();
+
+        for (unsigned j = 0; j < ksel; j++) {
+            float my_val = -INFINITY;
+            unsigned my_best = ~0u;
+            for (unsigned e = tid; e < E; e += blockDim.x) {
+                const float v = score[e] + (bias ? bias[e] : 0.0f);
+                if (v > my_val || (v == my_val && e < my_best)) {
+                    my_val = v;
+                    my_best = e;
                 }
-                *(unsigned*)(table + ((size_t)tok * ksel + j) * 8u) = best;
-                *(float*)(table + ((size_t)tok * ksel + j) * 8u + 4u) = score[best];
-                sum += score[best];
-                score[best] = -INFINITY;
             }
-            for (unsigned j = 0; j < ksel; j++) {
-                float* gate = (float*)(table + ((size_t)tok * ksel + j) * 8u + 4u);
-                if ((flags & 2u) && sum != 0.0f) *gate /= sum;
-                *gate *= route_scale;
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                float other_val = __shfl_xor_sync(0xffffffff, my_val, mask);
+                unsigned other_best = __shfl_xor_sync(0xffffffff, my_best, mask);
+                if (other_val > my_val || (other_val == my_val && other_best < my_best)) {
+                    my_val = other_val;
+                    my_best = other_best;
+                }
             }
+            if (lane == 0) {
+                s_warp_val[warp] = my_val;
+                s_warp_idx[warp] = my_best;
+            }
+            __syncthreads();
+
+            if (warp == 0) {
+                float w_val = (lane < nw) ? s_warp_val[lane] : -INFINITY;
+                unsigned w_best = (lane < nw) ? s_warp_idx[lane] : ~0u;
+                for (int mask = 16; mask > 0; mask >>= 1) {
+                    float other_val = __shfl_xor_sync(0xffffffff, w_val, mask);
+                    unsigned other_best = __shfl_xor_sync(0xffffffff, w_best, mask);
+                    if (other_val > w_val || (other_val == w_val && other_best < w_best)) {
+                        w_val = other_val;
+                        w_best = other_best;
+                    }
+                }
+                if (lane == 0) {
+                    *(unsigned*)(table + ((size_t)tok * ksel + j) * 8u) = w_best;
+                    *(float*)(table + ((size_t)tok * ksel + j) * 8u + 4u) = score[w_best];
+                    s_sum += score[w_best];
+                    score[w_best] = -INFINITY;
+                }
+            }
+            __syncthreads();
+        }
+
+        for (unsigned j = tid; j < ksel; j += blockDim.x) {
+            float* gate = (float*)(table + ((size_t)tok * ksel + j) * 8u + 4u);
+            if ((flags & 2u) && s_sum != 0.0f) *gate /= s_sum;
+            *gate *= route_scale;
         }
         __syncthreads();
     }
@@ -3739,11 +4981,15 @@ static __device__ void d_moe_align_pf_nv(
 static __device__ void d_moe_glu_mx_pf(
     bf16* fu, const bf16* x, const uint8_t* W, const uint8_t* S, const int* meta,
     const unsigned* row_token, const bf16* bias, unsigned I, unsigned K, unsigned E,
-    unsigned layout, unsigned act, float alpha, float limit, unsigned slice, unsigned nblk) {
+    unsigned layout, unsigned act, float alpha, float limit, unsigned slice, unsigned nblk,
+    unsigned mode = 0) {
+    const float2* s_lut = plow_mxfp4_init_lut(s_moe_mxfp4_lut);
     const unsigned warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
     const unsigned total = E * I, per = (total + nblk - 1u) / nblk;
     const unsigned lo = slice * per, hi = min(lo + per, total);
-    const size_t ldw = (K + 1u) >> 1, lds = (K + 31u) >> 5, N2 = 2u * I;
+    const size_t ldw = (mode == 1u) ? (size_t)K : (((size_t)K + 1u) >> 1);
+    const size_t lds = (mode == 2u) ? (((size_t)K + 15u) >> 4) : (((size_t)K + 31u) >> 5);
+    const size_t N2 = 2u * I;
     for (unsigned idx = lo + warp; idx < hi; idx += nwarp) {
         const unsigned e = idx / I, n = idx - e * I;
         const unsigned rg = layout ? n : 2u * n, ru = layout ? I + n : 2u * n + 1u;
@@ -3752,36 +4998,177 @@ static __device__ void d_moe_glu_mx_pf(
         for (unsigned r = (unsigned)meta[e]; r < (unsigned)(meta[e] + meta[E + e]); r++) {
             const unsigned tok = row_token[r];
             if (tok == PLOW_EXPERT_UNUSED) continue;
-            float g = plow_mxfp4_row_dot_nv(We + (size_t)rg * ldw, Se + (size_t)rg * lds, x + (size_t)tok * K, K);
-            float u = plow_mxfp4_row_dot_nv(We + (size_t)ru * ldw, Se + (size_t)ru * lds, x + (size_t)tok * K, K);
+            float2 gu = (mode == 1u)
+                ? plow_mxfp8_glu_dot_nv(
+                    We + (size_t)rg * ldw, We + (size_t)ru * ldw,
+                    Se + (size_t)rg * lds, Se + (size_t)ru * lds,
+                    x + (size_t)tok * K, K)
+                : ((mode == 2u)
+                    ? plow_nvfp4_glu_dot_nv(
+                        We + (size_t)rg * ldw, We + (size_t)ru * ldw,
+                        Se + (size_t)rg * lds, Se + (size_t)ru * lds,
+                        x + (size_t)tok * K, K, s_lut)
+                    : plow_mxfp4_glu_dot_nv(
+                        We + (size_t)rg * ldw, We + (size_t)ru * ldw,
+                        Se + (size_t)rg * lds, Se + (size_t)ru * lds,
+                        x + (size_t)tok * K, K, s_lut));
+            float g = gu.x, u = gu.y;
             if (bias) { g += __bfloat162float(bias[(size_t)e * N2 + rg]); u += __bfloat162float(bias[(size_t)e * N2 + ru]); }
             if ((threadIdx.x & 31u) == 0) fu[(size_t)r * I + n] = __float2bfloat16(
                 act == 3u ? plow_swiglu_oai(g, u, alpha, limit)
                           : (act == 1u ? act_silu(g) : act_gelu_tanh(g)) * u);
         }
     }
+    __syncthreads();
 }
+
+#if defined(PLOW_NV_HOPPER)
+template <bool GLU, class Output>
+static __device__ void d_nvfp4_grouped_hopper(
+    Output* out, const bf16* input, const uint8_t* weight, const uint8_t* scales,
+    const int* meta, const float* amax, const unsigned* row_partidx, const float* denominator,
+    unsigned cols, unsigned inner, unsigned E, unsigned slots, unsigned aligned_rows,
+    unsigned slice, unsigned nblk, unsigned topk = 1, float gate_cap = 0.0f, float up_cap = 0.0f) {
+    using namespace nvcuda;
+    constexpr unsigned M = 16, N = 16, K = 16;
+    constexpr unsigned ROW_TILES = GLU ? 2 : 1;
+    struct alignas(32) WarpTiles {
+        bf16 a[ROW_TILES][M * K];
+        bf16 b[N * K];
+        float c[M * N];
+    };
+    __shared__ WarpTiles tiles[PLOW_NV_WARPS];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned warps = blockDim.x >> 5;
+    WarpTiles& stage = tiles[warp];
+    constexpr unsigned ROUTING_TILE = 64;
+    const int* tile_prefix = meta + 2u * E;
+    const unsigned routing_tiles = tile_prefix[E];
+    if (routing_tiles == 0 || routing_tiles > aligned_rows / ROUTING_TILE) return;
+    const size_t work_items = (size_t)routing_tiles * ((cols + N - 1u) / N);
+    for (size_t work = slice * warps + warp; work < work_items; work += nblk * warps) {
+        const unsigned tile = work % routing_tiles;
+        const unsigned col0 = work / routing_tiles * N;
+        unsigned lo = 0, hi = E;
+        while (hi - lo > 1) {
+            const unsigned mid = lo + (hi - lo) / 2;
+            if ((unsigned)tile_prefix[mid] <= tile) lo = mid;
+            else hi = mid;
+        }
+        const unsigned expert = lo;
+        const unsigned begin = meta[expert], count = meta[E + expert];
+        const unsigned expert_tile = tile_prefix[expert];
+        if (begin >= aligned_rows || count > aligned_rows - begin || expert_tile > tile) continue;
+        const unsigned first = (tile - expert_tile) * ROUTING_TILE;
+        const unsigned end = min(first + ROUTING_TILE, count);
+        const float outer = amax[expert] / *denominator;
+        for (unsigned row0 = first; row0 < end; row0 += ROW_TILES * M) {
+            wmma::fragment<wmma::accumulator, M, N, K, float> acc[ROW_TILES];
+#pragma unroll
+            for (unsigned panel = 0; panel < ROW_TILES; ++panel)
+                wmma::fill_fragment(acc[panel], 0.0f);
+            for (unsigned k0 = 0; k0 < inner; k0 += K) {
+#pragma unroll
+                for (unsigned panel = 0; panel < ROW_TILES; ++panel) {
+                    if (row0 + panel * M >= end) continue;
+                    for (unsigned j = lane; j < M * K; j += 32) {
+                        const unsigned row = row0 + panel * M + j / K, k = k0 + j % K;
+                        const unsigned slot = row < count ? row_partidx[begin + row] : PLOW_EXPERT_UNUSED;
+                        const unsigned input_row = GLU ? slot / topk : slot;
+                        stage.a[panel][j] = slot < slots && k < inner
+                            ? input[(size_t)input_row * inner + k] : __float2bfloat16(0.0f);
+                    }
+                }
+                for (unsigned j = lane; j < N * K; j += 32) {
+                    const unsigned col = col0 + j / K, k = k0 + j % K;
+                    float w = 0.0f;
+                    if (col < cols && k < inner) {
+                        const size_t row = (size_t)expert * cols + col;
+                        const unsigned packed = weight[row * ((inner + 1u) / 2u) + k / 2u];
+                        const unsigned nibble = (packed >> ((k & 1u) * 4u)) & 15u;
+                        w = plow_mxfp4_e2m1(nibble)
+                            * plow_nvfp4_scale(scales[row * ((inner + 15u) / 16u) + k / 16u]);
+                    }
+                    stage.b[j] = __float2bfloat16(w);
+                }
+                __syncwarp();
+                wmma::fragment<wmma::matrix_b, M, N, K, bf16, wmma::col_major> b;
+                wmma::load_matrix_sync(b, stage.b, K);
+#pragma unroll
+                for (unsigned panel = 0; panel < ROW_TILES; ++panel) {
+                    if (row0 + panel * M >= end) continue;
+                    wmma::fragment<wmma::matrix_a, M, N, K, bf16, wmma::row_major> a;
+                    wmma::load_matrix_sync(a, stage.a[panel], K);
+                    wmma::mma_sync(acc[panel], a, b, acc[panel]);
+                }
+                __syncwarp();
+            }
+#pragma unroll
+            for (unsigned panel = 0; panel < ROW_TILES; ++panel) {
+                const unsigned panel_row = row0 + panel * M;
+                if (panel_row >= end) continue;
+                wmma::store_matrix_sync(stage.c, acc[panel], N, wmma::mem_row_major);
+                __syncwarp();
+                if constexpr (GLU) {
+                    const float* gates = reinterpret_cast<const float*>(row_partidx + aligned_rows);
+                    for (unsigned j = lane; j < M * N / 2; j += 32) {
+                        const unsigned row = panel_row + j / (N / 2), col = col0 + 2 * (j % (N / 2));
+                        if (row >= count || col + 1 >= cols) continue;
+                        const unsigned slot = row_partidx[begin + row];
+                        if (slot >= slots) continue;
+                        const float g = stage.c[2 * j] * outer, u = stage.c[2 * j + 1] * outer;
+                        out[(size_t)slot * (cols / 2) + col / 2] =
+                            __float2bfloat16(plow_inkling_swiglu(g, u, gate_cap, up_cap, gates[begin + row]));
+                    }
+                } else {
+                    for (unsigned j = lane; j < M * N; j += 32) {
+                        const unsigned row = panel_row + j / N, col = col0 + j % N;
+                        if (row >= count || col >= cols) continue;
+                        const unsigned slot = row_partidx[begin + row];
+                        if (slot < slots)
+                            out[(size_t)slot * cols + col] = stage.c[j] * outer;
+                    }
+                }
+                __syncwarp();
+            }
+        }
+    }
+    __syncthreads();
+}
+#endif
 
 static __device__ void d_moe_down_mx_pf(
     float* part, const bf16* fu, const uint8_t* W, const uint8_t* S, const int* meta,
     const bf16* bias, const unsigned* row_partidx, const float* row_gate,
-    unsigned H, unsigned I, unsigned E, unsigned slice, unsigned nblk) {
+    unsigned H, unsigned I, unsigned E, unsigned slice, unsigned nblk,
+    unsigned mode = 0) {
+    const float2* s_lut = plow_mxfp4_init_lut(s_moe_mxfp4_lut);
     const unsigned warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
     const unsigned total = E * H, per = (total + nblk - 1u) / nblk;
     const unsigned lo = slice * per, hi = min(lo + per, total);
-    const size_t ldw = (I + 1u) >> 1, lds = (I + 31u) >> 5;
+    const size_t ldw = (mode == 1u) ? (size_t)I : (((size_t)I + 1u) >> 1);
+    const size_t lds = (mode == 2u) ? (((size_t)I + 15u) >> 4) : (((size_t)I + 31u) >> 5);
     for (unsigned idx = lo + warp; idx < hi; idx += nwarp) {
         const unsigned e = idx / H, h = idx - e * H;
         for (unsigned r = (unsigned)meta[e]; r < (unsigned)(meta[e] + meta[E + e]); r++) {
             const unsigned pidx = row_partidx[r];
             if (pidx == PLOW_EXPERT_UNUSED) continue;
-            float v = plow_mxfp4_row_dot_nv(W + ((size_t)e * H + h) * ldw,
+            float v = (mode == 1u)
+                ? plow_mxfp8_row_dot_nv(W + ((size_t)e * H + h) * ldw,
+                                         S + ((size_t)e * H + h) * lds,
+                                         fu + (size_t)r * I, I)
+                : ((mode == 2u)
+                    ? plow_nvfp4_row_dot_nv(W + ((size_t)e * H + h) * ldw,
                                              S + ((size_t)e * H + h) * lds,
-                                             fu + (size_t)r * I, I);
+                                             fu + (size_t)r * I, I, s_lut)
+                    : plow_mxfp4_row_dot_nv(W + ((size_t)e * H + h) * ldw,
+                                             S + ((size_t)e * H + h) * lds,
+                                             fu + (size_t)r * I, I, s_lut));
             if (bias) v += __bfloat162float(bias[(size_t)e * H + h]);
             if ((threadIdx.x & 31u) == 0) part[(size_t)pidx * H + h] = row_gate[r] * v;
         }
     }
+    __syncthreads();
 }
 
 #endif

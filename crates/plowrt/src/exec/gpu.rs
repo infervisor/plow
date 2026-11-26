@@ -1428,6 +1428,270 @@ fn validate_gemv_decode_role_inst(
     Ok(())
 }
 
+fn validate_head_preparation(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let relative = d.i[5] == packet::dev::ROPE_PAIR_RELATIVE_LOGITS;
+        if d.op != DevOp::HeadNormRope as u16 || (!relative && d.i[5] != packet::dev::ROPE_PAIR_L2_CLIP) {
+            continue;
+        }
+        let extent = |slot: usize, bytes: u64| {
+            blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= bytes)
+        };
+        let heads = u64::from(d.i[1]);
+        let rows = u64::from(d.i[0]) * heads;
+        let positive = |bits| {
+            let value = f32::from_bits(bits);
+            value.is_finite() && value > 0.0
+        };
+        let hd = if relative { 16 } else { 128 };
+        let extent_out = if relative { packet::dev::FLASH_RELATIVE_EXTENT } else { hd };
+        let tau = if relative { 4 } else { 3 };
+        if d.i[2] != hd
+            || (relative && d.i[3] != extent_out)
+            || rows == 0
+            || rows > u64::MAX / (u64::from(extent_out) * 2)
+            || !positive(d.fj[0])
+            || !positive(d.i[4])
+            || d.fj[1] != 0
+            || d.fj[2] != 0
+            || (1..=5).any(|slot| d.t[slot] == d.t[0])
+            || !extent(0, rows * u64::from(extent_out) * 2)
+            || !extent(1, rows * u64::from(hd) * 2)
+            || ((relative || d.t[2] != TENSOR_NONE16) && !extent(2, heads * u64::from(hd) * 2))
+            || (relative && !extent(3, u64::from(hd) * u64::from(extent_out) * 2))
+            || (d.t[tau] != TENSOR_NONE16 && (!extent(tau, 8) || !extent(5, u64::from(d.i[0]) * 4)))
+        {
+            return Err(RuntimeError::Rejected("invalid head preparation operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_residual_copies(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::Residual as u16 || d.i[7] != 1 {
+            continue;
+        }
+        let elements = u64::from(d.i[0]);
+        let fits = |slot: usize, block: u32| {
+            elements.checked_mul(u64::from(block) + 1)
+                .and_then(|n| n.checked_mul(2))
+                .is_some_and(|n| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n))
+        };
+        if elements == 0 || d.t[0] == d.t[1] || d.t[2..].iter().any(|&h| h != TENSOR_NONE16)
+            || !fits(0, d.i[1]) || !fits(1, d.i[2])
+        {
+            return Err(RuntimeError::Rejected("invalid BF16 residual block copy".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_residual_message_controllers(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::AttnRes as u16 || !matches!(d.i[7], 2 | 3) {
+            continue;
+        }
+        let pair = d.i[7] == 2;
+        let inputs = if pair { 3 } else { 6 };
+        let rows = u64::from(d.i[0]);
+        let width = u64::from(d.i[1]);
+        let epsilon = f32::from_bits(d.fj[0]);
+        let fits = |slot: usize, count: u64, element_size: u64| {
+            count.checked_mul(width)
+                .and_then(|n| n.checked_mul(element_size))
+                .is_some_and(|n| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n))
+        };
+        if rows == 0 || width == 0 || !epsilon.is_finite() || epsilon <= 0.0
+            || d.t[1..inputs].contains(&d.t[0])
+            || d.t[inputs..].iter().any(|&h| h != TENSOR_NONE16)
+            || !fits(0, rows, if pair { 4 } else { 2 })
+            || !(1..if pair { 3 } else { 5 }).all(|slot| fits(slot, rows, 4))
+            || (!pair && !fits(5, 1, 2))
+        {
+            return Err(RuntimeError::Rejected("invalid residual message controller operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_normalized_residual_mix(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::AttnRes as u16 || d.i[7] != 1 { continue; }
+        let [rows, width, blocks, queries, stride, query_offset, ..] = d.i.map(u64::from);
+        let gamma = d.t[5] != TENSOR_NONE16;
+        let bytes = |slot: usize, factors: &[u64]| {
+            factors.iter().try_fold(1u64, |n, &v| n.checked_mul(v)).is_some_and(|n| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n)
+            })
+        };
+        let valid_eps = |slot| {
+            let eps = f32::from_bits(d.fj[slot]);
+            eps.is_finite() && eps > 0.0
+        };
+        if rows == 0 || width == 0 || blocks > 16 || queries == 0
+            || (blocks != 0 && stride < rows) || !valid_eps(0) || (gamma && !valid_eps(1))
+            || d.t[4] != TENSOR_NONE16 || d.t[6] != TENSOR_NONE16
+            || d.t[1..].contains(&d.t[0])
+            || !bytes(0, &[rows, width, queries, if gamma { 2 } else { 4 }])
+            || !bytes(1, &[rows, width, 2])
+            || (blocks != 0 && !bytes(2, &[blocks, stride, width, 2]))
+            || !bytes(3, &[query_offset + queries, width, 4])
+            || (gamma && !bytes(5, &[queries, width, 2]))
+            || (d.t[7] != TENSOR_NONE16 && !bytes(7, &[rows, width, 2]))
+        {
+            return Err(RuntimeError::Rejected("invalid normalized residual mix operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_attention(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let prefill = d.op == DevOp::FlashPrefill as u16
+            && d.t[6] == d.t[7] && d.t[7] != TENSOR_NONE16;
+        let decode = d.op == DevOp::FlashDecode as u16
+            && d.fj[2] == packet::dev::FLASH_DECODE_RELATIVE;
+        if !prefill && !decode { continue; }
+        let (heads, kv_heads, stride, mask, window, splits) = if prefill {
+            (d.i[2], d.i[3], d.fj[1], d.fj[2], d.i[5], d.i[7])
+        } else {
+            (d.i[1], d.i[2], d.i[3], d.i[7], d.i[4], d.i[5])
+        };
+        let rows = u64::from(d.i[0]);
+        let head_rows = rows * u64::from(heads);
+        let exists = |slot: usize, count: u64, width: u64| {
+            count.checked_mul(width).is_some_and(|n| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n)
+            })
+        };
+        let parts = head_rows.checked_mul(u64::from(splits));
+        let kv_bytes = u64::from(kv_heads).checked_mul(u64::from(stride))
+            .and_then(|n| n.checked_mul(if prefill { 1 } else { rows }));
+        if d.i[6] != 128 || rows == 0 || heads == 0 || kv_heads == 0 || heads % kv_heads != 0
+            || splits == 0 || stride == 0
+            || (mask != u32::MAX && mask >= stride)
+            || window > packet::dev::FLASH_RELATIVE_EXTENT
+            || !f32::from_bits(d.fj[0]).is_finite()
+            || [1, 2, 3, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[0])
+            || [2, 3, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[1])
+            || !parts.is_some_and(|n| exists(0, n, 512) && exists(1, n, 8))
+            || !exists(2, head_rows, 256)
+            || !kv_bytes.is_some_and(|n| exists(3, n, 256) && exists(4, n, 256))
+            || !exists(7, head_rows, 2 * u64::from(packet::dev::FLASH_RELATIVE_EXTENT))
+            || (decode && (!exists(5, rows, 4) || (d.t[6] != TENSOR_NONE16 && !exists(6, rows, 4))))
+            || (prefill && d.t[5] != TENSOR_NONE16)
+        {
+            return Err(RuntimeError::Rejected("invalid relative attention operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_gated_flash_merge(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::FlashMerge as u16
+            || (d.t[4] == TENSOR_NONE16 && d.t[5] == TENSOR_NONE16)
+        {
+            continue;
+        }
+        let rows = u64::from(d.i[0]) * u64::from(d.i[1]);
+        let extent = |slot: usize, count: u64, stride: u64| {
+            count.checked_mul(stride).is_some_and(|need| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= need)
+            })
+        };
+        let partials = rows.checked_mul(u64::from(d.i[2]));
+        if d.i[3] != 128
+            || rows == 0
+            || rows > u64::from(u32::MAX)
+            || d.i[2] == 0
+            || d.t[3] != TENSOR_NONE16
+            || [1, 2, 4, 5].iter().any(|&slot| d.t[slot] == d.t[0])
+            || !extent(0, rows, 256)
+            || !partials.is_some_and(|n| extent(1, n, 512) && extent(2, n, 8))
+            || !extent(4, rows, 256)
+            || !extent(5, rows, 2)
+        {
+            return Err(RuntimeError::Rejected("invalid gated FlashMerge operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_moe_outer_scales(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if !matches!(DevOp::from_u16(d.op), Some(DevOp::MoeGluMx | DevOp::MoeDownMx))
+            || (d.t[6] == TENSOR_NONE16 && d.t[7] == TENSOR_NONE16)
+        {
+            continue;
+        }
+        let size = |slot: usize| blob.tensors.get(d.t[slot] as usize).map(|t| t.bytes);
+        if d.i[7] != 2 || size(6) != Some(u64::from(d.i[3]) * 4) || size(7) != Some(4) {
+            return Err(RuntimeError::Rejected(
+                "invalid NVFP4 MoE outer-scale operands".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_grouped_nvfp4(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let op = DevOp::from_u16(d.op);
+        if !matches!(op, Some(DevOp::MoeAlignPf | DevOp::MoeDownMxPf | DevOp::MoeGluMxPf)) {
+            continue;
+        }
+        let fits = |slot: usize, factors: &[u64]| {
+            factors.iter().try_fold(1u64, |n, &factor| n.checked_mul(factor))
+                .is_some_and(|bytes| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= bytes))
+        };
+        if op == Some(DevOp::MoeAlignPf) {
+            let [rows, experts, topk, aligned_rows, ..] = d.i.map(u64::from);
+            if aligned_rows != 0 && (d.t[3] != d.t[4] || rows == 0 || experts == 0 || topk == 0
+                || rows.saturating_mul(topk).saturating_add(63 * experts) > aligned_rows
+                || !fits(0, &[3 * experts + 1, 4]) || !fits(1, &[rows, topk, 8])
+                || !fits(2, &[aligned_rows, 4]) || !fits(3, &[aligned_rows, 8]))
+            {
+                return Err(RuntimeError::Rejected("invalid grouped NVFP4 alignment operands".into()));
+            }
+            continue;
+        }
+        if d.i[7] != 3 {
+            continue;
+        }
+        if op == Some(DevOp::MoeGluMxPf) {
+            let [inner, hidden, experts, slots, aligned_rows, topk, ..] = d.i.map(u64::from);
+            if inner == 0 || 2 * inner > u64::from(u32::MAX) || hidden == 0
+                || experts == 0 || slots == 0 || aligned_rows < slots || topk == 0
+                || slots % topk != 0
+                || !fits(0, &[slots, inner, 2]) || !fits(1, &[slots / topk, hidden, 2])
+                || !fits(2, &[experts, 2 * inner, hidden.div_ceil(2)])
+                || !fits(3, &[experts, 2 * inner, hidden.div_ceil(16)])
+                || !fits(4, &[3 * experts + 1, 4]) || !fits(5, &[aligned_rows, 8])
+                || !fits(6, &[experts, 4]) || !fits(7, &[4])
+            {
+                return Err(RuntimeError::Rejected("invalid grouped NVFP4 gate/up operands".into()));
+            }
+            continue;
+        }
+        let [hidden, inner, experts, slots, aligned_rows, ..] = d.i.map(u64::from);
+        if hidden == 0 || inner == 0 || experts == 0 || slots == 0 || aligned_rows < slots
+            || !fits(0, &[slots, hidden, 4])
+            || !fits(1, &[slots, inner, 2])
+            || !fits(2, &[experts, hidden, inner.div_ceil(2)])
+            || !fits(3, &[experts, hidden, inner.div_ceil(16)])
+            || !fits(4, &[3 * experts + 1, 4])
+            || !fits(5, &[experts, 4])
+            || !fits(6, &[aligned_rows, 4])
+            || !fits(7, &[4])
+        {
+            return Err(RuntimeError::Rejected("invalid grouped NVFP4 down operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_mxfp4_moe_role_inst(
     d: &DevInst64,
     rows: u32,
@@ -1441,6 +1705,9 @@ fn validate_mxfp4_moe_role_inst(
         || d.i[0] == 0
         || d.i[0] > 16
         || d.i[3] == 0
+        || d.i[7] > 2
+        || d.t[6] != TENSOR_NONE16
+        || d.t[7] != TENSOR_NONE16
     {
         return Err(reject());
     }
@@ -1478,27 +1745,37 @@ fn validate_mxfp4_moe_role_inst(
         {
             let inter = u64::from(d.i[1]);
             let hidden = u64::from(d.i[2]);
+            let (w_row, s_row) = match d.i[7] {
+                1 => (hidden, hidden.div_ceil(32)),
+                2 => (hidden.div_ceil(2), hidden.div_ceil(16)),
+                _ => (hidden.div_ceil(2), hidden.div_ceil(32)),
+            };
             extent(0, checked(&[ksel, inter, 2])?, false)?;
             extent(1, checked(&[hidden, 2])?, false)?;
             extent(
                 3,
-                checked(&[experts, 2 * inter, hidden.div_ceil(2)])?,
+                checked(&[experts, 2 * inter, w_row])?,
                 false,
             )?;
             extent(
                 4,
-                checked(&[experts, 2 * inter, hidden.div_ceil(32)])?,
+                checked(&[experts, 2 * inter, s_row])?,
                 false,
             )?;
             extent(5, checked(&[experts, 2 * inter, 2])?, true)?;
         }
-        Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 => {
+        Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 && d.i[5] == 0 => {
             let hidden = u64::from(d.i[1]);
             let inter = u64::from(d.i[2]);
+            let (w_row, s_row) = match d.i[7] {
+                1 => (inter, inter.div_ceil(32)),
+                2 => (inter.div_ceil(2), inter.div_ceil(16)),
+                _ => (inter.div_ceil(2), inter.div_ceil(32)),
+            };
             extent(0, checked(&[ksel, hidden, 4])?, false)?;
             extent(1, checked(&[ksel, inter, 2])?, false)?;
-            extent(3, checked(&[experts, hidden, inter.div_ceil(2)])?, false)?;
-            extent(4, checked(&[experts, hidden, inter.div_ceil(32)])?, false)?;
+            extent(3, checked(&[experts, hidden, w_row])?, false)?;
+            extent(4, checked(&[experts, hidden, s_row])?, false)?;
             extent(5, checked(&[experts, hidden, 2])?, true)?;
         }
         _ => return Err(reject()),
@@ -2649,6 +2926,46 @@ const INFLIGHT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// The external GDN prefill library has a fixed state layout: every `QwenGdnPrefill` state
 /// operand (`t[6]`) must be a declared recurrent buffer of that stride, with or without a
 /// section, before any launch.
+fn validate_residual_conv(blob: &DevBlob, recurrent: Option<&RecurrentState>) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let op = DevOp::from_u16(d.op);
+        if !matches!(op, Some(DevOp::QwenGdnConv | DevOp::QwenGdnConvPrefill)) || d.i[4] == 0 {
+            continue;
+        }
+        let prefill = op == Some(DevOp::QwenGdnConvPrefill);
+        let channels = u64::from(d.i[0]);
+        let group = u64::from(d.i[4]);
+        let rows = u64::from(d.i[2]);
+        let padded = if prefill { u64::from(d.i[3]) } else { rows };
+        let scale = f32::from_bits(d.fj[0]);
+        let bytes = |slot: usize| blob.tensors.get(d.t[slot] as usize).map(|t| t.bytes);
+        let extent = |slot: usize, cols: u64, count: u64| {
+            cols.checked_mul(count)
+                .and_then(|n| n.checked_mul(2))
+                .is_some_and(|n| bytes(slot).is_some_and(|b| b >= n))
+        };
+        let declared = recurrent.and_then(|state| {
+            state.tensors.iter().find(|&&(h, _)| h == d.t[3] as usize)
+        });
+        if channels == 0 || channels % group != 0 || d.i[1] != 4 || rows == 0 || padded < rows
+            || !scale.is_finite() || scale <= 0.0
+            || d.fj[2] != 0
+            || (d.t[5] != TENSOR_NONE16 && (d.t[7] == TENSOR_NONE16 || !extent(5, channels, rows)))
+            || (1..=7).any(|slot| d.t[slot] == d.t[0])
+            || [1, 2, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[3])
+            || !extent(0, channels, padded) || !extent(1, channels, rows) || !extent(2, channels, 4)
+            || declared.is_none_or(|&(_, stride)| stride != channels * 6)
+            || (!prefill && !extent(3, channels * 3, rows))
+            || (!prefill && d.t[4] != TENSOR_NONE16 && !extent(4, 2, rows))
+            || (d.t[6] != TENSOR_NONE16 && !extent(6, channels / group * 4, rows))
+            || (d.t[7] != TENSOR_NONE16 && !extent(7, channels, rows))
+        {
+            return Err(RuntimeError::Rejected("invalid recurrent residual conv operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn check_gdn_state_operands(
     prefill: &[&crate::asset::devblob::DevProg],
     recurrent: Option<&RecurrentState>,
@@ -4512,6 +4829,14 @@ impl GpuEngine {
                 let image = crate::asset::packet_image::PacketImage::open(&pkt)?;
                 image.blob.check_l2_dispatch(false)?;
                 let blob = image.blob.clone();
+                validate_moe_outer_scales(&blob)?;
+                validate_grouped_nvfp4(&blob)?;
+                validate_gated_flash_merge(&blob)?;
+                validate_head_preparation(&blob)?;
+                validate_relative_attention(&blob)?;
+                validate_normalized_residual_mix(&blob)?;
+                validate_residual_copies(&blob)?;
+                validate_residual_message_controllers(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {
@@ -5039,6 +5364,7 @@ impl GpuEngine {
             }
         }
         check_gdn_state_operands(&blob.prefill_progs(), recurrent.as_ref())?;
+        validate_residual_conv(&blob, recurrent.as_ref())?;
         let unsupported_hd128_fp8_kv = blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
             (inst.op == DevOp::HeadNormRopeFp8 as u16 && inst.i[2] == 128)
                 || (matches!(

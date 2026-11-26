@@ -11,6 +11,14 @@ struct Facts {
     /// Runs the FP8 opcode family.
     fp8_arms: bool,
     gdn: bool,
+    relative: bool,
+    normalized_residual_mix: bool,
+    residual_copy: bool,
+    nvfp4_grouped_down: bool,
+    nvfp4_grouped_glu: bool,
+    residual_message_controller: bool,
+    residual_mix_query_offset: bool,
+    conv_residual_operand: bool,
     /// Runs a GDN conv or gated norm over a row-pitched source.
     gdn_pitched: bool,
     /// Runs the full-tile FP8 GEMM, the opcode the route-specific arms serve.
@@ -22,6 +30,14 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
     let mut f = Facts {
         fp8_arms: false,
         gdn: false,
+        relative: false,
+        normalized_residual_mix: false,
+        residual_copy: false,
+        nvfp4_grouped_down: false,
+        nvfp4_grouped_glu: false,
+        residual_message_controller: false,
+        residual_mix_query_offset: false,
+        conv_residual_operand: false,
         gdn_pitched: false,
         fp8_gemm: false,
         rows: 0,
@@ -31,6 +47,19 @@ fn facts<'a>(m: &Model, programs: impl Iterator<Item = &'a usize>) -> Facts {
         for inst in &m.progs[index].insts {
             f.fp8_arms |= req::fp8_arm_op(inst.op);
             f.gdn |= req::gdn_op(inst.op);
+            f.normalized_residual_mix |= inst.op == DevOp::AttnRes as u16 && inst.i[7] == 1;
+            f.conv_residual_operand |= matches!(DevOp::from_u16(inst.op),
+                Some(DevOp::QwenGdnConv | DevOp::QwenGdnConvPrefill))
+                && inst.i[4] != 0 && inst.t[5] != packet::TENSOR_NONE;
+            f.residual_mix_query_offset |= inst.op == DevOp::AttnRes as u16 && inst.i[7] == 1 && inst.i[5] != 0;
+            f.residual_message_controller |= inst.op == DevOp::AttnRes as u16 && matches!(inst.i[7], 2 | 3);
+            f.nvfp4_grouped_down |= inst.op == DevOp::MoeDownMxPf as u16 && inst.i[7] == 3;
+            f.nvfp4_grouped_glu |= inst.op == DevOp::MoeGluMxPf as u16 && inst.i[7] == 3;
+            f.residual_copy |= inst.op == DevOp::Residual as u16 && inst.i[7] == 1;
+            f.relative |= (inst.op == DevOp::FlashDecode as u16
+                && inst.j[1] == packet::dev::FLASH_DECODE_RELATIVE)
+                || (inst.op == DevOp::FlashPrefill as u16
+                    && inst.t[6] == inst.t[7] && inst.t[7] != packet::TENSOR_NONE);
             f.gdn_pitched |= inst.j[1] != 0
                 && [
                     DevOp::QwenGdnConv,
@@ -74,8 +103,28 @@ pub(crate) const W8A8_VLLM_PREFILL_ROWS: [u32; 4] = [128, 1024, 4096, 8192];
 fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requirement> {
     let f = facts(m, programs.iter());
     let mut out = Vec::new();
+    if f.relative { out.push(Requirement::new(req::RELATIVE_ATTENTION_ABI, 1)); }
+    if f.normalized_residual_mix { out.push(Requirement::new(req::NORMALIZED_RESIDUAL_MIX_ABI, 1)); }
     if f.gdn {
         out.push(Requirement::new(req::GDN_PREFILL_ABI, 1));
+    }
+    if f.residual_message_controller {
+        out.push(Requirement::new(req::RESIDUAL_MESSAGE_CONTROLLER_ABI, 1));
+    }
+    if f.nvfp4_grouped_down {
+        out.push(Requirement::new(req::NVFP4_GROUPED_DOWN_ABI, 1));
+    }
+    if f.nvfp4_grouped_glu {
+        out.push(Requirement::new(req::NVFP4_GROUPED_GLU_ABI, 1));
+    }
+    if f.residual_copy {
+        out.push(Requirement::new(req::RESIDUAL_COPY_ABI, 1));
+    }
+    if f.residual_mix_query_offset {
+        out.push(Requirement::new(req::RESIDUAL_MIX_QUERY_OFFSET_ABI, 1));
+    }
+    if f.conv_residual_operand {
+        out.push(Requirement::new(req::CONV_RESIDUAL_OPERAND_ABI, 1));
     }
     if f.gdn_pitched {
         out.push(Requirement::new(req::GDN_PITCHED_ABI, 1));
@@ -99,6 +148,20 @@ fn prefill_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requireme
 fn decode_list(m: &Model, programs: &[usize], routes: &Routes) -> Vec<Requirement> {
     let f = facts(m, programs.iter());
     let mut out = Vec::new();
+    if f.relative { out.push(Requirement::new(req::RELATIVE_ATTENTION_ABI, 1)); }
+    if f.normalized_residual_mix { out.push(Requirement::new(req::NORMALIZED_RESIDUAL_MIX_ABI, 1)); }
+    if f.residual_message_controller {
+        out.push(Requirement::new(req::RESIDUAL_MESSAGE_CONTROLLER_ABI, 1));
+    }
+    if f.residual_copy {
+        out.push(Requirement::new(req::RESIDUAL_COPY_ABI, 1));
+    }
+    if f.residual_mix_query_offset {
+        out.push(Requirement::new(req::RESIDUAL_MIX_QUERY_OFFSET_ABI, 1));
+    }
+    if f.conv_residual_operand {
+        out.push(Requirement::new(req::CONV_RESIDUAL_OPERAND_ABI, 1));
+    }
     if f.gdn_pitched {
         out.push(Requirement::new(req::GDN_PITCHED_ABI, 1));
     }
@@ -243,6 +306,21 @@ mod tests {
         append(&m, &mut sections).unwrap();
         assert_eq!(sections.len(), 1);
         assert!(append(&m, &mut sections).unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn grouped_nvfp4_requires_the_matching_hopper_prefill_arm() {
+        for (op, symbol) in [
+            (DevOp::MoeDownMxPf, req::NVFP4_GROUPED_DOWN_ABI),
+            (DevOp::MoeGluMxPf, req::NVFP4_GROUPED_GLU_ABI),
+        ] {
+            let mut m = model(&[op], &[DevOp::MoeDownMx], &[1, 4]);
+            assert!(manifest(&m, None).prefill.is_empty());
+            m.progs[0].insts[0].i[7] = 3;
+            let requirements = manifest(&m, None);
+            assert_eq!(requirements.prefill, vec![Requirement::new(symbol, 1)]);
+            assert!(requirements.decode.is_empty());
+        }
     }
 
     #[test]

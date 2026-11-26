@@ -245,7 +245,12 @@ mod cuda {
                 });
                 std::fs::write(&out, serde_json::to_vec_pretty(&doc)?)?;
                 println!("wrote {}", out.display());
-                if let Some(profile) = e.trace_summary()? {
+                let profile = if verb == "prefill-bench" {
+                    e.trace_summary_pf()?
+                } else {
+                    e.trace_summary()?
+                };
+                if let Some(profile) = profile {
                     println!("{profile}");
                 }
                 Ok(())

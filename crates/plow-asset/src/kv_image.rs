@@ -273,7 +273,8 @@ fn readers(packet: &Packet<'_>, pair: [u16; 2]) -> Result<Vec<u32>> {
             {
                 continue;
             }
-            if op == Some(DevOp::FlashDecode) && d.t[7] != TENSOR_NONE16 {
+            if op == Some(DevOp::FlashDecode) && d.t[7] != TENSOR_NONE16
+                && d.fj[2] != packet::dev::FLASH_DECODE_RELATIVE {
                 return Err("its decode writes rows inside the attention (folded writer)".into());
             }
             let q = p.insts[..pc]

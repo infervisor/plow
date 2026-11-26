@@ -513,6 +513,20 @@ const GQA2_WIDE_QUALIFIED: Status = Status::Qualified {
     ],
 };
 
+const INKLING_HOPPER: F = F::And(&[
+    F::Target(T::Cap("inkling")),
+    F::Target(T::Arch("sm_90a")),
+    F::Target(T::Tp(1)),
+]);
+
+const INKLING_HOPPER_ON: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: INKLING_HOPPER,
+        value: TRUE,
+    }],
+    otherwise: FALSE,
+};
+
 /// `apply_production_defaults` forces the arms that read the local cache directly off under
 /// `--dcp > 1`: they bypass the owner gather.
 const GLM_DCP_SHARDED: F = F::And(&[GLM_TARGET, F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1))]);
@@ -1173,6 +1187,15 @@ pub const TARGETS: &[TargetSpec] = &[
         caps: &[],
         recipe: &[],
     },
+    TargetSpec {
+        name: "inkling_sm90a_tp1",
+        arch: "sm_90a",
+        tp: 1,
+        n_cu: 132,
+        model: "inkling2_loop",
+        caps: &["inkling", "decode_ladder"],
+        recipe: &[],
+    },
 ];
 
 #[rustfmt::skip]
@@ -1230,6 +1253,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.fuse_merge", Some("PLOW_FUSE_MERGE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_fold_wide", Some("PLOW_NV_FA_FOLD_WIDE"), Layer::Emit, Domain::Bool, NV_FA_FOLD_WIDE_DEFAULT, PROMOTED),
     KnobSpec::new("emit.nv_fa_fold", Some("PLOW_NV_FA_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.nv_moe_combine_fold", Some("PLOW_NV_MOE_COMBINE_FOLD"), Layer::Emit, Domain::Bool, INKLING_HOPPER_ON, PROMOTED),
+    KnobSpec::new("emit.nv_moe_router_fold", Some("PLOW_NV_MOE_ROUTER_FOLD"), Layer::Emit, Domain::Bool, INKLING_HOPPER_ON, PROMOTED),
     KnobSpec::new("emit.nv_dense_tune", Some("PLOW_NV_DENSE_TUNE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_gemv_rem_split", Some("PLOW_NV_GEMV_REM_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.packed_prefill_small_hd", Some("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -2337,6 +2362,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_MINBLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MLA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MOE_COMMON", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_MXFP4_MOE_SMEM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MXFP4_MOE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MXFP4_PROJ", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_ENTRY_TRACE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
