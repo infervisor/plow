@@ -59,6 +59,7 @@ use tunedb::{Digests, TuneStore};
 pub mod demand;
 pub mod gemm;
 pub mod ingest;
+pub mod manifest;
 pub mod status;
 
 /// What the user asked `tune` to do.
@@ -80,6 +81,9 @@ pub enum TuneAction {
     Regress {
         threshold: f64,
     },
+    /// Build a canonical [`tunedb::TuneManifest`] from any model and check/report
+    /// store coverage against `opts.db`.
+    Manifest(manifest::ManifestRequest),
     /// Derive the compiler's dense-GEMM demand and print it.
     Shapes(demand::EmitSpec),
     /// Measure a campaign over those shapes and publish it.
@@ -126,6 +130,7 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
     // The campaign actions print the PROBED build digest themselves, so they are dispatched
     // before the generic target header (which would otherwise print twice).
     match &opts.action {
+        TuneAction::Manifest(req) => return manifest::run(opts, spec, &hw, req),
         TuneAction::Gemm(c) => return gemm::run(&opts.root, c, hw.isa, &cell),
         TuneAction::Ingest {
             samples,
@@ -206,7 +211,8 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
         }
         TuneAction::Shapes(spec) => shapes(spec)?,
         // Handled above, before the target header.
-        TuneAction::Gemm(_)
+        TuneAction::Manifest(_)
+        | TuneAction::Gemm(_)
         | TuneAction::Ingest { .. }
         | TuneAction::Best { .. }
         | TuneAction::Regress { .. } => {

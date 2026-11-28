@@ -5152,6 +5152,7 @@ version = "0.1.3"
 dependencies = [
  "hwspec",
  "kernelcaps",
+ "nn-graph",
  "packet",
  "plow-asset",
  "serde",
