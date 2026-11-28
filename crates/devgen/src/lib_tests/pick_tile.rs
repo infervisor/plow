@@ -557,6 +557,40 @@ fn llama31_8b_prefill_8k_kv_already_half_full() {
 }
 
 #[test]
+fn glu_fusion_gate_ignores_wide_and_c5_single_gemm_winners() {
+    // Where the 5-rung single-GEMM picker switches to GemmWide (128x256) or GemmC5 (192x256),
+    // testing `pick_tile(..) == DevOp::Gemm` would unfuse the 256x256 GemmGlu epilogue into
+    // two separate GEMMs + Glu. `gfx950_glu_fusion_wins` ranks over the 3-rung GLU-era
+    // inventory (`[Gemm, GemmMed, GemmSmall]`) and keeps the fused path whenever 256x256 beats
+    // 128x128 and 64x128.
+    for (m, n, k, label) in [
+        (
+            1024u32,
+            8192u32,
+            5376u32,
+            "1024x8192x5376 (GemmWide single-GEMM)",
+        ),
+        (
+            2048,
+            21504,
+            5376,
+            "2048x21504x5376 (GemmC5 measured winner)",
+        ),
+        (4096, 14336, 4096, "4096x14336x4096 (LLaMA-3 8B gate/up)"),
+    ] {
+        assert_eq!(
+            pt_legacy_rungs(m, n, k, N_CU),
+            DevOp::Gemm,
+            "{label}: 256x256 must win over 128x128 and 64x128"
+        );
+        assert!(
+            super::gfx950_glu_fusion_wins(m, n, k, N_CU),
+            "{label}: GemmGlu fusion must stay enabled"
+        );
+    }
+}
+
+#[test]
 fn qwen3_4b_prefill_4k() {
     // hidden 2560, inter 9728, heads 32, kv_heads 8, hd 128.
     assert_eq!(pt(4096, 4096, 2560), DevOp::Gemm, "q_proj");

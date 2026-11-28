@@ -21,7 +21,9 @@ use crate::attention::AttentionMeasurement;
 use crate::decode::{rank_by_cell, CellRanking, DecodeMeasurement};
 use crate::moe_decode::MoeDecodeMeasurement;
 use crate::object::{rank_by_cell as rank_objects_by_cell, ObjectMeasurement, ObjectRanking};
-use crate::record::{Correctness, Digests, KernelMeasurement, RecordState};
+use crate::record::{
+    blockers_for, BlockMeasurement, Correctness, Digests, KernelMeasurement, RecordState, Selection,
+};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -619,6 +621,129 @@ impl TuneStore {
         }
         Ok((best, stale))
     }
+
+    fn block_measurement_path(&self, hardware: &str) -> PathBuf {
+        self.root.join(hardware).join("block_measurement.jsonl")
+    }
+
+    fn selection_path(&self, hardware: &str) -> PathBuf {
+        self.root.join(hardware).join("selection.jsonl")
+    }
+
+    fn load_jsonl<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<T>, StoreError> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for line in BufReader::new(File::open(path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push(serde_json::from_str(&line)?);
+        }
+        Ok(out)
+    }
+
+    /// All whole-block measurements recorded for `hardware`.
+    pub fn load_block_measurements(
+        &self,
+        hardware: &str,
+    ) -> Result<Vec<BlockMeasurement>, StoreError> {
+        self.load_jsonl(&self.block_measurement_path(hardware))
+    }
+
+    /// Publish whole-block measurements for `hardware`. Checks sample
+    /// sufficiency (`MIN_SAMPLES`) and hardware ownership before appending.
+    pub fn publish_block_measurements(
+        &self,
+        hardware: &str,
+        records: Vec<BlockMeasurement>,
+    ) -> Result<usize, StoreError> {
+        for r in &records {
+            let mut blockers = blockers_for(&Correctness::Pass, r.stats.samples);
+            if r.hardware != hardware {
+                blockers.push(format!(
+                    "hardware mismatch: record {:?}, store {:?}",
+                    r.hardware, hardware
+                ));
+            }
+            if !blockers.is_empty() {
+                return Err(StoreError::NotQualifiable {
+                    kernel: r.block.clone(),
+                    blockers,
+                });
+            }
+        }
+        let n = records.len();
+        self.append_jsonl(&self.block_measurement_path(hardware), &records)?;
+        Ok(n)
+    }
+
+    /// All kernel selection decisions recorded for `hardware`.
+    pub fn load_selections(&self, hardware: &str) -> Result<Vec<Selection>, StoreError> {
+        self.load_jsonl(&self.selection_path(hardware))
+    }
+
+    /// Publish kernel [`Selection`] decisions for `hardware`.
+    pub fn publish_selections(
+        &self,
+        hardware: &str,
+        records: Vec<Selection>,
+    ) -> Result<usize, StoreError> {
+        for r in &records {
+            if r.hardware != hardware {
+                return Err(StoreError::NotQualifiable {
+                    kernel: r.op_case.clone(),
+                    blockers: vec![format!(
+                        "hardware mismatch: record {:?}, store {:?}",
+                        r.hardware, hardware
+                    )],
+                });
+            }
+        }
+        let n = records.len();
+        self.append_jsonl(&self.selection_path(hardware), &records)?;
+        Ok(n)
+    }
+
+    /// Best qualified, non-stale [`BlockMeasurement`] per canonical block hash.
+    pub fn best_blocks_for(
+        &self,
+        hardware: &str,
+        want: &Digests,
+    ) -> Result<(BTreeMap<String, BlockMeasurement>, Vec<StaleNote>), StoreError> {
+        let mut best: BTreeMap<String, BlockMeasurement> = BTreeMap::new();
+        let mut stale = Vec::new();
+
+        for rec in self.load_block_measurements(hardware)? {
+            if !rec.state.is_selectable()
+                || !blockers_for(&Correctness::Pass, rec.stats.samples).is_empty()
+                || rec.hardware != hardware
+            {
+                continue;
+            }
+            let changed = rec.digests.stale_against(want);
+            if !changed.is_empty() {
+                stale.push(StaleNote {
+                    op_case: rec.block.clone(),
+                    kernel_name: rec.profile.clone(),
+                    changed: changed.iter().map(|s| s.to_string()).collect(),
+                });
+                continue;
+            }
+            match best.get(&rec.block) {
+                Some(cur) if !rec.stats.beats(&cur.stats) => {}
+                _ => {
+                    best.insert(rec.block.clone(), rec);
+                }
+            }
+        }
+        Ok((best, stale))
+    }
 }
 
 /// A record that exists but cannot be used, and why.
@@ -1135,6 +1260,71 @@ mod tests {
         assert!(best.is_empty());
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].changed, vec!["interpreter"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn block_measurement_and_selection_roundtrip_with_validation_and_staleness() {
+        let dir = tmpdir("blocks");
+        let s = TuneStore::new(&dir);
+
+        let good_blk = BlockMeasurement {
+            block: "blk-0001".into(),
+            hardware: HW.into(),
+            profile: "prefill_dense".into(),
+            digests: digests(),
+            stats: Stats::from_samples(vec![500.0; 5]).unwrap(),
+            kernels: vec![1, 2],
+            peak_bytes: Some(4096),
+            state: RecordState::Qualified,
+            campaign: "c1".into(),
+        };
+        let faster_blk = BlockMeasurement {
+            stats: Stats::from_samples(vec![300.0; 5]).unwrap(),
+            kernels: vec![3, 4],
+            ..good_blk.clone()
+        };
+        let bad_hw = BlockMeasurement {
+            hardware: "amd/gfx950/mi350x".into(),
+            ..good_blk.clone()
+        };
+
+        assert!(matches!(
+            s.publish_block_measurements(HW, vec![bad_hw]),
+            Err(StoreError::NotQualifiable { .. })
+        ));
+        assert_eq!(
+            s.publish_block_measurements(HW, vec![good_blk, faster_blk])
+                .unwrap(),
+            2
+        );
+
+        let (best, stale) = s.best_blocks_for(HW, &digests()).unwrap();
+        assert!(stale.is_empty());
+        assert_eq!(best["blk-0001"].kernels, vec![3, 4]);
+
+        let mut moved = digests();
+        moved.oracle = "gemm-v2".into();
+        let (best, stale) = s.best_blocks_for(HW, &moved).unwrap();
+        assert!(best.is_empty());
+        assert_eq!(stale.len(), 2);
+        assert_eq!(stale[0].changed, vec!["oracle"]);
+
+        let sel = Selection {
+            op_case: "op-abc".into(),
+            hardware: HW.into(),
+            profile: "prefill_dense".into(),
+            objective: "min_median_ns".into(),
+            kernel_id: 11,
+            kernel_name: "FAST".into(),
+            fallbacks: vec![12],
+            tier: "measured".into(),
+            digests: digests(),
+            campaign: "c1".into(),
+        };
+        assert_eq!(s.publish_selections(HW, vec![sel.clone()]).unwrap(), 1);
+        assert_eq!(s.load_selections(HW).unwrap(), vec![sel]);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

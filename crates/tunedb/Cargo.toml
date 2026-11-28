@@ -21,3 +21,12 @@ packet.workspace = true
 plow-asset.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+nn-graph = { workspace = true, features = ["models"], optional = true }
+
+[features]
+default = ["models"]
+models = ["dep:nn-graph"]
+
+[[bin]]
+name = "tunedb-manifest"
+required-features = ["models"]

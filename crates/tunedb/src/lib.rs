@@ -30,6 +30,7 @@ pub mod attention_role;
 pub mod decode;
 pub mod gemm;
 pub mod gemv;
+pub mod manifest;
 pub mod moe_decode;
 pub mod object;
 pub mod projection;
@@ -54,6 +55,14 @@ pub use attention_role::{
 pub use decode::{
     rank_by_cell, CellRanking, CtxBucket, DecodeCell, DecodeKnobs, DecodeMeasurement,
 };
+pub use manifest::{
+    block_definition_hash, check_strict, format_report, infer_digests_for_cell, op_case_hash,
+    store_op_case_key, BlockCoverage, BlockOpCount, CoverageState, ManifestBlock, ManifestCoverage,
+    ManifestOpCase, NetworkBlock, NetworkBlockDefinition, NetworkOp, OpResolution, TuneManifest,
+    MANIFEST_VERSION,
+};
+#[cfg(feature = "models")]
+pub use manifest::{from_config_json, from_graph};
 pub use moe_decode::{
     select_moe_decode_route, MoeDecodeCell, MoeDecodeMeasurement, MoeDecodeRoute,
     MoeDecodeSelection, MoeDecodeSource, GFX950_SEGMENT_HANDOFF_NS, MIN_GAIN_FRACTION,

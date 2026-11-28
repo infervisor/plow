@@ -602,7 +602,7 @@ struct StagePlanCli {
 /// states it, instead of being re-declared here where it could drift.
 #[derive(Args, Debug)]
 struct TuneCli {
-    /// inventory | select | status | shapes | gemm | ingest | best | regress
+    /// inventory | select | status | manifest | shapes | gemm | ingest | best | regress
     #[arg(value_name = "ACTION")]
     action: Option<String>,
 
@@ -676,6 +676,23 @@ struct TuneCli {
     /// digests. `gemm_c4` regressed ~0.30 and nothing reported it.
     #[arg(long, default_value_t = 0.10, value_name = "FRACTION")]
     threshold: f64,
+
+    /// `manifest`: direct path to a HuggingFace `config.json` (alternative to top-level
+    /// `--hf-dir`, `--model`, or `--net`).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// `manifest`: print the resolved `TuneManifest` as pretty JSON.
+    #[arg(long)]
+    json: bool,
+
+    /// `manifest`: write the resolved `TuneManifest` JSON to FILE.
+    #[arg(long, value_name = "FILE")]
+    out_manifest: Option<PathBuf>,
+
+    /// `manifest`: exit non-zero if any op case is missing, stale, or provisional.
+    #[arg(long)]
+    strict: bool,
 }
 
 /// `plowc knob-scope`.
@@ -2865,6 +2882,38 @@ fn run_tune(t: &TuneCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         "regress" => TuneAction::Regress {
             threshold: t.threshold,
         },
+        "manifest" => {
+            let source = if let Some(cfg) = &t.config {
+                tune::manifest::ManifestSource::ConfigJson(cfg.clone())
+            } else if let Some(dir) = &cli.hf_dir {
+                tune::manifest::ManifestSource::HfDir(dir.clone())
+            } else if let Some(model) = &cli.model {
+                tune::manifest::ManifestSource::HubModel(model.clone())
+            } else if let Some(net) = &cli.net {
+                tune::manifest::ManifestSource::NetJson(net.clone())
+            } else {
+                return Err(
+                    "`tune manifest` needs a model source: pass `--config <config.json>`, \
+                     or top-level `--hf-dir <dir>`, `--model <id>`, or `--net <file>`"
+                        .into(),
+                );
+            };
+            let (batches, seqs) = if let Some(preset) = cli.preset {
+                (preset.batches(), preset.seqs())
+            } else {
+                (cli.batch.clone(), cli.seq.clone())
+            };
+            TuneAction::Manifest(tune::manifest::ManifestRequest {
+                source,
+                batches,
+                seqs,
+                phases: cli.phase.phases(),
+                image_size: 1024,
+                strict: t.strict,
+                json: t.json,
+                out: t.out_manifest.clone(),
+            })
+        }
         "shapes" => TuneAction::Shapes(emit_spec("`tune shapes`")?),
         "best" => TuneAction::Best {
             quant: t.quant.clone(),
@@ -2901,7 +2950,7 @@ fn run_tune(t: &TuneCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         other => {
             return Err(format!(
                 "unknown tune action {other:?}; expected one of: \
-                 inventory, select, status, regress, shapes, gemm, ingest, best"
+                 inventory, select, status, manifest, regress, shapes, gemm, ingest, best"
             )
             .into())
         }
