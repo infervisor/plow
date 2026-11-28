@@ -229,6 +229,19 @@ PASS_CONFIGS_KEYS = ("TL_DISABLE_TMA_LOWER", "TL_DISABLE_WARP_SPECIALIZED")
 def tilelang_compile(func, extra=()):
     import tilelang
     cfg = {getattr(tilelang.PassConfigKey, k): True for k in (*PASS_CONFIGS_KEYS, *extra)}
+    cuda_home = os.environ.get("CUDA_HOME", "/nix/store/p49i1vrhcaw5nf2r3bwgmwfz5x8zgb14-cuda-merged-12.9")
+    flags = [
+        f"-I{cuda_home}/include",
+        "-D_NV_TARGET_BOOL_NV_IS_DEVICE=1",
+        "-allow-unsupported-compiler",
+    ]
+    cxx = os.environ.get("CXX")
+    if not cxx or cxx == "g++":
+        if os.path.exists("/usr/bin/g++-14"):
+            cxx = "/usr/bin/g++-14"
+    if cxx:
+        flags.append(f"-ccbin={cxx}")
+    cfg[tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS] = flags
     return tilelang.compile(func, target={"kind": "cuda", "arch": "sm_90a"}, pass_configs=cfg)
 
 
@@ -311,10 +324,17 @@ def nvcc_compile(name, header, out):
         hpath = Path(tmp) / f"{name}_body.cuh"
         hpath.write_text(header)
         cmd = [nvcc, "-std=c++20", "-arch=sm_90a", "-O3", "-cubin", "-w", "-Xcudafe",
-               "--diag_suppress=177", "-Xptxas=-v", f"-I{env.TILELANG_TEMPLATE_PATH}",
+               "--diag_suppress=177", "-Xptxas=-v", "-D_NV_TARGET_BOOL_NV_IS_DEVICE=1",
+               f"-I{env.TILELANG_TEMPLATE_PATH}",
                f"-I{env.CUTLASS_INCLUDE_DIR}", f"-I{REPO / 'runtime/common'}",
                f"-I{REPO / 'runtime/nvidia'}", f'-DPLOW_GEN_BODY="{hpath}"',
                *ENTRIES[name].get("defines", ()), "-o", str(out), str(wrapper)]
+        cxx = os.environ.get("CXX")
+        if not cxx or cxx == "g++":
+            if os.path.exists("/usr/bin/g++-14"):
+                cxx = "/usr/bin/g++-14"
+        if cxx:
+            cmd.insert(1, f"-ccbin={cxx}")
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode:
             sys.exit(f"nvcc failed for {name}:\n{res.stderr[-4000:]}")

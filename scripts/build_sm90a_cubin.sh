@@ -129,7 +129,7 @@ GEMMA_GATE="-DPLOW_NV_MLA=0 -DPLOW_NV_MAMBA=0 -DPLOW_NV_DSA=0"
 # wins instead. That inversion is why these belong in the tuner (tuning/README-decode-tuner.md)
 # rather than as one hand-set constant -- GV_MOE_UN and PLOW_NS_ABS both went stale mid-campaign
 # exactly this way.
-GEMV_RB="-DPLOW_NV_GEMV_RB=1 -DPLOW_NV_RB_GEMV=1 -DPLOW_NV_RB_QKV=1 -DPLOW_NV_RB_LMHEAD=1 -DPLOW_NV_GEMV_XREG=1 -DPLOW_NV_GEMV_KPANEL=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4 -DPLOW_NV_GEMV_MMA=1 -DGV_MM_MAX=16 -DPLOW_NV_GEMV_MMA_UNB=12 -DGV_UNROLL_GLU=10 -DPLOW_NV_PTXSYNC=3 -DPLOW_NV_GEMV_NOSTAGE=1 -DPLOW_NV_FA_KUN=4"
+GEMV_RB="-DPLOW_NV_GEMV_RB=1 -DPLOW_NV_RB_GEMV=1 -DPLOW_NV_RB_QKV=1 -DPLOW_NV_RB_LMHEAD=1 -DPLOW_NV_GEMV_XREG=1 -DPLOW_NV_GEMV_KPANEL=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4 -DPLOW_NV_GEMV_MMA=1 -DGV_MM_MAX=32 -DPLOW_NV_GEMV_MMA_UNB=12 -DGV_UNROLL_GLU=10 -DPLOW_NV_PTXSYNC=3 -DPLOW_NV_GEMV_NOSTAGE=1 -DPLOW_NV_FA_KUN=4 -DPLOW_NV_W8A8=1 -DPLOW_NV_LIGHT_FP8_ATTN=1"
 
 # TUNER HOOK. scripts/tune_decode_sweep.sh appends knob overrides here
 # (-DPLOW_NV_FORCE_MINBLK=2 -DGV_UNROLL=4 …) so the sweep builds the SHIPPED
@@ -155,8 +155,16 @@ if [ -n "${PLOW_CUBIN_CONFIG:-}" ]; then
   DECODE_EXTRA="$DECODE_EXTRA $CONFIG_FLAGS -DPLOW_BUCKET_DECODE=1"
   PREFILL_EXTRA="$PREFILL_EXTRA $CONFIG_FLAGS -DPLOW_BUCKET_DECODE=0"
   FLASH_EXTRA="$FLASH_EXTRA $CONFIG_FLAGS -DPLOW_BUCKET_FLASH=1"
-  if grep -qx '#define PLOW_HAS_FLASH_HD64 1' "$PLOW_CUBIN_CONFIG"; then
+  if grep -qx '#define PLOW_NV_GEMMA 0' "$PLOW_CUBIN_CONFIG" || grep -qx '#define PLOW_HAS_FLASH_HD64 1' "$PLOW_CUBIN_CONFIG"; then
     PACKET_GEOMETRY="-DPLOW_NV_GEMMA=0"
+  else
+    PACKET_GEOMETRY="-DPLOW_NV_GEMMA=1"
+  fi
+  if grep -q '^#define PLOW_NV_FA_GF ' "$PLOW_CUBIN_CONFIG"; then
+    gf_val=$(grep '^#define PLOW_NV_FA_GF ' "$PLOW_CUBIN_CONFIG" | awk '{print $3}')
+    PACKET_GEOMETRY="$PACKET_GEOMETRY -DPLOW_NV_FA_GF=$gf_val"
+  elif [ "$PACKET_GEOMETRY" = "-DPLOW_NV_GEMMA=1" ]; then
+    PACKET_GEOMETRY="$PACKET_GEOMETRY -DPLOW_NV_FA_GF=2"
   fi
 fi
 
@@ -422,6 +430,17 @@ if [ -n "${PLOW_CUBIN_CONFIG:-}" ] &&
 fi
 
 if [ "${PLOW_BUILD_DECODE_ONLY:-0}" = "1" ]; then
+  if [ "${PLOW_BUILD_FP8KV:-0}" = "1" ]; then
+    OUT_KV="${OUT%.cubin}_fp8kv.cubin"
+    "${NVENV[@]}" \
+      "$NVCC" -arch=sm_90a -O3 -cubin \
+      -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+      -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $DECODE_EXTRA \
+      -o "$OUT_KV" "$SRC"
+    "${NVENV[@]}" \
+      cuobjdump -symbols "$OUT_KV" | grep -q "$KSYM" || { echo "FATAL: $KSYM missing in $OUT_KV" >&2; exit 1; }
+    echo "built $OUT_KV ($(stat -c%s "$OUT_KV") B), kernel $KSYM present"
+  fi
   exit 0
 fi
 

@@ -238,13 +238,13 @@ mod tests {
     use crate::dist::Digest;
 
     fn tmp() -> std::path::PathBuf {
+        // A counter, not the clock: two tests starting in the same clock tick shared a directory
+        // and one removed it under the other.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let p = std::env::temp_dir().join(format!(
             "plow-fetch-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(p.join("v1/blobs/sha256")).unwrap();
         p

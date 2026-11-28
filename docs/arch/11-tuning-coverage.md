@@ -247,3 +247,22 @@ prefill routing is heavily skewed. In a 4096-row window the hottest expert takes
 32,768 slots, so prefill grouped GEMMs reach only ~430 TFLOPS. A load-balanced split of the hot
 expert, not a different GEMM library, is the remaining prefill lever. Harness, cubins, histograms
 and CSVs: /opt/dlami/nvme/lava-tts/dg-moe.
+
+---
+
+## Unified BlockContract & Empirical Roofline Certification
+
+Tuning qualifications are governed by formal analytical contracts rather than ad-hoc heuristics:
+
+1. **`BlockContract` (`crates/costmodel/src/contract.rs`):**
+   - Defines theoretical FLOPs, memory transfer bytes, and arithmetic intensity $I = \frac{\text{FLOPs}}{\text{Bytes}}$ per block.
+   - Categorizes each operation into `BoundCategory::MemoryBound` (Decode GEMV, linear attention scan) vs `BoundCategory::ComputeBound` (Prefill GEMM, MoE grouped dense).
+   - Computes hardware-calibrated ridge points $I_{\text{ridge}} = \frac{\text{Peak FLOPs}}{\text{Bandwidth}}$.
+
+2. **Qualification Thresholds (`crates/kernelcaps/src/contract.rs` & `tunedb::record`):**
+   - **Memory-bound operations:** Require $\ge 80\%$ of theoretical empirical roofline efficiency ($\text{floor\_us} / \text{measured\_us} \ge 0.80$).
+   - **Compute-bound operations:** Require $\ge 75\%$ of theoretical empirical roofline efficiency ($\text{floor\_us} / \text{measured\_us} \ge 0.75$).
+
+3. **Fail-Closed Record Invariant:**
+   - `tunedb::record::contract_blockers(&self, contract, gpu)` automatically rejects any measurement record that fails the efficiency threshold.
+   - Uncertified kernels are prevented from being promoted or committed into production recipes.

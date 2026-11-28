@@ -47,7 +47,7 @@ section directory: "SECT", count u32, SectionEntry[count] (48 B each)
 
 | Field | Meaning |
 |-------|---------|
-| `magic[8]` | `PLOWDEV` + version byte. `\x07` plain, `\x08` sectioned, `\x09` sectioned with generated tensors, `\x0a`/`\x0b` the same with combined L2 segment placement. An extension container has its own magic (`packet::ext`). |
+| `magic[8]` | `PLOWDEV` + version byte. `\x07` plain, `\x08` sectioned, `\x09` sectioned with generated tensors, `\x0a`/`\x0b` the same with combined L2 segment placement, `\x0c` modular base container (see [31-modular-packet-buckets.md](31-modular-packet-buckets.md)). An extension container has its own magic (`packet::ext`), and modular bucket packets use `PLOWBKT\x01`. |
 | `n_cu` | Workgroups each program's streams are laid out for (one stream per CU). |
 | `n_tensor`, `n_prog`, `n_kvrow`, `init_bytes` | Table sizes. |
 | `flags` | `1` global-queue appendix present, `2` L2-domain placement, `4` L2 placement keeps segments in `seg`. A reader refuses any other bit. |

@@ -400,6 +400,7 @@ pub struct Codec {
 }
 
 type Capacity = (usize, usize, Vec<usize>);
+type VoicePrefills = std::collections::BTreeMap<u32, Vec<usize>>;
 
 /// The step programs' per-launch inputs and host staging buffers.
 struct StepIo {
@@ -497,8 +498,8 @@ const CACHE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Cached windows attend to `2 P - 8` prompt rows plus 8 tail rows.
 const CACHE_MIN_PROMPT: usize = 4;
 
-struct Bound {
-    runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>,
+struct Bound<R = Box<dyn crate::exec::packet_runtime::PacketRuntime>> {
+    runtime: R,
     /// (batch, frames, programs in order), ascending by batch * frames.
     capacities: Vec<Capacity>,
     /// The same for windows ([`Window`]) on the cached capacities.
@@ -975,7 +976,18 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     let loaded = load_packet_runtime_on(path, "cuda", device).map_err(e)?;
     let runtime = loaded.runtime;
     let asset = PacketAsset::load(path).map_err(e)?;
-    let pipeline = asset.bind_driver(DRIVER, runtime.as_ref()).map_err(e)?;
+    let (metadata, prefill) = bind_metadata(&asset, runtime.as_ref())?;
+    let mut bound = metadata.with_runtime(runtime);
+    bound.initialize(prefill)?;
+    Ok(bound)
+}
+
+fn bind_metadata(
+    asset: &PacketAsset,
+    runtime: &dyn crate::exec::packet_runtime::PacketRuntime,
+) -> Result<(Bound<()>, VoicePrefills), String> {
+    let e = |x: crate::RuntimeError| x.to_string();
+    let pipeline = asset.bind_driver(DRIVER, runtime).map_err(e)?;
     let param = |k: &str| pipeline.parameter(k).map(|v| v as usize).map_err(e);
     let mut sequences: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
         Default::default();
@@ -1057,7 +1069,6 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     if capacities.is_empty() {
         return Err("codec packet declares no decode capacity".into());
     }
-    let mut runtime = runtime;
     let step_io = if steps.is_empty() {
         None
     } else {
@@ -1087,9 +1098,6 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         for (b, v) in slot_buf.iter_mut().enumerate() {
             *v = b as u32;
         }
-        runtime
-            .write_tensor(slot, bytemuck::cast_slice(&slot_buf))
-            .map_err(e)?;
         let n = (0..param("lengths.count")?)
             .map(|k| pipeline.tensor(&format!("stream.n.{k}")).map_err(e))
             .collect::<Result<Vec<_>, String>>()?;
@@ -1112,9 +1120,6 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             pcm_buf: Vec::new(),
         })
     };
-    // Run every capacity once now: each program sequence is captured as a CUDA graph on first
-    // use, and a capture that overlaps another thread's context synchronize (the LM engine) fails.
-    let t = std::time::Instant::now();
     let voice_slots = if slot_caps.is_empty() {
         None
     } else {
@@ -1128,10 +1133,6 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         let n = param("voice.slots")?;
         if slot_caps.iter().any(|c| c.0 > n) {
             return Err("codec voice-slot capacity exceeds its voice slots".into());
-        }
-        // Empty slots (prompt length 0) until a launch assigns them.
-        for t in tables {
-            runtime.write_tensor(t, &vec![0u8; t.bytes]).map_err(e)?;
         }
         Some(VoiceSlots {
             tables,
@@ -1154,9 +1155,6 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         if cslot_caps.iter().any(|c| c.0 > cslot.bytes / 4) {
             return Err("codec slot-cache capacity exceeds its cslot input".into());
         }
-        runtime
-            .write_tensor(cslot, &vec![0u8; cslot.bytes])
-            .map_err(e)?;
         Some(CacheSlots {
             prefill: ordered(cprefill),
             cslot,
@@ -1164,23 +1162,6 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             used: vec![std::time::Instant::now(); n],
         })
     };
-    for (_, _, programs) in capacities
-        .iter()
-        .chain(&cached)
-        .chain(&steps)
-        .chain(&slot_caps)
-        .chain(&cslot_caps)
-    {
-        runtime.run_sequence(programs).map_err(e)?;
-    }
-    if let Some(c) = &cache_slots {
-        runtime.run_sequence(&c.prefill).map_err(e)?;
-    }
-    tracing::info!(
-        capacities = capacities.len() + cached.len() + steps.len() + slot_caps.len(),
-        ms = t.elapsed().as_millis() as u64,
-        "codec graphs warmed"
-    );
     let lengths = (0..param("lengths.count")?)
         .map(|k| {
             Ok((
@@ -1191,23 +1172,6 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
         .collect::<Result<Vec<_>, String>>()?;
     let seed = pipeline.tensor("seed").map_err(e)?;
     let voice = pipeline.tensor("voice").ok();
-    // The cached capacities read each voice's prompt K/V: fill them once, from the prompt alone.
-    if !cached.is_empty() {
-        let (Some(voice), Some(&(count, _))) = (voice, lengths.first()) else {
-            return Err("cached codec capacities need voice and length inputs".into());
-        };
-        for (v, stages) in prefill {
-            let zero = |t: PacketTensor| vec![0u8; t.bytes];
-            let mut vb = zero(voice);
-            vb[..4].copy_from_slice(&v.to_le_bytes());
-            runtime.write_tensor(voice, &vb).map_err(e)?;
-            runtime.write_tensor(count, &zero(count)).map_err(e)?;
-            let mut sb = zero(seed);
-            sb[..8].copy_from_slice(&0x5eed_u64.to_le_bytes());
-            runtime.write_tensor(seed, &sb).map_err(e)?;
-            runtime.run_sequence(&ordered(stages)).map_err(e)?;
-        }
-    }
     let phase = ["phase", "phase_out", "seam", "next_seam"].map(|k| pipeline.tensor(k).ok());
     let phase = phase
         .iter()
@@ -1216,7 +1180,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
     if !(cached.is_empty() && slot_caps.is_empty()) && phase.is_none() {
         return Err("cached codec capacities without the window phase tensors".into());
     }
-    let mut bound = Bound {
+    let bound = Bound {
         slots: step_io
             .as_ref()
             .map(|io| std::sync::Arc::new(Mutex::new(SlotPool::new(io.slots)))),
@@ -1252,7 +1216,7 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             .unwrap_or_default(),
         lengths,
         capacities,
-        runtime,
+        runtime: (),
         yield_hook: Default::default(),
         buckets: Default::default(),
         yield_programs: pipeline
@@ -1260,16 +1224,13 @@ fn bind(path: &Path, device: u8) -> Result<Bound, String> {
             .map(|v| v as usize)
             .unwrap_or(0),
     };
-    let mut inputs: smallvec::SmallVec<[PacketTensor; 16]> =
-        smallvec::smallvec![bound.codes, bound.seed];
-    inputs.extend(bound.lengths.iter().map(|&(t, _)| t));
-    if let Some(io) = &bound.step_io {
-        inputs.extend([io.slot, io.pos, io.rope]);
-        inputs.extend(io.row_pos);
-        inputs.extend(io.n.iter().copied());
-    }
-    bound.runtime.prepare_writes(&inputs).map_err(e)?;
-    Ok(bound)
+    Ok((
+        bound,
+        prefill
+            .into_iter()
+            .map(|(voice, stages)| (voice, ordered(stages)))
+            .collect(),
+    ))
 }
 
 /// The smallest of `family` (ascending by batch * frames) holding `batch` items of `frames`.
@@ -1314,7 +1275,139 @@ fn pack(
     take
 }
 
+impl Bound<()> {
+    fn with_runtime(self, runtime: Box<dyn crate::exec::packet_runtime::PacketRuntime>) -> Bound {
+        let Self {
+            runtime: (),
+            capacities,
+            cached,
+            steps,
+            step_io,
+            slots,
+            slot_caps,
+            voice_slots,
+            cslot_caps,
+            cache_slots,
+            phase,
+            harmonics,
+            codes,
+            seed,
+            voice,
+            pcm,
+            lengths,
+            frame_codes,
+            frame_samples,
+            window,
+            lookahead,
+            voices,
+            parameters,
+            yield_hook,
+            buckets,
+            yield_programs,
+        } = self;
+        Bound {
+            runtime,
+            capacities,
+            cached,
+            steps,
+            step_io,
+            slots,
+            slot_caps,
+            voice_slots,
+            cslot_caps,
+            cache_slots,
+            phase,
+            harmonics,
+            codes,
+            seed,
+            voice,
+            pcm,
+            lengths,
+            frame_codes,
+            frame_samples,
+            window,
+            lookahead,
+            voices,
+            parameters,
+            yield_hook,
+            buckets,
+            yield_programs,
+        }
+    }
+}
+
 impl Bound {
+    fn initialize(&mut self, prefill: VoicePrefills) -> Result<(), String> {
+        let e = |x: crate::RuntimeError| x.to_string();
+        if let Some(io) = &self.step_io {
+            self.runtime
+                .write_tensor(io.slot, bytemuck::cast_slice(&io.slot_buf))
+                .map_err(e)?;
+        }
+        let t = std::time::Instant::now();
+        if let Some(voices) = &self.voice_slots {
+            for tensor in voices.tables {
+                self.runtime
+                    .write_tensor(tensor, &vec![0u8; tensor.bytes])
+                    .map_err(e)?;
+            }
+        }
+        if let Some(cache) = &mut self.cache_slots {
+            self.runtime
+                .write_tensor(cache.cslot, &vec![0u8; cache.cslot.bytes])
+                .map_err(e)?;
+            // Cache idleness starts after its initial device selector write.
+            cache.used.fill(std::time::Instant::now());
+        }
+        // Capture before another request can synchronize the shared CUDA context.
+        for (_, _, programs) in self
+            .capacities
+            .iter()
+            .chain(&self.cached)
+            .chain(&self.steps)
+            .chain(&self.slot_caps)
+            .chain(&self.cslot_caps)
+        {
+            self.runtime.run_sequence(programs).map_err(e)?;
+        }
+        if let Some(c) = &self.cache_slots {
+            self.runtime.run_sequence(&c.prefill).map_err(e)?;
+        }
+        tracing::info!(
+            capacities =
+                self.capacities.len() + self.cached.len() + self.steps.len() + self.slot_caps.len(),
+            ms = t.elapsed().as_millis() as u64,
+            "codec graphs warmed"
+        );
+        // The cached capacities read each voice's prompt K/V: fill them once, from the prompt alone.
+        if !self.cached.is_empty() {
+            let (Some(voice), Some(&(count, _))) = (self.voice, self.lengths.first()) else {
+                return Err("cached codec capacities need voice and length inputs".into());
+            };
+            for (v, programs) in prefill {
+                let zero = |t: PacketTensor| vec![0u8; t.bytes];
+                let mut vb = zero(voice);
+                vb[..4].copy_from_slice(&v.to_le_bytes());
+                self.runtime.write_tensor(voice, &vb).map_err(e)?;
+                self.runtime.write_tensor(count, &zero(count)).map_err(e)?;
+                let mut sb = zero(self.seed);
+                sb[..8].copy_from_slice(&0x5eed_u64.to_le_bytes());
+                self.runtime.write_tensor(self.seed, &sb).map_err(e)?;
+                self.runtime.run_sequence(&programs).map_err(e)?;
+            }
+        }
+        let mut inputs: smallvec::SmallVec<[PacketTensor; 16]> =
+            smallvec::smallvec![self.codes, self.seed];
+        inputs.extend(self.lengths.iter().map(|&(t, _)| t));
+        if let Some(io) = &self.step_io {
+            inputs.extend([io.slot, io.pos, io.rope]);
+            inputs.extend(io.row_pos);
+            inputs.extend(io.n.iter().copied());
+        }
+        self.runtime.prepare_writes(&inputs).map_err(e)?;
+        Ok(())
+    }
+
     fn capacities_of(&self, family: Family) -> &[Capacity] {
         match family {
             Family::Decode => &self.capacities,
@@ -2402,6 +2495,253 @@ fn sched_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, PartialEq)]
+    enum InitCall {
+        Write(usize, Vec<u8>),
+        Run(Vec<usize>),
+        Prepare(Vec<usize>),
+    }
+
+    struct InitRuntime {
+        tensors: std::collections::BTreeMap<String, PacketTensor>,
+        calls: std::sync::Arc<Mutex<Vec<InitCall>>>,
+    }
+
+    impl crate::exec::packet_runtime::PacketRuntime for InitRuntime {
+        fn tensor(&self, name: &str) -> Option<PacketTensor> {
+            self.tensors.get(name).copied()
+        }
+        fn write_tensor(&mut self, tensor: PacketTensor, bytes: &[u8]) -> crate::Result<()> {
+            assert_eq!(bytes.len(), tensor.bytes);
+            self.calls
+                .lock()
+                .push(InitCall::Write(tensor.handle, bytes.to_vec()));
+            Ok(())
+        }
+        fn prepare_writes(&mut self, tensors: &[PacketTensor]) -> crate::Result<()> {
+            self.calls.lock().push(InitCall::Prepare(
+                tensors.iter().map(|tensor| tensor.handle).collect(),
+            ));
+            Ok(())
+        }
+        fn read_tensor(&self, _: PacketTensor, _: &mut [u8]) -> crate::Result<()> {
+            panic!("codec initialization must not read back")
+        }
+        fn copy_tensor(
+            &mut self,
+            _: PacketTensor,
+            _: usize,
+            _: PacketTensor,
+            _: usize,
+            _: usize,
+        ) -> crate::Result<()> {
+            panic!("unexpected codec initialization copy")
+        }
+        fn run(&mut self, program: usize) -> crate::Result<()> {
+            self.run_sequence(&[program])
+        }
+        fn run_sequence(&mut self, programs: &[usize]) -> crate::Result<()> {
+            self.calls.lock().push(InitCall::Run(programs.to_vec()));
+            Ok(())
+        }
+        fn last_run_us(&self) -> f64 {
+            0.0
+        }
+    }
+
+    fn initialization_fixture() -> (PacketAsset, InitRuntime) {
+        use packet::dev::DevOp;
+        use packet::devbuild::{Builder, Model, SectionData, SECT_METADATA};
+        use plow_asset::packet_pipeline::{
+            PacketPipeline, PacketPipelines, PipelineDType as D, PipelineTensor, SECTION, VERSION,
+        };
+        use std::collections::BTreeMap;
+
+        let mut builder = Builder::new(1);
+        builder.force_uniseg();
+        let mut tensors = BTreeMap::new();
+        let mut bindings = BTreeMap::new();
+        for (name, dtype, elements) in [
+            ("codes", D::U32, 4),
+            ("seed", D::U64, 1),
+            ("pcm", D::F32, 6),
+            ("lengths.0", D::U32, 2),
+            ("stream.slot", D::U32, 2),
+            ("stream.pos", D::U32, 2),
+            ("stream.rope_pos", D::U32, 4),
+            ("stream.row_pos", D::U32, 2),
+            ("stream.n.0", D::U32, 2),
+            ("slot.prompt_token", D::U32, 4),
+            ("slot.prompt_feat", D::F32, 640),
+            ("slot.spks", D::F32, 160),
+            ("slot.prompt_len", D::U32, 2),
+            ("cslot", D::U32, 1),
+            ("voice", D::U32, 2),
+            ("phase", D::F32, 2),
+            ("phase_out", D::F32, 2),
+            ("seam", D::F32, 4),
+            ("next_seam", D::F32, 4),
+        ] {
+            let bytes = elements * dtype.bytes();
+            let handle = builder.tensor(name, bytes);
+            tensors.insert(
+                name.to_owned(),
+                PacketTensor {
+                    handle: handle as usize,
+                    bytes: bytes as usize,
+                },
+            );
+            bindings.insert(
+                name.to_owned(),
+                PipelineTensor {
+                    name: name.to_owned(),
+                    dtype,
+                    shape: vec![elements],
+                },
+            );
+        }
+        let pcm = tensors["pcm"].handle as u32;
+        let declarations = builder.tensors();
+        let progs = (0..12)
+            .map(|_| {
+                let mut program = Builder::new(1);
+                program.force_uniseg();
+                for tensor in &declarations {
+                    program.tensor(&tensor.name, tensor.bytes);
+                }
+                program.emit(DevOp::SiluF32, program.all(), &[], |inst| {
+                    inst.t[..2].copy_from_slice(&[pcm, pcm]);
+                    inst.i[0] = 6;
+                });
+                program.finish()
+            })
+            .collect();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: declarations,
+            progs,
+            prog_t: vec![1; 12],
+            kv_row_insts: vec![],
+            gen: vec![],
+        };
+        let metadata = PacketPipelines {
+            version: VERSION,
+            pipelines: vec![PacketPipeline {
+                name: "codec".into(),
+                driver: DRIVER.into(),
+                programs: [
+                    ("cvsynth.b1.t2.0", 0),
+                    ("cprefill.0", 1),
+                    ("csynth.b1.t2.0", 2),
+                    ("csynth.b1.t2.1", 3),
+                    ("vsynth.b1.t2.0", 4),
+                    ("step.b2.f1", 5),
+                    ("decode.b2.f1", 6),
+                    ("decode.b1.f2", 7),
+                    ("prefill.v0.0", 8),
+                    ("prefill.v0.1", 9),
+                    ("prefill.v1.0", 10),
+                    ("prefill.v1.1", 11),
+                ]
+                .into_iter()
+                .map(|(role, id)| (role.to_owned(), id))
+                .collect(),
+                tensors: bindings,
+                parameters: [
+                    ("lengths.count", 1),
+                    ("lengths.0.rows_per_frame", 1),
+                    ("stream.stateful", 1),
+                    ("stream.slots", 2),
+                    ("stream.transformer_rows_per_frame", 2),
+                    ("voice.slots", 2),
+                    ("prompt.max", 2),
+                    ("voice.cache_slots", 1),
+                    ("codec.frame_codes", 2),
+                    ("codec.frame_samples", 3),
+                    ("stream.window_frames", 2),
+                    ("stream.lookahead_frames", 1),
+                    ("vocoder.harmonics", 3),
+                    ("render.yield_programs", 2),
+                ]
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+                strings: BTreeMap::from([("voices".into(), "left\nright".into())]),
+            }],
+        };
+        let image = model.to_blob_v6(&[SectionData {
+            kind: SECT_METADATA,
+            name: SECTION.into(),
+            data: serde_json::to_vec(&metadata).unwrap(),
+        }]);
+        (
+            PacketAsset::from_bytes(&image).unwrap(),
+            InitRuntime {
+                tensors,
+                calls: Default::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn metadata_binding_defers_all_gpu_initialization_and_preserves_legacy_call_order() {
+        let (asset, runtime) = initialization_fixture();
+        let calls = runtime.calls.clone();
+        let (metadata, prefill) = bind_metadata(&asset, &runtime).unwrap();
+        assert!(calls.lock().is_empty());
+        assert_eq!((metadata.frame_codes, metadata.frame_samples), (2, 3));
+        assert_eq!((metadata.window, metadata.lookahead), (2, 1));
+        assert_eq!(metadata.voices, ["left", "right"]);
+        assert_eq!(metadata.harmonics, 3);
+        assert_eq!(metadata.yield_programs, 2);
+        let mut bound = metadata.with_runtime(Box::new(runtime));
+        assert!(calls.lock().is_empty());
+        bound.initialize(prefill).unwrap();
+        use InitCall::{Prepare, Run, Write};
+        assert_eq!(
+            &*calls.lock(),
+            &[
+                Write(
+                    4,
+                    [0u32, 1].into_iter().flat_map(u32::to_ne_bytes).collect()
+                ),
+                Write(9, vec![0; 16]),
+                Write(10, vec![0; 2560]),
+                Write(11, vec![0; 640]),
+                Write(12, vec![0; 8]),
+                Write(13, vec![0; 4]),
+                Run(vec![6]),
+                Run(vec![7]),
+                Run(vec![2, 3]),
+                Run(vec![5]),
+                Run(vec![4]),
+                Run(vec![0]),
+                Run(vec![1]),
+                Write(14, vec![0; 8]),
+                Write(3, vec![0; 8]),
+                Write(1, 0x5eed_u64.to_le_bytes().to_vec()),
+                Run(vec![8, 9]),
+                Write(
+                    14,
+                    [1u32, 0].into_iter().flat_map(u32::to_le_bytes).collect()
+                ),
+                Write(3, vec![0; 8]),
+                Write(1, 0x5eed_u64.to_le_bytes().to_vec()),
+                Run(vec![10, 11]),
+                Prepare(vec![0, 1, 3, 4, 5, 6, 7, 8]),
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_binding_rejects_missing_storage_without_gpu_work() {
+        let (asset, mut runtime) = initialization_fixture();
+        runtime.tensors.remove("seed");
+        assert!(bind_metadata(&asset, &runtime).is_err());
+        assert!(runtime.calls.lock().is_empty());
+    }
 
     fn queued_codec() -> (Codec, mpsc::Receiver<Msg>) {
         let (tx, rx) = mpsc::channel();

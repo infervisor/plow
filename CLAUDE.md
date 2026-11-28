@@ -33,8 +33,8 @@ Put code where its kind already lives. Never create a new top-level directory, a
   by hardware fingerprint, written only by a tuning run.
 * `docs/` — `BUILD.md`, `DISTRIBUTION.md`, `arch/` (design, organised by technique; never names a
   tool or assistant, model names allowed as examples), `bringup/` (stage playbooks,
-  `agent-tools.md`, `isa/`, `results/`), `runtime/`, `schemas/`, `amd/`.
-* Campaign summaries: `docs/bringup/results/<campaign>/comparison.{md,csv}`. Raw logs, JSON,
+  `agent-tools.md`, `isa/`), `runtime/`, `schemas/`, `amd/`.
+* Campaign summaries: `perf-data/campaign/<campaign>/comparison.{md,csv}`. Raw logs, JSON,
   captures, generated reports and temporary CSVs go to campaign scratch outside the repo, never
   under `docs/`, `scripts/`, `perf-data/` or `recipes/`.
 * `lean-plow/` — Lean 4 verification. `tools/` — the `bench` crate and `bench-api`.
@@ -122,6 +122,10 @@ Before coding:
 * Don't add doc comments unless useful or required by existing style.
 
 ## Performance
+
+Order is strict (`docs/bringup/agent-tools.md`, both HARD RULES), for every model and stage:
+block-vs-roofline table first, then op fusion, then each kernel to its roofline on a single block,
+and only then scheduling, admission or serving knobs. Peer serving grids confirm; they never pick the work.
 
 For `plowrt`:
 

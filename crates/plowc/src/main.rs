@@ -2557,6 +2557,14 @@ fn build_cubin_from_manifest(
         "-DPLOW_CUBIN_SPEECH={}",
         if asr { "ON" } else { "OFF" }
     ));
+    if asr
+        && man
+            .pointer("/objects/speech_conv/required")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        args.push("-DPLOW_CUBIN_SPEECH_CONV=ON".into());
+    }
 
     let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
     let config = pkt.with_file_name("plow_config.h");

@@ -175,6 +175,15 @@ pub(super) struct VmmServe {
 }
 
 impl VmmServe {
+    pub(super) fn evict_all(&mut self) {
+        if let Some(rings) = &mut self.rings {
+            rings.release_all();
+        }
+        if let Some(kv) = &self.kv {
+            kv.evict_all();
+        }
+    }
+
     pub(super) fn prefix_kv(&self) -> Option<&crate::memory::vmm::VmmKv> {
         self.kv.as_ref().filter(|kv| kv.prefix_reuse())
     }
@@ -537,13 +546,8 @@ impl GpuEngine {
             .iter()
             .find(|t| t.name == "in.pos")
             .map(|t| (t.bytes / 4) as u32)?;
-        let max_ctx = crate::config::RuntimeConfig::get()
-            .rt_max_ctx
-            .map(|c| c as u32)
-            .unwrap_or(packet_max_ctx)
-            .min(packet_max_ctx);
         let Some(mut geo) =
-            kv.and_then(|kv| crate::memory::vmm::VmmGeometry::from_kv(kv, max_ctx, batch))
+            kv.and_then(|kv| crate::memory::vmm::VmmGeometry::from_kv(kv, packet_max_ctx, batch))
         else {
             tracing::warn!("vmm off: no usable KV geometry in the serve manifest");
             return None;
@@ -615,7 +619,7 @@ impl GpuEngine {
             match (geo.elem, scales_of(l)) {
                 (2, None) => {}
                 (1, Some((ik, iv))) => {
-                    let want = batch as u64 * geo.kvh_full as u64 * max_ctx as u64 * 4;
+                    let want = batch as u64 * geo.kvh_full as u64 * geo.max_ctx as u64 * 4;
                     if blob.tensors[ik].bytes != want || blob.tensors[iv].bytes != want {
                         tracing::warn!(layer = l, "vmm off: full-layer KV scale bytes mismatch");
                         return None;
@@ -753,7 +757,8 @@ impl GpuEngine {
             // arm time, `bound_ring_park`): remapping a slot's ring on readmission (unmap +
             // cuMemCreate + map + set_access per unit, serial on the mux tick) cost 26B BF16 at
             // 1.8 sessions/s TTFT P99 1688 ms against 680 ms with every slot parked.
-            let park = geo.batch;
+            let rt = crate::config::RuntimeConfig::get();
+            let park = geo.batch.min(rt.decode_max_rung.unwrap_or(geo.batch));
             rings.enable_bounded_park(u64::from(park) * rings.slot_charge());
             tracing::info!(
                 park,
@@ -1200,12 +1205,11 @@ impl GpuEngine {
             }
             p += step;
         }
-        if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) {
+        let aborted = self.disconnected[b];
+        if !prompt_end && rows < prompt && !kv.checkpoint_awaited(toks, p_a) && !aborted {
             return;
         }
-        // A turn end (prompt + reply) is never published: the next prompt re-renders the reply
-        // and diverges before it (0 of 1223 attaches on Gemma 4); the prompt end below is
-        // restored or touched instead. The boundary tree retires structurally inside the publish.
+        let end = session_prompt_end(prompt) / 32 * 32;
         let turn_end = rows > prompt;
         if !turn_end {
             let kind = if prompt_end {
@@ -1214,14 +1218,17 @@ impl GpuEngine {
                 Kind::CHECKPOINT
             };
             self.publish_boundary(b, p_a, kind);
-        }
-        // Turn end: pressure may have evicted the prompt end (the next turn's attach point)
-        // while this turn decoded. The rings still hold its window, so restore it now, newest in
-        // LRU just before the next request; a surviving one is only touched. A client without
-        // `X-Session-Id` continues its conversation the same way.
-        let end = session_prompt_end(prompt) / 32 * 32;
-        if rows > prompt && end > 0 && end < p_a {
-            self.publish_boundary(b, end, Kind::PROMPT_END);
+        } else {
+            // Turn end: restore or touch the prompt end first so it is present as the parent
+            // and fallback attach point if a future turn diverges.
+            if end > 0 && end <= p_a {
+                self.publish_boundary(b, end, Kind::PROMPT_END);
+            }
+            // Publish the decoded tokens up to the 32-token boundary as TURN_END, caching
+            // the assistant reply for the next turn.
+            if p_a > end {
+                self.publish_boundary(b, p_a, Kind::TURN_END);
+            }
         }
     }
 

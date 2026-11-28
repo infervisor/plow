@@ -1478,56 +1478,113 @@ impl KvStore {
         if self.inner.lock().host_cap == 0 {
             return false;
         }
+
+        struct StagedSpill {
+            id: BlockId,
+            class: usize,
+            dev: Slot<Dev>,
+            host_slot: Slot<Host>,
+            host_va: u64,
+            dev_va: u64,
+            bytes: u64,
+        }
+
+        let mut staged = Vec::with_capacity(ids.len().min(64));
         let mut all = true;
-        for &id in ids {
+
+        // Phase 1: Batch inspect and reserve host slots under a single lock acquisition.
+        {
             let mut inner = self.inner.lock();
-            let t0 = std::time::Instant::now();
-            let Some(b) = inner.block(id) else {
-                continue;
-            };
-            let class = b.class;
-            let dev = match b.place {
-                Where::Device(dev) => dev,
-                Where::Spilling { .. } | Where::Host(_) => continue,
-                // Coming back to the device: it stays.
-                Where::Restoring { .. } => {
+            for &id in ids {
+                let Some(b) = inner.block(id) else {
+                    continue;
+                };
+                let class = b.class;
+                let dev = match b.place {
+                    Where::Device(dev) => dev,
+                    Where::Spilling { .. } | Where::Host(_) => continue,
+                    // Coming back to the device: it stays.
+                    Where::Restoring { .. } => {
+                        all = false;
+                        continue;
+                    }
+                };
+                if b.state != State::Ready {
+                    continue;
+                }
+                if b.holds > 0 {
                     all = false;
                     continue;
                 }
-            };
-            if b.state != State::Ready {
-                continue;
+                let Some(h) = self.host_slot(&mut inner, class) else {
+                    all = false;
+                    continue;
+                };
+                let bytes = inner.classes[class].spec.block_bytes();
+                let dev_va = inner.classes[class].device.va(dev);
+                let host_va = inner.classes[class].host.va(h);
+
+                // Set temporary Spilling placement so concurrent gathers continue reading from device
+                // while preventing duplicate spill attempts.
+                let b = inner.block_mut(id).expect("block");
+                b.place = Where::Spilling {
+                    dev,
+                    host: h,
+                    fence: u64::MAX,
+                };
+
+                staged.push(StagedSpill {
+                    id,
+                    class,
+                    dev,
+                    host_slot: h,
+                    host_va,
+                    dev_va,
+                    bytes,
+                });
             }
-            if b.holds > 0 {
-                all = false;
-                continue;
+        }
+
+        if staged.is_empty() {
+            return all;
+        }
+
+        // Phase 2: Asynchronous DMA copy submissions WITHOUT holding the inner lock.
+        let t0 = std::time::Instant::now();
+        let mut results = Vec::with_capacity(staged.len());
+        for s in &staged {
+            match self.ops.copy_dtoh_async(s.host_va, s.dev_va, s.bytes) {
+                Ok(fence) => results.push((fence, true)),
+                Err(_) => results.push((0, false)),
             }
-            let Some(h) = self.host_slot(&mut inner, class) else {
-                all = false;
-                continue;
-            };
-            let bytes = inner.classes[class].spec.block_bytes();
-            let va = inner.classes[class].device.va(dev);
-            let host = inner.classes[class].host.va(h);
-            match self.ops.copy_dtoh_async(host, va, bytes) {
-                Ok(fence) => {
-                    let b = inner.block_mut(id).expect("block");
+        }
+        let copy_us = t0.elapsed().as_micros() as u64;
+
+        // Phase 3: Commit fences and update spilling bookkeeping under a single lock acquisition.
+        {
+            let mut inner = self.inner.lock();
+            for (s, (fence, ok)) in staged.into_iter().zip(results) {
+                if ok {
+                    let b = inner.block_mut(s.id).expect("block");
                     b.place = Where::Spilling {
-                        dev,
-                        host: h,
+                        dev: s.dev,
+                        host: s.host_slot,
                         fence,
                     };
-                    inner.spilling.push_back((id, bytes));
-                    inner.spilling_bytes += bytes;
+                    inner.spilling.push_back((s.id, s.bytes));
+                    inner.spilling_bytes += s.bytes;
                     inner.stats.spills += 1;
-                }
-                Err(_) => {
-                    inner.classes[class].host.put(h);
+                } else {
+                    inner.classes[s.class].host.put(s.host_slot);
+                    if let Some(b) = inner.block_mut(s.id) {
+                        b.place = Where::Device(s.dev);
+                    }
                     all = false;
                 }
             }
-            inner.stats.spill_us += t0.elapsed().as_micros() as u64;
+            inner.stats.spill_us += copy_us;
         }
+
         all
     }
 

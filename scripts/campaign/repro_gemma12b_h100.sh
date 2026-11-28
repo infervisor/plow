@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # repro_gemma12b_h100.sh <step> — reproduce the Gemma-4-12B-it-FP8 / 1x H100 strict comparison
-# (Infervisor vs vLLM 0.28, docs/bringup/results/gemma12b-fp8-20260930/comparison.md) from this checkout.
+# (Infervisor vs vLLM 0.28, perf-data/campaign/gemma12b-fp8-20260930/comparison.md) from this checkout.
 #
 #   build                    CPU: plowc + plowrt + both packets (FP8-KV production, BF16-KV rq1k)
 #   ref                      GPU: FP32 reference + vLLM peer capture, only when $REF is absent

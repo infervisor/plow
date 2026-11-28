@@ -189,6 +189,10 @@ pub use codec_tick::{CodecTick, CodecTickState};
 pub use fish_depth::{FishInfo, FishRow};
 mod fp8_block;
 mod gen_decode;
+pub(crate) mod handoff;
+pub(crate) mod handoff_aux;
+pub(crate) mod handoff_causal;
+pub(crate) mod handoff_provider;
 mod mixed_step;
 mod moe_lt;
 mod native_decode;
@@ -1424,6 +1428,270 @@ fn validate_gemv_decode_role_inst(
     Ok(())
 }
 
+fn validate_head_preparation(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let relative = d.i[5] == packet::dev::ROPE_PAIR_RELATIVE_LOGITS;
+        if d.op != DevOp::HeadNormRope as u16 || (!relative && d.i[5] != packet::dev::ROPE_PAIR_L2_CLIP) {
+            continue;
+        }
+        let extent = |slot: usize, bytes: u64| {
+            blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= bytes)
+        };
+        let heads = u64::from(d.i[1]);
+        let rows = u64::from(d.i[0]) * heads;
+        let positive = |bits| {
+            let value = f32::from_bits(bits);
+            value.is_finite() && value > 0.0
+        };
+        let hd = if relative { 16 } else { 128 };
+        let extent_out = if relative { packet::dev::FLASH_RELATIVE_EXTENT } else { hd };
+        let tau = if relative { 4 } else { 3 };
+        if d.i[2] != hd
+            || (relative && d.i[3] != extent_out)
+            || rows == 0
+            || rows > u64::MAX / (u64::from(extent_out) * 2)
+            || !positive(d.fj[0])
+            || !positive(d.i[4])
+            || d.fj[1] != 0
+            || d.fj[2] != 0
+            || (1..=5).any(|slot| d.t[slot] == d.t[0])
+            || !extent(0, rows * u64::from(extent_out) * 2)
+            || !extent(1, rows * u64::from(hd) * 2)
+            || ((relative || d.t[2] != TENSOR_NONE16) && !extent(2, heads * u64::from(hd) * 2))
+            || (relative && !extent(3, u64::from(hd) * u64::from(extent_out) * 2))
+            || (d.t[tau] != TENSOR_NONE16 && (!extent(tau, 8) || !extent(5, u64::from(d.i[0]) * 4)))
+        {
+            return Err(RuntimeError::Rejected("invalid head preparation operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_residual_copies(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::Residual as u16 || d.i[7] != 1 {
+            continue;
+        }
+        let elements = u64::from(d.i[0]);
+        let fits = |slot: usize, block: u32| {
+            elements.checked_mul(u64::from(block) + 1)
+                .and_then(|n| n.checked_mul(2))
+                .is_some_and(|n| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n))
+        };
+        if elements == 0 || d.t[0] == d.t[1] || d.t[2..].iter().any(|&h| h != TENSOR_NONE16)
+            || !fits(0, d.i[1]) || !fits(1, d.i[2])
+        {
+            return Err(RuntimeError::Rejected("invalid BF16 residual block copy".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_residual_message_controllers(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::AttnRes as u16 || !matches!(d.i[7], 2 | 3) {
+            continue;
+        }
+        let pair = d.i[7] == 2;
+        let inputs = if pair { 3 } else { 6 };
+        let rows = u64::from(d.i[0]);
+        let width = u64::from(d.i[1]);
+        let epsilon = f32::from_bits(d.fj[0]);
+        let fits = |slot: usize, count: u64, element_size: u64| {
+            count.checked_mul(width)
+                .and_then(|n| n.checked_mul(element_size))
+                .is_some_and(|n| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n))
+        };
+        if rows == 0 || width == 0 || !epsilon.is_finite() || epsilon <= 0.0
+            || d.t[1..inputs].contains(&d.t[0])
+            || d.t[inputs..].iter().any(|&h| h != TENSOR_NONE16)
+            || !fits(0, rows, if pair { 4 } else { 2 })
+            || !(1..if pair { 3 } else { 5 }).all(|slot| fits(slot, rows, 4))
+            || (!pair && !fits(5, 1, 2))
+        {
+            return Err(RuntimeError::Rejected("invalid residual message controller operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_normalized_residual_mix(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::AttnRes as u16 || d.i[7] != 1 { continue; }
+        let [rows, width, blocks, queries, stride, query_offset, ..] = d.i.map(u64::from);
+        let gamma = d.t[5] != TENSOR_NONE16;
+        let bytes = |slot: usize, factors: &[u64]| {
+            factors.iter().try_fold(1u64, |n, &v| n.checked_mul(v)).is_some_and(|n| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n)
+            })
+        };
+        let valid_eps = |slot| {
+            let eps = f32::from_bits(d.fj[slot]);
+            eps.is_finite() && eps > 0.0
+        };
+        if rows == 0 || width == 0 || blocks > 16 || queries == 0
+            || (blocks != 0 && stride < rows) || !valid_eps(0) || (gamma && !valid_eps(1))
+            || d.t[4] != TENSOR_NONE16 || d.t[6] != TENSOR_NONE16
+            || d.t[1..].contains(&d.t[0])
+            || !bytes(0, &[rows, width, queries, if gamma { 2 } else { 4 }])
+            || !bytes(1, &[rows, width, 2])
+            || (blocks != 0 && !bytes(2, &[blocks, stride, width, 2]))
+            || !bytes(3, &[query_offset + queries, width, 4])
+            || (gamma && !bytes(5, &[queries, width, 2]))
+            || (d.t[7] != TENSOR_NONE16 && !bytes(7, &[rows, width, 2]))
+        {
+            return Err(RuntimeError::Rejected("invalid normalized residual mix operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_attention(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let prefill = d.op == DevOp::FlashPrefill as u16
+            && d.t[6] == d.t[7] && d.t[7] != TENSOR_NONE16;
+        let decode = d.op == DevOp::FlashDecode as u16
+            && d.fj[2] == packet::dev::FLASH_DECODE_RELATIVE;
+        if !prefill && !decode { continue; }
+        let (heads, kv_heads, stride, mask, window, splits) = if prefill {
+            (d.i[2], d.i[3], d.fj[1], d.fj[2], d.i[5], d.i[7])
+        } else {
+            (d.i[1], d.i[2], d.i[3], d.i[7], d.i[4], d.i[5])
+        };
+        let rows = u64::from(d.i[0]);
+        let head_rows = rows * u64::from(heads);
+        let exists = |slot: usize, count: u64, width: u64| {
+            count.checked_mul(width).is_some_and(|n| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= n)
+            })
+        };
+        let parts = head_rows.checked_mul(u64::from(splits));
+        let kv_bytes = u64::from(kv_heads).checked_mul(u64::from(stride))
+            .and_then(|n| n.checked_mul(if prefill { 1 } else { rows }));
+        if d.i[6] != 128 || rows == 0 || heads == 0 || kv_heads == 0 || heads % kv_heads != 0
+            || splits == 0 || stride == 0
+            || (mask != u32::MAX && mask >= stride)
+            || window > packet::dev::FLASH_RELATIVE_EXTENT
+            || !f32::from_bits(d.fj[0]).is_finite()
+            || [1, 2, 3, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[0])
+            || [2, 3, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[1])
+            || !parts.is_some_and(|n| exists(0, n, 512) && exists(1, n, 8))
+            || !exists(2, head_rows, 256)
+            || !kv_bytes.is_some_and(|n| exists(3, n, 256) && exists(4, n, 256))
+            || !exists(7, head_rows, 2 * u64::from(packet::dev::FLASH_RELATIVE_EXTENT))
+            || (decode && (!exists(5, rows, 4) || (d.t[6] != TENSOR_NONE16 && !exists(6, rows, 4))))
+            || (prefill && d.t[5] != TENSOR_NONE16)
+        {
+            return Err(RuntimeError::Rejected("invalid relative attention operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_gated_flash_merge(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if d.op != DevOp::FlashMerge as u16
+            || (d.t[4] == TENSOR_NONE16 && d.t[5] == TENSOR_NONE16)
+        {
+            continue;
+        }
+        let rows = u64::from(d.i[0]) * u64::from(d.i[1]);
+        let extent = |slot: usize, count: u64, stride: u64| {
+            count.checked_mul(stride).is_some_and(|need| {
+                blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= need)
+            })
+        };
+        let partials = rows.checked_mul(u64::from(d.i[2]));
+        if d.i[3] != 128
+            || rows == 0
+            || rows > u64::from(u32::MAX)
+            || d.i[2] == 0
+            || d.t[3] != TENSOR_NONE16
+            || [1, 2, 4, 5].iter().any(|&slot| d.t[slot] == d.t[0])
+            || !extent(0, rows, 256)
+            || !partials.is_some_and(|n| extent(1, n, 512) && extent(2, n, 8))
+            || !extent(4, rows, 256)
+            || !extent(5, rows, 2)
+        {
+            return Err(RuntimeError::Rejected("invalid gated FlashMerge operands".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_moe_outer_scales(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        if !matches!(DevOp::from_u16(d.op), Some(DevOp::MoeGluMx | DevOp::MoeDownMx))
+            || (d.t[6] == TENSOR_NONE16 && d.t[7] == TENSOR_NONE16)
+        {
+            continue;
+        }
+        let size = |slot: usize| blob.tensors.get(d.t[slot] as usize).map(|t| t.bytes);
+        if d.i[7] != 2 || size(6) != Some(u64::from(d.i[3]) * 4) || size(7) != Some(4) {
+            return Err(RuntimeError::Rejected(
+                "invalid NVFP4 MoE outer-scale operands".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_grouped_nvfp4(blob: &DevBlob) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let op = DevOp::from_u16(d.op);
+        if !matches!(op, Some(DevOp::MoeAlignPf | DevOp::MoeDownMxPf | DevOp::MoeGluMxPf)) {
+            continue;
+        }
+        let fits = |slot: usize, factors: &[u64]| {
+            factors.iter().try_fold(1u64, |n, &factor| n.checked_mul(factor))
+                .is_some_and(|bytes| blob.tensors.get(d.t[slot] as usize).is_some_and(|t| t.bytes >= bytes))
+        };
+        if op == Some(DevOp::MoeAlignPf) {
+            let [rows, experts, topk, aligned_rows, ..] = d.i.map(u64::from);
+            if aligned_rows != 0 && (d.t[3] != d.t[4] || rows == 0 || experts == 0 || topk == 0
+                || rows.saturating_mul(topk).saturating_add(63 * experts) > aligned_rows
+                || !fits(0, &[3 * experts + 1, 4]) || !fits(1, &[rows, topk, 8])
+                || !fits(2, &[aligned_rows, 4]) || !fits(3, &[aligned_rows, 8]))
+            {
+                return Err(RuntimeError::Rejected("invalid grouped NVFP4 alignment operands".into()));
+            }
+            continue;
+        }
+        if d.i[7] != 3 {
+            continue;
+        }
+        if op == Some(DevOp::MoeGluMxPf) {
+            let [inner, hidden, experts, slots, aligned_rows, topk, ..] = d.i.map(u64::from);
+            if inner == 0 || 2 * inner > u64::from(u32::MAX) || hidden == 0
+                || experts == 0 || slots == 0 || aligned_rows < slots || topk == 0
+                || slots % topk != 0
+                || !fits(0, &[slots, inner, 2]) || !fits(1, &[slots / topk, hidden, 2])
+                || !fits(2, &[experts, 2 * inner, hidden.div_ceil(2)])
+                || !fits(3, &[experts, 2 * inner, hidden.div_ceil(16)])
+                || !fits(4, &[3 * experts + 1, 4]) || !fits(5, &[aligned_rows, 8])
+                || !fits(6, &[experts, 4]) || !fits(7, &[4])
+            {
+                return Err(RuntimeError::Rejected("invalid grouped NVFP4 gate/up operands".into()));
+            }
+            continue;
+        }
+        let [hidden, inner, experts, slots, aligned_rows, ..] = d.i.map(u64::from);
+        if hidden == 0 || inner == 0 || experts == 0 || slots == 0 || aligned_rows < slots
+            || !fits(0, &[slots, hidden, 4])
+            || !fits(1, &[slots, inner, 2])
+            || !fits(2, &[experts, hidden, inner.div_ceil(2)])
+            || !fits(3, &[experts, hidden, inner.div_ceil(16)])
+            || !fits(4, &[3 * experts + 1, 4])
+            || !fits(5, &[experts, 4])
+            || !fits(6, &[aligned_rows, 4])
+            || !fits(7, &[4])
+        {
+            return Err(RuntimeError::Rejected("invalid grouped NVFP4 down operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_mxfp4_moe_role_inst(
     d: &DevInst64,
     rows: u32,
@@ -1437,6 +1705,9 @@ fn validate_mxfp4_moe_role_inst(
         || d.i[0] == 0
         || d.i[0] > 16
         || d.i[3] == 0
+        || d.i[7] > 2
+        || d.t[6] != TENSOR_NONE16
+        || d.t[7] != TENSOR_NONE16
     {
         return Err(reject());
     }
@@ -1474,27 +1745,37 @@ fn validate_mxfp4_moe_role_inst(
         {
             let inter = u64::from(d.i[1]);
             let hidden = u64::from(d.i[2]);
+            let (w_row, s_row) = match d.i[7] {
+                1 => (hidden, hidden.div_ceil(32)),
+                2 => (hidden.div_ceil(2), hidden.div_ceil(16)),
+                _ => (hidden.div_ceil(2), hidden.div_ceil(32)),
+            };
             extent(0, checked(&[ksel, inter, 2])?, false)?;
             extent(1, checked(&[hidden, 2])?, false)?;
             extent(
                 3,
-                checked(&[experts, 2 * inter, hidden.div_ceil(2)])?,
+                checked(&[experts, 2 * inter, w_row])?,
                 false,
             )?;
             extent(
                 4,
-                checked(&[experts, 2 * inter, hidden.div_ceil(32)])?,
+                checked(&[experts, 2 * inter, s_row])?,
                 false,
             )?;
             extent(5, checked(&[experts, 2 * inter, 2])?, true)?;
         }
-        Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 => {
+        Some(DevOp::MoeDownMx) if d.i[1] > 0 && d.i[2] > 0 && d.i[2] % 32 == 0 && d.i[5] == 0 => {
             let hidden = u64::from(d.i[1]);
             let inter = u64::from(d.i[2]);
+            let (w_row, s_row) = match d.i[7] {
+                1 => (inter, inter.div_ceil(32)),
+                2 => (inter.div_ceil(2), inter.div_ceil(16)),
+                _ => (inter.div_ceil(2), inter.div_ceil(32)),
+            };
             extent(0, checked(&[ksel, hidden, 4])?, false)?;
             extent(1, checked(&[ksel, inter, 2])?, false)?;
-            extent(3, checked(&[experts, hidden, inter.div_ceil(2)])?, false)?;
-            extent(4, checked(&[experts, hidden, inter.div_ceil(32)])?, false)?;
+            extent(3, checked(&[experts, hidden, w_row])?, false)?;
+            extent(4, checked(&[experts, hidden, s_row])?, false)?;
             extent(5, checked(&[experts, hidden, 2])?, true)?;
         }
         _ => return Err(reject()),
@@ -2645,6 +2926,46 @@ const INFLIGHT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// The external GDN prefill library has a fixed state layout: every `QwenGdnPrefill` state
 /// operand (`t[6]`) must be a declared recurrent buffer of that stride, with or without a
 /// section, before any launch.
+fn validate_residual_conv(blob: &DevBlob, recurrent: Option<&RecurrentState>) -> Result<()> {
+    for d in blob.progs.iter().flat_map(|p| &p.insts) {
+        let op = DevOp::from_u16(d.op);
+        if !matches!(op, Some(DevOp::QwenGdnConv | DevOp::QwenGdnConvPrefill)) || d.i[4] == 0 {
+            continue;
+        }
+        let prefill = op == Some(DevOp::QwenGdnConvPrefill);
+        let channels = u64::from(d.i[0]);
+        let group = u64::from(d.i[4]);
+        let rows = u64::from(d.i[2]);
+        let padded = if prefill { u64::from(d.i[3]) } else { rows };
+        let scale = f32::from_bits(d.fj[0]);
+        let bytes = |slot: usize| blob.tensors.get(d.t[slot] as usize).map(|t| t.bytes);
+        let extent = |slot: usize, cols: u64, count: u64| {
+            cols.checked_mul(count)
+                .and_then(|n| n.checked_mul(2))
+                .is_some_and(|n| bytes(slot).is_some_and(|b| b >= n))
+        };
+        let declared = recurrent.and_then(|state| {
+            state.tensors.iter().find(|&&(h, _)| h == d.t[3] as usize)
+        });
+        if channels == 0 || channels % group != 0 || d.i[1] != 4 || rows == 0 || padded < rows
+            || !scale.is_finite() || scale <= 0.0
+            || d.fj[2] != 0
+            || (d.t[5] != TENSOR_NONE16 && (d.t[7] == TENSOR_NONE16 || !extent(5, channels, rows)))
+            || (1..=7).any(|slot| d.t[slot] == d.t[0])
+            || [1, 2, 4, 5, 6, 7].iter().any(|&slot| d.t[slot] == d.t[3])
+            || !extent(0, channels, padded) || !extent(1, channels, rows) || !extent(2, channels, 4)
+            || declared.is_none_or(|&(_, stride)| stride != channels * 6)
+            || (!prefill && !extent(3, channels * 3, rows))
+            || (!prefill && d.t[4] != TENSOR_NONE16 && !extent(4, 2, rows))
+            || (d.t[6] != TENSOR_NONE16 && !extent(6, channels / group * 4, rows))
+            || (d.t[7] != TENSOR_NONE16 && !extent(7, channels, rows))
+        {
+            return Err(RuntimeError::Rejected("invalid recurrent residual conv operands".into()));
+        }
+    }
+    Ok(())
+}
+
 fn check_gdn_state_operands(
     prefill: &[&crate::asset::devblob::DevProg],
     recurrent: Option<&RecurrentState>,
@@ -2802,6 +3123,7 @@ pub struct GpuEngine {
     /// Per-tensor device buffers, indexed by blob tensor handle. Ordinarily
     /// **views** into `_weight_slab`, not owners — see it for why.
     devp: Vec<DeviceMem>,
+    handoff_shared: Option<handoff_causal::SharedCausalTensors>,
     /// Owner of the one span every non-VMM-prefix tensor is carved out of.
     ///
     /// The blob declares every tensor and its size before a byte moves, so the
@@ -3079,6 +3401,12 @@ pub struct GpuEngine {
     debug_nsplit_kvlen: Option<u32>,
     /// This engine's rank in a process rank group (tensor or pipeline parallel), if any.
     rank_bind: Option<rank::RankBind>,
+    checkpoint_dir: std::path::PathBuf,
+    assets_dir: std::path::PathBuf,
+    blob: Arc<DevBlob>,
+    derived_weights: Option<plow_asset::derived_weights::DerivedWeights>,
+    tp_declared_shards: Option<crate::asset::shard::DeclaredShards>,
+    hibernated: bool,
 }
 
 /// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
@@ -4152,6 +4480,170 @@ pub enum PrefillStep {
     Done(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadedTensorKind {
+    CheckpointWeight,
+    Init,
+    Generated,
+}
+
+/// Advance checkpoint prefetch cursor over up to `budget` weight tensors.
+fn prefetch_tensor_spans(
+    cur: &mut usize,
+    budget: usize,
+    tensors: &[crate::asset::devblob::DevTensor],
+    ckpt: &Checkpoint,
+    prefetch: Option<&crate::asset::checkpoint::Prefetcher>,
+    packed_prefill: Option<&plow_asset::packed_prefill::Manifest>,
+) {
+    let Some(pool) = prefetch else {
+        return;
+    };
+    let mut n = 0;
+    while *cur < tensors.len() && n < budget {
+        let td = &tensors[*cur];
+        *cur += 1;
+        if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill) {
+            continue;
+        }
+        if let Some(s) = ckpt.span(&td.name, 0, td.bytes as usize) {
+            pool.push(s);
+        }
+        n += 1;
+    }
+}
+
+/// Upload or stream a single tensor's contents (checkpoint weight, init slice, or generated
+/// RoPE/table) into the upload pipeline, waiting on slab commitment for each chunk.
+/// Returns `Ok(Some(kind))` if data was pushed to `pipe`, or `Ok(None)` if this tensor
+/// is uninitialized/scratch.
+fn upload_single_tensor(
+    td: &crate::asset::devblob::DevTensor,
+    i: usize,
+    dst_base: u64,
+    ckpt: &Checkpoint,
+    derived_weights: Option<&plow_asset::derived_weights::DerivedWeights>,
+    tp_shards: Option<(u32, u32, &crate::asset::shard::DeclaredShards)>,
+    packed_prefill: Option<&plow_asset::packed_prefill::Manifest>,
+    blob_init: &[u8],
+    gen: Option<&packet::rope::GenTensor>,
+    pipe: &mut UploadPipe,
+    mut commit: impl FnMut(u64) -> Result<()>,
+    mut prefetch_tick: impl FnMut(),
+) -> Result<Option<UploadedTensorKind>> {
+    if td.init.is_none() && is_checkpoint_tensor(i, &td.name, packed_prefill) {
+        let assembled = if td.name.starts_with(packet::names::CONCAT_PREFIX) {
+            let spec = derived_weights
+                .and_then(|d| d.get(&td.name))
+                .ok_or_else(|| {
+                    RuntimeError::Rejected(format!(
+                        "{}: no {} entry",
+                        td.name,
+                        plow_asset::derived_weights::SECTION
+                    ))
+                })?;
+            Some(ckpt.concatenated(spec, td.bytes))
+        } else {
+            ckpt.widened_f32(&td.name, td.bytes)
+        };
+        if let Some(wide) = assembled {
+            if tp_shards.is_some() {
+                return Err(RuntimeError::Rejected(format!(
+                    "{}: assembled weights are not sharded for tensor parallelism",
+                    td.name
+                )));
+            }
+            let wide = wide?;
+            for (o, chunk) in wide.chunks(STAGE).enumerate() {
+                let dst = dst_base + (o * STAGE) as u64;
+                commit(dst + chunk.len() as u64)?;
+                pipe.push(dst, chunk)?;
+            }
+            return Ok(Some(UploadedTensorKind::CheckpointWeight));
+        }
+        let missing = || RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name));
+        let src: std::borrow::Cow<[u8]> = match &tp_shards {
+            Some((r, n, decl)) => {
+                let (bytes, shape) = ckpt.tensor_ex(&td.name).ok_or_else(missing)?;
+                crate::asset::shard::slice_for_as(
+                    &td.name,
+                    decl.axis(&td.name),
+                    bytes,
+                    shape,
+                    td.bytes,
+                    *r,
+                    *n,
+                )?
+            }
+            None => std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?),
+        };
+        if src.len() as u64 != td.bytes {
+            return Err(RuntimeError::Device(format!(
+                "SIZE MISMATCH {} (want {} got {})",
+                td.name,
+                td.bytes,
+                src.len()
+            )));
+        }
+        tracing::debug!(
+            tensor = %td.name,
+            bytes = td.bytes,
+            mib = td.bytes / (1 << 20),
+            "uploading weight tensor"
+        );
+        prefetch_tick();
+        for (o, chunk) in src.chunks(STAGE).enumerate() {
+            let dst = dst_base + (o * STAGE) as u64;
+            commit(dst + chunk.len() as u64)?;
+            if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
+                // SAFETY: `chunk` borrows the checkpoint mmap (`ckpt`, whose Arc outlives pipe.finish()).
+                unsafe { pipe.push_direct(dst, chunk)? }
+            } else {
+                pipe.push(dst, chunk)?;
+            }
+        }
+        return Ok(Some(UploadedTensorKind::CheckpointWeight));
+    } else if let Some(r) = &td.init {
+        for (o, chunk) in blob_init[r.clone()].chunks(STAGE).enumerate() {
+            let dst = dst_base + (o * STAGE) as u64;
+            commit(dst + chunk.len() as u64)?;
+            if pipe.is_direct() {
+                // SAFETY: `chunk` borrows `blob.init`, which lives past pipe.finish().
+                unsafe { pipe.push_direct(dst, chunk)? }
+            } else {
+                pipe.push(dst, chunk)?;
+            }
+        }
+        return Ok(Some(UploadedTensorKind::Init));
+    } else if let Some(g) = gen {
+        let data = g.generate().ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "devblob: gen recipe for `{}` has unknown kind {}",
+                td.name, g.kind
+            ))
+        })?;
+        if data.len() as u64 != td.bytes {
+            return Err(RuntimeError::Device(format!(
+                "devblob: gen recipe for `{}` produced {} B, decl says {}",
+                td.name,
+                data.len(),
+                td.bytes
+            )));
+        }
+        for (o, chunk) in data.chunks(STAGE).enumerate() {
+            let dst = dst_base + (o * STAGE) as u64;
+            commit(dst + chunk.len() as u64)?;
+            pipe.push(dst, chunk)?;
+        }
+        tracing::debug!(
+            tensor = %td.name, bytes = td.bytes, kind = g.kind,
+            "materialised generated tensor"
+        );
+        return Ok(Some(UploadedTensorKind::Generated));
+    }
+    Ok(None)
+}
+
 impl GpuEngine {
     /// Bring the model up on the device: blob + cubin + weights + decode
     /// tables. Slow (a 12B checkpoint is ~22 GiB of H2D) — called once at
@@ -4167,7 +4659,144 @@ impl GpuEngine {
         be: Arc<CudaBackend>,
         assets_dir: &Path,
         checkpoint_dir: &Path,
+        rank_bind: Option<rank::RankBind>,
+    ) -> Result<Self> {
+        Self::load_rank_inner(be, assets_dir, checkpoint_dir, rank_bind, None)
+    }
+
+    pub(crate) fn load_handoff_shared(
+        be: Arc<CudaBackend>,
+        assets_dir: &Path,
+        checkpoint_dir: &Path,
+        shared: handoff_causal::SharedCausalTensors,
+    ) -> Result<Self> {
+        Self::load_rank_inner(be, assets_dir, checkpoint_dir, None, Some(shared))
+    }
+
+    /// Hibernate the model to warm dormancy: unmap physical pages of weights, activations,
+    /// and dynamic KV cache while keeping device virtual addresses, CUDA graphs,
+    /// cuBLASLt algorithm profiles, and cubin modules resident in driver context.
+    pub fn hibernate(&mut self) -> Result<u64> {
+        if self.hibernated {
+            return Ok(0);
+        }
+        self.be.stream_synchronize(&self.stream)?;
+        let freed_bytes = self._weight_slab.hibernate()?;
+        if let Some(vmm) = &mut self.vmm {
+            vmm.evict_all();
+        }
+        self.pos.fill(0);
+        self.vmm_attached.fill(0);
+        self.resume_rows.fill(0);
+        self.seq_tokens.iter_mut().for_each(|v| v.clear());
+        self.vmm_active.fill(false);
+        self.rewind_snapshots.iter_mut().for_each(|s| *s = None);
+        self.kv_hw.fill(0);
+        self.slot_generations
+            .iter_mut()
+            .for_each(|g| *g = g.wrapping_add(1));
+        self.hibernated = true;
+        Ok(freed_bytes)
+    }
+
+    /// Whether the engine is currently hibernated in warm dormancy.
+    pub fn is_hibernated(&self) -> bool {
+        self.hibernated
+    }
+
+    /// Awaken the model from warm dormancy: remap physical backing for weights and activations
+    /// into the exact same reserved virtual address space, stream weights and init data from
+    /// `checkpoint_dir`, and zero activation buffers. CUDA graphs, cuBLASLt algorithm profiles,
+    /// and cubin modules remain fully valid without re-capture or re-profiling.
+    pub fn awaken(&mut self, checkpoint_dir: &Path) -> Result<()> {
+        if !self.hibernated {
+            return Ok(());
+        }
+        self._weight_slab.awaken(WEIGHT_SLAB_CHUNK)?;
+        let ckpt = Arc::new(Checkpoint::open(checkpoint_dir)?);
+        let mut pipe = UploadPipe::new(&self.be, false)?;
+
+        let depth = crate::asset::checkpoint::prefetch_depth();
+        let pref_threads = crate::asset::checkpoint::prefetch_threads();
+        let prefetch = crate::asset::checkpoint::Prefetcher::start(
+            Arc::clone(&ckpt),
+            pref_threads,
+            depth,
+            None,
+        );
+        let mut pf = 0usize;
+        prefetch_tensor_spans(
+            &mut pf,
+            depth,
+            &self.blob.tensors,
+            &ckpt,
+            prefetch.as_ref(),
+            self.packed_prefill.as_ref(),
+        );
+
+        let gen_by_tensor: std::collections::HashMap<u32, &packet::rope::GenTensor> =
+            self.blob.gen.iter().map(|g| (g.tensor, g)).collect();
+
+        let tp_shards = match (self.blob.tp, self.rank_bind.as_ref()) {
+            (Some(_), Some(r)) => {
+                let decl = self.tp_declared_shards.clone().unwrap_or_default();
+                Some((r.tp_rank, r.tp, decl))
+            }
+            _ => None,
+        };
+
+        let mut slab_wait_ms = 0f64;
+        for (i, td) in self.blob.tensors.iter().enumerate() {
+            let mem = &self.devp[i];
+            if !self._weight_slab.contains(mem.base) {
+                continue;
+            }
+            let kind = upload_single_tensor(
+                td,
+                i,
+                mem.base,
+                &ckpt,
+                self.derived_weights.as_ref(),
+                tp_shards.as_ref().map(|(r, n, decl)| (*r, *n, decl)),
+                self.packed_prefill.as_ref(),
+                &self.blob.init,
+                gen_by_tensor.get(&(i as u32)).copied(),
+                &mut pipe,
+                |end| slab_commit_wait(&self._weight_slab, end, &mut slab_wait_ms),
+                || {
+                    prefetch_tensor_spans(
+                        &mut pf,
+                        1,
+                        &self.blob.tensors,
+                        &ckpt,
+                        prefetch.as_ref(),
+                        self.packed_prefill.as_ref(),
+                    )
+                },
+            )?;
+            if kind.is_none() {
+                slab_commit_wait(&self._weight_slab, mem.base + td.bytes, &mut slab_wait_ms)?;
+                self.be.memset_d8(mem.base, 0, td.bytes as usize)?;
+            }
+        }
+        pipe.finish()?;
+        if let WeightSlab::Vmm(slab) = &*self._weight_slab {
+            slab.wait_mapped(slab.len())?;
+        }
+        self.be
+            .memset_d8(self._ctr_block.base, 0, self.ctr_bytes + self.cursor_bytes)?;
+        self.be.stream_synchronize(&self.stream)?;
+        self.checkpoint_dir = checkpoint_dir.to_path_buf();
+        self.hibernated = false;
+        Ok(())
+    }
+
+    fn load_rank_inner(
+        be: Arc<CudaBackend>,
+        assets_dir: &Path,
+        checkpoint_dir: &Path,
         mut rank_bind: Option<rank::RankBind>,
+        handoff_shared: Option<handoff_causal::SharedCausalTensors>,
     ) -> Result<Self> {
         let t0 = std::time::Instant::now();
         crate::knob_spec::check_assets(&assets_dir.join("model.pkt"))?;
@@ -4200,6 +4829,14 @@ impl GpuEngine {
                 let image = crate::asset::packet_image::PacketImage::open(&pkt)?;
                 image.blob.check_l2_dispatch(false)?;
                 let blob = image.blob.clone();
+                validate_moe_outer_scales(&blob)?;
+                validate_grouped_nvfp4(&blob)?;
+                validate_gated_flash_merge(&blob)?;
+                validate_head_preparation(&blob)?;
+                validate_relative_attention(&blob)?;
+                validate_normalized_residual_mix(&blob)?;
+                validate_residual_copies(&blob)?;
+                validate_residual_message_controllers(&blob)?;
                 if blob.progs.iter().flat_map(|p| &p.insts).any(|d| {
                     d.op == DevOp::IndexFp8Decode as u16 || d.op == DevOp::IndexFp8Prefill as u16
                 }) {
@@ -4727,6 +5364,7 @@ impl GpuEngine {
             }
         }
         check_gdn_state_operands(&blob.prefill_progs(), recurrent.as_ref())?;
+        validate_residual_conv(&blob, recurrent.as_ref())?;
         let unsupported_hd128_fp8_kv = blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
             (inst.op == DevOp::HeadNormRopeFp8 as u16 && inst.i[2] == 128)
                 || (matches!(
@@ -5096,11 +5734,30 @@ impl GpuEngine {
             }
         };
         let config = RuntimeConfig::get();
+        if let Some(shared) = &handoff_shared {
+            if rank_bind.is_some() {
+                return Err(RuntimeError::Rejected(
+                    "shared causal tensors do not support rank bindings".into(),
+                ));
+            }
+            shared.validate(&be, &blob, |id, name| {
+                vmm_va_of(id).is_none()
+                    && !name.starts_with("kv.")
+                    && !vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(&id))
+                    && !is_checkpoint_tensor(id, name, packed_prefill_metadata.as_ref())
+                    && !blob.gen.iter().any(|g| g.tensor == id as u32)
+            })?;
+        }
         let slab_bytes: u64 = blob
             .tensors
             .iter()
             .enumerate()
-            .filter(|(id, _)| vmm_va_of(*id).is_none())
+            .filter(|(id, td)| {
+                vmm_va_of(*id).is_none()
+                    && !handoff_shared
+                        .as_ref()
+                        .is_some_and(|s| s.contains(&td.name))
+            })
             .map(|(_, td)| carve_bytes(td.bytes))
             .sum();
         // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
@@ -5223,30 +5880,15 @@ impl GpuEngine {
                 )
             }
         };
-        // Runs `depth` WEIGHT tensors ahead of the copy over the same list in the
-        // same order, so the cursor only moves forward and each tensor is queued
-        // exactly once. Non-weights are skipped so the depth counts reads, not
-        // table entries — most of a blob's tensors are scratch that touches no
-        // checkpoint at all. TP1 here, so the touched bytes are the whole tensor.
-        let prefetch_ahead = |cur: &mut usize, budget: usize| {
-            let Some(pool) = prefetch.as_ref() else {
-                return;
-            };
-            let mut n = 0;
-            while *cur < blob.tensors.len() && n < budget {
-                let td = &blob.tensors[*cur];
-                *cur += 1;
-                if !is_checkpoint_tensor(*cur - 1, &td.name, packed_prefill_metadata.as_ref()) {
-                    continue;
-                }
-                if let Some(s) = ckpt.span(&td.name, 0, td.bytes as usize) {
-                    pool.push(s);
-                }
-                n += 1;
-            }
-        };
         let mut pf = 0usize;
-        prefetch_ahead(&mut pf, depth);
+        prefetch_tensor_spans(
+            &mut pf,
+            depth,
+            &blob.tensors,
+            &ckpt,
+            prefetch.as_ref(),
+            packed_prefill_metadata.as_ref(),
+        );
 
         let gen_by_tensor: std::collections::HashMap<u32, &packet::rope::GenTensor> =
             blob.gen.iter().map(|g| (g.tensor, g)).collect();
@@ -5265,23 +5907,32 @@ impl GpuEngine {
             for (i, td) in blob.tensors.iter().enumerate() {
                 let vmm_va = vmm_va_of(i);
                 let packet_cache = vmm.as_ref().is_some_and(|v| v.cache_tensors.contains(&i));
-                let t_alloc =
-                    (load_prof && vmm_va.is_none() && matches!(weight_slab, WeightSlab::PerTensor))
-                        .then(std::time::Instant::now);
+                let shared = handoff_shared.as_ref().filter(|s| s.contains(&td.name));
+                let t_alloc = (load_prof
+                    && shared.is_none()
+                    && vmm_va.is_none()
+                    && matches!(weight_slab, WeightSlab::PerTensor))
+                .then(std::time::Instant::now);
                 let tensor_bytes = td.bytes;
-                let mem = match (vmm_va, &weight_slab) {
-                    (Some(va), _) => DeviceMem::view(va, td.bytes),
-                    (None, WeightSlab::Vmm(slab)) => {
-                        let m = DeviceMem::view(slab.base() + slab_off, tensor_bytes);
-                        slab_off += carve_bytes(tensor_bytes);
-                        m
+                let mem = if let Some(s) = shared {
+                    s.memory(&td.name)?.ok_or_else(|| {
+                        RuntimeError::Rejected("missing shared tensor binding".into())
+                    })?
+                } else {
+                    match (vmm_va, &weight_slab) {
+                        (Some(va), _) => DeviceMem::view(va, td.bytes),
+                        (None, WeightSlab::Vmm(slab)) => {
+                            let m = DeviceMem::view(slab.base() + slab_off, tensor_bytes);
+                            slab_off += carve_bytes(tensor_bytes);
+                            m
+                        }
+                        (None, WeightSlab::Flat(slab)) => {
+                            let m = slab.subview(slab_off, tensor_bytes)?;
+                            slab_off += carve_bytes(tensor_bytes);
+                            m
+                        }
+                        (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                     }
-                    (None, WeightSlab::Flat(slab)) => {
-                        let m = slab.subview(slab_off, tensor_bytes)?;
-                        slab_off += carve_bytes(tensor_bytes);
-                        m
-                    }
-                    (None, WeightSlab::PerTensor) => be.alloc(0, tensor_bytes)?,
                 };
                 // Producers use the mirror only after every interpreter candidate passed the guard.
                 let mem = match (&tp_shards, td.name.as_str()) {
@@ -5321,147 +5972,57 @@ impl GpuEngine {
                         td.name
                     )));
                 }
-                if !packet_cache
-                    && td.init.is_none()
-                    && is_checkpoint_tensor(i, &td.name, packed_prefill_metadata.as_ref())
-                {
-                    let assembled = if td.name.starts_with(packet::names::CONCAT_PREFIX) {
-                        let spec = derived_weights
-                            .as_ref()
-                            .and_then(|d| d.get(&td.name))
-                            .ok_or_else(|| {
-                                RuntimeError::Rejected(format!(
-                                    "{}: no {} entry",
-                                    td.name,
-                                    plow_asset::derived_weights::SECTION
-                                ))
-                            })?;
-                        Some(ckpt.concatenated(spec, td.bytes))
+                if shared.is_some_and(|s| !s.initialize(&td.name)) {
+                    devp.push(mem);
+                    continue;
+                }
+                let commit = |end, wait: &mut f64| -> Result<()> {
+                    if shared.is_some() {
+                        Ok(())
                     } else {
-                        ckpt.widened_f32(&td.name, td.bytes)
-                    };
-                    if let Some(wide) = assembled {
-                        if tp_shards.is_some() {
-                            return Err(RuntimeError::Rejected(format!(
-                                "{}: assembled weights are not sharded for tensor parallelism",
-                                td.name
-                            )));
-                        }
-                        let wide = wide?;
-                        for (o, chunk) in wide.chunks(STAGE).enumerate() {
-                            let dst = mem.base + (o * STAGE) as u64;
-                            slab_commit_wait(
-                                &weight_slab,
-                                dst + chunk.len() as u64,
-                                &mut slab_wait_ms,
-                            )?;
-                            pipe.push(dst, chunk)?;
-                        }
-                        wb += td.bytes;
-                        nw += 1;
-                        devp.push(mem);
-                        continue;
+                        slab_commit_wait(&weight_slab, end, wait)
                     }
-                    let missing = || RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name));
-                    let src: std::borrow::Cow<[u8]> = match &tp_shards {
-                        Some((r, n, decl, ..)) => {
-                            let (bytes, shape) = ckpt.tensor_ex(&td.name).ok_or_else(missing)?;
-                            crate::asset::shard::slice_for_as(
-                                &td.name,
-                                decl.axis(&td.name),
-                                bytes,
-                                shape,
-                                td.bytes,
-                                *r,
-                                *n,
-                            )?
+                };
+                if !packet_cache {
+                    let uploaded = upload_single_tensor(
+                        td,
+                        i,
+                        mem.base,
+                        &ckpt,
+                        derived_weights.as_ref(),
+                        tp_shards.as_ref().map(|(r, n, decl, _)| (*r, *n, decl)),
+                        packed_prefill_metadata.as_ref(),
+                        &blob.init,
+                        gen_by_tensor.get(&(i as u32)).copied(),
+                        &mut pipe,
+                        |end| commit(end, &mut slab_wait_ms),
+                        || {
+                            prefetch_tensor_spans(
+                                &mut pf,
+                                1,
+                                &blob.tensors,
+                                &ckpt,
+                                prefetch.as_ref(),
+                                packed_prefill_metadata.as_ref(),
+                            )
+                        },
+                    )?;
+                    match uploaded {
+                        Some(UploadedTensorKind::CheckpointWeight) => {
+                            wb += td.bytes;
+                            nw += 1;
                         }
+                        Some(UploadedTensorKind::Init | UploadedTensorKind::Generated) => {}
                         None => {
-                            std::borrow::Cow::Borrowed(ckpt.tensor(&td.name).ok_or_else(missing)?)
+                            if vmm_va.is_none() && !td.name.starts_with("kv.") {
+                                commit(mem.base + td.bytes, &mut slab_wait_ms)?;
+                                let t_ms = load_prof.then(std::time::Instant::now);
+                                be.memset_d8(mem.base, 0, td.bytes as usize)?;
+                                if let (Some(t), Some(tm)) = (t_ms, load_tim.as_mut()) {
+                                    tm.memset_ms += t.elapsed().as_secs_f64() * 1e3;
+                                }
+                            }
                         }
-                    };
-                    if src.len() as u64 != td.bytes {
-                        return Err(RuntimeError::Device(format!(
-                            "SIZE MISMATCH {} (want {} got {})",
-                            td.name,
-                            td.bytes,
-                            src.len()
-                        )));
-                    }
-                    tracing::debug!(
-                        tensor = %td.name,
-                        bytes = td.bytes,
-                        mib = td.bytes / (1 << 20),
-                        "uploading weight tensor"
-                    );
-                    prefetch_ahead(&mut pf, 1);
-                    for (o, chunk) in src.chunks(STAGE).enumerate() {
-                        let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
-                        if pipe.is_direct() && matches!(src, std::borrow::Cow::Borrowed(_)) {
-                            // SAFETY: `chunk` borrows the checkpoint mmap
-                            // (`ckpt`, whose Arc outlives pipe.finish()).
-                            unsafe { pipe.push_direct(dst, chunk)? }
-                        } else {
-                            pipe.push(dst, chunk)?;
-                        }
-                    }
-                    wb += td.bytes;
-                    nw += 1;
-                } else if let Some(r) = &td.init {
-                    for (o, chunk) in blob.init[r.clone()].chunks(STAGE).enumerate() {
-                        let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
-                        if pipe.is_direct() {
-                            // SAFETY: `chunk` borrows `blob.init`, which lives
-                            // past pipe.finish().
-                            unsafe { pipe.push_direct(dst, chunk)? }
-                        } else {
-                            pipe.push(dst, chunk)?;
-                        }
-                    }
-                } else if let Some(g) = gen_by_tensor.get(&(i as u32)) {
-                    let data = g.generate().ok_or_else(|| {
-                        RuntimeError::Device(format!(
-                            "devblob: gen recipe for `{}` has unknown kind {}",
-                            td.name, g.kind
-                        ))
-                    })?;
-                    if data.len() as u64 != td.bytes {
-                        return Err(RuntimeError::Device(format!(
-                            "devblob: gen recipe for `{}` produced {} B, decl says {}",
-                            td.name,
-                            data.len(),
-                            td.bytes
-                        )));
-                    }
-                    for (o, chunk) in data.chunks(STAGE).enumerate() {
-                        let dst = mem.base + (o * STAGE) as u64;
-                        slab_commit_wait(
-                            &weight_slab,
-                            dst + chunk.len() as u64,
-                            &mut slab_wait_ms,
-                        )?;
-                        pipe.push(dst, chunk)?;
-                    }
-                    tracing::debug!(
-                        tensor = %td.name, bytes = td.bytes, kind = g.kind,
-                        "materialised generated tensor"
-                    );
-                } else if vmm_va.is_none() && !packet_cache && !td.name.starts_with("kv.") {
-                    slab_commit_wait(&weight_slab, mem.base + td.bytes, &mut slab_wait_ms)?;
-                    let t_ms = load_prof.then(std::time::Instant::now);
-                    be.memset_d8(mem.base, 0, td.bytes as usize)?;
-                    if let (Some(t), Some(tm)) = (t_ms, load_tim.as_mut()) {
-                        tm.memset_ms += t.elapsed().as_secs_f64() * 1e3;
                     }
                 }
                 devp.push(mem);
@@ -6466,13 +7027,33 @@ impl GpuEngine {
                 .enumerate()
                 .map(|(index, g)| {
                     let program = blob.progs.len() - blob.decode_progs().len() + index;
-                    let projection_roles = segment_roles
-                        .as_ref()
-                        .and_then(|r| r.program(program))
-                        .map(|p| &p.roles)
-                        .filter(|roles| {
-                            roles.iter().copied().any(plow_asset::segment_roles::is_projection)
-                        });
+                    let rows = packet::devbuild::program_rows(g.t);
+                    let lt_min = crate::config::RuntimeConfig::get().nv.decode_cublaslt_min_rows;
+                    let projection_roles = if lt_min > 0 && rows < lt_min {
+                        if segment_roles
+                            .as_ref()
+                            .and_then(|r| r.program(program))
+                            .map(|p| &p.roles)
+                            .is_some_and(|roles| {
+                                roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                            })
+                        {
+                            tracing::info!(
+                                rows,
+                                lt_min,
+                                "decode rung kept native for speculative verify (below decode_cublaslt_min_rows)"
+                            );
+                        }
+                        None
+                    } else {
+                        segment_roles
+                            .as_ref()
+                            .and_then(|r| r.program(program))
+                            .map(|p| &p.roles)
+                            .filter(|roles| {
+                                roles.iter().copied().any(plow_asset::segment_roles::is_projection)
+                            })
+                    };
                     let mut rung = if let (Some(lt), Some(roles)) = (&cublaslt, projection_roles) {
                         let segments = cublaslt::decode_segments(g, &blob.tensors, roles)?;
                         let moe_segments =
@@ -7890,22 +8471,41 @@ impl GpuEngine {
         // The floor is 2% of the device, at most half of what is free after load; a card the
         // rings nearly fill (26B: 5 GiB) keeps an eighth of it instead.
         let blocks = vmm.as_ref().and_then(|v| v.blocks.clone());
-        let mut store_room = None;
         let mut cache_floor = 0;
         let mut store_floor_band = None;
-        if let Some(kv) = vmm
-            .as_mut()
-            .and_then(|v| v.kv.as_mut())
-            .filter(|kv| kv.prefix_reuse())
-        {
-            if let Ok((free, total)) = be.mem_info() {
-                let config = crate::config::RuntimeConfig::get();
-                if let Some(floor) = config.vmm_cache_min_free_bytes(total, Some(free)) {
-                    kv.enable_pressure_eviction(floor);
-                    cache_floor = floor;
+        if let Ok((free, total)) = be.mem_info() {
+            let config = crate::config::RuntimeConfig::get();
+            let ring_charge = vmm
+                .as_ref()
+                .and_then(|v| v.rings.as_ref())
+                .map(|r| r.slot_charge())
+                .unwrap_or(0);
+            let packet_batch = vmm
+                .as_ref()
+                .and_then(|v| v.rings.as_ref())
+                .map(|r| r.slots() as u32)
+                .unwrap_or(batch as u32);
+            let budget = crate::memory::budget::GpuMemoryBudget::compute(
+                crate::memory::budget::GpuMemoryBudgetParams {
+                    total_bytes: total,
+                    free_bytes: free,
+                    packet_batch,
+                    ring_slot_charge: ring_charge,
+                    config,
+                },
+            );
+
+            if let Some(kv) = vmm
+                .as_mut()
+                .and_then(|v| v.kv.as_mut())
+                .filter(|kv| kv.prefix_reuse())
+            {
+                if budget.floor_bytes > 0 {
+                    kv.enable_pressure_eviction(budget.floor_bytes);
+                    cache_floor = budget.floor_bytes;
                     let cache_cap = config.prefix_cache_cap_bytes(total);
                     tracing::info!(
-                        floor_mib = floor >> 20,
+                        floor_mib = budget.floor_bytes >> 20,
                         free_mib = free >> 20,
                         cache_cap_mib = cache_cap >> 20,
                         "vmm prefix cache: pressure eviction armed (static cap is the fallback)"
@@ -7913,37 +8513,38 @@ impl GpuEngine {
                     // The store may reserve what the pool could have grown to; pressure
                     // shrinks it below that when the rings grow.
                     if let (0, Some(bs)) = (cache_cap, blocks.as_ref()) {
-                        bs.set_device_cap(free.saturating_sub(floor));
-                        store_room = Some(free.saturating_sub(floor));
+                        bs.set_device_cap(budget.usable_room_bytes);
                         // Slot growth beyond the block pool creates blocks from free memory:
                         // the store stops a pool's worth above the floor so that does not
                         // trip the OOM path on every new slot.
-                        bs.set_device_floor(floor + (config.kv_pool_mib() << 20));
+                        bs.set_device_floor(budget.floor_bytes + (config.kv_pool_mib() << 20));
                         store_floor_band = Some(config.kv_pool_mib() << 20);
                     }
                 }
             }
-        }
-        // Parked ring units come out of the free memory the store grows into: they may hold at
-        // most half of its device tier, so a wide batch parks fewer slots than it serves instead
-        // of starving the store.
-        if let (Some(room), Some(rings)) = (store_room, vmm.as_mut().and_then(|v| v.rings.as_mut()))
-        {
-            let charge = rings.slot_charge().max(1);
-            let slots = (room / 2 / charge).min(rings.slots() as u64);
-            rings.set_park_cap(slots * charge);
+
+            // Parked ring units come out of the free memory the store grows into: they may hold at
+            // most half of its device tier, and clamp to decode_max_rung so wide compiled batches
+            // never park more slots than the server is admitted to run concurrently.
+            if let Some(rings) = vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+                rings.set_park_cap(budget.ring_park_cap_bytes);
+                tracing::info!(
+                    park_slots = budget.ring_park_slots,
+                    slots = rings.slots(),
+                    park_mib = budget.ring_park_cap_bytes >> 20,
+                    store_cap_mib = budget.usable_room_bytes >> 20,
+                    "vmm prefix: live ring park bounded by the block store"
+                );
+            }
+        } else if let Some(rings) = vmm.as_mut().and_then(|v| v.rings.as_mut()) {
+            let config = crate::config::RuntimeConfig::get();
+            let max_park = config.decode_max_rung.unwrap_or(rings.slots() as u32) as u64;
+            let park_slots = (rings.slots() as u64).min(max_park);
+            rings.set_park_cap(park_slots * rings.slot_charge());
             tracing::info!(
-                park_slots = slots,
+                park_slots,
                 slots = rings.slots(),
-                park_mib = (slots * charge) >> 20,
-                store_cap_mib = room >> 20,
-                "vmm prefix: live ring park bounded by the block store"
-            );
-        } else if let Some(rings) = vmm.as_ref().and_then(|v| v.rings.as_ref()) {
-            tracing::info!(
-                park_slots = rings.slots(),
-                slots = rings.slots(),
-                park_mib = (rings.slots() as u64 * rings.slot_charge()) >> 20,
+                park_mib = (park_slots * rings.slot_charge()) >> 20,
                 "vmm prefix: live ring park unbounded (no pressure-sized block store)"
             );
         }
@@ -8011,6 +8612,7 @@ impl GpuEngine {
                 .map(|c| c.stride.saturating_sub(c.window))
                 .min()
         });
+        let blob = Arc::new(blob);
         let mut engine = GpuEngine {
             be,
             f,
@@ -8061,6 +8663,7 @@ impl GpuEngine {
             ctr_bytes,
             cursor_bytes,
             devp,
+            handoff_shared,
             _weight_slab: Arc::new(weight_slab),
             d_inst,
             _ctr_block: ctr_block,
@@ -8188,6 +8791,12 @@ impl GpuEngine {
             debug_min_rows: 0,
             debug_nsplit_kvlen: None,
             rank_bind,
+            checkpoint_dir: checkpoint_dir.to_path_buf(),
+            assets_dir: assets_dir.to_path_buf(),
+            blob: Arc::clone(&blob),
+            derived_weights,
+            tp_declared_shards: tp_shards.as_ref().map(|(.., decl, _)| decl.clone()),
+            hibernated: false,
         };
         engine.spec_upload_identity()?;
         engine.mm_spans = engine.handle_of("act.mm_span").is_some();
@@ -8197,7 +8806,9 @@ impl GpuEngine {
             engine.fish =
                 fish_depth::FishDepth::load_if_present(&mut engine, &blob, &raw, assets_dir)?;
         }
-        engine.depth_calibrate()?;
+        if engine.handoff_shared.is_none() {
+            engine.depth_calibrate()?;
+        }
         engine.speech_identities = prefix::SpeechIdentities::new(engine.token_input_vocab());
         engine.shared_tail =
             shared_tail::SharedTail::load(&engine, &blob, kv_shared_tail_metadata.as_ref())?;
@@ -8306,8 +8917,12 @@ impl GpuEngine {
         // admission budget and store cap are sized as before, the planner's load measurement
         // includes it: 2 x Gemma-4-E4B (4 GiB each, 128 slots) was admitted on a measurement
         // without it and both engines ran out of device memory on first use.
+        // Clamped to `decode_max_rung` since wider decode rungs never run past the max rung.
         if let Some(v) = engine.vmm.as_ref().filter(|v| v.prefix_kv().is_some()) {
-            for b in 0..engine.vmm_active.len() {
+            let max_slots = config.decode_max_rung.map_or(engine.vmm_active.len(), |r| {
+                (r as usize).min(engine.vmm_active.len())
+            });
+            for b in 0..max_slots {
                 v.ensure_rows(b, 1)?;
             }
         }
@@ -9131,16 +9746,16 @@ impl GpuEngine {
             return;
         }
         // The turn-end pass: restores or touches the prompt end (the next turn's attach point).
-        if cache_output {
+        // On abort/disconnect, preserve whatever prefill or decode work was already computed.
+        if cache_output || disconnected {
             self.vmm_publish(b, self.pos[b]);
         }
         // After the publish, so the signal demotes the boundary this turn just touched and the
         // request cannot re-protect it.
         let signal = if session_end {
             Some(crate::memory::vmm::DemoteSignal::Header)
-        } else if disconnected {
-            Some(crate::memory::vmm::DemoteSignal::Abort)
         } else {
+            // Client cancel-and-resend waves re-send immediately; do not demote to cold LRU
             None
         };
         if let (Some(signal), Some((_, kv))) = (signal, self.vmm_prefix()) {
@@ -9539,6 +10154,10 @@ impl GpuEngine {
 
     pub fn record_stream_event(&self, event: &CudaEvent) -> Result<()> {
         self.be.event_record(event, &self.stream)
+    }
+
+    pub(crate) fn quarantine_unretired(&self, error: &RuntimeError) -> RuntimeError {
+        self.be.quarantine_unretired(error)
     }
 
     fn step_slots_sampled_unchecked(
@@ -10043,9 +10662,18 @@ impl GpuEngine {
             self.rank_arm(&plan)?;
         }
         self.launch_decode_program(selection)?;
-        let cap = self
-            .selected_decode(selection)
-            .map_or(self.batch, |r| r.rows);
+        let effective_rungs = self.effective_decode_rungs();
+        let cap = effective_rungs
+            .iter()
+            .copied()
+            .find(|&w| w as usize >= self.decode_extent)
+            .map_or_else(
+                || {
+                    self.selected_decode(selection)
+                        .map_or(self.batch, |r| r.rows)
+                },
+                |w| w as usize,
+            );
         self.buckets.record(
             crate::obs::bucket::Family::Decode,
             self.decode_extent,
@@ -10584,17 +11212,24 @@ impl GpuEngine {
         }
         let mut fed: smallvec::SmallVec<[(usize, u32); 32]> = feeds.iter().copied().collect();
         if self.pipe_busy() && !self.pipe_covers(feeds) {
-            // A mixed launch can leave a step in flight whose rows are not these feeds: read it
-            // out first — its tokens belong to the same sink — then start a fresh step.
-            self.pipe_drain(out)?;
-            // The mux gathered `feeds` before this drain and cannot re-gather from in here (its
-            // own drain path does, at the call site). For a row the drain just produced a token
-            // for, the caller's token is one step stale, and feeding it back would resample the
-            // token that was already emitted.
-            for (b, token) in fed.iter_mut() {
-                if let Some(&(_, fresh)) = out.iter().rev().find(|&&(slot, _)| slot == *b) {
-                    *token = fresh;
+            if lookahead {
+                // Dynamic slot transition: step N-1 is in flight.
+                // Enqueue step N with PipeUpload::State: held slots stream from d_last on device,
+                // newly arrived slots stage from host.
+                self.pipe_enqueue(feeds, PipeUpload::State)?;
+                // Now complete step N-1, leaving step N in flight.
+                return self.pipe_complete(out);
+            } else {
+                // Lookahead disabled: drain the in-flight step first.
+                self.pipe_drain(out)?;
+                for (b, token) in fed.iter_mut() {
+                    if let Some(&(_, fresh)) = out.iter().rev().find(|&&(slot, _)| slot == *b) {
+                        *token = fresh;
+                    }
                 }
+                let feeds: &[(usize, u32)] = &fed;
+                self.pipe_enqueue(feeds, PipeUpload::All)?;
+                return self.pipe_complete(out);
             }
         }
         let feeds: &[(usize, u32)] = &fed;
@@ -12723,6 +13358,21 @@ impl GpuEngine {
         }
 
         if c0 + real < n {
+            if self.vmm_prefix_enabled() {
+                let br = self
+                    .vmm
+                    .as_ref()
+                    .and_then(|v| v.kv.as_ref())
+                    .map(|kv| kv.block_rows())
+                    .unwrap_or(32);
+                let prev_blocks = c0 as u32 / br;
+                let new_blocks = (c0 + real) as u32 / br;
+                if new_blocks > prev_blocks {
+                    let chunk_boundary = new_blocks * br;
+                    self.record_prompt_prefix(b, prompt, chunk_boundary as usize);
+                    self.vmm_publish(b, chunk_boundary);
+                }
+            }
             return Ok(PrefillStep::Progress(c0 + real));
         }
         // VMM: prefill finished — publish the prompt's whole sharing blocks
@@ -15768,6 +16418,21 @@ impl GpuEngine {
                 "instruction caps cannot profile library-routed decode; use segment kernel timing"
                     .into(),
             ));
+        }
+        for gw in self.gemv_wide_modules.iter().flatten() {
+            self.be
+                .module_global_set_u32(gw.module(), "plow_debug_max_inst_gw", limit)?;
+        }
+        self.be
+            .module_global_set_u32(&self.module, "plow_debug_max_inst", limit)
+    }
+
+    /// [`Self::set_debug_max_inst`] for the depth stage alone: its programs run in the interpreter
+    /// objects whatever route serves the backbone rung, so a library-routed backbone does not
+    /// refuse the cap. The caller steps only the depth stage while a cap is set.
+    pub fn set_depth_debug_max_inst(&self, limit: u32) -> Result<bool> {
+        if !self.has_depth_stage() {
+            return Err(RuntimeError::Rejected("packet has no depth stage".into()));
         }
         for gw in self.gemv_wide_modules.iter().flatten() {
             self.be

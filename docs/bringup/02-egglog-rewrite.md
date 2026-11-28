@@ -1,118 +1,89 @@
-# Stage 2 — Egglog rewrite rules
+# Stage 2 — Egglog Rewrite Rules
 
-Target-independent. Input: the Stage-1 `nn_graph::Graph`. Output: a rule set that covers the
-model's fusible patterns, each rule proven sound (Checkpoint A).
+Target-independent stage (CPU-only). Extends the term rewrite engine to discover and lower fusible operator subgraphs, with every rewrite rule proven sound in Lean 4.
 
-## Where the rewrite runs
+* **Input:** The `nn_graph::Graph` from Stage 1.
+* **Output:** Egglog rewrite rules covering recurring operator compositions, proven sound in Lean 4 (`soundRules`), and lowered into `devgen::rewrite_lower`.
+* **Architecture Reference:** [`docs/arch/01-compiler-pipeline.md`](../arch/01-compiler-pipeline.md) §4 and [`docs/arch/08-formal-verification.md`](../arch/08-formal-verification.md).
 
-- `rewrite::rewrite_graph` lowers → saturates → extracts a `FusedGraph`.
-- `rewrite::fused_sites_for_config` keys every extracted fused node by checkpoint weight name;
-  `plowc --emit devblob` passes these sites to devgen (`PLOW_EMIT_REWRITE`, default on), and
-  `crates/devgen/src/rewrite_lower.rs` maps fused kinds to the emitter fusions that lower them.
-  A seam whose fused kind has no `Lowering` keeps the hand fusion.
-- `rewrite::explore_stats` saturates without extracting (fusion-opportunity counts only).
+---
 
-Rules reach packets by default. A new fused kind reaches a kernel only when `rewrite_lower.rs`
-lowers it.
+## 1. Rewrite Engine Architecture
 
-## Reuse vs add
+* **Engine:** `crates/rewrite` converts the operator DAG to an e-graph, runs equality saturation using Egglog rules, and extracts a minimal-cost `FusedGraph`.
+* **Devblob Bridge:** `plowc --emit devblob` queries fused sites via `rewrite::fused_sites_for_config` and lowers them through `devgen::rewrite_lower`.
+* **Default Behavior:** Rewrite lowering is active by default (`PLOW_EMIT_REWRITE=1`). Subgraphs not matching any rewrite rule fall back to standard non-fused emitter lowerings.
 
-Most decoder LLMs need no new rule. Existing coverage (`crates/rewrite/src/egl/rules.egg`):
+---
 
-| fusion site | rule(s) | fused target |
+## 2. Standard Pattern Coverage
+
+Review existing rules in `crates/rewrite/src/egl/rules.egg` before authoring new patterns:
+
+| Fusion Pattern | Existing Egglog Rule | Fused Target Node |
 |---|---|---|
-| norm → projection | `rmsnorm-linear-fuse`, `rmsnorm-linearbias-fuse` | `FusedNormLinear(Bias)` |
-| LayerNorm → projection | `layernorm-linear-fuse`, `layernorm-linearbias-fuse` | `FusedLayerNormLinear(Bias)` |
-| gated MLP | `gated-mlp-fuse` | `SwiGLU` |
-| residual add → norm | `residual-rmsnorm-fuse`, `residual-layernorm-fuse` | `FusedResidualNorm` / `FusedResidualLayerNorm` |
-| linear → activation | `linear-act-fuse`, `linearbias-act-fuse` | `FusedLinearAct(Bias)` |
-| embedding → scale | `embedding-scale-fuse` | `FusedEmbeddingScale` |
-| qk-norm → RoPE | `rmsnorm-rope-fuse`, `rmsnorm-rope-scale-fuse` | `FusedNormRope(Scale)` |
-| GroupNorm → act (→ Conv3d) | `groupnorm-act-fuse`, `groupnorm-act-conv3d(-bias)-fuse` | `FusedGroupNormAct[Conv3d[Bias]]` |
-| AdaLN modulate, gated residual | `adaln-modulate-fuse`, `gated-residual-fuse` | `FusedAdaLN`, `FusedGatedResidual` |
-| output gate | `kda-gated-norm-fuse`, `mla-out-gate-fuse` | `FusedKdaGatedNorm`, `FusedMlaOutGate` |
+| RMSNorm / LayerNorm → Projection | `rmsnorm-linear(-bias)-fuse`<br>`layernorm-linear(-bias)-fuse` | `FusedNormLinear(Bias)`<br>`FusedLayerNormLinear(Bias)` |
+| Gated MLP (Gate + Up + Act) | `gated-mlp-fuse` | `SwiGLU` |
+| Residual Add → Norm | `residual-rmsnorm-fuse`<br>`residual-layernorm-fuse` | `FusedResidualNorm`<br>`FusedResidualLayerNorm` |
+| Linear → Activation | `linear-act-fuse`<br>`linearbias-act-fuse` | `FusedLinearAct(Bias)` |
+| Embedding → Scale | `embedding-scale-fuse` | `FusedEmbeddingScale` |
+| QK-Norm → RoPE | `rmsnorm-rope(-scale)-fuse` | `FusedNormRope(Scale)` |
+| GroupNorm → Act → Conv3D | `groupnorm-act-conv3d-fuse` | `FusedGroupNormActConv3d` |
+| AdaLN Modulation / Gated Residual | `adaln-modulate-fuse`<br>`gated-residual-fuse` | `FusedAdaLN`<br>`FusedGatedResidual` |
+| Output Gate Projection | `output-gate-fuse` | `FusedLinearAct` |
 
-- Reuse: the model expresses its compute with schema ops (`schema.egg`) in an existing shape.
-- Add a rule: a recurring composition no rule matches. Either schema ops in a new arrangement
-  (add rule + target + theorem), or a new base op (extend `schema.egg` and `lower.rs` first).
-- Do not add a rule for a one-off pattern or one you cannot prove sound.
+---
 
-## Adding a rule — schema, rules, lower (if needed), Lean in one change
+## 3. Step-by-Step Rule Addition Workflow
 
-1. **Fused target** — `crates/rewrite/src/egl/schema.egg` under `; === fused targets ===`. Carry
-   every operand leaf of the unfused form, in the operand order of the Lean `expand`. A new base op
-   goes into `Expr` with a `term_for` arm in `crates/rewrite/src/lower.rs`. An op with no term
-   returns `LowerError::Unsupported`; never lower to `Opaque` (single-input passthrough, drops
-   operands).
-2. **Rule** — `crates/rewrite/src/egl/rules.egg`. Every `(rewrite …)` is immediately preceded by
-   exactly one `; rule: <kebab-name>`; `parse_rule_catalog` (`crates/plowc/src/lib.rs`) rejects a
-   dangling annotation or an unannotated rewrite. Pin constant discriminants as literals
-   (`"sigmoid"`, `"mul"`) to keep distinct e-nodes distinct.
-   ```egglog
-   ; rule: gated-mlp-fuse
-   (rewrite (Ew "mul" (Act ?k ?g) ?u)
-            (SwiGLU ?k ?g ?u))
-   ```
-3. **Cost** — no `:cost` annotations. Extraction uses `extract::BigTreeAdditiveCost` (uniform head
-   weight 1, `BigInt`), so a fused form wins by having fewer e-nodes. A `:cost` is silently ignored;
-   a different cost function re-ranks the fusion space.
-4. **Lean** — `lean-plow/Plow/Rewrite.lean`: add the fused variant to `inductive Op`, extend
-   `expand` so it unfolds to exactly the unfused composition, add `rule_<name_with_underscores>`
-   proven by `rfl`, and add the kebab name to `soundRules`.
+### Step 1: Define Egglog Rule (`crates/rewrite/src/egl/rules.egg`)
+* Express the pattern using canonical `Op` syntax:
+  ```lisp
+  (rule ((= fused (Add (Linear ?x ?w1) (Linear ?x ?w2))))
+        ((union fused (FusedDualLinear ?x ?w1 ?w2))))
+  ```
+* Invariant: Never eliminate an intermediate node that has consumers outside the matched pattern.
+* Invariant: External input tensors and weight bindings must be preserved bit-for-bit.
+
+### Step 2: Formulate Lean 4 Soundness Proof (`lean-plow/LeanPlow/Rewrites.lean`)
+Every rule added to `rules.egg` must have a corresponding semantic equivalence proof in Lean 4:
+1. Declare the AST pattern in `inductive Op`.
+2. Define the denotational semantics in `def expand : Op → Semantics`.
+3. State and prove the equivalence theorem:
    ```lean
-   theorem rule_gated_mlp_fuse (g u : Op) (k : String) :
-       expand (Op.SwiGLU g u k) =
-         Op.Ew "mul" (Op.Act k (expand g)) (expand u) := rfl
+   theorem <rule_name>_sound (x w1 w2 : Tensor) :
+     expand (Op.Add (Op.Linear x w1) (Op.Linear x w2)) =
+     expand (Op.FusedDualLinear x w1 w2) := by
+     ...
    ```
-5. **Emitter** — to reach a packet, map the fused kind to a `Lowering` in
-   `crates/devgen/src/rewrite_lower.rs` and have the emitter query it.
-6. **Tests** — a `fuse_<model>` case in `crates/rewrite/tests/fuse_all_models.rs` asserting the
-   fused op names, `ops_after < ops_before`, and fused weight set = graph weight set
-   (`fused_weights` vs `graph_weights`); sites in `crates/rewrite/tests/fused_sites.rs` when the
-   kind is lowered.
+4. Append the theorem to `def soundRules : List RewriteRule`.
 
-## Gate (all before Stage 3)
+### Step 3: Implement Devblob Lowering (`crates/devgen/src/rewrite_lower.rs`)
+* Wire the matched pattern to device generation:
+  - Add extraction logic in `rewrite_lower.rs`.
+  - Validate tensor shapes, strides, and memory alignments for the target fused kernel.
+  - Emit packet instruction descriptors and register fused weight slices.
 
-```bash
-nix develop --command cargo test -p rewrite --test fuse_all_models fuse_<model>
-nix develop --command cargo test -p rewrite --test negative_fusions
-nix develop --command bash -c "cd lean-plow && lake build"
-nix develop --command cargo test -p plowc --test lean_verify_rewrite -- --ignored
-```
+### Step 4: Unit & Property Tests (`crates/rewrite/tests/`)
+* Verify pattern discovery:
+  ```rust
+  #[test]
+  fn test_<pattern>_fires() {
+      let graph = build_test_subgraph();
+      let fused = rewrite::optimize(&graph);
+      assert!(fused.has_op(Op::Fused<Pattern>));
+  }
+  ```
+* Verify weight manifest preservation: assert count and hashes of weights remain identical before and after saturation.
 
-- [ ] The model lowers and saturates; extraction returns a term (no `LowerError::Unsupported` /
-      `UnmappedTensor`).
-- [ ] Intended fusions fire; `ops_after < ops_before`; no weight leaf dropped.
-- [ ] Negative-fusion tests pass (no mis-firing).
-- [ ] Every rule in `rules.egg` is in `soundRules` with a `rule_*` theorem; `lake build` and
-      `lean_verify_rewrite` pass.
+---
 
-## Pitfalls
+## 4. Machine-Checked Gate Checklist
 
-- A rule without its Lean theorem fails Checkpoint A (`checkA` rejects names not in `soundRules`).
-- Name mismatch: kebab-case in `rules.egg` and `soundRules`, `rule_<underscores>` in Lean.
-- Checkpoint A does not re-check rule bodies: keep the `rules.egg` RHS and `expand` in sync and pin
-  operands in a `fuse_*` test.
-- `Attention` collapses its config into one opaque token: no rule can branch on an attention
-  attribute. That is a vocabulary limit, not a missing rule.
-- Extraction can hit an upstream egglog panic on some large graphs; `explore_stats` (saturate +
-  `print-size`) never enters that path.
-
-## Stop and ask
-
-- The pattern must branch on an attribute the vocabulary makes opaque (attention config, grouped
-  routing).
-- The `rule_* := rfl` theorem does not hold: the fusion may be unsound; do not force it.
-- The change needs a cost-model or extraction-objective change.
-- The pattern is a one-off with no reuse.
-
-## Code pointers
-
-- `crates/rewrite/src/`: `egl/schema.egg`, `egl/rules.egg`, `lower.rs` (`lower`, `term_for`),
-  `extract.rs` (`BigTreeAdditiveCost`, `FusedGraph`), `lib.rs` (`rewrite_graph`,
-  `fused_sites_for_config`, `explore_stats`).
-- `crates/devgen/src/rewrite_lower.rs` — fused kind → emitter fusion.
-- `lean-plow/Plow/Rewrite.lean` (`expand`, `soundRules`); `lean-plow/Plow/CLI/Checkpoints.lean`
-  (`checkA`); `crates/plowc/src/lib.rs` (`parse_rule_catalog`);
-  `crates/lean_verify/src/checkpoints/rewrite.rs`.
-- `docs/arch/08-formal-verification.md` (Checkpoint A), `docs/arch/01-compiler-pipeline.md`.
+Before advancing to Stage 3:
+- [ ] `cargo test -p rewrite` passes with 0 failures and 0 warnings.
+- [ ] Lean 4 verification passes: `cd lean-plow && lake build` builds with 0 errors.
+- [ ] The new rule is registered in `LeanPlow.Rewrites.soundRules`.
+- [ ] `cargo test -p devgen --lib rewrite` passes for single-block and full-model emission.
+- [ ] No intermediate tensors with external consumers are dropped during e-graph extraction.
+- [ ] Emitted packet weight manifest matches checkpoint safetensors index bit-for-bit.

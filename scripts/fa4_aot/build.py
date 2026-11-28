@@ -178,8 +178,12 @@ def main():
         blobs.append(cubin)
     nvcc = os.environ.get("PLOW_NVCC", "/usr/local/cuda/bin/nvcc")
     adapters = work / "kv_adapters.cubin"
-    subprocess.run([nvcc, "-cubin", "-std=c++17", "-O3", "-arch=sm_90a", "-o", str(adapters),
-                    str(REPO / "runtime/nvidia/kv_dequant_sm90.cu")], check=True)
+    nvcc_cmd = [nvcc, "-cubin", "-std=c++17", "-O3", "-arch=sm_90a",
+                "-D_NV_TARGET_BOOL_NV_IS_DEVICE=1"]
+    if os.environ.get("CXX"):
+        nvcc_cmd.insert(1, f"-ccbin={os.environ['CXX']}")
+    nvcc_cmd += ["-o", str(adapters), str(REPO / "runtime/nvidia/kv_dequant_sm90.cu")]
+    subprocess.run(nvcc_cmd, check=True)
     blob = adapters.read_bytes()
     entries.append({"name": "kv_adapters", "role": "adapters", "kv_heads": 0, "symbol": "",
                     "params": [], "sha256": hashlib.sha256(blob).hexdigest(), "exemplars": []})

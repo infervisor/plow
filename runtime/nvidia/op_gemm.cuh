@@ -339,6 +339,42 @@ static __device__ void d_gemv_tp_f32(float* C, const __nv_bfloat16* x, const __n
 }
 #endif
 
+/* GemvF32Out on the decode walk (PLOW_NV_HEAD_MMA): a depth stage's codebook heads at batched
+ * rungs, where the dot8 body is compute-bound (Qwen3-TTS, 2048 x 1024 at 128 rows: 289 us a head
+ * against 26 us for a 1024 x 1024 projection on the walk). fp32 accumulation on the tensor cores:
+ * the sum order differs from the dot8 body's, so logits can differ in the last fp32 bits. */
+#ifndef PLOW_NV_HEAD_MMA
+#define PLOW_NV_HEAD_MMA 0
+#endif
+/* Decode objects only: prefill and speech objects keep dot8 sums when a recipe sets the define
+ * for every cubin. */
+#if PLOW_NV_HEAD_MMA && PLOW_NV_GEMV_MMA && !PLOW_NV_SPEECH && !PLOW_NV_PREFILL
+/* The walk indexes C as GvF32R rows; the stores write through float*. */
+static_assert(sizeof(GvF32R) == sizeof(float) && alignof(GvF32R) == alignof(float), "GvF32R is a float");
+template <typename Output>
+static __device__ __forceinline__ void gemv_f32out_mma(Output* C, const __nv_bfloat16* x,
+                                                       const __nv_bfloat16* W, unsigned M, unsigned N,
+                                                       unsigned K, unsigned slice, unsigned nblk) {
+    const bool single_tile = M <= GV_MM_MAX;
+    gemv_walk(M, [&](auto mm, unsigned m0, unsigned rows) {
+        constexpr int MM = decltype(mm)::v;
+        gemv_rows_mma<false, (MM + 15) / 16, (MM <= 8), false, Output>(
+            C + (size_t)m0 * N, x + (size_t)m0 * K, W, rows, N, K, slice, nblk, nullptr, nullptr,
+            single_tile);
+    });
+}
+/* false: shape outside the walk's contract, the caller runs the dot8 body. */
+static __device__ __forceinline__ bool d_gemv_f32out_mma(float* C, const __nv_bfloat16* x,
+                                                         const __nv_bfloat16* W, unsigned M, unsigned N,
+                                                         unsigned K, bool round_bf16, unsigned slice,
+                                                         unsigned nblk) {
+    if (M < 2u || (K & 31u) || (N & 7u)) return false;
+    if (round_bf16) gemv_f32out_mma((GvF32R*)C, x, W, M, N, K, slice, nblk);
+    else gemv_f32out_mma(C, x, W, M, N, K, slice, nblk);
+    return true;
+}
+#endif
+
 #if PLOW_PACKET_LINEAR_BIAS
 static __device__ void d_gemv_bias(__nv_bfloat16* __restrict__ C,
                                    const __nv_bfloat16* __restrict__ x,
@@ -3038,7 +3074,7 @@ __device__ __forceinline__ void d_gemv_qkv_sm90_xreg(
     const __nv_bfloat16* x,
     const __nv_bfloat16* Wq, const __nv_bfloat16* Wk, const __nv_bfloat16* Wv,
     unsigned Nq, unsigned Nk, unsigned Nv, unsigned slice, unsigned nblk) {
-    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+    static_assert(K == 2048 || K == 2304 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
                   K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144);
     constexpr unsigned chunks = K / GV_STEP;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -3062,16 +3098,26 @@ __device__ __forceinline__ void d_gemv_qkv_sm90_xreg(
         }
         const __nv_bfloat16* row = W + (size_t)n * K;
         float acc = 0.f;
+        if constexpr (chunks <= 12) {
+            bf16v8 weights[chunks];
 #pragma unroll
-        for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
-            bf16v8 weights[GV_UNROLL];
+            for (unsigned c = 0; c < chunks; c++)
+                weights[c] = ld_glob8_cs(row + c * GV_STEP + lane * 8u);
 #pragma unroll
-            for (unsigned u = 0; u < GV_UNROLL; u++)
-                if (c + u < chunks)
-                    weights[u] = ld_glob8(row + (c + u) * GV_STEP + lane * 8u);
+            for (unsigned c = 0; c < chunks; c++)
+                acc = dot8(weights[c], xv[c], acc);
+        } else {
 #pragma unroll
-            for (unsigned u = 0; u < GV_UNROLL; u++)
-                if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+            for (unsigned c = 0; c < chunks; c += GV_UNROLL) {
+                bf16v8 weights[GV_UNROLL];
+#pragma unroll
+                for (unsigned u = 0; u < GV_UNROLL; u++)
+                    if (c + u < chunks)
+                        weights[u] = ld_glob8_cs(row + (c + u) * GV_STEP + lane * 8u);
+#pragma unroll
+                for (unsigned u = 0; u < GV_UNROLL; u++)
+                    if (c + u < chunks) acc = dot8(weights[u], xv[c + u], acc);
+            }
         }
         const float total = warp_sum32(acc);
         if (lane == 0) C[n] = __float2bfloat16(total);
@@ -3082,7 +3128,7 @@ template <unsigned K>
 __device__ __forceinline__ void d_gemv_glu_sm90_xreg(__nv_bfloat16* C,
     const __nv_bfloat16* x, const __nv_bfloat16* Wg, const __nv_bfloat16* Wu,
     unsigned N, unsigned act, unsigned slice, unsigned nblk) {
-    static_assert(K == 2048 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
+    static_assert(K == 2048 || K == 2304 || K == 2560 || K == 2816 || K == 3072 || K == 3584 ||
                   K == 3840 || K == 4096 || K == 5120 || K == 5376 || K == 6144);
     constexpr unsigned chunks = K / GV_STEP;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -3102,8 +3148,8 @@ __device__ __forceinline__ void d_gemv_glu_sm90_xreg(__nv_bfloat16* C,
 #pragma unroll
             for (unsigned u = 0; u < GV_UNROLL_GLU; u++) {
                 if (c + u < chunks) {
-                    gv[u] = ld_glob8(grow + (c + u) * GV_STEP + lane * 8u);
-                    uv[u] = ld_glob8(urow + (c + u) * GV_STEP + lane * 8u);
+                    gv[u] = ld_glob8_cs(grow + (c + u) * GV_STEP + lane * 8u);
+                    uv[u] = ld_glob8_cs(urow + (c + u) * GV_STEP + lane * 8u);
                 }
             }
 #pragma unroll
@@ -3696,18 +3742,9 @@ static __device__ void d_gemv_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
  * multiply its exact power-of-two E8M0 scale and accumulate across blocks. */
 __device__ __forceinline__ float plow_mxfp4_e2m1(unsigned v) {
     const unsigned mag = v & 7u;
-    float x;
-    switch (mag) {
-    case 0: x = 0.0f; break;
-    case 1: x = 0.5f; break;
-    case 2: x = 1.0f; break;
-    case 3: x = 1.5f; break;
-    case 4: x = 2.0f; break;
-    case 5: x = 3.0f; break;
-    case 6: x = 4.0f; break;
-    default: x = 6.0f; break;
-    }
-    return (v & 8u) ? -x : x;
+    const unsigned sign = (v & 8u) << 28;
+    const unsigned base = (mag ? 252u : 0u) + (mag > 1u ? mag : 0u);
+    return __uint_as_float(sign | (base << 22));
 }
 
 __device__ __forceinline__ float plow_mxfp4_scale(unsigned v) {

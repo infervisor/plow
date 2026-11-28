@@ -2,6 +2,41 @@
   "schema": 1,
   "verifiers": [
     {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "032ad7aa2fa011037144d84e1cd8a4fe34d208eb993b6cab0218daa971b91536",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-moe-lut",
+      "note": "Shared memory LUT dequantization and D18 scalar ALU elimination; user-approved 2026-11-23"
+    },
+    {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "972256bf6a55e09adc2f73ec782a978fc06a623791f5d7f1a05dd9861cce8f60",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-router-fold",
+      "note": "MoE router GEMV + TopK fusion savings (theorem F6) and barrier reduction; user-approved 2026-11-23"
+    },
+    {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "cf2b879705a0f661212d31da7706d86b041bc0f757726e3d8d65e04c1df97699",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-moe-reg-cache",
+      "note": "Register-cached MoE row-dot inner loops, D17 activation read reduction and loop equivalence; user-approved 2026-11-23"
+    },
+    {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "42d98798d246d923da4bb9c3a88bcbd87fc8cde8ea465c50a4b59a564229373f",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-moe-smem-activation",
+      "note": "smem activation traffic reuse and D15 layout theorems; user-approved 2026-11-23"
+    },
+    {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "bba0626a2f82e81aadeeb1a92be27f3aaaa9f9bd398650bef4be8e68b8879536",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-merge-fold",
+      "note": "split-KV merge fold savings (theorem F4) + monotonicity; user-approved 2026-11-23"
+    },
+    {
       "sha256": "becacc81e2d66465a53c029907d184601eed76fc9fe4b1d22f59dc6b74c793e0",
       "lean_sources_sha256": "9a268299673606209b797be3bb9f6caf5c476d61056156e503875960c7f79d67",
       "toolchain": "leanprover/lean4:v4.15.0",
@@ -63,6 +98,41 @@
       "toolchain": "leanprover/lean4:v4.15.0",
       "commit": "e313efda3",
       "note": "page_envelope.v1 (paged library attention table pad vs split cap); user-approved 2026-10-31"
+    },
+    {
+      "sha256": "0f9d5d06feb9e04685496837dcecd8d0ac2db78c0b389f4f08343d13808802f8",
+      "lean_sources_sha256": "3d1a6fbc386170f2a3d5834f52376f0ba3bd77a6d273a60233bea6d2566a8153",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "e313efda3",
+      "note": "the same sources built by the lean CI job on a GitHub-hosted ubuntu-24.04 runner (identical on two runs); user-approved 2026-11-21"
+    },
+    {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "6e502238d1bb4b57a6a4f9da2b13186ab27528cb67d91001e0c91c27ef7b1c0d",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-moe",
+      "note": "MXFP4 MoE layout bounds, pure ALU dequant and pipelined dot equivalence (§D4-D8); user-approved 2026-11-22"
+    },
+    {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "c0a4dc076cc1d30ba4b5e527d42f386891a503575db85526b38757592ebf5992",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-hybrid-moe-recurrent",
+      "note": "NVFP4/MXFP8 hybrid MoE layout bounds, scale safety and recurrent loop KV isolation (§D9-D11); user-approved 2026-11-22"
+    },
+    {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "90656aeda0f4cc98912abc68dc07d47c312e596a283b9481ccc991083f52ae53",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-moe-proofs",
+      "note": "NVFP4/MXFP8 hybrid MoE layout, LUT dequantization bounds and recurrent loop KV isolation theorems; user-approved 2026-11-23"
+    },
+    {
+      "sha256": "10c83d6ff7c29819d1ec7ce1f5d857f8d7cfb47d1fdc3525cfbcba7703ff4483",
+      "lean_sources_sha256": "732962fcfc5dfcd50685f1d3c12a235edc38455f34ea55a6edc60f95812ad71d",
+      "toolchain": "leanprover/lean4:v4.15.0",
+      "commit": "inkling-moe-recurrent-flat",
+      "note": "Flat token-slot injectivity and 48-pass recurrent loop boundary verification (§D14); user-approved 2026-11-23"
     }
   ]
 }

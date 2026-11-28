@@ -70,6 +70,9 @@ pub enum HfArch {
     /// are mxfp4. Config is accepted here; emission refuses (see
     /// [`build_full_model_plan`] and `devgen::mla::kimi_k3_emit`).
     KimiK3,
+    /// Inkling-2 Mini / Loop (`inkling2_loop`): sliding/full hybrid with short
+    /// convolutions and 128-expert MoE. Single block emitted via `--emit devblob`.
+    Inkling2Loop,
 }
 
 /// Per-layer attention implementation. This is FIRST-CLASS per-layer data, not
@@ -220,6 +223,9 @@ pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> 
     if v["model_type"].as_str() == Some("qwen3_5") {
         return synth_qwen35(&v, name);
     }
+    if v["model_type"].as_str() == Some("inkling2_loop") {
+        return synth_inkling2_loop(&v, name);
+    }
     if matches!(
         v["model_type"].as_str(),
         Some("muse_spark" | "muse_spark_text")
@@ -302,6 +308,9 @@ fn parse_weight_dtype(v: &Value) -> nn_graph::DType {
             // OCP MX microscaling FP4 (e2m1 + one E8M0 scale per 32). Transformers
             // spells the gpt-oss / MX-quantized checkpoints `quant_method: "mxfp4"`.
             "mxfp4" | "fp4" => return nn_graph::DType::F4,
+            "modelopt" if v["quantization_config"]["quant_algo"].as_str() == Some("NVFP4") => {
+                return nn_graph::DType::F4;
+            }
             _ => {}
         }
     }
@@ -663,6 +672,14 @@ fn synth_qwen35(v: &Value, name: String) -> Result<HfSynthesis, String> {
 }
 
 pub fn ensure_layer_plan_supported(synth: &HfSynthesis) -> Result<(), String> {
+    if synth.arch == HfArch::Inkling2Loop {
+        return Err(
+            "inkling2_loop uses relative position bias (d_rel=16), short convs (sconv=4), \
+             and looped recurrent execution (passes=3). Emit single block via \
+             `plowc --hf-dir ... --emit devblob --block <L>`."
+                .to_string(),
+        );
+    }
     let Some(q) = synth.qwen35 else {
         return Ok(());
     };
@@ -942,6 +959,81 @@ fn kimi_k3_attn_kinds(t: &Value, layers: i64) -> Result<Vec<AttnKind>, String> {
     Ok(out.into_iter().map(|k| k.unwrap()).collect())
 }
 
+/// Inkling-2 Loop architecture (`inkling2_loop`).
+fn synth_inkling2_loop(v: &Value, name: String) -> Result<HfSynthesis, String> {
+    let t = v
+        .get("text_config")
+        .filter(|c| c.is_object())
+        .ok_or("inkling2_loop config.json has no `text_config` object")?;
+    let sub = t["model_type"].as_str().unwrap_or("<missing>");
+    if sub != "inkling2_loop_text" {
+        return Err(format!(
+            "inkling2_loop text_config.model_type is {sub:?}, expected \"inkling2_loop_text\""
+        ));
+    }
+
+    let hidden = req_i64(t, "hidden_size")?;
+    let heads = req_i64(t, "num_attention_heads")?;
+    let kvh = req_i64(t, "num_key_value_heads")?;
+    let hd = req_i64(t, "head_dim")?;
+    let layers = req_i64(t, "num_hidden_layers")?;
+    let vocab = req_i64(t, "vocab_size")?;
+    let inter = req_i64(t, "intermediate_size")?;
+    let n_exp = req_i64(t, "n_routed_experts")?;
+    let top_k = req_i64(t, "num_experts_per_tok")?;
+
+    let local_layers: BTreeSet<i64> = t["local_layer_ids"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
+        .unwrap_or_default();
+
+    let is_full: Vec<bool> = (0..layers).map(|l| !local_layers.contains(&l)).collect();
+    let attn_kind: Vec<AttnKind> = is_full
+        .iter()
+        .map(|&full| if full { AttnKind::Full } else { AttnKind::Sliding })
+        .collect();
+
+    Ok(HfSynthesis {
+        name: name.clone(),
+        arch: HfArch::Inkling2Loop,
+        hidden_size: hidden,
+        num_attention_heads: heads,
+        kvh_slide: kvh,
+        kvh_full: kvh,
+        hd_slide: hd,
+        hd_full: hd,
+        intermediate_size: inter,
+        num_layers: layers as u32,
+        vocab_size: vocab,
+        is_full,
+        attn_kind,
+        k_eq_v: false,
+        tied_embed: false,
+        prefix: "model.llm.".to_string(),
+        has_qk_norm: true,
+        has_v_norm: true,
+        moe: true,
+        n_exp,
+        top_k,
+        moe_inter: inter,
+        q_lora_rank: 0,
+        kv_lora_rank: 0,
+        qk_rope_head_dim: 0,
+        qk_nope_head_dim: 0,
+        v_head_dim: 0,
+        first_k_dense: 0,
+        n_shared_experts: 0,
+        moe_latent: 0,
+        qwen35: None,
+        weight_dtype: parse_weight_dtype(v),
+        net: NetConfig {
+            name,
+            hidden,
+            ops: vec![],
+        },
+    })
+}
+
 /// Build a full-model [`LayerPlan`] with all N layers unrolled, using
 /// safetensor-matching weight names. This is the Option A "unroll at emit time"
 /// path.
@@ -971,6 +1063,11 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
         "kimi_k3 has no full-model plan: 69/93 layers are KDA (linear attention) and \
          the MoE is latent + mxfp4. Run `plowc --hf-dir <k3> --emit devblob` for the \
          itemised missing-capability report (devgen::mla::kimi_k3_emit)."
+    );
+    assert_ne!(
+        synth.arch,
+        HfArch::Inkling2Loop,
+        "inkling2_loop has no full-model plan: call ensure_layer_plan_supported before planning"
     );
     let rows = bucket.rows();
     let seq = bucket.attn_seq();
@@ -2542,5 +2639,44 @@ mod tests {
             Some("Qwen/Qwen3-ASR-1.7B")
         );
         assert_eq!(hub_repo_id(Path::new("/work/prep/t3")), None);
+    }
+
+    #[test]
+    fn synth_inkling2_loop_parses_geometry() {
+        let json = r#"{
+            "model_type": "inkling2_loop",
+            "text_config": {
+                "model_type": "inkling2_loop_text",
+                "hidden_size": 2304,
+                "num_hidden_layers": 24,
+                "vocab_size": 201024,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "intermediate_size": 1152,
+                "n_routed_experts": 128,
+                "num_experts_per_tok": 8,
+                "local_layer_ids": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22]
+            },
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4"
+            }
+        }"#;
+        let s = synthesize_full(json, "inkling".into()).unwrap();
+        assert_eq!(s.arch, HfArch::Inkling2Loop);
+        assert_eq!(s.hidden_size, 2304);
+        assert_eq!(s.num_layers, 24);
+        assert_eq!(s.num_attention_heads, 24);
+        assert_eq!(s.kvh_slide, 8);
+        assert_eq!(s.hd_slide, 128);
+        assert_eq!(s.intermediate_size, 1152);
+        assert_eq!(s.n_exp, 128);
+        assert_eq!(s.top_k, 8);
+        assert_eq!(s.weight_dtype, nn_graph::DType::F4);
+        assert!(!s.is_full[0]);
+        assert!(s.is_full[5]);
+        assert_eq!(s.prefix, "model.llm.");
+        assert!(ensure_layer_plan_supported(&s).is_err());
     }
 }

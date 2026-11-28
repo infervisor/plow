@@ -32,6 +32,7 @@
 //! instead of leaving it to be rediscovered from a flat benchmark.
 
 pub mod build;
+pub mod contract;
 pub mod probe;
 pub mod resource;
 pub mod select;
@@ -42,6 +43,7 @@ pub mod targets;
 // Re-exported so a consumer of the registry does not need a separate `hwspec`
 // dependency just to name the hardware it is selecting for.
 pub use build::{BuildId, Provenance};
+pub use contract::{BlockContract, BoundCategory};
 pub use hwspec::{CalibrationTier, HardwareFingerprint, IsaLevel};
 pub use probe::{probe, ProbeError, ProbeTarget, ProbedObject};
 pub use resource::{GateVerdict, ResourceEnvelope, ResourceGate};

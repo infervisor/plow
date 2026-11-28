@@ -70,6 +70,13 @@ const SESSION_TTL_CANDIDATE: Status = Status::Candidate {
         "no effect without `X-Session-Id`; `=0` gives sessions no special retention",
     ],
 };
+/// Default 50 ms above `rt.asr_encode_hold_inflight`; no checkpoint P certificate yet.
+const ASR_ENCODE_HOLD_CANDIDATE: Status = Status::Candidate {
+    evidence: &[
+        "Qwen3-ASR 1.7B H100 serving concurrency screen, hold 50 vs 0: c64 RTFx 1041 vs 850, c256 1152 vs 1169, c1 p50 54.1 vs 53.8 ms",
+        "`=0` is the rollback",
+    ],
+};
 const INFLIGHT_WAIT_QUALIFIED: Status = Status::Qualified {
     evidence: &[
         "agent/prefix-cache v2, 12B H100 prefix-repetition C16, default vs =0: hits 57/67 vs 53/67, TTFT 259.4 vs 295.7 ms, tok/s 915 vs 889; C4 hits 26 vs 25, TTFT 144.7 vs 123.3 (v1 default 122.3, same hits)",
@@ -880,6 +887,7 @@ pub const RETIRED_ENV: &[&str] = &[
     "PLOW_TOKEN_BATCH_SOLO",
     "PLOW_ROWBAND_CLEAR_WS",
     "PLOW_VMM_RING_RECYCLE",
+    "PLOW_VMM_CACHE_MEMORY_UTILIZATION",
     "PLOW_CFG_DEVICE",
     "PLOW_NV_KERNEL_SAMPLE",
     "PLOW_PF_ENTRY_TRACE",
@@ -923,6 +931,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_cache", Some("PLOW_PREFIX_CACHE"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.tts_first_lookahead", Some("PLOW_TTS_FIRST_LOOKAHEAD"), Layer::Runtime, USIZE, Default::Static(Val::Nat(1)), OPT_IN),
     KnobSpec::new("rt.tts_stream_first_frames", Some("PLOW_TTS_STREAM_FIRST_FRAMES"), Layer::Runtime, USIZE, UNSET, OPT_IN),
+    KnobSpec::new("rt.tts_stream_step_frames", Some("PLOW_TTS_STREAM_STEP_FRAMES"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tts_tags_default", Some("PLOW_TTS_TAGS_DEFAULT"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.tts_codec_hold_ms", Some("PLOW_TTS_CODEC_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.tts_codec_launch_us", Some("PLOW_TTS_CODEC_LAUNCH_US"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
@@ -944,7 +953,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.overload_miss", Some("PLOW_OVERLOAD_MISS"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.05,0.1,0.2")), DIAG),
     KnobSpec::new("rt.asr_partial_duty", Some("PLOW_ASR_PARTIAL_DUTY"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0.5")), DIAG),
     KnobSpec::new("rt.asr_request_timeout_ms", Some("PLOW_ASR_REQUEST_TIMEOUT_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(120_000)), OPT_IN),
-    KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
+    KnobSpec::new("rt.asr_encode_hold_ms", Some("PLOW_ASR_ENCODE_HOLD_MS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(50)), ASR_ENCODE_HOLD_CANDIDATE),
     KnobSpec::new("rt.asr_encode_hold_inflight", Some("PLOW_ASR_ENCODE_HOLD_INFLIGHT"), Layer::Runtime, USIZE, Default::Static(Val::Nat(32)), DIAG),
     KnobSpec::new("rt.asr_context_max_tokens", Some("PLOW_ASR_CONTEXT_MAX_TOKENS"), Layer::Runtime, USIZE, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.api_keys", Some("PLOW_API_KEYS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -967,7 +976,6 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.encode_fast", Some("PLOW_ENCODE_FAST"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.encode_threads", Some("PLOW_ENCODE_THREADS"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
     KnobSpec::new("rt.encode_split_min", Some("PLOW_ENCODE_SPLIT_MIN"), Layer::Runtime, U32, UNSET, ONE_WORD_ENCODE_QUALIFIED),
-    KnobSpec::new("rt.vmm_cache_memory_utilization", Some("PLOW_VMM_CACHE_MEMORY_UTILIZATION"), Layer::Runtime, Domain::Str, Default::Static(Val::Str("0")), OPT_IN),
     KnobSpec::new("rt.vmm_cache_min_free_mib", Some("PLOW_VMM_CACHE_MIN_FREE_MIB"), Layer::Runtime, U32, UNSET, PRESSURE_EVICTION_DEFAULT),
     KnobSpec::new("rt.host_kvcache_size", Some("PLOW_HOST_KVCACHE_SIZE"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.kv_host_prepin", Some("PLOW_KV_HOST_PREPIN"), Layer::Runtime, Domain::Bool, ON, OPT_IN),
@@ -991,6 +999,8 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.prefix_arm_end", Some("PLOW_PREFIX_ARM_END"), Layer::Runtime, Domain::Bool, OFF, DIAG),
     KnobSpec::new("rt.vmm_strict_publish", Some("PLOW_VMM_STRICT_PUBLISH"), Layer::Runtime, Domain::Bool, ON, DIAG),
     KnobSpec::new("rt.pf_admit_overlap", Some("PLOW_PF_ADMIT_OVERLAP"), Layer::Runtime, Domain::Bool, OFF, DIAG),
+    KnobSpec::new("rt.kv_reserve_output_tokens", Some("PLOW_KV_RESERVE_OUTPUT_TOKENS"), Layer::Runtime, U32, Default::Static(Val::Nat(256)), DIAG),
+    KnobSpec::new("rt.kv_soft_reserve_output_tokens", Some("PLOW_KV_SOFT_RESERVE_OUTPUT_TOKENS"), Layer::Runtime, U32, Default::Static(Val::Nat(64)), DIAG),
     KnobSpec::new("rt.shed_queue_depth", Some("PLOW_SHED_QUEUE_DEPTH"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("rt.rt_max_ctx", Some("PLOW_RT_MAX_CTX"), Layer::Runtime, USIZE, UNSET, OPT_IN),
     KnobSpec::new("rt.tbt_slo_ms", Some("PLOW_TBT_SLO_MS"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -1022,7 +1032,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.vmm_deferred_reclaim", Some("PLOW_VMM_DEFERRED_RECLAIM"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.vmm_stale_reserve", Some("PLOW_VMM_STALE_RESERVE"), Layer::Runtime, Domain::Bool, ON, STALE_RESERVE_QUALIFIED),
     KnobSpec::new("rt.vmm_publish_shared", Some("PLOW_VMM_PUBLISH_SHARED"), Layer::Runtime, Domain::Bool, ON, PUBLISH_SHARED_QUALIFIED),
-    KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, ON, INFLIGHT_WAIT_QUALIFIED),
+    KnobSpec::new("rt.prefix_inflight_wait", Some("PLOW_PREFIX_INFLIGHT_WAIT"), Layer::Runtime, Domain::Bool, OFF, INFLIGHT_WAIT_QUALIFIED),
     KnobSpec::new("rt.prefix_session_ttl_s", Some("PLOW_PREFIX_SESSION_TTL_S"), Layer::Runtime, U32, Default::Static(Val::Nat(150)), SESSION_TTL_CANDIDATE),
     KnobSpec::new("rt.prefix_chunk_publish", Some("PLOW_PREFIX_CHUNK_PUBLISH"), Layer::Runtime, Domain::Bool, ON, CHUNK_PUBLISH_QUALIFIED),
     KnobSpec::new("rt.vmm_release_retire", Some("PLOW_VMM_RELEASE_RETIRE"), Layer::Runtime, Domain::Bool, ON, RELEASE_RETIRE_QUALIFIED),
@@ -1055,6 +1065,7 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.multistep", Some("PLOW_MULTISTEP"), Layer::Runtime, U32, UNSET, DIAG),
     KnobSpec::new("rt.tts_stream_windows", Some("PLOW_TTS_STREAM_WINDOWS"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.decode_pipeline", Some("PLOW_DECODE_PIPELINE"), Layer::Runtime, Domain::Bool, UNSET, DIAG),
+    KnobSpec::new("rt.decode_cublaslt_min_rows", Some("PLOW_DECODE_CUBLASLT_MIN_ROWS"), Layer::Runtime, U32, Default::Static(Val::Nat(0)), OPT_IN),
     KnobSpec::new("rt.spec", Some("PLOW_SPEC"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.spec_sampled", Some("PLOW_SPEC_SAMPLED"), Layer::Runtime, Domain::Bool, ON, PROMOTED),
     KnobSpec::new("rt.spec_sampled_kmax", Some("PLOW_SPEC_SAMPLED_KMAX"), Layer::Runtime, U32, Default::Static(Val::Nat(3)), PROMOTED),
@@ -1186,6 +1197,9 @@ pub const RUNTIME: &[KnobSpec] = &[
     KnobSpec::new("rt.row_decode", Some("PLOW_ROW_DECODE"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.tick_delivery", Some("PLOW_TICK_DELIVERY"), Layer::Runtime, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("rt.decode_max_rung", Some("PLOW_DECODE_MAX_RUNG"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.decode_nominal_rung", Some("PLOW_DECODE_NOMINAL_RUNG"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.decode_elastic_rung", Some("PLOW_DECODE_ELASTIC_RUNG"), Layer::Runtime, U32, UNSET, DIAG),
+    KnobSpec::new("rt.decode_elastic_wait_ms", Some("PLOW_DECODE_ELASTIC_WAIT_MS"), Layer::Runtime, U32, Default::Static(Val::Nat(250)), DIAG),
     KnobSpec::new("rt.rt_hsaco", Some("PLOW_HSACO"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.fp8_dir", Some("PLOW_FP8_DIR"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("rt.trace_raw", Some("PLOW_TRACE_RAW"), Layer::Runtime, Domain::Str, UNSET, OPT_IN),
@@ -1262,6 +1276,8 @@ pub const RUNTIME: &[KnobSpec] = &[
 
 #[rustfmt::skip]
 pub const RAW_ENV: &[KnobSpec] = &[
+    KnobSpec::new("env.PLOW_DSV41_NO_WG", Some("PLOW_DSV41_NO_WG"), Layer::RawEnv, Domain::Str, UNSET, DIAG),
+    KnobSpec::new("env.PLOW_DSV41_PROFILE", Some("PLOW_DSV41_PROFILE"), Layer::RawEnv, U32, Default::Static(Val::Nat(0)), DIAG),
     KnobSpec::new("env.PLOW_PUBLISH_URL", Some("PLOW_PUBLISH_URL"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_PUBLISH_KEY", Some("PLOW_PUBLISH_KEY"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("env.PLOW_READELF", Some("PLOW_READELF"), Layer::RawEnv, Domain::Str, UNSET, OPT_IN),

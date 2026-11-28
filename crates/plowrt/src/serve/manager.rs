@@ -435,24 +435,20 @@ const GRAPH_BYTES_PER_PROGRAM: u64 = 320 << 10;
 /// (Gemma-4 E4B BF16), 8.1 KiB (12B FP8), 9.3 KiB (26B FP8).
 const SEG_GRAPH_BYTES_PER_SEGMENT_SLOT: u64 = 12 << 10;
 
-/// Bound on the device memory `GpuEngine::load` takes warming prefill segment graphs: every
-/// segmented prefill program is captured for every decode slot. Up to 8.9 GiB on an H100, the
-/// bulk of a CUDA engine's non-tensor overhead.
+/// Bound on the device memory `GpuEngine::load` takes warming prefill segment graphs.
+/// Graphs are shared per bucket/range across slots (one seg graph per bucket/range serves every slot).
 fn seg_graph_bound(blob: &DevBlob) -> u64 {
     let nv = &crate::config::RuntimeConfig::get().nv;
     if !nv.pf_seg_graph || nv.pf_seg_time {
         return 0;
     }
-    let slots = blob.decode_prog().map_or(0, |g| u64::from(g.t));
     let segments: u64 = blob
         .prefill_progs()
         .iter()
         .map(|p| p.stream.iter().map(|e| e.seg as u64 + 1).max().unwrap_or(1))
         .filter(|&n| n > 1)
         .fold(0, u64::saturating_add);
-    segments
-        .saturating_mul(slots)
-        .saturating_mul(SEG_GRAPH_BYTES_PER_SEGMENT_SLOT)
+    segments.saturating_mul(SEG_GRAPH_BYTES_PER_SEGMENT_SLOT)
 }
 
 /// Device bytes of the speech pipeline's sibling packets beside `pkt` ([`sidecar_files`]),
@@ -599,6 +595,26 @@ pub struct UnloadReport {
     pub pool_trimmed: u64,
     /// Device free-memory delta across the whole operation.
     pub freed: u64,
+}
+
+/// What one control-plane hibernate did.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct HibernateReport {
+    pub slug: String,
+    /// Time spent stopping and flushing in-flight generations.
+    pub stop_ms: f64,
+    /// Time spent hibernating the engine (unmapping physical VMM chunks and KV).
+    pub hibernate_ms: f64,
+    /// Device memory freed (bytes).
+    pub freed: u64,
+}
+
+/// What one control-plane awaken did.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct AwakenReport {
+    pub slug: String,
+    /// Time spent awakening the engine (re-mapping VMM chunks and streaming weights).
+    pub awaken_ms: f64,
 }
 
 /// Why `ensure_resident` refused.
@@ -1256,7 +1272,13 @@ impl ModelManager {
             .models
             .read()
             .iter()
-            .filter(|v| v.slug != target && self.is_resident(&v.slug))
+            .filter(|v| {
+                v.slug != target
+                    && self.is_resident(&v.slug)
+                    && self
+                        .state()
+                        .map_or(true, |s| s.residency(&v.slug) != crate::serve::Residency::Dormant)
+            })
             .map(|v| v.slug.clone())
             .collect();
         let idle: Vec<String> = victims
@@ -1445,7 +1467,10 @@ impl ModelManager {
         // belongs here too — mid-unload a model is briefly still resident, and
         // admitting then would hand the request a mux that is about to vanish.
         let state = self.state()?;
-        if self.is_serving(slug) && state.residency(slug).admits() {
+        if self.is_serving(slug)
+            && state.residency(slug).admits()
+            && state.residency(slug) != crate::serve::Residency::Dormant
+        {
             self.touch(slug);
             return Ok(());
         }
@@ -1475,11 +1500,54 @@ impl ModelManager {
     /// An engine with no dispatcher (a load cut off between the two) serves nothing and is not
     /// resident for any caller: take it down so the load runs again.
     async fn clear_partial(&self, slug: &str) -> std::result::Result<(), EnsureError> {
-        if self.is_resident(slug) && !self.is_serving(slug) {
+        let state = self.state()?;
+        if self.is_resident(slug)
+            && !self.is_serving(slug)
+            && state.residency(slug) != crate::serve::Residency::Dormant
+        {
             tracing::warn!(%slug, "planner: engine installed without a dispatcher — reloading");
             self.evict(slug, Stop::Now).await?;
         }
         Ok(())
+    }
+
+    async fn fit_and_evict(
+        &self,
+        slug: &str,
+        m: &Managed,
+        need: u64,
+        evicted: &mut Vec<(String, f64, f64)>,
+    ) -> std::result::Result<(), EnsureError> {
+        let reusable_cap = m.plan.slab_reusable();
+        loop {
+            let trimmed = self.device.pool_trim(reusable_cap);
+            if trimmed > 0 {
+                tracing::info!(
+                    trimmed_mib = trimmed >> 20,
+                    "planner: released pooled chunks the target cannot reuse"
+                );
+            }
+            let mut avail = self
+                .fit_capacity(self.device.pool_bytes())
+                .map_err(EnsureError::Load)?;
+            if !residency_contract::admits(need, avail) {
+                avail = self.reclaim_caches(need, avail).await?;
+            }
+            if residency_contract::admits(need, avail) {
+                return Ok(());
+            }
+            let Some(victim) = self.lru_victim(slug) else {
+                tracing::warn!(
+                    %slug,
+                    need_gib = gib(need),
+                    free_gib = gib(avail),
+                    "planner: capacity cannot fit — shedding"
+                );
+                return Err(EnsureError::WontFit { need, free: avail });
+            };
+            let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
+            evicted.push((victim, drain_ms, unload_ms));
+        }
     }
 
     async fn ensure_resident_locked(
@@ -1497,6 +1565,9 @@ impl ModelManager {
         }
         self.clear_partial(slug).await?;
         if self.is_resident(slug) {
+            if state.residency(slug) == crate::serve::Residency::Dormant {
+                self.awaken_locked(slug).await?;
+            }
             self.touch(slug);
             return Ok(());
         }
@@ -1520,37 +1591,8 @@ impl ModelManager {
         // overhead all allocate fresh — and holding them uncredited squeezed
         // a fitting switch into WontFit (a 30 GiB victim pool credited at a
         // 24 GiB target's cap left 5.7 GiB dead).
-        let reusable_cap = m.plan.slab_reusable();
         loop {
-            loop {
-                let trimmed = self.device.pool_trim(reusable_cap);
-                if trimmed > 0 {
-                    tracing::info!(
-                        trimmed_mib = trimmed >> 20,
-                        "planner: released pooled chunks the target cannot reuse"
-                    );
-                }
-                let mut avail = self
-                    .fit_capacity(self.device.pool_bytes())
-                    .map_err(EnsureError::Load)?;
-                if !residency_contract::admits(need, avail) {
-                    avail = self.reclaim_caches(need, avail).await?;
-                }
-                if residency_contract::admits(need, avail) {
-                    break;
-                }
-                let Some(victim) = self.lru_victim(slug) else {
-                    tracing::warn!(
-                        %slug,
-                        need_gib = gib(need),
-                        free_gib = gib(avail),
-                        "planner: switch cannot fit — shedding"
-                    );
-                    return Err(EnsureError::WontFit { need, free: avail });
-                };
-                let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
-                report.evicted.push((victim, drain_ms, unload_ms));
-            }
+            self.fit_and_evict(slug, &m, need, &mut report.evicted).await?;
 
             let t0 = Instant::now();
             match self.load_model(&m).await {
@@ -1708,6 +1750,197 @@ impl ModelManager {
         Ok(report)
     }
 
+    /// Warm hibernate: stop in-flight work and unmap device physical memory (weights,
+    /// activations, and dynamic KV cache) while keeping virtual addresses, CUDA graphs,
+    /// and driver context resident.
+    pub async fn hibernate(
+        &self,
+        slug: &str,
+        drain: Option<Duration>,
+    ) -> std::result::Result<HibernateReport, EnsureError> {
+        let _g = self.switch.lock().await;
+        self.hibernate_locked(slug, drain).await
+    }
+
+    async fn hibernate_locked(
+        &self,
+        slug: &str,
+        drain: Option<Duration>,
+    ) -> std::result::Result<HibernateReport, EnsureError> {
+        if !self.manages(slug) {
+            return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
+        }
+        let state = self.state()?;
+        if !self.is_resident(slug) {
+            return Err(EnsureError::Load(RuntimeError::Rejected(format!(
+                "{slug} is not loaded"
+            ))));
+        }
+        if state.residency(slug) == crate::serve::Residency::Dormant {
+            return Ok(HibernateReport {
+                slug: slug.to_string(),
+                ..HibernateReport::default()
+            });
+        }
+
+        let stop = match drain {
+            Some(bound) => Stop::Bounded(bound),
+            None => Stop::Now,
+        };
+        let t0 = Instant::now();
+        let mut release = residency_contract::ReleaseGate::default();
+        let completed = if let Some(mux) = state.mux_for_retirement(slug) {
+            match stop {
+                Stop::Now => mux.preempt_fenced().await,
+                Stop::Bounded(bound) => {
+                    match tokio::time::timeout(bound, mux.drain_fenced()).await {
+                        Ok(ack) => ack,
+                        Err(_) => mux.preempt_fenced().await,
+                    }
+                }
+                Stop::Graceful => match drain_timeout_ms() {
+                    None => mux.drain_fenced().await,
+                    Some(ms) => {
+                        let deadline = std::time::Duration::from_millis(ms);
+                        match tokio::time::timeout(deadline, mux.drain_fenced()).await {
+                            Ok(ack) => ack,
+                            Err(_) => mux.preempt_fenced().await,
+                        }
+                    }
+                },
+            }
+        } else {
+            true
+        };
+        release.complete(completed);
+        if !release.claim_return() {
+            return Err(EnsureError::Load(RuntimeError::Msg(format!(
+                "{slug}: dispatcher completion was not acknowledged"
+            ))));
+        }
+        state.remove_mux(slug);
+        let stop_ms = ms(t0);
+
+        let free_before = self.device.mem_info().map_or(0, |(free, _)| free);
+        let t1 = Instant::now();
+        let engine = state.gpu_engine(slug).ok_or_else(|| {
+            EnsureError::Load(RuntimeError::Msg(format!("{slug} has no gpu engine")))
+        })?;
+        let engine_clone = Arc::clone(&engine);
+        let unmapped = on_own_thread("plow-hibernate", move || {
+            let mut guard = engine_clone.lock();
+            guard.hibernate()
+        })
+        .await
+        .and_then(|r| r)
+        .map_err(EnsureError::Load)?;
+
+        self.kv_claims.lock().remove(slug);
+        let pool_trimmed = self.device.pool_trim(0);
+        let free_after = self.device.mem_info().map_or(0, |(free, _)| free);
+        let hibernate_ms = ms(t1);
+
+        state.set_residency(slug, crate::serve::Residency::Dormant);
+
+        let report = HibernateReport {
+            slug: slug.to_string(),
+            stop_ms,
+            hibernate_ms,
+            freed: free_after
+                .saturating_sub(free_before)
+                .max(unmapped)
+                .max(pool_trimmed),
+        };
+        tracing::info!(
+            %slug,
+            stop_ms = report.stop_ms,
+            hibernate_ms = report.hibernate_ms,
+            freed_gib = gib(report.freed),
+            "model hibernated to warm dormancy"
+        );
+        Ok(report)
+    }
+
+    /// Awaken a dormant model: re-map physical memory handles into the existing VA reservations,
+    /// stream weights, and re-spawn the dispatcher. Existing CUDA graphs remain valid without re-capture.
+    pub async fn awaken(
+        self: &Arc<Self>,
+        slug: &str,
+    ) -> std::result::Result<AwakenReport, EnsureError> {
+        let _g = self.switch.lock().await;
+        self.awaken_locked(slug).await
+    }
+
+    async fn awaken_locked(
+        self: &Arc<Self>,
+        slug: &str,
+    ) -> std::result::Result<AwakenReport, EnsureError> {
+        if !self.manages(slug) {
+            return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
+        }
+        let state = self.state()?;
+        if !self.is_resident(slug) {
+            return Err(EnsureError::Load(RuntimeError::Rejected(format!(
+                "{slug} is not resident; load it first"
+            ))));
+        }
+        if state.residency(slug) != crate::serve::Residency::Dormant {
+            return Ok(AwakenReport {
+                slug: slug.to_string(),
+                awaken_ms: 0.0,
+            });
+        }
+        let m = self
+            .managed(slug)
+            .ok_or_else(|| EnsureError::Load(RuntimeError::UnknownModel(slug.into())))?;
+        let need = sum_bytes([self.required(slug).expect("managed"), RESERVE]);
+        let mut evicted = Vec::new();
+        loop {
+            self.fit_and_evict(slug, &m, need, &mut evicted).await?;
+
+            let t0 = Instant::now();
+            let engine = state.gpu_engine(slug).ok_or_else(|| {
+                EnsureError::Load(RuntimeError::Msg(format!("{slug} has no gpu engine")))
+            })?;
+            let engine_clone = Arc::clone(&engine);
+            let ckpt = m.ckpt.clone();
+            let res = on_own_thread("plow-awaken", move || {
+                let mut guard = engine_clone.lock();
+                guard.awaken(&ckpt)
+            })
+            .await
+            .and_then(|r| r);
+
+            match res {
+                Ok(()) => {
+                    let cfg = state
+                        .engine_config(&m.slug)
+                        .unwrap_or_else(crate::config::RuntimeConfig::get);
+                    self.activate_serving(&state, slug, cfg).await?;
+                    state.set_residency(slug, crate::serve::Residency::Auto);
+                    self.touch(slug);
+                    let awaken_ms = ms(t0);
+                    tracing::info!(%slug, awaken_ms, "model awakened from warm hibernation");
+                    return Ok(AwakenReport {
+                        slug: slug.to_string(),
+                        awaken_ms,
+                    });
+                }
+                Err(e) if is_oom(&e) => {
+                    let Some(victim) = self.lru_victim(slug) else {
+                        tracing::warn!(%slug, error = %e, "planner: awaken out of memory — shedding");
+                        let free = self.free_vram().map_err(EnsureError::Load)?;
+                        return Err(EnsureError::WontFit { need, free });
+                    };
+                    tracing::warn!(%slug, %victim, error = %e, "planner: awaken out of memory — evicting");
+                    let (drain_ms, unload_ms) = self.evict(&victim, Stop::Graceful).await?;
+                    evicted.push((victim, drain_ms, unload_ms));
+                }
+                Err(e) => return Err(EnsureError::Load(e)),
+            }
+        }
+    }
+
     /// Control-plane load: make `slug` resident now and clear any operator
     /// unload. Returns the load wall time in ms (`0.0` when already resident).
     ///
@@ -1745,6 +1978,12 @@ impl ModelManager {
     ) -> std::result::Result<f64, EnsureError> {
         self.clear_partial(slug).await?;
         if self.is_resident(slug) {
+            let state = self.state()?;
+            if state.residency(slug) == crate::serve::Residency::Dormant {
+                let report = self.awaken_locked(slug).await?;
+                self.touch(slug);
+                return Ok(report.awaken_ms);
+            }
             self.touch(slug);
             return Ok(0.0);
         }
@@ -2116,13 +2355,27 @@ impl ModelManager {
             let _ = self.evict(&m.slug, Stop::Now).await;
             return Err(EnsureError::Load(e));
         }
-        if let Err(e) = self.claim_kv_reclaiming(&state, &m.slug, cfg).await {
-            tracing::warn!(slug = %m.slug, error = %e, "planner: loaded model left without KV room — unloading");
-            let _ = self.evict(&m.slug, Stop::Now).await;
+        self.activate_serving(&state, &m.slug, cfg).await?;
+        Ok(())
+    }
+
+    async fn activate_serving(
+        &self,
+        state: &Arc<AppState>,
+        slug: &str,
+        cfg: &'static crate::config::RuntimeConfig,
+    ) -> std::result::Result<(), EnsureError> {
+        if let Err(e) = self.claim_kv_reclaiming(state, slug, cfg).await {
+            tracing::warn!(%slug, error = %e, "planner: model left without KV room — unloading");
+            let _ = self.evict(slug, Stop::Now).await;
             return Err(e);
         }
-        let mux = mux::spawn(m.slug.clone(), bundle, Arc::clone(&state), self.mux_cfg);
-        state.install_mux(m.slug.clone(), mux);
+        let bundle = state
+            .registry
+            .bundle_for(state.model_of(slug), self.vendor())
+            .map_err(EnsureError::Load)?;
+        let mux = mux::spawn(slug.to_string(), bundle, Arc::clone(state), self.mux_cfg);
+        state.install_mux(slug.to_string(), mux);
         Ok(())
     }
 
@@ -3168,6 +3421,23 @@ mod tests {
         lru.insert("c".to_string(), t0 + std::time::Duration::from_secs(2));
         assert_eq!(pick_victim(&residents, &lru).as_deref(), Some("a"));
         assert_eq!(pick_victim(&[], &lru), None);
+    }
+
+    #[tokio::test]
+    async fn dormancy_state_and_rejection_checks() {
+        let (state, mgr) = failing_manager(Path::new("/nonexistent"));
+        // Model not resident yet -> hibernate should fail with rejection
+        let err = mgr.hibernate("m", None).await.unwrap_err();
+        assert!(err.to_string().contains("not loaded"));
+
+        // Awaken when not resident should fail with rejection
+        let err = mgr.awaken("m").await.unwrap_err();
+        assert!(err.to_string().contains("not resident"));
+
+        // Set residency to Dormant manually and verify admits and as_str
+        state.set_residency("m", crate::serve::Residency::Dormant);
+        assert!(state.residency("m").admits());
+        assert_eq!(state.residency("m").as_str(), "dormant");
     }
 }
 

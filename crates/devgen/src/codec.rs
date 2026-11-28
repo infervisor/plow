@@ -386,6 +386,7 @@ fn snac_program(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        stream_in: None,
         wgmma_ragged: false,
         pad_after: None,
     };
@@ -629,6 +630,58 @@ pub(crate) struct Conv {
     pub(crate) taps_wgmma: bool,
     /// Wgmma tiles may span taps / transposed-conv phases at widths % 4 (flag bit 3).
     pub(crate) wgmma_ragged: bool,
+    /// A stream step's carried input `(state, slot, pos)`, read in place by the bf16 taps arm
+    /// ([`bf16_taps_ok`]) or the staged input-SnakeBeta conv ([`staged_beta_ok`]): `x` holds the
+    /// new rows, `in_rows` counts the carried ones too.
+    pub(crate) stream_in: Option<(String, u32, u32)>,
+}
+
+/// `c` (unpadded, length-free) takes the bf16 taps arm under `PLOW_EMIT_CODEC_CONV_BF16`:
+/// [`fused_conv`]'s taps route with a geometry `conv_bf16_geometry` fits.
+pub(crate) fn bf16_taps_ok(c: &Conv, splits: bool) -> bool {
+    let span = c.dilation * c.kernel.saturating_sub(1);
+    splits
+        && crate::emit_config::active().codec_conv_bf16
+        && c.taps_wgmma
+        && !c.transpose
+        && c.groups == 1
+        && c.kernel > 1
+        && c.row_scale.is_none()
+        && c.pad == 0
+        && c.pad_after.unwrap_or(0) == 0
+        && c.len == packet::dev::TENSOR_NONE
+        && matches!(c.act_in, Activation::None | Activation::SnakeBeta)
+        && matches!(c.act_out, Activation::None | Activation::SnakeBeta)
+        && c.in_rows > span
+        && crate::pipeline::conv_bf16_geometry(
+            c.cin,
+            c.cout,
+            c.kernel,
+            c.dilation,
+            c.batch,
+            c.in_rows - span,
+        )
+        .is_some()
+}
+
+/// `c` (unpadded, length-free) is a few-output conv whose input SnakeBeta runs in the staged arm's
+/// staging over a stream input read in place (pipeline [`crate::pipeline::staged_beta_ok`]).
+pub(crate) fn staged_beta_ok(c: &Conv) -> bool {
+    !c.transpose
+        && c.groups == 1
+        && c.stride == 1
+        && c.pad == 0
+        && c.pad_after.unwrap_or(0) == 0
+        && c.len == packet::dev::TENSOR_NONE
+        && c.residual.is_none()
+        && c.row_scale.is_none()
+        && c.act_in == Activation::SnakeBeta
+        && c.act_out == Activation::None
+        && c.alpha.is_some()
+        && c.alpha_out.is_none()
+        && !c.taps_wgmma
+        && c.in_rows > c.dilation * c.kernel.saturating_sub(1)
+        && crate::pipeline::staged_beta_ok(c.cin, c.cout, c.kernel, c.dilation)
 }
 
 /// `c` with the fusions `fuse` decides; an unfused piece runs as its own `UnaryF32` /
@@ -668,7 +721,21 @@ pub(crate) fn fused_conv(
         Some(u) => (Some(format!("{u}.a1")), Some(format!("{u}.a2"))),
         None => (c.alpha.clone(), None),
     };
-    let dual = dual && !taps;
+    let bf16 = taps && bf16_taps_ok(&c, true);
+    // The bf16 arm stages its input once: an input SnakeBeta runs there, alpha = [a1 | a2].
+    let pre_bf16 = bf16
+        && c.act_in == Activation::SnakeBeta
+        && c.act_out == Activation::SnakeBeta
+        && unit.is_some();
+    // The staged arm reads a stream input in place with its input SnakeBeta in the staging.
+    let staged_beta = c.stream_in.is_some() && !bf16 && staged_beta_ok(&c);
+    if c.stream_in.is_some() && !bf16 && !staged_beta {
+        return Err(
+            "codec conv: a stream input needs the bf16 taps arm or the staged input-SnakeBeta conv"
+                .into(),
+        );
+    }
+    let dual = (dual && !taps) || pre_bf16;
     // An input SnakeBeta (two parameter arrays) only runs as its own unary pass.
     let fuse_in = act_in
         && c.act_in != Activation::SnakeBeta
@@ -682,7 +749,7 @@ pub(crate) fn fused_conv(
     let fuse_res =
         c.residual.is_some() && (c.row_scale.is_some() || fuse.residual(&c.weight, true));
     let (mut x, mut dep) = (x, dep);
-    if act_in && !fuse_in {
+    if act_in && !fuse_in && !pre_bf16 && !staged_beta {
         let output = if c.input_is_temp {
             TensorRef::Handle(x)
         } else {
@@ -722,7 +789,7 @@ pub(crate) fn fused_conv(
     let deps: Vec<u32> = std::iter::once(dep)
         .chain(c.row_scale.map(|r| r.1))
         .collect();
-    let stage = Conv1dF32Stage {
+    let mut stage = Conv1dF32Stage {
         output: TensorRef::Named(c.output),
         weight: TensorRef::Named(&c.weight),
         bias: c.bias.as_deref().map(TensorRef::Named),
@@ -730,7 +797,7 @@ pub(crate) fn fused_conv(
             c.alpha_out.as_deref().map(TensorRef::Named)
         } else if out_alpha.is_some() {
             out_alpha.as_deref().map(TensorRef::Named)
-        } else if fuse_in {
+        } else if fuse_in || staged_beta {
             c.alpha.as_deref().map(TensorRef::Named)
         } else {
             None
@@ -748,7 +815,11 @@ pub(crate) fn fused_conv(
         pad_before: c.pad,
         pad_after: c.pad_after.unwrap_or(c.pad),
         pad_mode: PadMode::Zero,
-        input_activation: if fuse_in { c.act_in } else { Activation::None },
+        input_activation: if fuse_in || pre_bf16 || staged_beta {
+            c.act_in
+        } else {
+            Activation::None
+        },
         output_activation: if fuse_out {
             c.act_out
         } else {
@@ -764,8 +835,27 @@ pub(crate) fn fused_conv(
         pinned: true,
         wgmma_ragged: c.wgmma_ragged && (ct || taps),
         input_split: false,
+        bf16_taps: false,
+        single_bf16: crate::emit_config::active().codec_bf16_1p,
+        stream_in: None,
         output_split: false,
     };
+    stage.bf16_taps = bf16
+        && split
+        && stage
+            .out_rows(false)
+            .and_then(|rows| crate::pipeline::conv_bf16_plan(&stage, false, rows))
+            .is_some();
+    if bf16 && !stage.bf16_taps {
+        return Err(format!(
+            "codec conv {}: bf16_taps_ok but outside conv_bf16_plan",
+            c.weight
+        ));
+    }
+    stage.stream_in = c
+        .stream_in
+        .as_ref()
+        .map(|(state, slot, pos)| (TensorRef::Named(state), *slot, *pos));
     let e = match c.row_scale {
         Some((scale, _)) => p.conv1d_f32_row_scaled(x, &deps, stage, scale)?,
         None => p.conv1d_f32(x, c.transpose, &deps, stage)?,
@@ -984,6 +1074,7 @@ mod tests {
             row_scale: None,
             alpha_out: None,
             taps_wgmma: false,
+            stream_in: None,
             wgmma_ragged: false,
         };
         fused_conv(&mut p, ConvFusions(None), Some(&splits), x, first.done, c).unwrap();
@@ -1092,6 +1183,7 @@ mod tests {
             row_scale: None,
             alpha_out: Some("w.dec.blk0.ru0.a12".into()),
             taps_wgmma: true,
+            stream_in: None,
             wgmma_ragged: false,
         };
         fused_conv(&mut p, ConvFusions(None), Some(&splits), x, first.done, c).unwrap();

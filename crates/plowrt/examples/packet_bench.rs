@@ -48,42 +48,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline = asset
         .bind(pos[1], &rt)
         .or_else(|_| asset.bind_driver(pos[1], &rt))?;
-    if each {
-        for (n, program) in pipeline.program_sequence(pos[2])?.into_iter().enumerate() {
-            for _ in 0..3 {
-                rt.run(program)?;
-            }
-            let mut us: Vec<f64> = (0..iters)
-                .map(|_| rt.run(program).map(|_| rt.last_run_us()))
-                .collect::<Result<_, _>>()?;
-            us.sort_by(f64::total_cmp);
-            println!(
-                "{{\"role\":\"{}.{n}\",\"program\":{program},\"us\":{:.2}}}",
-                pos[2],
-                us[iters / 2]
-            );
-        }
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--seq") {
-        // The whole role sequence `ROLE.<n>` as one CUDA graph (inputs zeroed).
-        let programs = pipeline.program_sequence(pos[2])?;
-        for _ in 0..3 {
-            rt.run_sequence(&programs)?;
-        }
-        let mut us: Vec<f64> = (0..iters)
-            .map(|_| rt.run_sequence(&programs).map(|_| rt.last_run_us()))
-            .collect::<Result<_, _>>()?;
-        us.sort_by(f64::total_cmp);
-        println!(
-            "{{\"role\":\"{}\",\"programs\":{},\"us\":{:.2}}}",
-            pos[2],
-            programs.len(),
-            us[iters / 2]
-        );
-        return Ok(());
-    }
-    let program = pipeline.program(pos[2])?;
     if let Ok(n) = std::env::var("PB_STEP_FRAMES") {
         let n: u32 = n.parse()?;
         for k in 0..pipeline.parameter("lengths.count")? {
@@ -120,6 +84,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rt.run(pipeline.program(role)?)?;
         }
     }
+    if each {
+        for (n, program) in pipeline.program_sequence(pos[2])?.into_iter().enumerate() {
+            for _ in 0..3 {
+                rt.run(program)?;
+            }
+            let mut us: Vec<f64> = (0..iters)
+                .map(|_| rt.run(program).map(|_| rt.last_run_us()))
+                .collect::<Result<_, _>>()?;
+            us.sort_by(f64::total_cmp);
+            println!(
+                "{{\"role\":\"{}.{n}\",\"program\":{program},\"us\":{:.2}}}",
+                pos[2],
+                us[iters / 2]
+            );
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--seq") {
+        // The whole role sequence `ROLE.<n>` as one CUDA graph.
+        let programs = pipeline.program_sequence(pos[2])?;
+        for _ in 0..3 {
+            rt.run_sequence(&programs)?;
+        }
+        let mut us: Vec<f64> = (0..iters)
+            .map(|_| rt.run_sequence(&programs).map(|_| rt.last_run_us()))
+            .collect::<Result<_, _>>()?;
+        us.sort_by(f64::total_cmp);
+        println!(
+            "{{\"role\":\"{}\",\"programs\":{},\"us\":{:.2}}}",
+            pos[2],
+            programs.len(),
+            us[iters / 2]
+        );
+        return Ok(());
+    }
+    let program = pipeline.program(pos[2])?;
     let mut time = |rt: &mut CudaPacketRuntime| -> Result<f64, Box<dyn std::error::Error>> {
         for _ in 0..3 {
             rt.run(program)?;

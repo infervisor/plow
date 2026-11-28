@@ -214,6 +214,16 @@ pub struct RuntimeConfig {
     )]
     pub tts_stream_first_frames: Option<usize>,
 
+    /// Most new frames one stateful codec step decodes (capped by the packet's
+    /// `stream.step_frames`): batched steps pay their launch's longest step, so equal short steps
+    /// pad less than a ramp to the packet's cap. Unset: the packet's cap.
+    #[arg(
+        long = "tts-stream-step-frames",
+        env = "PLOW_TTS_STREAM_STEP_FRAMES",
+        global = true
+    )]
+    pub tts_stream_step_frames: Option<usize>,
+
     /// Strip markup and insert runtime pauses on speech packets without a tag map. Unset: legacy text path.
     #[arg(long = "tts-tags-default", env = "PLOW_TTS_TAGS_DEFAULT", value_parser = ["strip"], global = true)]
     pub tts_tags_default: Option<String>,
@@ -340,11 +350,12 @@ pub struct RuntimeConfig {
     /// Packed audio-encoder hold (ms): while `PLOW_ASR_ENCODE_HOLD_INFLIGHT` requests are in flight
     /// and the queued audio is short of a full launch, the encoder waits up to this long from its
     /// oldest queued request for more, trading that wait for fewer per-launch fixed costs. 0 =
-    /// launch whatever is queued.
+    /// launch whatever is queued. 50 (Qwen3-ASR 1.7B, H100, open loop): holds 150 req/s at 99%
+    /// under 1 s where 0 holds 100, saturation 985 -> 1277 audio s/s, c1 and c16 unchanged.
     #[arg(
         long = "asr-encode-hold-ms",
         env = "PLOW_ASR_ENCODE_HOLD_MS",
-        default_value_t = 0,
+        default_value_t = 50,
         global = true
     )]
     pub asr_encode_hold_ms: u64,
@@ -602,31 +613,17 @@ pub struct RuntimeConfig {
     )]
     pub encode_split_min: Option<u32>,
 
-    /// Optional soft cap on prefix blocks and boundary snapshots as a fraction of the device's
-    /// memory, 0..=1 — the unit vLLM's `--gpu-memory-utilization` uses, scoped here to the
-    /// prefix cache. Default 0: no static cap; the cache grows into free memory and pressure
-    /// eviction (`--vmm-cache-min-free-mib`) or allocation OOM evicts it, as vLLM's prefix
-    /// cache uses every free KV block. `--vmm-cache-mib` sets an explicit size.
-    #[arg(
-        long = "vmm-cache-memory-utilization",
-        env = "PLOW_VMM_CACHE_MEMORY_UTILIZATION",
-        default_value_t = 0.0,
-        value_parser = clap::value_parser!(f64),
-        global = true
-    )]
-    pub vmm_cache_memory_utilization: f64,
-
-    /// Explicit soft cap on prefix blocks and boundary snapshots in MiB; overrides
-    /// `--vmm-cache-memory-utilization`. 0 = OOM-driven eviction only.
+    /// Explicit soft cap on prefix blocks and boundary snapshots in MiB.
+    /// Unset or 0 = dynamic headroom budgeting (OOM-driven pressure eviction only).
     #[arg(long = "vmm-cache-mib", env = "PLOW_VMM_CACHE_MIB", global = true)]
     pub vmm_cache_mib: Option<u32>,
 
     /// Keep every cached prefix (whole shared blocks and private boundary snapshots alike)
     /// until free device memory would drop below this many MiB, instead of trimming as soon
-    /// as `--vmm-cache-mib`/`--vmm-cache-memory-utilization` bytes of cache are held. Unset
-    /// (the default) derives 4% of the device; `=0` is the rollback to the static byte budget
-    /// as the only trim trigger. Needs the backend to report free device memory cheaply
-    /// (`VmmOps::free_bytes`); a backend that cannot degrades to the static budget unchanged.
+    /// as `--vmm-cache-mib` bytes of cache are held. Unset (the default) derives 4% of the
+    /// device; `=0` is the rollback to the static byte budget as the only trim trigger.
+    /// Needs the backend to report free device memory cheaply (`VmmOps::free_bytes`); a
+    /// backend that cannot degrades to the static budget unchanged.
     #[arg(
         long = "vmm-cache-min-free-mib",
         env = "PLOW_VMM_CACHE_MIN_FREE_MIB",
@@ -729,6 +726,32 @@ pub struct RuntimeConfig {
     /// the launch is already full of admitted rows. Admission then costs no GPU time.
     #[arg(long = "pf-admit-overlap", env = "PLOW_PF_ADMIT_OVERLAP", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_admit_overlap: bool,
+
+    /// Adaptive KV output token reservation cap: when nonzero, bounds initial output token
+    /// reservation against the KV budget to min(max_tokens, max(generated + 128, cap))
+    /// instead of locking down the full client `max_tokens` (e.g. 4096) upfront.
+    /// `0` restores full static `max_tokens` reservation.
+    #[arg(
+        long = "kv-reserve-output-tokens",
+        env = "PLOW_KV_RESERVE_OUTPUT_TOKENS",
+        default_value_t = 256,
+        hide = true,
+        global = true
+    )]
+    pub kv_reserve_output_tokens: u32,
+
+    /// Soft admission KV output token reservation cap: when the KV pool is under pressure
+    /// and cannot fit the full `kv_reserve_output_tokens` (e.g. 256), a request can be softly
+    /// admitted with this initial output reservation (e.g. 64) so prefill starts immediately
+    /// without stalling in the queue. `0` disables soft admission.
+    #[arg(
+        long = "kv-soft-reserve-output-tokens",
+        env = "PLOW_KV_SOFT_RESERVE_OUTPUT_TOKENS",
+        default_value_t = 64,
+        hide = true,
+        global = true
+    )]
+    pub kv_soft_reserve_output_tokens: u32,
 
     /// Load shedding at the capacity knee: refuse a new request with 429 + `Retry-After` while
     /// this many requests already wait for their first token (queued plus seated in prefill),
@@ -1030,7 +1053,7 @@ pub struct RuntimeConfig {
     /// CUDA packed prefill: a request whose prompt shares whole KV blocks with a prompt another
     /// slot is still prefilling waits (bounded) for that slot's checkpoint and attaches to it
     /// instead of recomputing the shared rows beside it. `0` admits it at once.
-    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "prefix-inflight-wait", env = "PLOW_PREFIX_INFLIGHT_WAIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub prefix_inflight_wait: bool,
 
     /// CUDA token-batch prefill: publish the whole-block checkpoints a prompt chunk completed
@@ -1069,6 +1092,34 @@ pub struct RuntimeConfig {
         global = true
     )]
     pub decode_max_rung: Option<u32>,
+
+    /// Expert: nominal decode rung ceiling during steady-state (e.g. 32).
+    #[arg(
+        long = "decode-nominal-rung",
+        env = "PLOW_DECODE_NOMINAL_RUNG",
+        hide = true,
+        global = true
+    )]
+    pub decode_nominal_rung: Option<u32>,
+
+    /// Expert: elastic burst decode rung ceiling during queue backlog (e.g. 40).
+    #[arg(
+        long = "decode-elastic-rung",
+        env = "PLOW_DECODE_ELASTIC_RUNG",
+        hide = true,
+        global = true
+    )]
+    pub decode_elastic_rung: Option<u32>,
+
+    /// Expert: queue wait time threshold in ms before elastic burst expansion activates (default 250).
+    #[arg(
+        long = "decode-elastic-wait-ms",
+        env = "PLOW_DECODE_ELASTIC_WAIT_MS",
+        default_value_t = 250,
+        hide = true,
+        global = true
+    )]
+    pub decode_elastic_wait_ms: u32,
 
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / observability (shared, off by default)
@@ -1532,6 +1583,17 @@ pub struct NvidiaRuntimeConfig {
     /// the diagnostic rollback.
     #[arg(long = "decode-pipeline", env = "PLOW_DECODE_PIPELINE", hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub decode_pipeline: Option<bool>,
+
+    /// Minimum decode rung rows to route through cuBLASLt (CUDA). Rungs narrower than this run
+    /// natively in the decode interpreter, leaving them available for speculative decode verify.
+    /// Default 0 uses the emitted packet's projection roles as-is.
+    #[arg(
+        long = "decode-cublaslt-min-rows",
+        env = "PLOW_DECODE_CUBLASLT_MIN_ROWS",
+        default_value_t = 0,
+        global = true
+    )]
+    pub decode_cublaslt_min_rows: u32,
 
     /// Speculative decoding with the packet's drafter (CUDA; packets emitted with
     /// `PLOW_EMIT_SPEC`): pure decode ticks of greedy rows draft and verify when the measured
@@ -2109,6 +2171,18 @@ impl RuntimeConfig {
         } else {
             self.pf_chunk as usize
         }
+    }
+
+    /// Adaptive KV output token reservation cap.
+    #[inline]
+    pub fn kv_reserve_output_tokens(&self) -> usize {
+        self.kv_reserve_output_tokens as usize
+    }
+
+    /// Soft admission KV output token reservation cap.
+    #[inline]
+    pub fn kv_soft_reserve_output_tokens(&self) -> usize {
+        self.kv_soft_reserve_output_tokens as usize
     }
 }
 
@@ -3036,10 +3110,8 @@ impl RuntimeConfig {
     }
 
     /// Prefix-cache soft cap in bytes for a device with `device_bytes` of memory.
-    /// An explicit `--vmm-cache-mib` wins; otherwise `--vmm-cache-memory-utilization`
-    /// of the device. `device_bytes == 0` means the backend could not say, and the cap
-    /// falls back to the 4 GiB the H100 campaign qualified rather than to "unbounded".
-    pub(crate) fn prefix_cache_cap_bytes(&self, device_bytes: u64) -> u64 {
+    /// An explicit `--vmm-cache-mib` wins; otherwise 0 (dynamic headroom budgeting).
+    pub(crate) fn prefix_cache_cap_bytes(&self, _device_bytes: u64) -> u64 {
         let allow_env = !Self::is_initialized();
         let explicit: Option<u32> = if allow_env {
             Self::env_parse("PLOW_VMM_CACHE_MIB").or(self.vmm_cache_mib)
@@ -3049,20 +3121,7 @@ impl RuntimeConfig {
         if let Some(mib) = explicit {
             return (mib as u64) << 20;
         }
-        let fraction = select_compat(
-            self.vmm_cache_memory_utilization,
-            Self::env_parse("PLOW_VMM_CACHE_MEMORY_UTILIZATION"),
-            allow_env,
-        )
-        .clamp(0.0, 1.0);
-        if fraction == 0.0 {
-            return 0;
-        }
-        if device_bytes == 0 {
-            return 4096u64 << 20;
-        }
-        // Whole MiB, so the figure in logs and metrics reads like the knob.
-        ((device_bytes as f64 * fraction) as u64) >> 20 << 20
+        0
     }
 
     /// The free-device-memory floor the prefix cache evicts to hold, in bytes, for a device
@@ -4093,25 +4152,18 @@ mod tests {
             .find(|arg| arg.get_id() == "vmm_cache_mib")
             .unwrap();
         assert!(budget.get_default_values().is_empty());
-        let fraction = command
-            .get_arguments()
-            .find(|arg| arg.get_id() == "vmm_cache_memory_utilization")
-            .unwrap();
-        assert_eq!(fraction.get_default_values(), ["0"]);
-        // No static cap by default: the cache grows until pressure or OOM evicts it.
+        // No static cap by default: dynamic headroom budgeting partitions usable VRAM.
         let matches = command.clone().try_get_matches_from(["test"]).unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 0);
         assert_eq!(config.prefix_cache_cap_bytes(0), 0);
-        // An explicit fraction scales with the device; an unknown size keeps 4 GiB.
+        // An explicit --vmm-cache-mib sets the soft cap.
         let matches = command
             .clone()
-            .try_get_matches_from(["test", "--vmm-cache-memory-utilization=0.05"])
+            .try_get_matches_from(["test", "--vmm-cache-mib=4096"])
             .unwrap();
         let config = super::RuntimeConfig::from_arg_matches(&matches).unwrap();
         assert_eq!(config.prefix_cache_cap_bytes(80 << 30), 4096 << 20);
-        assert_eq!(config.prefix_cache_cap_bytes(192 << 30), 9830 << 20);
-        assert_eq!(config.prefix_cache_cap_bytes(0), 4096 << 20);
         for (flag, expected) in [("--vmm-prefix", true), ("--vmm-prefix=false", false)] {
             let matches = command
                 .clone()

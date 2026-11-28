@@ -237,7 +237,7 @@ impl Lt {
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 let rec: StoredAlgo = serde_json::from_str(line)
                     .map_err(|e| RuntimeError::Device(format!("PLOW_LT_ALGOS: bad record: {e}")))?;
-                if rec.dtype != "bf16" {
+                if rec.dtype != "bf16" && rec.dtype != "fp8" && rec.dtype != "e4m3" {
                     continue;
                 }
                 if let Some(algo) = rec.to_algo() {
@@ -434,6 +434,40 @@ impl Lt {
                     ),
                     "FP8 Lt heuristic",
                 )?;
+                if let Some(algo) = self
+                    .stored
+                    .get(&(m, n, k, false, rung_key(m, &[])))
+                    .copied()
+                {
+                    plan.algo = algo;
+                    let mut check_result = Heuristic::default();
+                    if check(
+                        (self.api.cublasLtMatmulAlgoCheck)(
+                            self.handle as Handle,
+                            plan.desc as Handle,
+                            plan.w as Handle,
+                            plan.a as Handle,
+                            plan.c as Handle,
+                            plan.c as Handle,
+                            &plan.algo,
+                            &mut check_result,
+                        ),
+                        "FP8 Lt stored algorithm check",
+                    )
+                    .is_ok()
+                        && check_result.state == 0
+                        && check_result.workspace <= bytes
+                    {
+                        tracing::info!(m, n, k, "cuBLASLt FP8 stored algorithm pinned");
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        m,
+                        n,
+                        k,
+                        "cuBLASLt FP8 stored algorithm rejected; falling back"
+                    );
+                }
                 plan.algo = results
                     .get(..count as usize)
                     .unwrap_or(&[])

@@ -47,6 +47,7 @@ use packet::rope::{GenTensor, RopeScale};
 use serde_json::Value;
 
 mod checkpoint;
+pub mod consolidated;
 pub mod cost_inputs;
 pub mod gemm_policy;
 use checkpoint::{layer_scalars, validate_coverage};
@@ -68,6 +69,7 @@ pub mod kda;
 pub mod knob_spec;
 use config::*;
 mod gptoss;
+mod inkling;
 mod ladder;
 mod mla;
 mod muse;
@@ -9007,6 +9009,8 @@ struct EmitCapabilities {
     glm53: bool,
     /// Routed experts in `config.json` (`num_experts`, `num_local_experts`, `n_routed_experts`).
     moe: bool,
+    /// Inkling recurrent hybrid MoE families (`inkling2_loop`, `inkling2_loop_text`).
+    inkling: bool,
     /// Full-attention layers at head dim 512 (`config.json` `global_head_dim`): the hybrid
     /// geometry the sm_90a hd512 segment objects and the balanced decode split are built for.
     full_attn_hd512: bool,
@@ -9025,6 +9029,7 @@ impl EmitCapabilities {
             ("glm", self.glm),
             ("glm53", self.glm53),
             ("moe", self.moe),
+            ("inkling", self.inkling),
             ("full_attn_hd512", self.full_attn_hd512),
         ]
         .into_iter()
@@ -9055,16 +9060,18 @@ fn emit_capabilities(model_type: &str) -> EmitCapabilities {
             | "gemma4_unified_text"
     );
     let dense = gemma || matches!(model_type, "llama" | "qwen3" | "qwen3_asr");
+    let inkling = matches!(model_type, "inkling2_loop" | "inkling2_loop_text" | "inkling");
     EmitCapabilities {
         gemma,
         dense_packet_contracts: dense,
         decode_objects: dense || model_type == "qwen3_5",
         cublaslt_decode: gemma || matches!(model_type, "llama" | "qwen3" | "qwen3_asr" | "qwen3_5"),
-        decode_ladder: dense || model_type == "gpt_oss",
+        decode_ladder: dense || model_type == "gpt_oss" || inkling,
         packed_prefill_siblings: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
         glm: matches!(model_type, "glm_moe_dsa" | "glm5_next"),
         glm53: model_type == "glm5_next",
         moe: false,
+        inkling,
         full_attn_hd512: false,
     }
 }
@@ -9076,6 +9083,16 @@ fn apply_production_defaults(
     tp: u32,
     n_cu: u32,
 ) {
+    if capabilities.inkling && arch == "sm_90a" && tp == 1 {
+        if !emit_config::explicitly_set("nv_moe_combine_fold") {
+            cfg.nv_moe_combine_fold = true;
+            emit_config::note_production_default("nv_moe_combine_fold", "true".into());
+        }
+        if !emit_config::explicitly_set("nv_moe_router_fold") {
+            cfg.nv_moe_router_fold = true;
+            emit_config::note_production_default("nv_moe_router_fold", "true".into());
+        }
+    }
     // Exact Gemma-4 BF16 and W8A8 4K/8K packets need pure GEMM segments to
     // reach the lean SM90 TMA/WGMMA object. The mixed topology measured 26-45%
     // slower than the pure topology. Keep the promotion on the qualified
@@ -9751,6 +9768,21 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // on the absent `global_head_dim`.
     if matches!(model_type.as_str(), "muse_spark" | "muse_spark_text") {
         muse::run(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            block_spec.as_deref(),
+            rope_gen,
+            &arch,
+            &gpu,
+            verify.as_ref(),
+        );
+        return;
+    }
+    if matches!(model_type.as_str(), "inkling2_loop" | "inkling2_loop_text") {
+        inkling::run(
             &dir,
             ctx,
             &out,
@@ -12099,7 +12131,14 @@ fn emit_dense_gqa(
                     .unwrap_or_else(|error| panic!("Qwen audio encoder dims: {error}"));
                 let lower = |bucket: &asr::qwen::AudioBucket| {
                     bucket
-                        .lower(n_cu, audio_dims)
+                        .lower_with(
+                            n_cu,
+                            audio_dims,
+                            asr::qwen::AudioLowering {
+                                continuous_dense: emit_config::active().asr_dense_continuous,
+                                conv_bf16: emit_config::active().asr_conv_bf16,
+                            },
+                        )
                         .unwrap_or_else(|error| panic!("Qwen audio packet lowering: {error}"))
                 };
                 let (base, rest) = buckets.split_first().expect("single-utterance capacities");
@@ -12278,6 +12317,19 @@ fn emit_dense_gqa(
             if speech.ring_kv {
                 man["speech_ring_kv"] = true.into();
             }
+            if speech.conv_bf16 {
+                man["speech_conv_bf16"] = true.into();
+            }
+            man["speech_conv_arms"] = speech.conv_arms.into();
+            if speech.conv_bf16 {
+                man["speech_conv_bf16_variants"] = speech.conv_bf16_variants.into();
+            }
+            if speech.conv_object {
+                man["objects"]["speech_conv"] = serde_json::json!({ "required": true });
+            }
+            // The speech fields above feed the pairing hash (split-image, ring KV, bf16 arms).
+            man["pairing"]["hash"] =
+                serde_json::json!(format!("0x{:016x}", manifest::pairing_hash(&man)));
         }
         // Every cuBLASLt projection shape of the final packet (prefill and decode rungs), and the
         // tune store's exact-shape algorithm rows for them; `campaign.py build` probes the shapes

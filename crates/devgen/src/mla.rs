@@ -2142,11 +2142,13 @@ fn require_gf_divides(gf: u32, nh_l: u32, phase: &str) {
 /// a dense latent stream. Measured on the shipped gfx942 decode object (exact-object replay,
 /// FP8 latent, GF=4, top_k 2048, us per packet on one rank; the walk is context-independent):
 ///
-///     rows   ns=4   ns=8   ns=16 (shipped)  ns=32
-///       1     85     69     64               62
-///       8    100     82     80              114
-///      16    105     90    125              188
-///      20    108    142    167              226
+/// ```text
+/// rows   ns=4   ns=8   ns=16 (shipped)  ns=32
+///   1     85     69     64               62
+///   8    100     82     80              114
+///  16    105     90    125              188
+///  20    108    142    167              226
+/// ```
 ///
 /// Past one item per CU the second round costs more than the shorter walk saves (rows 16 and
 /// 20 at ns=16 run 640 items on 304 CUs); below it the per-item fixed cost (Q staging, six

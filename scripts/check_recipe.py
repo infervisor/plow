@@ -206,11 +206,23 @@ def check_emit(recipe: dict, build_json: dict, record: dict | None = None) -> li
     # `[spec]` derives its knobs; a drafter dir stated through `{env:...}` is a host path the
     # shard pin already identifies, so only its presence is checked.
     derived = spec_env.emit_env(recipe)
+    serve_env = {
+        k: v for k, v in {**((recipe.get("serve") or {}).get("env") or {}), **spec_env.serve_env(recipe)}.items()
+        if k not in ("PLOW_PREFIX_CACHE", "PLOW_PF_SEG_DIR", "PLOW_LT_ALGOS", "PLOW_LT_ALGOS_WRITE")
+    }
+    if serve_env and "PLOW_EMIT_SERVE_DEFAULTS" in observed:
+        derived["PLOW_EMIT_SERVE_DEFAULTS"] = ",".join(f"{k}={v}" for k, v in sorted(serve_env.items()))
+    if observed.get("PLOW_UNISEG") == "0" and "PLOW_UNISEG" not in ((recipe.get("emit") or {}).get("env") or {}):
+        observed.pop("PLOW_UNISEG", None)
     if "{env:" in derived.get("PLOW_SPEC_DRAFT_DIR", ""):
         need("PLOW_SPEC_DRAFT_DIR" in observed, "emit: [spec] builds a drafter but the build recorded no PLOW_SPEC_DRAFT_DIR")
         observed = {k: v for k, v in observed.items() if k != "PLOW_SPEC_DRAFT_DIR"}
         derived.pop("PLOW_SPEC_DRAFT_DIR")
-    requested = {**derived, **((recipe.get("emit") or {}).get("env") or {})}
+    requested = {
+        **derived,
+        **((recipe.get("emit") or {}).get("env") or {}),
+        **((recipe.get("emit_roles") or {}).get("env") or {}),
+    }
     # Machine paths are not decisions: `PLOW_VERIFY_BIN` names where the Lean
     # verifier lives on the build host and the knob record never carries it
     # (the receipts beside the packet are what prove the verification ran).
@@ -404,7 +416,9 @@ def check(recipe_path: Path, bundle: Path | None, objects: Path | None, strict: 
     need(not spec_errors, "; ".join(spec_errors))
 
     if bundle and (bundle / "model.pkt").exists():
-        notes += [f"{level}: {message}" for level, message in rc.check_packet_speech_tags(bundle / "model.pkt", recipe, recipe_path) if level != "NOTICE"]
+        for level, message in rc.check_packet_speech_tags(bundle / "model.pkt", recipe, recipe_path):
+            if level != "NOTICE":
+                notes.append(f"{'info' if level == 'ok' else level}: {message}")
     if bundle:
         bj = rc.load_json(bundle / "build.json") if (bundle / "build.json").exists() else {}
         wj = rc.load_json(bundle / "weights.json") if (bundle / "weights.json").exists() else {}

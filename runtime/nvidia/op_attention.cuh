@@ -1049,11 +1049,14 @@ __device__ __forceinline__ void fa_decode_rg_item(
 #define PLOW_NV_FA_RG8S_STAGES 2
 #endif
 #define FA_RG8_U(D) ((D) == 256 ? PLOW_NV_FA_RG8_U256 : PLOW_NV_FA_RG8_U)
-/* One warp's stage: U rows of K, U of V, then U k scales and U v scales. */
-#define FA_RG8S_WST(D) ((2u * (unsigned)FA_RG8_U(D) * (D) + 8u * (unsigned)FA_RG8_U(D) + 15u) / 16u * 16u)
-#define FA_RG8S_RING_OFF(D) ((PLOW_NV_WARPS * ((D) + 2u) + 31u) / 32u * 32u)
+/* One warp's stage: U rows of K, U of V (2 * U * D bytes). Row scales are uniform across the warp
+ * and read directly through L1 cache, avoiding SMEM overhead that exceeds 64 KiB.
+ * The fold scratch reuses the ring buffer after the streaming loop finishes. */
+#define FA_RG8S_WST(D) (2u * (unsigned)FA_RG8_U(D) * (D))
+#define FA_RG8S_RING_OFF(D) 0u
 #define FA_RG8S_SMEM_FLOATS(D) \
-    (PLOW_NV_FA_RG8S ? FA_RG8S_RING_OFF(D) + PLOW_NV_WARPS * PLOW_NV_FA_RG8S_STAGES * FA_RG8S_WST(D) / 4u : 0u)
+    (PLOW_NV_FA_RG8S ? (PLOW_NV_WARPS * ((D) + 2u) > (PLOW_NV_WARPS * PLOW_NV_FA_RG8S_STAGES * FA_RG8S_WST(D) / 4u) ? \
+                        PLOW_NV_WARPS * ((D) + 2u) : (PLOW_NV_WARPS * PLOW_NV_FA_RG8S_STAGES * FA_RG8S_WST(D) / 4u)) : 0u)
 __device__ __forceinline__ void fa_rg8s_cp16(unsigned dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
 }
@@ -1077,7 +1080,7 @@ __device__ __forceinline__ void fa_decode_rg8_item(
 #if PLOW_NV_FA_RG8S
     constexpr unsigned NSTG = PLOW_NV_FA_RG8S_STAGES, KB = (unsigned)U * D, WST = FA_RG8S_WST(D);
     static_assert(NSTG >= 2 && NSTG <= 8 && KB % 512u == 0 && 2u * U <= 32u, "RG8S stage shape");
-    const unsigned char* const wring = (const unsigned char*)(lds + FA_RG8S_RING_OFF(D)) + grp * NSTG * WST;
+    const unsigned char* const wring = (const unsigned char*)lds + grp * NSTG * WST;
     const unsigned wring_s = (unsigned)__cvta_generic_to_shared(wring);
     const unsigned nit = hi > lo ? (hi - lo + NGRP * U - 1u) / (NGRP * U) : 0u;
     /* One commit group per iteration (empty past the last), so wait_group<NSTG-1> retires `it`. */
@@ -1090,10 +1093,6 @@ __device__ __forceinline__ void fa_decode_rg8_item(
                 const unsigned r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
                 fa_rg8s_cp16(dst + (i * 512u >= KB ? KB : 0u) + u * D + col * 16u,
                              (i * 512u >= KB ? vb8 : kb8) + (size_t)r * D + col * 16u);
-            }
-            if (lane < 2u * U) {
-                const unsigned u = lane % U, r = min(r0 + NGRP * u, hi - 1u) & kv_mask;
-                fa_rg8s_cp4(dst + 2u * KB + lane * 4u, (lane < (unsigned)U ? ksc : vsc) + r);
             }
         }
         fa_cp_commit();
@@ -1128,17 +1127,17 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             __syncwarp(); /* every lane has read the stage the next issue overwrites */
             issue(it + NSTG - 1u);
             fa_rg8s_wait<NSTG - 1>();
-            __syncwarp(); /* the scales were copied by other lanes */
             const unsigned char* st = wring + (it % NSTG) * WST;
 #pragma unroll
             for (int u = 0; u < U; u++) {
+                const unsigned r = min(r0 + NGRP * (unsigned)u, hi - 1u) & kv_mask;
 #pragma unroll
                 for (int c = 0; c < (int)NCH; c++) {
                     k8[u][c] = *(const uint2*)(st + u * D + c * 256u + lane * 8u);
                     v8[u][c] = *(const uint2*)(st + KB + u * D + c * 256u + lane * 8u);
                 }
-                ks[u] = ((const float*)(st + 2u * KB))[u];
-                vs[u] = ((const float*)(st + 2u * KB))[U + u];
+                ks[u] = ksc[r];
+                vs[u] = vsc[r];
             }
         }
 #else
@@ -1161,14 +1160,31 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             float kf[E];
 #pragma unroll
             for (int c = 0; c < (int)NCH; c++) fp8w2_to_f32(k8[u][c], kf + c * 8);
+            if constexpr (GF == 2) {
+                float d0 = 0.0f, d1 = 0.0f;
 #pragma unroll
-            for (int g = 0; g < GF; g++) {
-                float d = 0.0f;
+                for (int i = 0; i < E; i++) {
+                    d0 = fmaf(kf[i], qf[0][i], d0);
+                    d1 = fmaf(kf[i], qf[1][i], d1);
+                }
 #pragma unroll
-                for (int i = 0; i < E; i++) d = fmaf(kf[i], qf[g][i], d);
+                for (unsigned sh = 16; sh > 0; sh >>= 1) {
+                    d0 += __shfl_xor_sync(0xffffffffu, d0, sh, 32);
+                    d1 += __shfl_xor_sync(0xffffffffu, d1, sh, 32);
+                }
+                const bool valid = r0 + NGRP * (unsigned)u < hi;
+                sc[0][u] = valid ? d0 * ks[u] : FA_NEG_INF;
+                sc[1][u] = valid ? d1 * ks[u] : FA_NEG_INF;
+            } else {
 #pragma unroll
-                for (unsigned sh = 16; sh > 0; sh >>= 1) d += __shfl_xor_sync(0xffffffffu, d, sh, 32);
-                sc[g][u] = r0 + NGRP * (unsigned)u < hi ? d * ks[u] : FA_NEG_INF;
+                for (int g = 0; g < GF; g++) {
+                    float d = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < E; i++) d = fmaf(kf[i], qf[g][i], d);
+#pragma unroll
+                    for (unsigned sh = 16; sh > 0; sh >>= 1) d += __shfl_xor_sync(0xffffffffu, d, sh, 32);
+                    sc[g][u] = r0 + NGRP * (unsigned)u < hi ? d * ks[u] : FA_NEG_INF;
+                }
             }
         }
 #pragma unroll
@@ -1199,12 +1215,23 @@ __device__ __forceinline__ void fa_decode_rg8_item(
             float vf[E];
 #pragma unroll
             for (int c = 0; c < (int)NCH; c++) fp8w2_to_f32(v8[u][c], vf + c * 8);
+            if constexpr (GF == 2) {
 #pragma unroll
-            for (int g = 0; g < GF; g++)
+                for (int i = 0; i < E; i++) {
+                    o[0][i] = fmaf(sc[0][u], vf[i], o[0][i]);
+                    o[1][i] = fmaf(sc[1][u], vf[i], o[1][i]);
+                }
+            } else {
 #pragma unroll
-                for (int i = 0; i < E; i++) o[g][i] = fmaf(sc[g][u], vf[i], o[g][i]);
+                for (int g = 0; g < GF; g++)
+#pragma unroll
+                    for (int i = 0; i < E; i++) o[g][i] = fmaf(sc[g][u], vf[i], o[g][i]);
+            }
         }
     }
+#if PLOW_NV_FA_RG8S
+    __syncthreads(); /* all warps finish streaming before lds is reused as fold scratch */
+#endif
     float* go = lds;              /* [NGRP][D] */
     float* gm = lds + NGRP * D;   /* [NGRP] */
     float* gl = gm + NGRP;        /* [NGRP] */
@@ -3250,12 +3277,68 @@ __device__ __noinline__ void d_flash_decode_slots(
 /* Combine the split partials: standard online-softmax merge, work unit = (batch, head).
  * Deliberately NOT split over the feature axis — see the AMD comment: widening the merge
  * widens its consumer's gate and made the TOKEN slower there. Kept identical here. */
-template <int D, bool SINKS = false>
+/* HD128 BF16 relative attention with FP32 split partials. */
+template <bool PREFILL>
+static __device__ void d_flash_relative128(
+    float* out, float* ml, const __nv_bfloat16* q, const __nv_bfloat16* k,
+    const __nv_bfloat16* v, const __nv_bfloat16* bias, const int* lengths,
+    const int* slots, unsigned rows, unsigned heads, unsigned kv_heads,
+    unsigned stride, unsigned mask, unsigned window, unsigned splits,
+    unsigned key_rows, unsigned q0, float scale, unsigned slice, unsigned nblk) {
+    constexpr unsigned D = 128, E = 1024;
+    const unsigned lane = threadIdx.x & 31u, warps = blockDim.x / 32;
+    for (size_t work = slice * warps + threadIdx.x / 32; work < (size_t)rows * heads * splits;
+         work += nblk * warps) {
+        const unsigned split = work % splits, head = work / splits % heads;
+        const unsigned row = work / splits / heads;
+        const int slot = PREFILL ? 0 : (slots ? slots[row] : (int)row);
+        const int len = PREFILL ? (int)key_rows : lengths[row];
+        const int pos = PREFILL ? (int)(q0 + row) : len - 1;
+        float m = FA_NEG_INF, l = 0.0f;
+        float sums[4] = {};
+        if (slot >= 0 && pos >= 0 && pos < len && (mask != 0xffffffffu || (unsigned)len <= stride)) {
+            const unsigned live = (unsigned)pos + 1;
+            const unsigned lower = window && live > window ? live - window : 0;
+            const unsigned count = live - lower;
+            const unsigned lo = lower + (uint64_t)count * split / splits;
+            const unsigned hi = lower + (uint64_t)count * (split + 1) / splits;
+            const size_t q_head = (size_t)row * heads + head;
+            const size_t kv_head = (size_t)slot * kv_heads + head / (heads / kv_heads);
+            const __nv_bfloat16* const qrow = q + q_head * D;
+            float query[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) query[i] = __bfloat162float(qrow[lane + i * 32]);
+            for (unsigned key = lo; key < hi; ++key) {
+                const size_t kv_off = (kv_head * stride + (key & mask)) * D + lane;
+                float dot = 0.0f;
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i)
+                    dot = fmaf(query[i], __bfloat162float(k[kv_off + i * 32]), dot);
+                const unsigned distance = pos - key;
+                const float rel = distance < E ? __bfloat162float(bias[q_head * E + distance]) : 0.0f;
+                const float score = FA_SCALE(warp_sum32(dot) * scale + rel);
+                const float next = fmaxf(m, score);
+                const float carry = FA_EXP(m - next), p = FA_EXP(score - next);
+                l = l * carry + p;
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i)
+                    sums[i] = fmaf(__bfloat162float(v[kv_off + i * 32]), p, sums[i] * carry);
+                m = next;
+            }
+        }
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) out[work * D + lane + i * 32] = sums[i];
+        if (lane == 0) { ml[2 * work] = m; ml[2 * work + 1] = l; }
+    }
+}
+
+template <int D, bool SINKS = false, bool GATED = false>
 __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __restrict__ Opart,
                               const float* __restrict__ mlpart, unsigned n_batch, unsigned n_head,
                               unsigned nsplit, unsigned slice, unsigned nblk,
                               const int* req = nullptr,
-                              const __nv_bfloat16* __restrict__ sinks = nullptr) {
+                              const __nv_bfloat16* __restrict__ sinks = nullptr,
+                              const __nv_bfloat16* __restrict__ gate = nullptr) {
     /* BRANCHLESS: the old body computed the exp weight under an `== NEG_INF` guard per (d, s)
      * element — nsplit FSETP+guarded-EX2 chains per output, predicate pressure high enough that
      * ptxas spilled predicates (P2R). The guard is unnecessary: an empty split carries
@@ -3280,8 +3363,8 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
         float gm = FA_NEG_INF;
         for (unsigned s = 0; s < nsplit; s++) gm = fmaxf(gm, ml2[s].x);
         float sink = FA_NEG_INF;
-        if constexpr (SINKS) {
-            sink = FA_SCALE(__bfloat162float(sinks[h]));
+        if constexpr (SINKS || GATED) {
+            sink = FA_SCALE(__bfloat162float(sinks[GATED ? w : h]));
             gm = fmaxf(gm, sink);
         }
         float gl = 0.0f;
@@ -3289,14 +3372,17 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
             const float2 ml = ml2[s];
             gl += ml.y * FA_EXP(ml.x - gm);
         }
-        if constexpr (SINKS) gl += FA_EXP(sink - gm);
+        if constexpr (SINKS || GATED) gl += FA_EXP(sink - gm);
         const float inv = (gl > 0.0f) ? (1.0f / gl) : 0.0f;
 
         for (unsigned d = threadIdx.x; d < D; d += PLOW_NV_THREADS) {
             float acc = 0.0f;
             for (unsigned s = 0; s < nsplit; s++)
                 acc += Opart[((size_t)(b * n_head + h) * nsplit + s) * D + d] * FA_EXP(ml2[s].x - gm);
-            O[((size_t)b * n_head + h) * D + d] = __float2bfloat16(acc * inv);
+            const size_t col = (size_t)w * D + d;
+            float out = acc * inv;
+            if constexpr (GATED) out *= 1.0f / (1.0f + __expf(-__bfloat162float(gate[col])));
+            O[col] = __float2bfloat16(out);
         }
     }
 }

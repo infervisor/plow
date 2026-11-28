@@ -1840,7 +1840,8 @@ fn fp8_flash256_blocks(span: &LightSpan, original_blocks: u32) -> Option<u32> {
         || span.fused != 0
         || d.op != DevOp::FlashDecodeFp8 as u16
         || d.i[6] != 256
-        || d.i[0] != 128
+        || d.i[0] > 128
+        || d.i[0] == 0
         || d.i[1] != 16
         || d.i[2] != 8
         || d.i[5] != 1
@@ -3207,6 +3208,8 @@ mod tests {
         assert_eq!(fp8_flash256_blocks(&span, 132), None);
         span.fused = 0;
         span.op[0].d.i[0] = 64;
+        assert_eq!(fp8_flash256_blocks(&span, 132), Some(512));
+        span.op[0].d.i[0] = 256;
         assert_eq!(fp8_flash256_blocks(&span, 132), None);
     }
 

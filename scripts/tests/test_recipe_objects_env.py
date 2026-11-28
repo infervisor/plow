@@ -83,9 +83,11 @@ class RecipeObjectsEnvTests(unittest.TestCase):
                         tier_recipe["objects"] = {"env": tier_env}
                         notes = check_recipe.check_objects(tier_recipe, defines)
                         self.assertEqual(notes, [], f"{path} lowrung[{k}]: {notes}")
-                        # A tier is exactly the decode rows at its own width.
+                        # A tier is exactly the decode rows at its own width, beside the
+                        # two fixed objects every build_gfx942.sh run compiles.
+                        fixed = ("test_kernels", "gemma4_gemm_glu_gfx942")
                         self.assertTrue(
-                            all(stem.startswith("interp_decode") or stem == "test_kernels" for stem in defines),
+                            all(stem.startswith("interp_decode") or stem in fixed for stem in defines),
                             f"{path} lowrung[{k}] built non-decode rows: {sorted(defines)}",
                         )
         self.assertGreater(checked, 0, "no recipe uses scripts/build_gfx942.sh")

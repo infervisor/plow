@@ -310,6 +310,7 @@ fn program_for(
         row_scale: None,
         alpha_out: None,
         taps_wgmma: false,
+        stream_in: None,
         wgmma_ragged: false,
     };
     // Causal: `(k - 1) * d + 1 - s` zero rows on the left, none on the right at whole frames.
@@ -362,6 +363,9 @@ fn program_for(
             pinned: false,
             wgmma_ragged: false,
             input_split: false,
+            bf16_taps: false,
+            single_bf16: false,
+            stream_in: None,
             output_split: false,
         },
     )?;

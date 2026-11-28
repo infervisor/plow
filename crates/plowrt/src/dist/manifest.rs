@@ -198,6 +198,17 @@ fn sha256_file(p: &Path) -> Result<String> {
     Ok(format!("{:x}", h.finalize()))
 }
 
+/// `std::env::temp_dir()`, unless it lies under a prefix [`no_build_host_paths`] refuses (a CI
+/// runner's TMPDIR under `/home/`): a fixture recipe's path is recorded in its bundle.
+#[cfg(test)]
+pub(crate) fn portable_temp_dir() -> PathBuf {
+    let dir = std::env::temp_dir();
+    match no_build_host_paths(dir.to_string_lossy().as_bytes(), "") {
+        Ok(()) => dir,
+        Err(_) => PathBuf::from("/tmp"),
+    }
+}
+
 /// A 12-hex identity over the parts that define an artifact, as the retired
 /// Python packers formed one.
 fn short_id(parts: &[&str]) -> String {

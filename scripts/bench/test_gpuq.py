@@ -1,10 +1,12 @@
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("gpuq", Path(__file__).with_name("gpuq.py"))
 gpuq = importlib.util.module_from_spec(spec)
@@ -12,6 +14,92 @@ spec.loader.exec_module(gpuq)
 
 
 class QueueTests(unittest.TestCase):
+    def test_submit_can_leave_the_queued_job_for_a_host_runner(self):
+        for enqueue_only in (False, True):
+            with self.subTest(enqueue_only=enqueue_only), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve() / "queue"
+                root.mkdir()
+                alias = Path(directory) / "queue-link"
+                alias.symlink_to(root, target_is_directory=True)
+                argv = ["gpuq", "--root", str(alias), "--vendor", "nvidia", "submit"]
+                if enqueue_only:
+                    argv.append("--enqueue-only")
+                argv.extend(["m2s-test", "1", "printf", "%s", "hello world"])
+                with patch.object(gpuq.sys, "argv", argv), \
+                     patch.object(gpuq.platform, "system", return_value="Linux"), \
+                     patch.dict(gpuq.os.environ, {"PLOW_CAMPAIGN_NO_NIX": "1", "GPU_LEASE_TIMEOUT": "777"}), \
+                     patch.object(gpuq.subprocess, "Popen") as launch, \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    gpuq.main()
+                job = json.loads((root / (output.getvalue().strip() + ".json")).read_text())
+                self.assertEqual(job["state"], "queued")
+                self.assertEqual(job["label"], "m2s-test")
+                self.assertEqual(job["ngpu"], 1)
+                self.assertEqual(job["command"], ["printf", "%s", "hello world"])
+                self.assertEqual(job["cwd"], gpuq.os.getcwd())
+                self.assertEqual(job["lease_timeout"], 777)
+                self.assertEqual(job["vendor"], "nvidia")
+                if enqueue_only:
+                    launch.assert_not_called()
+                    self.assertFalse((root / "runner.log").exists())
+                else:
+                    launch.assert_called_once()
+                    self.assertEqual(launch.call_args.args[0],
+                                     [gpuq.sys.executable, str(Path(gpuq.__file__).resolve()),
+                                      "--root", str(root), "run"])
+
+    def test_cancelled_queued_job_never_takes_a_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gpuq.save(root / "1.json", dict(state="queued", ngpu=1))
+            (root / "1.cancel").touch()
+            with patch.object(gpuq.os, "access", return_value=True), \
+                 patch.object(gpuq.time, "monotonic", side_effect=[0, 1, 1, 2001]), \
+                 patch.object(gpuq.subprocess, "run") as audit, \
+                 patch.object(gpuq.subprocess, "Popen") as launch:
+                gpuq.work(root)
+            audit.assert_not_called()
+            launch.assert_not_called()
+            self.assertEqual(json.loads((root / "1.json").read_text())["state"], "cancelled")
+
+    def test_running_cancellation_terminates_lease_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cancellation = Path(directory) / "1.cancel"
+            child = Mock()
+            calls = 0
+            def wait(timeout):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    cancellation.touch()
+                    raise subprocess.TimeoutExpired("lease", timeout)
+                return -15
+            child.wait.side_effect = wait
+            self.assertEqual(gpuq.wait_process(child, cancellation), -15)
+            child.terminate.assert_called_once_with()
+
+    def test_foreground_returns_job_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "1.json"
+            gpuq.save(path, dict(state="failed", rc=7))
+            with patch.object(gpuq.signal, "signal"):
+                self.assertEqual(gpuq.wait_job(path, Mock()), 7)
+
+    def test_foreground_signal_cancels_and_waits_for_terminal_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "1.json"
+            gpuq.save(path, dict(state="running", pid=123))
+            handlers = {}
+            def register(sig, handler):
+                handlers[sig] = handler
+            def finish(delay):
+                handlers[gpuq.signal.SIGTERM](gpuq.signal.SIGTERM, None)
+                self.assertTrue(path.with_suffix(".cancel").exists())
+                gpuq.save(path, dict(state="cancelled", rc=-15))
+            with patch.object(gpuq.signal, "signal", side_effect=register), \
+                 patch.object(gpuq.time, "sleep", side_effect=finish):
+                self.assertEqual(gpuq.wait_job(path, Mock(poll=Mock(return_value=None))), 143)
+
     def test_waits_on_foreign_process_without_starting_job(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

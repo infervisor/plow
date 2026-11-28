@@ -40,10 +40,11 @@ pub(super) fn effective_decode_widths(
     if widest_only {
         return vec![widest as u32].into_boxed_slice();
     }
-    narrow
+    let widths: Vec<u32> = narrow
         .map(|rows| rows as u32)
         .chain(std::iter::once(widest as u32))
-        .collect()
+        .collect();
+    widths.into_boxed_slice()
 }
 
 pub(super) fn validate_decode_ladder(blob: &DevBlob) -> Result<bool> {
@@ -247,7 +248,8 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
         let hnr_folded = g
             .insts
             .iter()
-            .any(|d| d.op == DevOp::FlashDecode as u16 && d.t[7] != TENSOR_NONE16);
+            .any(|d| d.op == DevOp::FlashDecode as u16 && d.t[7] != TENSOR_NONE16
+                && d.fj[2] != packet::dev::FLASH_DECODE_RELATIVE);
         let class = if routed.get(index).copied().unwrap_or(false) {
             1
         } else if folded {
@@ -308,6 +310,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     }
                     d.i[1] = 1;
                 }
+                Some(DevOp::MoeRouter) => {}
                 Some(DevOp::MoeRouterTopkPf) => {
                     if d.i[4] != g.t {
                         return Err(reject("MoE router rows disagree with rung width"));
@@ -398,6 +401,7 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     | DevOp::Gemm
                     | DevOp::GemmNorm
                     | DevOp::Gemv
+                    | DevOp::GemvF32Out
                     | DevOp::GemvArgmax
                     | DevOp::GemvFp8
                     | DevOp::GemvQkv
@@ -412,12 +416,16 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
                     | DevOp::EmbedFrameBf16
                     | DevOp::FlashDecode
                     | DevOp::FlashDecodeFp8
-                    | DevOp::FlashMerge,
+                    | DevOp::FlashMerge
+                    | DevOp::AttnRes,
                 ) => {
                     if d.i[0] != g.t {
                         return Err(reject("instruction rows disagree with rung width"));
                     }
                     d.i[0] = 1;
+                    if d.op == DevOp::AttnRes as u16 && d.i[7] == 1 && d.i[4] == g.t {
+                        d.i[4] = 1;
+                    }
                     if matches!(
                         DevOp::from_u16(d.op),
                         Some(DevOp::HeadNormRope | DevOp::HeadNormRopeFp8)
@@ -519,9 +527,11 @@ fn validate_decode_ladder_impl(blob: &DevBlob, segmented: bool, routed: &[bool])
             continue;
         }
         let fp8 = d.op == DevOp::FlashDecodeFp8 as u16;
+        let relative = !fp8 && d.fj[2] == packet::dev::FLASH_DECODE_RELATIVE;
         if !matches!(d.i[6], 64 | 128 | 256 | 512)
             || (fp8 && d.i[6] == 64)
-            || (!fp8 && (d.t[6] != TENSOR_NONE16 || d.t[7] != TENSOR_NONE16) && !hnr_fold(d))
+            || (!fp8 && d.t[6] != TENSOR_NONE16)
+            || (!fp8 && d.t[7] != TENSOR_NONE16 && !relative && !hnr_fold(d))
         {
             if crate::config::RuntimeConfig::get().nv.ladder_debug {
                 eprintln!("ladder: unsupported FlashDecode geometry or bound slot/fold operands");

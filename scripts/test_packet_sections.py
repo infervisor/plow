@@ -7,8 +7,8 @@ from pathlib import Path
 from packet_sections import read_section
 
 
-def write_packet(path, pipelines):
-    raw = json.dumps(dict(version=1, pipelines=pipelines)).encode()
+def write_packet(path, pipelines, *, version=1, **metadata):
+    raw = json.dumps(dict(version=version, pipelines=pipelines, **metadata)).encode()
     header = bytearray(64)
     header[:8] = b"PLOWDEV\x08"
     struct.pack_into("<Q", header, 40, 64 + len(raw))

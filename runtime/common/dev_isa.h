@@ -81,6 +81,7 @@ enum {
      * (GLM/Kimi); 2 = FORCE half-split (NeoX `rotate_half`) at EVERY hd. GPT-OSS is hd=64
      * half-split, the one combination the legacy rule gets wrong, and a wrong pairing is fluent
      * text from the wrong model. Zero-init packets keep the legacy rule byte-for-byte. */
+    /* CUDA pair mode 4 uses t2=head/channel BF16 scale and i4=FP32 L2 clip threshold bits. */
     PLOW_DOP_HEADNORM_ROPE = 3,
 
     /* t0=out t1=a t2=b                 i0=n                     f0=scale
@@ -212,7 +213,9 @@ enum {
      *     O   = sum_s O_s * e^(m_s - gm') / gl'
      * m_s/l_s are in the natural-exp domain the flash ops write (m_s = running max of the SCALED
      * logits, l_s = sum e^(logit - m_s)); a split with m_s == -inf (empty) is skipped as today.
-     * With t3 == NONE the arithmetic is byte-for-byte the old merge.
+     * With t3, t4 and t5 absent the arithmetic is byte-for-byte the old merge.
+     * CUDA HD128 accepts paired t4=gate(bf16[B,H,D]), t5=row_sinks(bf16[B,H])
+     * with t3 absent. It folds the per-row sink and applies sigmoid(gate) before BF16 storage.
      *
      * THE FOLD POINT IS THE MERGE AND ONLY THE MERGE. FLASH_PREFILL / FLASH_DECODE never see the
      * sinks, so with sinks present the emitter MUST emit a FLASH_MERGE at every nsplit (including
@@ -856,6 +859,8 @@ enum {
      * stay ONE packet, which rules out splitting the reduction across blocks.
      * t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb,H] bf16)
      * t3=score_w([H] f32)   i0=T i1=H i2=nb   f0=eps */
+    /* CUDA i7=1: normalized values, block-major stack, query-major output.
+     * See DevOp::AttnRes for the operand extents and optional FP32 addend. */
     PLOW_DOP_ATTN_RES = 104,
     /* `situ` GLU — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared experts,
      * routed experts). out = beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta).
@@ -1257,6 +1262,8 @@ enum {
      *   i0=M i1=N i2=K */
     PLOW_DOP_GEMV_F32 = 135,
     /* Packed causal convolution + SiLU. t0=out,t1=in,t2=weight[Bf16,C,W],t3=history[Bf16,B,C,W-1],t4=active[I32,B]; i0=C,i1=W,i2=B. History is oldest-first. */
+    /* CUDA residual variant (i4=channels/group): (x + conv4) * f0. Optional t6
+     * holds token/group/tap deltas and selects lag-major static weights. */
     PLOW_DOP_QWEN_GDN_CONV = 136,
     /* Qwen recurrence. t0=out[Bf16,B,HV,V],t1=packed QKV,t2=a,t3=b,t4=A_log,t5=dt_bias,t6=state[F32,B,HV,V,K],t7=active[I32,B]. i0=HK,i1=HV,i2=K(128),i3=V,i4=B,i5=A_log F32 flag (else Bf16); f0=Q scale,f1=L2 eps. Other inputs Bf16; beta rounds Bf16. */
     PLOW_DOP_QWEN_GDN_STEP = 137,
@@ -1308,7 +1315,11 @@ enum {
      *   i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch(0 = 1)   f0=alpha f1=limit
      * slot s in [0, B*k) reads x row s/k and writes fu row s:
      *   fu[s][n] = A(g)*B(u),  g = dot(W_e[gate_n], x) + b_e[gate_n],  u = likewise for up_n
-     * with (A, B) the act's pair form (act=3 is documented on GLU, op 5). */
+     * with (A, B) the act's pair form (act=3 is documented on GLU, op 5).
+     * CUDA i7=2 selects NVFP4 block-16 E4M3 scales, with optional paired
+     * t6=amax(f32[E]) and t7=denominator(f32) for the expert outer scale.
+     * CUDA act=4 takes gate/up soft caps in f0/f1 and stores
+     * bf16(softcap(gate) * sigmoid(gate) * softcap(up) * table[s].gate). */
     PLOW_DOP_MOE_GLU_MX = 150,
 
     /* DECODE grouped down + gate scale.
@@ -1316,6 +1327,8 @@ enum {
      *   t3=W_d(fp4 [E][H][I/2]) t4=S_d(e8m0 [E][H][I/32]) t5=bias_d?(bf16 [E][H])
      *   i0=k i1=H i2=I i3=n_exp i6=n_batch(0 = 1)
      *   part[s][h] = table[s].gate * (dot(W_e[h], fu[s]) + b_e[h])      (f32, no bf16 round)
+     * CUDA i7=2 accepts the paired NVFP4 outer-scale operands above. CUDA i5=1
+     * skips the gate multiply when the GLU already applied it.
      * The row sum is MOE_COMBINE (43) / MOE_COMBINE_PF (87, i2=T=B) in fixed slot order. */
     PLOW_DOP_MOE_DOWN_MX = 151,
 
@@ -1566,6 +1579,17 @@ enum {
      * g = gu[r*i3 + p], u = gu[r*i3 + i4 + p]. t0=out t1=gu i0=n (rows*width) i1=act
      * i2=width i3=in_stride i4=up_col (elements) f0=alpha f1=limit. */
     PLOW_DOP_GLU_PITCHED = 230,
+
+    /* DeepSeek-V4.1 activation fake quant (kernel.py act_quant(x, 32, "ue8m0")) ahead of
+     * GEMM_FP8_MX: t0=out(bf16, may alias t1) t1=x(bf16) i0=rows i1=K. runtime/common/op_act_quant_mx.h */
+    PLOW_DOP_ACT_QUANT_MX = 231,
+    /* DeepSeek-V4.1 batched decode (runtime/nvidia/op_sparse_attn_decode.cuh, op_compress.cuh,
+     * op_index_decode.cuh); operand tables in crates/packet/src/dev.rs. */
+    PLOW_DOP_SPARSE_ATTN_DECODE = 232,
+    PLOW_DOP_SPARSE_ATTN_MERGE = 233,
+    PLOW_DOP_COMPRESS_DECODE_STEP = 234,
+    PLOW_DOP_INDEX_SCORE_DECODE = 235,
+    PLOW_DOP_INDEX_SELECT_DECODE = 236,
 
     PLOW_DOP__COUNT
 };

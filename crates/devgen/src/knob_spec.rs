@@ -513,6 +513,20 @@ const GQA2_WIDE_QUALIFIED: Status = Status::Qualified {
     ],
 };
 
+const INKLING_HOPPER: F = F::And(&[
+    F::Target(T::Cap("inkling")),
+    F::Target(T::Arch("sm_90a")),
+    F::Target(T::Tp(1)),
+]);
+
+const INKLING_HOPPER_ON: Default = Default::Production {
+    cases: &[DefaultCase {
+        when: INKLING_HOPPER,
+        value: TRUE,
+    }],
+    otherwise: FALSE,
+};
+
 /// `apply_production_defaults` forces the arms that read the local cache directly off under
 /// `--dcp > 1`: they bypass the owner gather.
 const GLM_DCP_SHARDED: F = F::And(&[GLM_TARGET, F::Atom("emit.dcp", Cmp::Gt, Val::Nat(1))]);
@@ -1173,6 +1187,15 @@ pub const TARGETS: &[TargetSpec] = &[
         caps: &[],
         recipe: &[],
     },
+    TargetSpec {
+        name: "inkling_sm90a_tp1",
+        arch: "sm_90a",
+        tp: 1,
+        n_cu: 132,
+        model: "inkling2_loop",
+        caps: &["inkling", "decode_ladder"],
+        recipe: &[],
+    },
 ];
 
 #[rustfmt::skip]
@@ -1204,6 +1227,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.max_chunk", Some("PLOW_MAX_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.max_request_chunk", Some("PLOW_MAX_REQUEST_CHUNK"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.asr_packed_max_chunks", Some("PLOW_ASR_PACKED_MAX_CHUNKS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.asr_dense_continuous", Some("PLOW_ASR_DENSE_CONTINUOUS"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.asr_conv_bf16", Some("PLOW_ASR_CONV_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.multimodal", Some("PLOW_EMIT_MULTIMODAL"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.mm_slab_rows", Some("PLOW_EMIT_MM_SLAB_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.mm_vision_ladder", Some("PLOW_EMIT_MM_VISION_LADDER"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
@@ -1228,6 +1253,8 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.fuse_merge", Some("PLOW_FUSE_MERGE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_fold_wide", Some("PLOW_NV_FA_FOLD_WIDE"), Layer::Emit, Domain::Bool, NV_FA_FOLD_WIDE_DEFAULT, PROMOTED),
     KnobSpec::new("emit.nv_fa_fold", Some("PLOW_NV_FA_FOLD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.nv_moe_combine_fold", Some("PLOW_NV_MOE_COMBINE_FOLD"), Layer::Emit, Domain::Bool, INKLING_HOPPER_ON, PROMOTED),
+    KnobSpec::new("emit.nv_moe_router_fold", Some("PLOW_NV_MOE_ROUTER_FOLD"), Layer::Emit, Domain::Bool, INKLING_HOPPER_ON, PROMOTED),
     KnobSpec::new("emit.nv_dense_tune", Some("PLOW_NV_DENSE_TUNE"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_gemv_rem_split", Some("PLOW_NV_GEMV_REM_SPLIT"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.packed_prefill_small_hd", Some("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1236,9 +1263,13 @@ pub const EMIT: &[KnobSpec] = &[
     KnobSpec::new("emit.snac_split_bf16", Some("PLOW_EMIT_SNAC_SPLIT_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.codec_wgmma_ragged", Some("PLOW_EMIT_CODEC_WGMMA_RAGGED"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.codec_dec_in_wgmma", Some("PLOW_EMIT_CODEC_DEC_IN_WGMMA"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.codec_conv_bf16", Some("PLOW_EMIT_CODEC_CONV_BF16"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.codec_bf16_1p", Some("PLOW_EMIT_CODEC_BF16_1P"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
+    KnobSpec::new("emit.codec_conv_object", Some("PLOW_EMIT_CODEC_CONV_OBJECT"), Layer::Emit, U32, UNSET, OPT_IN),
     KnobSpec::new("emit.codec_conv_arms", Some("PLOW_EMIT_CODEC_CONV_ARMS"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.codec_conv_classes", Some("PLOW_EMIT_CODEC_CONV_CLASSES"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.fish_codec_max_rows", Some("PLOW_EMIT_FISH_CODEC_MAX_ROWS"), Layer::Emit, U32, UNSET, OPT_IN),
+    KnobSpec::new("emit.codec_step_capacities", Some("PLOW_EMIT_CODEC_STEP_CAPACITIES"), Layer::Emit, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("emit.codec_ring_kv", Some("PLOW_CODEC_RING_KV"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_fa_mma_hd128", Some("PLOW_NV_FA_MMA_HD128"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
     KnobSpec::new("emit.nv_gemv_k8_b1", Some("PLOW_NV_GEMV_K8_B1"), Layer::Emit, Domain::Bool, OFF, OPT_IN),
@@ -1720,6 +1751,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_BENCH_GEMV_M16_BK128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_M64N128", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_M64N64", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_BENCH_QWEN_ASR", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_QWEN_GEMV", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_W8A8", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_BENCH_WS384", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -1751,6 +1783,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_CUBIN_PACKED_PREFILL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_ROUTED_DECODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_SPEECH", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_CUBIN_SPEECH_CONV", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_DEVICE_CONTROL", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_GEMM_F16_NODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_CUBIN_FP8_TC64_DEPTH2", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2192,6 +2225,8 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_GW_MIN_BYTES", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GW_MIN_BYTES_SB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GW_MIN_ROWS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    // GemvF32Out (depth-stage codebook heads) on the tensor-core decode walk at batched rungs.
+    KnobSpec::new("def.PLOW_NV_HEAD_MMA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_GEMV_MMA_UNB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     // Whole-chunk batch width of the warp-per-row norm walk (op_norm.cuh T17 path); default 4.
     KnobSpec::new("def.PLOW_NV_ROW_NB", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2327,6 +2362,7 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_MINBLK", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MLA", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MOE_COMMON", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_NV_MXFP4_MOE_SMEM", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MXFP4_MOE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_MXFP4_PROJ", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_NV_ENTRY_TRACE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
@@ -2445,6 +2481,10 @@ pub const OBJECT_DEFINES: &[KnobSpec] = &[
     KnobSpec::new("def.PLOW_NV_GEMM_F16_NODE", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SPEECH_CONV_POSTS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SPEECH_SPLIT_A", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_SPEECH_CONV_BF16", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_SPEECH_CONV_ARMS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_SPEECH_CONV_BF16_VARIANTS", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
+    KnobSpec::new("def.PLOW_SPEECH_CONV_OBJECT", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_SPEECH_CONV_WIDE_PADDED", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_STAGE1_MIN_OCC", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),
     KnobSpec::new("def.PLOW_STAGE1_WG", None, Layer::ObjectDefine, Domain::Str, UNSET, OPT_IN),

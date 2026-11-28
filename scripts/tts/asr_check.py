@@ -198,7 +198,10 @@ SEED_TTS_SOURCE = "https://github.com/BytedanceSpeech/seed-tts-eval/blob/752f429
 
 
 def norm_seed_en(text):
-    from zhon.hanzi import punctuation
+    try:
+        from zhon.hanzi import punctuation
+    except ImportError:
+        punctuation = "！？｡。＂＃＄％＆＇（）＊＋，－／：；＜＝＞＠［＼］＾＿｀｛｜｝～｟｠｢｣､、〃》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟〰〾〿–—‘’‛“”„‟…‧﹏﹑﹔·"
     return text.translate(str.maketrans("", "", (punctuation + string.punctuation).replace("'", ""))).replace("  ", " ").lower()
 
 
@@ -386,7 +389,8 @@ def main():
         inputs.append((wav, meta))
     import torch, jiwer, soundfile as sf, librosa
     from transformers import pipeline
-    asr = pipeline("automatic-speech-recognition", model=args.model, torch_dtype=torch.float16, device=args.device)
+    dtype = torch.float32 if args.device == "cpu" else torch.float16
+    asr = pipeline("automatic-speech-recognition", model=args.model, torch_dtype=dtype, device=args.device)
     cers, by_lang, rows = [], {}, []
     for w, meta in inputs:
         ref, lang = meta["text"], meta.get("language")

@@ -14,44 +14,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The nix build runs on self-hosted hardware, so it must never be triggered by
-  # a pull request from a fork: that would execute untrusted code on our runner.
-  # Fork PRs are covered by the hosted job below and merged only after review.
+  # Every job runs on GitHub-hosted runners: sandboxed, so fork pull requests
+  # get the same checks as ours, and free for a public repository.
+  #
+  # The flake's GPU toolchains (ROCm, CUDA) and the package they build. No GPU
+  # is needed: the drivers are `dlopen`ed at run time and nothing here runs a
+  # kernel. The validators and the workspace tests live in hosted-check.
   nix-build:
-    if: >-
-      github.event_name == 'push' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux]
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: nix develop .#ci --command bash -euo pipefail {0}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Reject stale perf tool paths
+      # The two SDKs are several GB each; a stock runner has about 14 GB free.
+      - name: Free disk for the GPU toolchains
         run: |
-          old_path='perf-data/'"harness/"
-          ! git grep -n --fixed-strings "$old_path" -- .
-      - name: Reject new amd-bench performance consumers
-        run: scripts/check_amd_bench_consumers.sh
-      - name: Check fusion-ladder result validator
-        run: |
-          python3 perf-data/tools/fusion_ladder_results.py --self-test
-          python3 perf-data/tools/fusion_ladder_run.py --self-test
-      - name: Check bench/serve parity validator
-        run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
-      - name: Check recipe tools
-        run: |
-          python3 scripts/check_recipe.py --self-test
-          python3 scripts/render_recipe.py --self-test
-      - name: Check recipes describe their builds
-        run: |
-          python3 scripts/check_recipe.py recipes/*/*/*.toml
-          python3 scripts/render_recipe.py recipes/*/*/*.toml --check
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - uses: cachix/install-nix-action@v31
+      # The toolchains come from vendor servers and GitHub; one retry for a
+      # download that fails.
       - name: Enter Nix shell
-        run: nix develop --command true
+        run: nix develop --command true || { sleep 30; nix develop --command true; }
       # Both need the flake's ROCm toolchain (build_gfx942.sh refuses to run without it), and
       # neither compiles a kernel: PLOW_DEFINES_ONLY resolves the axes in seconds. The first
       # asserts the PLOW_HSACO_CONFIG path derives the object set from a packet and refuses a
@@ -62,36 +48,57 @@ jobs:
       - name: Check recipes' object env against build_gfx942.sh
         run: nix develop --command python3 scripts/tests/test_recipe_objects_env.py
       - name: Build default package
-        run: nix build
-      - name: Test workspace
-        run: nix develop --command cargo test --locked --workspace
-      # The engine unit tests under exec/{amd,gpu} are feature-gated, so the
-      # default-feature workspace run never compiles them. They are host-side
-      # (device cases are #[ignore]d) and run without a GPU.
-      - name: Test engine host paths (cuda,hsa)
-        run: "nix develop --command cargo test --locked -p plowrt --features cuda,hsa --lib exec::"
-      # Required lean-correctness lane (CPU only): build the pinned plow_verify, audit every
-      # endpoint's acceptance theorems for sorry/unapproved axioms, check the binary against
-      # lean-plow/approved-verifiers.json, and run the explicit list of ignored CPU-verifier tests
-      # (docs/bringup/03-lean-verify.md).
+        run: nix build --print-build-logs
+      - name: Disk left
+        if: always()
+        run: df -h /
+
+  # Required lean-correctness lane (CPU only), in the `lean` shell: the hosted
+  # tools plus elan, without the GPU toolchains.
+  lean:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: nix develop .#lean --command bash -euo pipefail {0}
+    env:
+      CARGO_TERM_COLOR: always
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lean-${{ hashFiles('flake.lock', 'flake.nix') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # The pinned Lean toolchain; the verifier itself is always rebuilt, so
+      # its identity check never reads a cached binary.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: elan-${{ runner.os }}-${{ hashFiles('lean-plow/lean-toolchain') }}
+      # Build the pinned plow_verify, audit every endpoint's acceptance theorems
+      # for sorry/unapproved axioms, check the binary against
+      # lean-plow/approved-verifiers.json, and run the explicit list of ignored
+      # CPU-verifier tests (docs/bringup/03-lean-verify.md).
       - name: Lean correctness (build, proof audit, CPU verifier suites)
-        run: nix develop --command scripts/lean_correctness_ci.sh
-      # Checkpoint S for every knob this change touches (scripts/knob_scope_ci.sh): the production
-      # recipe and its one-layer cut, compared against the knob's declared scope. Passes at once
-      # when no knob is touched; otherwise it needs the runner's KNOB_SCOPE_HF_DIR,
-      # KNOB_SCOPE_RECIPE and PLOW_VERIFY_BIN, and fails without them.
+        run: scripts/lean_correctness_ci.sh
+      # Checkpoint S for every knob this change touches (scripts/knob_scope_ci.sh).
+      # Passes at once when no knob is touched. Checking a touched knob needs
+      # the production checkpoint (KNOB_SCOPE_HF_DIR, KNOB_SCOPE_RECIPE), which
+      # no hosted runner has: the script then warns, naming the unchecked
+      # knobs, and checkpoint S for them is run by hand on a host that has it.
       - name: Knob scope (checkpoint S)
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          nix develop --command bash -c 'cargo build --release -p plowc -p plowrt --features plowrt/hsa && scripts/knob_scope_ci.sh "$BASE_SHA"'
-      # Checkpoint P on default flips (scripts/perf_gate_ci.sh): a change to a production default
-      # or Qualified status needs a committed perf-certs/<knob>.json that plow_verify P accepts.
+          scripts/knob_scope_ci.sh "$BASE_SHA"
+      # Checkpoint P on default flips (scripts/perf_gate_ci.sh): a change to a
+      # production default or Qualified status needs a committed
+      # perf-certs/<knob>.json that the plow_verify built above accepts.
       - name: Perf gate (checkpoint P)
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: nix develop --command scripts/perf_gate_ci.sh "$BASE_SHA"
+        run: scripts/perf_gate_ci.sh "$BASE_SHA"
 
   fmt:
     runs-on: ubuntu-24.04
@@ -114,7 +121,8 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # The workspace tests alone take 45 minutes on these runners.
+    timeout-minutes: 90
     defaults:
       run:
         shell: nix develop .#ci --command bash -euo pipefail {0}
@@ -203,7 +211,7 @@ jobs:
   # Keep a stable required-check name across matrix changes.
   check:
     if: always()
-    needs: [fmt, hosted-check, nix-build]
+    needs: [fmt, hosted-check, nix-build, lean]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -211,8 +219,10 @@ jobs:
         env:
           FMT_RESULT: ${{ needs.fmt.result }}
           HOSTED_RESULT: ${{ needs.hosted-check.result }}
-          SELF_HOSTED_RESULT: ${{ needs.nix-build.result }}
+          NIX_RESULT: ${{ needs.nix-build.result }}
+          LEAN_RESULT: ${{ needs.lean.result }}
         run: |
           test "$FMT_RESULT" = success
           test "$HOSTED_RESULT" = success
-          test "$SELF_HOSTED_RESULT" = success || test "$SELF_HOSTED_RESULT" = skipped
+          test "$NIX_RESULT" = success
+          test "$LEAN_RESULT" = success

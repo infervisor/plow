@@ -368,6 +368,9 @@ pub(crate) fn cfg_from(dir: &Path) -> Cfg {
     if matches!(mt, "gemma3" | "gemma3_text") {
         return cfg_gemma3(&v);
     }
+    if matches!(mt, "inkling2_loop" | "inkling2_loop_text") {
+        panic!("inkling2_loop has custom emitter; use inkling::run");
+    }
     // Gemma-4 multimodal nests everything under `text_config` (prefix
     // "model.language_model."); the text-only "-it-text" re-export is FLAT with
     // model_type "gemma4_text" (prefix "model."). Same weights, two namings.

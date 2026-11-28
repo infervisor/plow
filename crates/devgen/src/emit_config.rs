@@ -239,6 +239,17 @@ pub struct EmitConfig {
     )]
     pub asr_packed_max_chunks: Option<u32>,
 
+    /// Qwen audio-encoder dense layers sum K in one k16 chain (DenseGemmF32 flag 0x800) in every
+    /// program, instead of split-K with a per-row reference in packed launches. Changes the
+    /// encoder's f32 sum order (bf16 products either way): re-gate WER.
+    #[arg(long = "emit-asr-dense-continuous", env = "PLOW_ASR_DENSE_CONTINUOUS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub asr_dense_continuous: bool,
+
+    /// Qwen audio-encoder conv2 / conv3 weights stored bf16 in the staged kernel's block order
+    /// (Conv2dF32 flag 1024): the same values and sums, copied instead of converted per tile.
+    #[arg(long = "emit-asr-conv-bf16", env = "PLOW_ASR_CONV_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub asr_conv_bf16: bool,
+
     /// Emit the checkpoint's vision/audio towers as encoder sidecars and give the text packet
     /// soft-token rows (`MmRowsBf16`, `in.mm_slab`, the `plow.multimodal.v1` contract). Off: the
     /// text packet is unchanged.
@@ -343,6 +354,15 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_NV_FA_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub nv_fa_fold: bool,
 
+    /// NVIDIA MoE combine epilogue fold into AddNorm: AddNorm reads the f32 MoE partials directly,
+    /// eliminating MoeCombinePf and its barrier.
+    #[arg(long, env = "PLOW_NV_MOE_COMBINE_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_moe_combine_fold: bool,
+
+    /// NVIDIA MoE router fold: fuses Gemv router projection and MoeRouterTopk into DevOp::MoeRouter.
+    #[arg(long, env = "PLOW_NV_MOE_ROUTER_FOLD", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub nv_moe_router_fold: bool,
+
     /// NVIDIA sm_90a dense (no MoE) hd <= 128 decode tuning: the `gemv_k8` walk with its L2
     /// prefetch, tensor-core decode scores (`fa_mmaqk` 4) and the classic B=1 GEMVs below K 3840.
     /// Measured on Veena / Qwen3-ASR / Chatterbox T3; a recipe opts in after its gate.
@@ -381,6 +401,25 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_EMIT_CODEC_DEC_IN_WGMMA", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub codec_dec_in_wgmma: bool,
 
+    /// Codec split-bf16 taps convs that fit the arm (`conv_bf16_plan`) run one bf16 product on
+    /// staged-once input rows (sm_90a speech object, `PLOW_SPEECH_CONV_BF16`) instead of the
+    /// three-product split-bf16 tile. Changes PCM: a recipe sets it once its audio gates pass.
+    #[arg(long, env = "PLOW_EMIT_CODEC_CONV_BF16", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub codec_conv_bf16: bool,
+
+    /// Codec split-bf16 convs that statically take only the wgmma arm (pointwise, merged-phase
+    /// ConvTranspose, codec-transformer projections) run one bf16 product per k16 (speech flag
+    /// layout 4), the bf16 conv a bf16 peer runs. Changes PCM: a recipe sets it once its audio
+    /// gates pass.
+    #[arg(long, env = "PLOW_EMIT_CODEC_BF16_1P", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub codec_bf16_1p: bool,
+
+    /// Wgmma convs (flags bit 17) of at least this many million MACs take their own segment, which
+    /// plowrt runs on the conv-only `_speechconv` object (its own registers and ping-pong
+    /// warpgroups). Same bits; smaller convs lose to the extra launches.
+    #[arg(long, env = "PLOW_EMIT_CODEC_CONV_OBJECT")]
+    pub codec_conv_object: Option<u32>,
+
     /// Measured Conv1dF32 arms per codec conv shape (tuning `codec_conv_arms.jsonl`): a shape
     /// listed with arm `rows` or `warp` takes flag bit 16 (sm_90 speech object); every other
     /// conv keeps the GEMM paths.
@@ -397,6 +436,11 @@ pub struct EmitConfig {
     /// frames); the largest sets the activation arena (PLOW_EMIT_FISH_CODEC_MAX_ROWS).
     #[arg(long, env = "PLOW_EMIT_FISH_CODEC_MAX_ROWS")]
     pub fish_codec_max_rows: Option<u32>,
+
+    /// Extra stateful codec step capacities as comma-separated batch:frames pairs (batch over
+    /// the 256 stream slots: Mimi only).
+    #[arg(long, env = "PLOW_EMIT_CODEC_STEP_CAPACITIES")]
+    pub codec_step_capacities: Option<String>,
 
     /// Slot-indexed codec KV rings and short-query attention (opt-in).
     #[arg(long, env = "PLOW_CODEC_RING_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -491,7 +535,8 @@ pub struct EmitConfig {
     pub decode_hnr_fold: Option<u32>,
     /// Maya 2 depth stage (DepthV2) op-chain reductions, a bit set: 1 = row views (the prefix
     /// embedding rows persist in `act.depth.xin`, qkv writes the K|V cache in place, the head reads
-    /// the last row in place; addressing only, codes bit-identical). Unset / 0 = off.
+    /// the last row in place; addressing only, codes bit-identical); 2 = persistent prefix
+    /// embeddings packed into contiguous projection rows, without projection views. Unset / 0 = off.
     #[arg(long, env = "PLOW_DEPTH_FUSE")]
     pub depth_fuse: Option<u32>,
     /// Staged depth programs: extra row capacities beside the decode rungs (comma list, each below
@@ -619,6 +664,7 @@ pub struct EmitConfig {
     // MoE (Gemma MoE family)
     // ──────────────────────────────────────────────────────────────────────────
     /// MoE prefill control. "0" to disable, unset = auto (on for MoE bf16).
+    /// "inkling-nvfp4" groups the down projection on Hopper; "inkling-nvfp4-glu" groups both projections.
     #[arg(long, env = "PLOW_MOE_PREFILL")]
     pub moe_prefill: Option<String>,
 
@@ -1990,6 +2036,8 @@ impl EmitConfig {
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             max_request_chunk: env_u32("PLOW_MAX_REQUEST_CHUNK"),
             asr_packed_max_chunks: env_u32("PLOW_ASR_PACKED_MAX_CHUNKS"),
+            asr_dense_continuous: env_bool("PLOW_ASR_DENSE_CONTINUOUS"),
+            asr_conv_bf16: env_bool("PLOW_ASR_CONV_BF16"),
             multimodal: env_bool("PLOW_EMIT_MULTIMODAL"),
             mm_slab_rows: env_u32("PLOW_EMIT_MM_SLAB_ROWS"),
             mm_vision_ladder: env_str("PLOW_EMIT_MM_VISION_LADDER"),
@@ -2010,6 +2058,8 @@ impl EmitConfig {
             fuse_merge: env_bool("PLOW_FUSE_MERGE"),
             nv_fa_fold_wide: env_bool_default_true("PLOW_NV_FA_FOLD_WIDE"),
             nv_fa_fold: env_bool("PLOW_NV_FA_FOLD"),
+            nv_moe_combine_fold: env_bool("PLOW_NV_MOE_COMBINE_FOLD"),
+            nv_moe_router_fold: env_bool("PLOW_NV_MOE_ROUTER_FOLD"),
             nv_dense_tune: env_bool("PLOW_NV_DENSE_TUNE"),
             nv_gemv_rem_split: env_bool("PLOW_NV_GEMV_REM_SPLIT"),
             packed_prefill_small_hd: env_bool("PLOW_EMIT_PACKED_PREFILL_SMALL_HD"),
@@ -2018,10 +2068,14 @@ impl EmitConfig {
             snac_split_bf16: env_bool("PLOW_EMIT_SNAC_SPLIT_BF16"),
             codec_wgmma_ragged: env_bool("PLOW_EMIT_CODEC_WGMMA_RAGGED"),
             codec_dec_in_wgmma: env_bool("PLOW_EMIT_CODEC_DEC_IN_WGMMA"),
+            codec_conv_bf16: env_bool("PLOW_EMIT_CODEC_CONV_BF16"),
+            codec_bf16_1p: env_bool("PLOW_EMIT_CODEC_BF16_1P"),
+            codec_conv_object: env_u32("PLOW_EMIT_CODEC_CONV_OBJECT"),
             codec_conv_arms: env_str("PLOW_EMIT_CODEC_CONV_ARMS").map(std::path::PathBuf::from),
             codec_conv_classes: env_str("PLOW_EMIT_CODEC_CONV_CLASSES")
                 .map(std::path::PathBuf::from),
             fish_codec_max_rows: env_u32("PLOW_EMIT_FISH_CODEC_MAX_ROWS"),
+            codec_step_capacities: env_str("PLOW_EMIT_CODEC_STEP_CAPACITIES"),
             codec_ring_kv: env_bool("PLOW_CODEC_RING_KV"),
             nv_fa_mma_hd128: env_bool("PLOW_NV_FA_MMA_HD128"),
             nv_gemv_k8_b1: env_bool("PLOW_NV_GEMV_K8_B1"),

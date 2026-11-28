@@ -541,7 +541,8 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
                     let (hd, nh, kvh, nb) = (inst.i[6], inst.i[1], inst.i[2], inst.i[0]);
                     s.hd.insert(hd);
-                    if op == DevOp::FlashDecode && inst.j[1] != 0 {
+                    if op == DevOp::FlashDecode && inst.j[1] != 0
+                        && inst.j[1] != packet::dev::FLASH_DECODE_RELATIVE {
                         s.flash_fold_hd = s.flash_fold_hd.max(hd);
                     }
                     s.kv_heads.insert(kvh);
@@ -1682,6 +1683,8 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>, s: &Shapes) -> V
     }
     if on("qwen_gdn") {
         req.push("PLOW_NV_QWEN_GDN=1".into());
+    }
+    if on("qwen_gdn") && s.gqa % 2 == 0 {
         req.push("PLOW_NV_FA_GF=2".into());
     } else if s.hd.iter().all(|&h| h <= 128) && s.gqa > 1 && s.gqa % 4 != 0 {
         // The hd128 flash-decode arm defaults to GF 4 and traps unless GF | gqa.
@@ -2879,6 +2882,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport, packed_prefill: 
     }
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
+            && inst.i[7] != 1
             && (inst.t[6] != packet::TENSOR_NONE
                 || inst.t[7] != packet::TENSOR_NONE
                 || inst.i[5] != packet::dev::TENSOR_NONE_I)
@@ -3115,6 +3119,9 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
     if manifest.get("speech_ring_kv").and_then(Value::as_bool) == Some(true) {
         feed("\x1espeech_ring_kv");
     }
+    if manifest.get("speech_conv_bf16").and_then(Value::as_bool) == Some(true) {
+        feed("\x1espeech_conv_bf16");
+    }
     feed("\x1e");
     if let Some(o) = manifest.get("tuning").and_then(Value::as_object) {
         for (k, v) in o {
@@ -3184,6 +3191,13 @@ pub fn speech_conv_posts(model: &packet::devbuild::Model) -> u64 {
         })
 }
 
+/// The conv arms of every conv a packet runs: `PLOW_SPEECH_CONV_ARMS`.
+pub fn speech_conv_arms(model: &packet::devbuild::Model) -> u64 {
+    model.progs.iter().flat_map(|p| &p.insts).fold(0, |m, i| {
+        m | plow_asset::speech_flag_layout::conv_arms(i.op, &i.i, i.j[0], i.j[1])
+    })
+}
+
 /// Whether a conv that can reach the wide tile (flags bit 14) pads with other than zeros:
 /// `PLOW_SPEECH_CONV_WIDE_PADDED`.
 pub fn speech_conv_wide_padded(model: &packet::devbuild::Model) -> bool {
@@ -3204,6 +3218,16 @@ pub struct SpeechMasks {
     pub split_a: bool,
     pub conv_wide_padded: bool,
     pub ring_kv: bool,
+    /// A conv takes the bf16 taps arm (Conv1dF32 flag bit 17 without bit 14):
+    /// `PLOW_SPEECH_CONV_BF16` compiles it and its larger launch arena into the speech object.
+    pub conv_bf16: bool,
+    /// `PLOW_SPEECH_CONV_ARMS`: the generic conv arms compiled into the speech object.
+    pub conv_arms: u64,
+    /// `PLOW_SPEECH_CONV_BF16_VARIANTS`: the bf16 taps conv bodies (plan kind x fused input).
+    pub conv_bf16_variants: u64,
+    /// A segment is one wgmma conv (`PLOW_EMIT_CODEC_CONV_OBJECT`): the conv-only `_speechconv`
+    /// object runs it (`objects.speech_conv.required`).
+    pub conv_object: bool,
 }
 
 impl SpeechMasks {
@@ -3222,6 +3246,27 @@ impl SpeechMasks {
                 .iter()
                 .flat_map(|p| &p.insts)
                 .any(|d| plow_asset::speech_flag_layout::ring_kv(d.op, &d.i)),
+            conv_bf16: model.progs.iter().flat_map(|p| &p.insts).any(|i| {
+                i.op == DevOp::Conv1dF32 as u16
+                    && i.j[1] & (1 << 17) != 0
+                    && i.j[1] & (1 << 14) == 0
+            }),
+            conv_arms: speech_conv_arms(model),
+            conv_bf16_variants: model.progs.iter().flat_map(|p| &p.insts).fold(0, |m, i| {
+                m | plow_asset::speech_flag_layout::conv_bf16_variants(i.op, &i.i, i.j[1])
+            }),
+            conv_object: model.progs.iter().any(|p| {
+                plow_asset::speech_flag_layout::conv_object_segments(
+                    &p.gq_seg_ofs,
+                    &p.gq_stream,
+                    |i| {
+                        let d = &p.insts[i as usize];
+                        plow_asset::speech_flag_layout::conv_object_inst(d.op, d.j[1])
+                    },
+                )
+                .iter()
+                .any(Option::is_some)
+            }),
         }
     }
     pub fn add(&mut self, other: Self) {
@@ -3230,6 +3275,10 @@ impl SpeechMasks {
         self.split_a |= other.split_a;
         self.conv_wide_padded |= other.conv_wide_padded;
         self.ring_kv |= other.ring_kv;
+        self.conv_bf16 |= other.conv_bf16;
+        self.conv_arms |= other.conv_arms;
+        self.conv_bf16_variants |= other.conv_bf16_variants;
+        self.conv_object |= other.conv_object;
     }
 }
 
@@ -3290,6 +3339,27 @@ pub fn config_header(manifest: &Value) -> String {
             "/* A conv reads split-image activations: the image GEMM arm and its launch arena. */\n\
              #ifndef PLOW_SPEECH_SPLIT_A\n#define PLOW_SPEECH_SPLIT_A 1\n#endif\n\n",
         );
+    }
+    if manifest.get("speech_conv_bf16").and_then(Value::as_bool) == Some(true) {
+        out.push_str(
+            "/* A conv takes the bf16 taps arm: compiled with its launch arena. */\n\
+             #ifndef PLOW_SPEECH_CONV_BF16\n#define PLOW_SPEECH_CONV_BF16 1\n#endif\n\n",
+        );
+    }
+    if let Some(arms) = manifest.get("speech_conv_arms").and_then(Value::as_u64) {
+        out.push_str(&format!(
+            "/* Generic conv arms the packet's convs reach; the rest are not compiled. */\n\
+             #ifndef PLOW_SPEECH_CONV_ARMS\n#define PLOW_SPEECH_CONV_ARMS 0x{arms:x}ull\n#endif\n\n"
+        ));
+    }
+    if let Some(v) = manifest
+        .get("speech_conv_bf16_variants")
+        .and_then(Value::as_u64)
+    {
+        out.push_str(&format!(
+            "/* bf16 taps conv bodies (plan kind x fused input) the packet's convs use. */\n\
+             #ifndef PLOW_SPEECH_CONV_BF16_VARIANTS\n#define PLOW_SPEECH_CONV_BF16_VARIANTS 0x{v:x}ull\n#endif\n\n"
+        ));
     }
     if let Some(radix) = manifest.get("sample_radix").and_then(Value::as_bool) {
         out.push_str(&format!(
@@ -3865,6 +3935,27 @@ pub fn config_header(manifest: &Value) -> String {
     if let Some(gqa) = manifest.pointer("/shapes/gqa").and_then(Value::as_u64) {
         out.push_str(&format!("#define PLOW_PACKET_GQA {gqa}\n"));
     }
+    let nvcc_req: Vec<&str> = manifest
+        .pointer("/backends/nvcc/requires")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !nvcc_req.is_empty() {
+        let nv_gemma = nvcc_req.iter().any(|v| *v == "PLOW_NV_GEMMA=1");
+        out.push_str(&format!(
+            "#ifndef PLOW_NV_GEMMA\n#define PLOW_NV_GEMMA {}\n#endif\n",
+            if nv_gemma { 1 } else { 0 }
+        ));
+        for r in &nvcc_req {
+            if let Some(val) = r.strip_prefix("PLOW_NV_FA_GF=") {
+                out.push_str(&format!(
+                    "#ifndef PLOW_NV_FA_GF\n#define PLOW_NV_FA_GF {val}\n#endif\n"
+                ));
+            }
+        }
+    }
 
     // What `scripts/build_gfx942.sh` reads under PLOW_HSACO_CONFIG: the AMD `requires` list,
     // the decode batch and ladder, and whether token-batch BODY programs (the `_tb` object
@@ -3930,7 +4021,7 @@ mod tests {
 
     #[test]
     fn fp8_tc64_is_an_explicit_wide_object_request() {
-        let _guard = crate::test_env::env_guard();
+        let _guard = held_env();
         let mut shapes = Shapes::default();
         shapes.decode_batch = 64;
         shapes.decode_gemv_k.insert(3840);
@@ -3964,7 +4055,20 @@ mod tests {
 
     /// Shadows [`super::build`]: most assertions here are about arms/shapes and
     /// do not care about the lean block, which has its own tests below.
+    thread_local! {
+        static HOLDS_ENV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn held_env() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::test_env::env_guard();
+        HOLDS_ENV.set(true);
+        guard
+    }
+
+    /// `super::build` reads the process-wide emit config: a sibling's `EnvScope` live during the
+    /// call changes the manifest (or trips a config assert), so every call holds the env lock.
     fn build(m: &Model, arch: &str) -> Value {
+        let _env = (!HOLDS_ENV.get()).then(crate::test_env::env_guard);
         super::build(m, arch, &crate::LeanReport::skipped("test: gate not run"))
     }
 
@@ -4282,7 +4386,7 @@ mod tests {
     /// the default manifest carries neither key nor macro, so its pairing hash is unchanged.
     #[test]
     fn moe_body_variants_are_opt_in_object_requests() {
-        let _guard = crate::test_env::env_guard();
+        let _guard = held_env();
         let ordinary = build(&model(), "gfx950");
         assert!(ordinary["objects"]["lean"].get("moe_stage1_body").is_none());
         assert!(ordinary["objects"]["lean"].get("moe_stage2_body").is_none());
@@ -4692,6 +4796,13 @@ mod tests {
         assert_eq!(pairing_hash(&a), pairing_hash(&c));
         c["speech_split_a"] = json!(true);
         assert_ne!(pairing_hash(&a), pairing_hash(&c));
+        let mut d = a.clone();
+        d["speech_conv_bf16"] = json!(true);
+        assert_ne!(pairing_hash(&a), pairing_hash(&d));
+        // Like the op mask, the conv arm mask is checked by the loader, not paired.
+        let mut e = a.clone();
+        e["speech_conv_arms"] = json!(0x18e);
+        assert_eq!(pairing_hash(&a), pairing_hash(&e));
     }
 
     #[test]
@@ -5751,7 +5862,7 @@ mod tests {
     /// token-batch body programs (the `_tb` object twins) exist.
     #[test]
     fn header_carries_the_object_recipe_inputs() {
-        let _guard = crate::test_env::env_guard();
+        let _guard = held_env();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_DECODE_BATCH_LADDER", "1,2,4")]);
         let mut man = build(&model(), "gfx942");
         let h = config_header(&man);
@@ -5914,6 +6025,7 @@ mod tests {
     /// anything else.
     #[test]
     fn lean_block_is_false_with_a_reason_when_the_verifier_is_absent() {
+        let _guard = held_env();
         let skipped = crate::LeanReport::skipped(
             "no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)",
         );
@@ -5935,6 +6047,7 @@ mod tests {
     /// The other side of it: a real pass says so, and says it with no reason.
     #[test]
     fn lean_block_reports_a_clean_verification() {
+        let _guard = held_env();
         let ok = crate::LeanReport {
             verified: true,
             oracle: true,
@@ -5960,6 +6073,7 @@ mod tests {
     /// re-creates in data the CLI coupling the flags were fixed to avoid.
     #[test]
     fn oracle_and_verify_are_recorded_independently() {
+        let _guard = held_env();
         let oracle_only = crate::LeanReport {
             verified: false,
             oracle: true,
@@ -5980,6 +6094,7 @@ mod tests {
     /// touching. It is hashed over `union` + `tuning` only; this pins that.
     #[test]
     fn the_lean_block_does_not_change_the_pairing_hash() {
+        let _guard = held_env();
         let m = model();
         let a = super::build(&m, "gfx950", &crate::LeanReport::skipped("absent"));
         let b = super::build(

@@ -369,8 +369,18 @@ fi
 # Generated-kernel catalog role objects (emit PLOW_EMIT_GEN_KERNELS), comma-separated entries,
 # rebuilt from the checked-in tuning table; needs a Python with TileLang (PYREF).
 if [ -n "${PLOW_BUILD_GEN_KERNELS:-}" ]; then
-  "${PYREF:-python3}" scripts/gen_kernels/build_catalog.py build "$gemma_out" \
-    --entries "$PLOW_BUILD_GEN_KERNELS"
+  gemma_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [ -n "${PLOW_TILELANG_PY:-}" ]; then
+    $PLOW_TILELANG_PY "$gemma_repo/scripts/gen_kernels/build_catalog.py" build "$gemma_out" \
+      --entries "$PLOW_BUILD_GEN_KERNELS"
+  elif [ -z "${PLOW_CAMPAIGN_NO_NIX:-}" ] && command -v nix >/dev/null 2>&1; then
+    env -i HOME="$HOME" USER="${USER:-$(id -un)}" PATH="$(dirname "$(command -v nix)"):$PATH" \
+      nix develop "$gemma_repo#tilelang" --command python3 "$gemma_repo/scripts/gen_kernels/build_catalog.py" build "$gemma_out" \
+      --entries "$PLOW_BUILD_GEN_KERNELS"
+  else
+    "${PYREF:-python3}" "$gemma_repo/scripts/gen_kernels/build_catalog.py" build "$gemma_out" \
+      --entries "$PLOW_BUILD_GEN_KERNELS"
+  fi
 fi
 # Library hd512 prefill attention (plowrt exec/gpu/lib_attention.rs): FlashAttention-4's SM90
 # forward AOT-exported as cubins into plow_fa4_hd512.aot with the KV adapter cubin (plowrt launches

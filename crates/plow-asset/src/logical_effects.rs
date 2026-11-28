@@ -19,7 +19,7 @@ fn ring_effects_require_positions_and_write_only_the_declared_destination() {
         t: [0; 8],
         ..Default::default()
     };
-    for (mode, written) in [(2, &[2][..]), (3, &[0][..])] {
+    for (mode, written) in [(2, &[2][..]), (3, &[0][..]), (4, &[2][..])] {
         d.i[7] = mode;
         assert_eq!(outputs(&d).unwrap(), written);
         d.t[5] = TENSOR_NONE16;
@@ -40,12 +40,14 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
     use DevOp::*;
     let op = DevOp::from_u16(d.op).ok_or("unknown kernel effects")?;
     if op == StreamTailF32 {
-        // Gather writes z from src + state; store writes state from z alone.
+        // Gather writes z from src + state; store writes state from z alone; store-from-source
+        // writes state from src + state.
         let (required, writes): (&[usize], &'static [usize]) = match d.i[7] {
             0 => (&[0, 1, 2, 3, 4, 5], &[0]),
             1 => (&[1, 2, 3, 4], &[2]),
             2 => (&[1, 2, 3, 4, 5], &[2]),
             3 => (&[0, 1, 2, 3, 4, 5], &[0]),
+            4 => (&[1, 2, 3, 4, 5], &[2]),
             _ => return Err("unknown stream-tail mode".into()),
         };
         if required.iter().any(|&slot| d.t[slot] == TENSOR_NONE16) {
@@ -73,6 +75,7 @@ pub(crate) fn outputs(d: &DevInst64) -> Result<&'static [usize], String> {
         Nop => 0,
         ZeroF32 => 1,
         CastF32Bf16 => 2,
+        Residual if d.i[7] == 1 && d.t[2..].iter().all(|&h| h == TENSOR_NONE16) => 2,
         Residual | Glu | GluStrided | NormResidual | Gemm | QuantFp8Block128 => 3,
         AddNorm | NormResidualNorm | MlaBmmFp8 => 4,
         GemmFp8Block128 => 5,
@@ -191,19 +194,42 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
             Some(&[0])
         }
         SoftCap | Argmax | ArgmaxFin if all(&[0, 1]) => Some(&[0]),
+        GemvF32Out if d.i[7] == 0 && all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => Some(&[0]),
         GemvArgmax if all(&[0, 1, 2, 3]) => Some(&[0, 3]),
-        FlashDecode if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
+        FlashDecode if d.fj[2] == packet::dev::FLASH_DECODE_RELATIVE
+            && all(&[0, 1, 2, 3, 4, 5, 7]) && none(&[6]) => Some(&[0, 1]),
+        FlashDecode if d.fj[2] != packet::dev::FLASH_DECODE_RELATIVE
+            && all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
         FlashDecodeFp8 if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0, 1]),
         FlashMerge if d.i[4] == 0 && all(&[0, 1, 2]) && none(&[3]) => Some(&[0]),
+        FlashPrefill if all(&[0, 1, 2, 3, 4, 7]) && none(&[5]) && d.t[6] == d.t[7]
+            => Some(&[0, 1]),
         FlashPrefill
-            if d.i[7] == 1 && d.i[4] >> 31 == 0 && all(&[0, 1, 2, 3, 4, 5]) && none(&[6]) =>
+            if (d.i[7] & 0xFFFF) == 1 && d.i[4] >> 31 == 0 && all(&[0, 1, 2, 3, 4, 5]) && none(&[6]) =>
         {
             Some(&[1, 5])
         }
-        FlashPrefillFp8 if d.i[7] == 1 && d.i[4] >> 31 == 0 && all(&[0, 1, 2, 3, 4, 5, 6, 7]) => {
+        FlashPrefill
+            if (d.i[7] & 0xFFFF) >= 1 && d.i[4] >> 31 == 0 && all(&[0, 1, 2, 3, 4]) && none(&[5, 6]) =>
+        {
+            Some(&[0, 1])
+        }
+        FlashPrefillFp8
+            if (d.i[7] & 0xFFFF) == 1
+                && d.i[4] >> 31 == 0
+                && all(&[0, 1, 2, 3, 4, 5, 6, 7]) =>
+        {
             Some(&[5])
         }
+        HeadNormRope if matches!(d.i[5], packet::dev::ROPE_PAIR_L2_CLIP | packet::dev::ROPE_PAIR_RELATIVE_LOGITS)
+            && all(&[0, 1, 5]) => Some(&[0]),
         HeadNormRope if d.i[7] == 0 && all(&[0, 1, 5]) && has(3) == has(4) => Some(&[0]),
+        HeadNormRope
+            if d.i[7] == 1 && all(&[0, 1, 5]) && none(&[6, 7]) && has(3) == has(4) =>
+        {
+            Some(&[0])
+        }
+        HeadNormRope if d.i[7] == 1 && all(&[0, 1, 5, 6, 7]) && has(3) == has(4) => Some(&[0, 6]),
         HeadNormRopeFp8 if d.i[7] == 0 && d.i[5] == 0 && all(&[0, 1, 5, 6]) && has(3) == has(4) => {
             Some(&[0, 6])
         }
@@ -279,8 +305,21 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         MoeGroupDownGemmaPfW8a8 if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0]),
         MoeExpertDownGemma if all(&[0, 1, 2, 3]) && (d.i[6] == 0 || all(&[5, 6, 7])) => Some(&[0]),
         MoeExpertGluNormGemma if all(&[0, 1, 2, 3, 4, 5, 6, 7]) => Some(&[0, 5]),
+        MoeRouter if all(&[0, 1, 2]) => Some(&[0]),
+        MoeRouterTopkPf if all(&[0, 1]) => Some(&[0]),
+        MoeAlignPf if all(&[0, 1, 2, 3, 4]) => Some(&[0, 2, 3, 4]),
+        MoeGluMx if all(&[0, 1, 2, 3, 4]) => Some(&[0]),
+        MoeDownMx if all(&[0, 1, 2, 3, 4]) => Some(&[0]),
+        MoeGluMxPf if all(&[0, 1, 2, 3, 4, 5]) => Some(&[0]),
+        MoeDownMxPf if all(&[0, 1, 2, 3, 4, 6, 7]) => Some(&[0]),
+        MoeCombinePf if all(&[0, 3]) => Some(&[0]),
         QwenGatedNorm if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0]),
-        QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3]) && none(&[5, 6, 7]) => Some(&[0, 3]),
+        QwenGdnConv | QwenGdnConvPrefill if all(&[0, 1, 2, 3])
+            && (if d.i[4] != 0 { !has(5) || has(7) } else { none(&[5, 6, 7]) })
+            => Some(&[0, 3]),
+        AttnRes if d.i[7] == 2 && all(&[0, 1, 2]) && none(&[3, 4, 5, 6, 7]) => Some(&[0]),
+        AttnRes if d.i[7] == 3 && all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0]),
+        AttnRes if d.i[7] == 1 && all(&[0, 1, 3]) && (d.i[2] == 0 || has(2)) => Some(&[0]),
         QwenGdnGatePrep if all(&[0, 1, 2, 3, 4, 5]) && none(&[6, 7]) => Some(&[0, 1]),
         QwenGdnQkvPrep if all(&[0, 1, 2, 3]) && none(&[4, 5, 6, 7]) => Some(&[0, 1, 2]),
         QwenGdnStep if all(&[0, 1, 2, 3, 4, 5, 6]) => Some(&[0, 6]),
@@ -295,6 +334,7 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         | SoftCap
         | Argmax
         | ArgmaxFin
+        | GemvF32Out
         | GemvArgmax
         | FlashDecode
         | FlashDecodeFp8
@@ -327,6 +367,14 @@ fn llm_outputs(op: DevOp, d: &DevInst64) -> Option<Result<&'static [usize], Stri
         | MoeGroupDownGemmaPfW8a8
         | MoeExpertDownGemma
         | MoeExpertGluNormGemma
+        | MoeRouter
+        | MoeRouterTopkPf
+        | MoeAlignPf
+        | MoeGluMx
+        | MoeDownMx
+        | MoeGluMxPf
+        | MoeDownMxPf
+        | MoeCombinePf
         | QwenGatedNorm
         | QwenGdnConv
         | QwenGdnConvPrefill
@@ -381,11 +429,15 @@ fn handle_accesses(d: &DevInst64) -> Result<Vec<(u32, bool)>, String> {
     };
     let fold = d.fj[2];
     let accesses: Vec<(u32, bool)> = match DevOp::from_u16(d.op) {
-        Some(DevOp::FlashDecode) if fold != 0 => vec![(fold & 0xFFFF, true), (fold >> 16, true)],
+        Some(DevOp::FlashDecode) if fold != 0 && fold != packet::dev::FLASH_DECODE_RELATIVE => vec![(fold & 0xFFFF, true), (fold >> 16, true)],
         Some(DevOp::FlashDecodeFp8) if fold != 0 => vec![(fold, false)],
         Some(DevOp::Gemv) if d.i[3] == 4 => reads(&[d.i[5], d.i[6], d.i[7]]),
         Some(DevOp::GemvGlu) if d.i[3] == 4 && fold == 0 => reads(&[d.i[4], d.i[6], d.i[7]]),
         // sm_90a TMA descriptors over A and B (dev_isa.h GEMM: 0 = absent).
+        // Chunked bf16 taps conv: tickets and chunk partials (op_speech_f32.cuh spb_chunks).
+        Some(DevOp::Conv1dF32) if crate::speech_flag_layout::conv_bf16_chunked(d.op, d.fj[2]) => {
+            vec![(d.fj[0] & 0x7FFF_FFFF, true)]
+        }
         Some(DevOp::Gemm | DevOp::GemmFp8) => [d.i[6], d.i[7]]
             .into_iter()
             .filter(|&h| h != 0)
@@ -413,7 +465,7 @@ fn tmaps_bound(packet: &Packet<'_>, d: &DevInst64) -> Result<(), String> {
                     matches!(g.kind, GEN_TMAP_BF16 | GEN_TMAP_E4M3) && g.aux == u32::from(target)
                 })
             }),
-        Some(DevOp::FlashPrefill) if d.t[7] != TENSOR_NONE16 => {
+        Some(DevOp::FlashPrefill) if d.t[7] != TENSOR_NONE16 && d.t[6] != d.t[7] => {
             gen(u32::from(d.t[7])).is_some_and(|g| {
                 g.kind == GEN_TMAP_KV_PAIR
                     && g.aux == u32::from(d.t[3])
@@ -1001,6 +1053,7 @@ mod tests {
         }
     }
 
+
     #[test]
     fn splitk_convolution_writes_scratch_while_row_scale_is_read_only() {
         let mut d = DevInst64 {
@@ -1050,17 +1103,24 @@ mod tests {
         (DevOp::GemvArgmax, &[0, 1, 2, 3], &[], 0, Some(&[0, 3]), "op_gemm.cuh:817 C, :828 part"),
         (DevOp::FlashDecode, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0, 1]), "op_attention.cuh:965-968 Opart/mlpart"),
         (DevOp::FlashDecode, &[0, 1, 2, 3, 4, 5, 7], &[], 0, None, "t7 HeadNormRope-fold descriptor"),
+        (DevOp::FlashDecode, &[0, 1, 2, 3, 4, 5, 7], &[], packet::dev::FLASH_DECODE_RELATIVE, Some(&[0, 1]), "relative logits read from t7"),
+        (DevOp::FlashDecode, &[0, 1, 2, 3, 4, 5], &[], packet::dev::FLASH_DECODE_RELATIVE, None, "relative logits required"),
         (DevOp::FlashDecodeFp8, &[0, 1, 2, 3, 4, 5, 6, 7], &[], 0, Some(&[0, 1]), "interp_sm120.cu:2832 same stores, scales read"),
         (DevOp::FlashMerge, &[0, 1, 2], &[], 0, Some(&[0]), "op_attention.cuh:3250 O"),
         (DevOp::FlashMerge, &[0, 1, 2], &[(4, 1024)], 0, None, "padded MLA layout producer"),
         (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5, 7], &[(7, 1)], 0, Some(&[1, 5]), "op_attention.cuh:3816 O; sm90 v3 :5460 fa_ws"),
-        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5, 7], &[(7, 2)], 0, None, "split-KV partials"),
+        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5, 7], &[(7, 2)], 0, None, "split-KV partials with O_final rejected"),
+        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4], &[(7, 2)], 0, Some(&[0, 1]), "op_attention.cuh:3816 Opart/mlpart split-KV"),
+        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 7], &[(7, 2)], 0, Some(&[0, 1]), "op_attention.cuh:3816 Opart/mlpart with tmap"),
         (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5, 7], &[(7, 1), (4, 1 << 31)], 0, None, "packed request table"),
+        (DevOp::FlashPrefill, &[0, 1, 2, 3, 4, 5], &[(7, 1 | (1 << 16))], 0, Some(&[1, 5]), "bidirectional span prefill"),
         (DevOp::FlashPrefillFp8, &[0, 1, 2, 3, 4, 5, 6, 7], &[(7, 1)], 0, Some(&[5]), "gen_attn_pf_hd256_sliding_fp8kv.cu:763 O"),
         (DevOp::HeadNormRope, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0]), "op_norm.cuh:1295 out (q / KV row)"),
+        (DevOp::HeadNormRope, &[0, 1, 2, 3, 4, 5], &[(7, 1)], 0, Some(&[0]), "gemma3 norm-offset out (q / KV row)"),
         (DevOp::HeadNormRope, &[0, 1, 5], &[], 0, Some(&[0]), "op_norm.cuh:1295 v row"),
         (DevOp::HeadNormRope, &[0, 1, 2, 3, 5], &[], 0, None, "op_norm.cuh:1274 sin read with cos"),
-        (DevOp::HeadNormRope, &[0, 1, 2, 3, 4, 5, 6], &[(7, 1)], 0, None, "fused KV pair writes t6"),
+        (DevOp::HeadNormRope, &[0, 1, 2, 3, 4, 5, 6], &[(7, 1)], 0, None, "fused KV pair missing t7"),
+        (DevOp::HeadNormRope, &[0, 1, 2, 3, 4, 5, 6, 7], &[(7, 1)], 0, Some(&[0, 6]), "fused KV pair writes t0 and t6"),
         (DevOp::HeadNormRopeFp8, &[0, 1, 2, 3, 4, 5, 6, 7], &[], 0, Some(&[0, 6]), "op_norm.cuh:1356 e4m3 row, :1474 scale"),
         (DevOp::HeadNormRopeFp8, &[0, 1, 5, 6], &[(5, 1)], 0, None, "unaudited i5"),
         (DevOp::QwenHeadNormRope, &[0, 1, 2, 3, 4, 5, 6], &[(2, 64)], 0, Some(&[0]), "op_qwen_gdn.cuh:840 out"),
@@ -1112,6 +1172,8 @@ mod tests {
         (DevOp::QwenGatedNorm, &[0, 1, 2, 3, 4], &[], 0, Some(&[0]), "op_qwen_gdn.cuh:365"),
         (DevOp::QwenGdnConv, &[0, 1, 2, 3, 4], &[], 0, Some(&[0, 3]), "op_qwen_gdn.cuh:134 history in place"),
         (DevOp::QwenGdnConvPrefill, &[0, 1, 2, 3, 4], &[], 0, Some(&[0, 3]), "op_qwen_gdn.cuh:962"),
+        (DevOp::QwenGdnConvPrefill, &[0, 1, 2, 3, 5, 7], &[(4, 2304)], 0, Some(&[0, 3]), "residual update reads t5 and t7"),
+        (DevOp::QwenGdnConvPrefill, &[0, 1, 2, 3, 5], &[(4, 2304)], 0, None, "residual update requires addend"),
         (DevOp::QwenGdnGatePrep, &[0, 1, 2, 3, 4, 5], &[], 0, Some(&[0, 1]), "op_qwen_gdn.cuh:1296"),
         (DevOp::QwenGdnQkvPrep, &[0, 1, 2, 3], &[], 0, Some(&[0, 1, 2]), "op_qwen_gdn.cuh:1217"),
         (DevOp::QwenGdnStep, &[0, 1, 2, 3, 4, 5, 6, 7], &[], 0, Some(&[0, 6]), "op_qwen_gdn.cuh:308/353 core, state"),

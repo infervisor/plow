@@ -88,7 +88,7 @@ fn conv_site(p: &Packet<'_>, d: &DevInst64) -> Result<Value, String> {
     Ok(json!({
         "kind": "conv_row_scale",
         "batch": d.i[0], "in_rows": d.i[1], "out_channels": d.i[3], "kernel": d.i[4],
-        "stride": d.i[5], "dilation": d.i[6], "pad_before": pads & 0xffff, "pad_after": pads >> 16,
+        "stride": d.i[5], "dilation": d.i[6] & 0x7FFF_FFFF, "pad_before": pads & 0xffff, "pad_after": pads >> 16,
         "out_bytes": bytes(p, d.t[0])?, "residual_bytes": bytes(p, d.t[5])?,
         "row_scale_bytes": bytes(p, d.t[7])?,
         "row_scale_is_out": d.t[7] == d.t[0], "row_scale_is_residual": d.t[7] == d.t[5],
@@ -105,7 +105,9 @@ pub fn request(p: &Packet<'_>) -> Result<Option<Value>, String> {
                     sites.push(ln_site(p, gp, pc)?)
                 }
                 Some(DevOp::Conv1dF32)
-                    if d.t[7] != TENSOR_NONE16 && d.fj[2] & CONV1D_SPLITK == 0 =>
+                    if d.t[7] != TENSOR_NONE16
+                        && d.fj[2] & CONV1D_SPLITK == 0
+                        && !crate::speech_flag_layout::conv_stream_in(d.op, d.fj[2]) =>
                 {
                     sites.push(conv_site(p, d)?)
                 }
@@ -120,6 +122,37 @@ pub fn request(p: &Packet<'_>) -> Result<Option<Value>, String> {
 mod tests {
     use super::*;
     use packet::devbuild::{Builder, Model};
+
+    #[test]
+    fn conv_stream_in_pos_is_not_a_row_scale_fusion_site() {
+        let mut b = Builder::new(1);
+        let out = b.tensor("act.out", 64);
+        let x = b.tensor("in.x", 64);
+        let w = b.tensor("w.w", 64);
+        let state = b.tensor("in.state", 64);
+        let slot = b.tensor("in.slot", 64);
+        let pos = b.tensor("in.pos", 1024);
+        b.emit(DevOp::Conv1dF32, vec![0], &[], |d| {
+            d.t[..3].copy_from_slice(&[out, x, w]);
+            d.t[5..8].copy_from_slice(&[state, slot, pos]);
+            d.i[..8].copy_from_slice(&[1, 4, 4, 4, 1, 1, 1, 1]);
+            // staged_input_beta: pre code snake (12 << 4), bits 2, 19, 22
+            d.j[1] = (12 << 4) | (1 << 2) | (1 << 19) | (1 << 22);
+        });
+        let p = b.finish();
+        let model = Model {
+            n_cu: 1,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
+        };
+        crate::program::with_model(&model, |packet| {
+            assert!(request(packet).unwrap().is_none());
+        });
+    }
 
     #[test]
     fn conv_splitk_scratch_is_not_a_row_scale_fusion_site() {

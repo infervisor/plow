@@ -717,6 +717,28 @@ impl VmmRings {
         }
     }
 
+    /// Return all mapped slots, parked slots, and spare units to the driver:
+    /// leaves zero physical device memory committed while preserving the VA reservations.
+    pub fn release_all(&mut self) {
+        for slot in 0..self.mapped.len() {
+            if self.mapped[slot] {
+                self.generations[slot] = self.generations[slot].wrapping_add(1);
+                self.for_slot_units(slot, |rings, window, unit| rings.release_unit(window, unit));
+                self.mapped[slot] = false;
+            }
+            if self.parked[slot] {
+                self.unpark(slot);
+            }
+        }
+        self.prefix = 0;
+        self.launch_rows = 0;
+        self.stats.mapped_slots = 0;
+        self.stats.mapped_prefix = 0;
+        while let Some((_, handle)) = self.spare.pop() {
+            self.ops.release(handle);
+        }
+    }
+
     /// [`Self::enable_bounded_park`]: return every parked slot and spare unit to the driver;
     /// device memory pressure outranks the next admission's saved driver calls.
     /// Returns whether any kept memory went back to the driver.
@@ -2285,6 +2307,74 @@ impl VmmKv {
         freed
     }
 
+    /// Return all physical KV cache and sequence window memory to the driver:
+    /// leaves zero physical device memory committed while preserving the VA window tracks.
+    pub fn evict_all(&self) {
+        let s = &self.shared;
+        let mut inner = s.inner.lock();
+        for seq in 0..s.geo.batch as usize {
+            release_window(s, &mut inner, seq);
+            s.frontier[seq].store(0, Ordering::Relaxed);
+        }
+        for (_, ids) in std::mem::take(&mut inner.node_blocks) {
+            for id in ids {
+                deref_block(s, &mut inner, id);
+            }
+        }
+        inner.by_id.clear();
+        for (_, snapshots) in std::mem::take(&mut inner.published) {
+            for snap in snapshots {
+                match snap.store {
+                    SnapStore::Device(_) if snap.quarantined => {}
+                    SnapStore::Device(va) => s.ops.free(va),
+                    SnapStore::Spilling { va, fence, .. } => match s.ops.fence_wait(fence) {
+                        Ok(()) => s.ops.free(va),
+                        Err(_) => {}
+                    },
+                    SnapStore::Host(_) | SnapStore::Restoring(_) => {}
+                    SnapStore::Blocks { handle, .. } => {
+                        if let Some(hook) = &inner.block_store {
+                            hook.release(handle);
+                        }
+                    }
+                }
+            }
+        }
+        for t in &mut inner.tracks {
+            for (va, slots) in &mut t.copy {
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    if let CopySlot::Spare(handle) = std::mem::replace(slot, CopySlot::Empty) {
+                        s.ops.unmap(*va + i as u64 * s.block_bytes, s.block_bytes);
+                        s.ops.release(handle);
+                    }
+                }
+            }
+        }
+        inner.stats.cache_blocks = 0;
+        inner.stats.cache_bytes = 0;
+        inner.stats.snapshot_bytes = 0;
+        inner.stats.host_snapshots = 0;
+        inner.stats.host_snapshot_bytes = 0;
+        inner.stats.host_capacity_bytes = 0;
+        while let Some(handle) = inner.pooled.pop() {
+            s.ops.release(handle);
+        }
+        inner.stats.blocks_pooled = 0;
+        if let Some(fresh_cache) = PrefixCache::new(
+            GrowablePool {
+                base: 0,
+                kv_factor: 1,
+                kv_heads: 1,
+                max_seqs: u32::MAX,
+                head_slot_bytes: 1 << 32,
+            },
+            s.block_rows as u64,
+            1,
+        ) {
+            inner.cache = fresh_cache;
+        }
+    }
+
     /// Take slot recycling off the caller's thread: [`Self::begin_seq`] keeps a
     /// private row-0 block in place and hands the rest of the window to the
     /// pool thread (see [`retire_window`]); zero-ref handles past the pool cap
@@ -2767,7 +2857,7 @@ impl VmmKv {
         let blocks = snap.store.blocks();
         let lost = prompt.len() as u64 - u64::from(rows);
         let st = &mut inner.stats;
-        let (hits, got, miss) = if kind.has(Kind::PROMPT_END) {
+        let (hits, got, miss) = if kind.has(Kind::PROMPT_END) || kind.has(Kind::TURN_END) {
             (
                 &mut st.attach_prompt_end,
                 &mut st.tokens_attached_prompt_end,
@@ -2981,25 +3071,26 @@ impl VmmKv {
                     inner.stats.attach_misses += 1;
                     inner.stats.tokens_attached -= rows as u64;
                     let st = &mut inner.stats;
-                    let (hits, got, miss) = if kind.has(Kind::PROMPT_END) {
-                        (
-                            &mut st.attach_prompt_end,
-                            &mut st.tokens_attached_prompt_end,
-                            &mut st.tokens_lost_prompt_end,
-                        )
-                    } else if kind.has(Kind::SHARED_END) {
-                        (
-                            &mut st.attach_shared,
-                            &mut st.tokens_attached_shared,
-                            &mut st.tokens_lost_shared,
-                        )
-                    } else {
-                        (
-                            &mut st.attach_block,
-                            &mut st.tokens_attached_block,
-                            &mut st.tokens_lost_block,
-                        )
-                    };
+                    let (hits, got, miss) =
+                        if kind.has(Kind::PROMPT_END) || kind.has(Kind::TURN_END) {
+                            (
+                                &mut st.attach_prompt_end,
+                                &mut st.tokens_attached_prompt_end,
+                                &mut st.tokens_lost_prompt_end,
+                            )
+                        } else if kind.has(Kind::SHARED_END) {
+                            (
+                                &mut st.attach_shared,
+                                &mut st.tokens_attached_shared,
+                                &mut st.tokens_lost_shared,
+                            )
+                        } else {
+                            (
+                                &mut st.attach_block,
+                                &mut st.tokens_attached_block,
+                                &mut st.tokens_lost_block,
+                            )
+                        };
                     *hits -= 1;
                     *got -= u64::from(rows);
                     *miss -= prompt.len() as u64 - u64::from(rows);
@@ -3100,7 +3191,9 @@ impl VmmKv {
         let mut inner = self.shared.inner.lock();
         inner.seqs[seq].session_ttl = Some(ttl);
         if let Some(id) = inner.seqs[seq].attached {
-            if let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END)) {
+            if let Some(snap) = snap_mut(&mut inner, id)
+                .filter(|s| s.kind.has(Kind::PROMPT_END) || s.kind.has(Kind::TURN_END))
+            {
                 snap.protect_until = Some(std::time::Instant::now() + ttl);
             }
         }
@@ -3131,7 +3224,9 @@ impl VmmKv {
         };
         inner.cold_tick += 1;
         let cold = inner.cold_tick;
-        let Some(snap) = snap_mut(&mut inner, id).filter(|s| s.kind.has(Kind::PROMPT_END)) else {
+        let Some(snap) = snap_mut(&mut inner, id)
+            .filter(|s| s.kind.has(Kind::PROMPT_END) || s.kind.has(Kind::TURN_END))
+        else {
             return;
         };
         snap.protect_until = None;
@@ -3402,7 +3497,7 @@ impl VmmKv {
                 // used: it is the conversation's next-turn attach point (a first conversation on
                 // a fresh server, or one whose lead is unique, missed its whole turn 2), and an
                 // unique one-shot prompt's copy is the first thing eviction takes.
-                if !kind.has(Kind::PROMPT_END) {
+                if !kind.has(Kind::PROMPT_END) && !kind.has(Kind::TURN_END) {
                     inner.stats.publishes_skipped += 1;
                     return Ok(());
                 }
@@ -3602,7 +3697,7 @@ impl VmmKv {
         if self.shared_publish && rows % s.block_rows != 0 {
             let mut inner = s.inner.lock();
             if !note_lead(&mut inner, seq, tokens) {
-                if !kind.has(Kind::PROMPT_END) {
+                if !kind.has(Kind::PROMPT_END) && !kind.has(Kind::TURN_END) {
                     inner.stats.publishes_skipped += 1;
                     return Ok(());
                 }
@@ -4656,6 +4751,9 @@ fn publish_locked(
     let continued = lineage.filter(|&l| l != id && inner.seqs[seq].lineage.is_none());
     let superseded = note_end(inner, seq, id, kind);
     protect(inner, seq, id, kind);
+    if kind.has(Kind::TURN_END) {
+        inner.seqs[seq].ended = Some(id);
+    }
     if cold {
         trim_cache_cold(s, inner);
     } else {
@@ -5284,7 +5382,7 @@ fn protect(inner: &mut Inner, seq: usize, id: u64, kind: Kind) {
     let Some(ttl) = inner.seqs[seq].session_ttl else {
         return;
     };
-    if !kind.has(Kind::PROMPT_END) {
+    if !kind.has(Kind::PROMPT_END) && !kind.has(Kind::TURN_END) {
         return;
     }
     if let Some(snap) = snap_mut(inner, id) {
@@ -5439,7 +5537,9 @@ fn free_snapshot(s: &Shared, inner: &mut Inner, snap: Snap) {
     }
     inner.by_id.remove(&snap.id);
     policy::unlink_snapshot(s, inner, &snap);
-    inner.stats.snapshots_evicted += 1;
+    if inner.drop_mech != Mechanism::Retire {
+        inner.stats.snapshots_evicted += 1;
+    }
     match snap.store {
         SnapStore::Device(va) => {
             inner.stats.snapshot_bytes -= snap.bytes;
@@ -5560,6 +5660,10 @@ fn unwind_attach(
 /// `MemAvailable` of `/proc/meminfo` in bytes; `None` where it cannot be read.
 /// `(MemAvailable, MemTotal)` in bytes.
 pub(crate) fn host_mem_available() -> Option<(u64, u64)> {
+    // Unit tests size mock tiers in bytes; the reserve (>= 16 GiB) would zero them on a small host.
+    if cfg!(test) {
+        return None;
+    }
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let field = |key: &str| -> Option<u64> {
         let line = text.lines().find(|l| l.starts_with(key))?;
@@ -6790,6 +6894,51 @@ pub enum WeightSlab {
     PerTensor,
 }
 
+impl WeightSlab {
+    pub fn hibernate(&self) -> Result<u64> {
+        match self {
+            Self::Vmm(slab) => slab.hibernate(),
+            Self::Flat(_) | Self::PerTensor => Ok(0),
+        }
+    }
+
+    pub fn awaken(&self, chunk_hint: u64) -> Result<()> {
+        match self {
+            Self::Vmm(slab) => slab.awaken(chunk_hint),
+            Self::Flat(_) | Self::PerTensor => Ok(()),
+        }
+    }
+
+    pub fn is_hibernated(&self) -> bool {
+        match self {
+            Self::Vmm(slab) => slab.is_hibernated(),
+            Self::Flat(_) | Self::PerTensor => false,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Vmm(slab) => slab.len(),
+            Self::Flat(mem) => mem.len,
+            Self::PerTensor => 0,
+        }
+    }
+
+    pub fn base(&self) -> u64 {
+        match self {
+            Self::Vmm(slab) => slab.base(),
+            Self::Flat(mem) => mem.base,
+            Self::PerTensor => 0,
+        }
+    }
+
+    pub fn contains(&self, va: u64) -> bool {
+        let b = self.base();
+        let l = self.len();
+        l > 0 && va >= b && va < b + l
+    }
+}
+
 /// A lazily-committed linear device slab: one VA reservation (µs — probe [6])
 /// whose physical backing a background thread creates and maps front-to-back,
 /// so a consumer writing the slab in address order overlaps the driver's page
@@ -6812,7 +6961,7 @@ pub struct VmmSlab {
     /// VA reservation span (`bytes` rounded up to the granularity).
     reserved: u64,
     shared: Arc<SlabShared>,
-    join: Option<std::thread::JoinHandle<()>>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 struct SlabShared {
@@ -6830,29 +6979,21 @@ struct SlabState {
     err: Option<String>,
     /// Drop asked the mapper to quit early.
     stop: bool,
+    /// Slab is currently in warm hibernation (physical memory unmapped & released, VA intact).
+    hibernated: bool,
 }
 
 impl VmmSlab {
-    /// Reserve `bytes` of VA and start committing physical chunks of
-    /// `chunk_hint` (rounded to the granularity) from the base upward.
-    pub fn new(ops: Arc<dyn VmmOps>, bytes: u64, chunk_hint: u64) -> Result<Self> {
-        let gran = ops.granularity()?;
-        let reserved = bytes.div_ceil(gran) * gran;
-        let chunk = chunk_hint.max(gran).div_ceil(gran) * gran;
-        let va = ops.reserve(reserved)?;
-        let shared = Arc::new(SlabShared {
-            m: Mutex::new(SlabState::default()),
-            cv: parking_lot::Condvar::new(),
-        });
-        // Pooled physical chunks from a previous slab's PLOW_SLAB_KEEP drop:
-        // re-mapping one skips the driver's serial page commit entirely, so a
-        // reload/S1 switch pays map+set_access (µs-class) instead of
-        // ~13 GiB/s of cuMemCreate. Drained unconditionally — a stale pool
-        // (flag flipped off between loads) is still valid physical memory and
-        // reusing it is strictly cheaper than re-creating.
+    fn spawn_mapper(
+        ops: Arc<dyn VmmOps>,
+        shared: Arc<SlabShared>,
+        va: u64,
+        reserved: u64,
+        chunk: u64,
+    ) -> Result<std::thread::JoinHandle<()>> {
         let mut pooled = ops.pool_take();
         let (t_ops, t_shared) = (Arc::clone(&ops), Arc::clone(&shared));
-        let join = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("wslab-map".into())
             .spawn(crate::config::inherit(move || {
                 let mut off = 0u64;
@@ -6861,9 +7002,6 @@ impl VmmSlab {
                         break;
                     }
                     let n = chunk.min(reserved - off);
-                    // Exact-size match only: every chunk but the tail is the
-                    // uniform `chunk` size, so cross-model reuse works and at
-                    // most one tail per generation misses.
                     let reuse = pooled
                         .iter()
                         .position(|&(_, b)| b == n)
@@ -6877,9 +7015,6 @@ impl VmmSlab {
                             .map(va + off, n, h)
                             .and_then(|()| t_ops.set_access(va + off, n))
                             .inspect_err(|_| {
-                                // Map/access failed: the chunk is not (fully)
-                                // usable — unwind it so Drop's walk only sees
-                                // consistent (mapped, released-once) chunks.
                                 t_ops.unmap(va + off, n);
                                 t_ops.release(h);
                             })
@@ -6900,20 +7035,38 @@ impl VmmSlab {
                     }
                     t_shared.cv.notify_all();
                 }
-                // Whatever the pool held beyond this slab's needs goes back
-                // (or is released, per the backend's default) — never leaked.
                 if !pooled.is_empty() {
                     t_ops.pool_put(pooled);
                 }
             }))
-            .map_err(|e| RuntimeError::Device(format!("vmm slab mapper thread: {e}")))?;
+            .map_err(|e| RuntimeError::Device(format!("vmm slab mapper thread: {e}")))
+    }
+
+    /// Reserve `bytes` of VA and start committing physical chunks of
+    /// `chunk_hint` (rounded to the granularity) from the base upward.
+    pub fn new(ops: Arc<dyn VmmOps>, bytes: u64, chunk_hint: u64) -> Result<Self> {
+        let gran = ops.granularity()?;
+        let reserved = bytes.div_ceil(gran) * gran;
+        let chunk = chunk_hint.max(gran).div_ceil(gran) * gran;
+        let va = ops.reserve(reserved)?;
+        let shared = Arc::new(SlabShared {
+            m: Mutex::new(SlabState::default()),
+            cv: parking_lot::Condvar::new(),
+        });
+        let join = Self::spawn_mapper(
+            Arc::clone(&ops),
+            Arc::clone(&shared),
+            va,
+            reserved,
+            chunk,
+        )?;
         Ok(VmmSlab {
             ops,
             va,
             bytes,
             reserved,
             shared,
-            join: Some(join),
+            join: Mutex::new(Some(join)),
         })
     }
 
@@ -6964,12 +7117,72 @@ impl VmmSlab {
             self.shared.cv.wait(&mut st);
         }
     }
+
+    /// Unmap and release all physical chunk allocations while keeping the VA reservation intact.
+    /// Returns the number of physical device bytes freed.
+    pub fn hibernate(&self) -> Result<u64> {
+        self.shared.m.lock().stop = true;
+        if let Some(j) = self.join.lock().take() {
+            let _ = j.join();
+        }
+        let mut st = self.shared.m.lock();
+        if st.hibernated {
+            return Ok(0);
+        }
+        let mut off = 0u64;
+        let mut freed_bytes = 0u64;
+        for &(_, n) in &st.handles {
+            self.ops.unmap(self.va + off, n);
+            off += n;
+            freed_bytes += n;
+        }
+        let handles = std::mem::take(&mut st.handles);
+        for (h, _) in handles {
+            self.ops.release(h);
+        }
+        st.mapped = 0;
+        st.err = None;
+        st.hibernated = true;
+        st.stop = false;
+        Ok(freed_bytes)
+    }
+
+    /// Re-commit physical backing chunks into the existing reserved VA space.
+    pub fn awaken(&self, chunk_hint: u64) -> Result<()> {
+        let mut st = self.shared.m.lock();
+        if !st.hibernated {
+            return Ok(());
+        }
+        st.hibernated = false;
+        st.stop = false;
+        st.err = None;
+        st.mapped = 0;
+        st.handles.clear();
+        drop(st);
+
+        let gran = self.ops.granularity()?;
+        let chunk = chunk_hint.max(gran).div_ceil(gran) * gran;
+        let join = Self::spawn_mapper(
+            Arc::clone(&self.ops),
+            Arc::clone(&self.shared),
+            self.va,
+            self.reserved,
+            chunk,
+        )?;
+        *self.join.lock() = Some(join);
+        Ok(())
+    }
+
+    /// Whether this slab is currently hibernated (physical backing unmapped).
+    pub fn is_hibernated(&self) -> bool {
+        self.shared.m.lock().hibernated
+    }
 }
 
 impl Drop for VmmSlab {
     fn drop(&mut self) {
         self.shared.m.lock().stop = true;
-        if let Some(j) = self.join.take() {
+        if let Some(j) = self.join.lock().take() {
             let _ = j.join();
         }
         let mut st = self.shared.m.lock();
@@ -12363,6 +12576,40 @@ mod tests {
         let b = hash_blocks(&two, 8);
         assert_eq!(b[0], a[0]);
         assert_ne!(b[1], a[1]);
+    }
+
+    #[test]
+    fn test_vmm_slab_hibernate_awaken_preserves_va() {
+        let ops = Arc::new(MockVmm::default());
+        let slab_bytes = 1024 * 1024;
+        let slab = VmmSlab::new(ops.clone(), slab_bytes, 256 * 1024).expect("slab creation");
+        let initial_va = slab.base();
+        assert_ne!(initial_va, 0);
+        assert!(!slab.is_hibernated());
+        slab.wait_mapped(slab_bytes).expect("wait mapped");
+
+        let freed = slab.hibernate().expect("hibernate");
+        assert!(freed >= slab_bytes);
+        assert!(slab.is_hibernated());
+        assert_eq!(slab.base(), initial_va, "VA reservation must not change during hibernation");
+
+        slab.awaken(256 * 1024).expect("awaken");
+        assert!(!slab.is_hibernated());
+        assert_eq!(slab.base(), initial_va, "VA reservation must not change after awaken");
+        slab.wait_mapped(slab_bytes).expect("wait mapped after awaken");
+    }
+
+    #[test]
+    fn test_vmm_kv_evict_all_preserves_tracks() {
+        let ops = Arc::new(MockVmm::default());
+        let p = pool(ops.clone());
+        p.ensure_rows(0, 16).expect("ensure rows");
+        assert!(p.mapped_rows(0) >= 16);
+        p.evict_all();
+        assert_eq!(p.mapped_rows(0), 0);
+        // After evict_all, tracks remain intact and new rows can be mapped at same tracks
+        p.ensure_rows(0, 16).expect("ensure rows after evict_all");
+        assert!(p.mapped_rows(0) >= 16);
     }
 }
 

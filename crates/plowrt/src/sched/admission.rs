@@ -236,6 +236,11 @@ impl DownstreamCredit {
             .store(limit, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// A stage is coupled (it set a backlog limit): its work runs on the model's device.
+    pub fn coupled(&self) -> bool {
+        self.limit.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
     /// Work handed to the stage and not finished.
     pub fn pending(&self) -> usize {
         self.backlog.load(std::sync::atomic::Ordering::Relaxed)
@@ -325,8 +330,95 @@ impl DownstreamCredit {
 /// them back admitted past the budget: on block-granular KV a sequence whose prompt + budget
 /// straddles a block boundary dropped to one block's charge while it mapped two (Qwen3.8-27B at
 /// 4K c32 under PLOW_KV_MEM_UTIL 0.91: 31 slots, 15.9 GiB mapped against an 11.3 GiB budget).
+/// Result of a successful [`seat`] decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seated {
+    /// The assigned slot index.
+    pub slot: usize,
+    /// KV rows admitted for this request (normal want or soft want).
+    pub admitted_rows: u64,
+    /// Whether this request was admitted under soft admission.
+    pub is_soft: bool,
+}
+
+impl Seated {
+    #[inline]
+    pub fn new(slot: usize, admitted_rows: u64, is_soft: bool) -> Self {
+        Self {
+            slot,
+            admitted_rows,
+            is_soft,
+        }
+    }
+
+    #[inline]
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
+impl PartialEq<usize> for Seated {
+    #[inline]
+    fn eq(&self, other: &usize) -> bool {
+        self.slot == *other
+    }
+}
+
+impl PartialEq<Seated> for usize {
+    #[inline]
+    fn eq(&self, other: &Seated) -> bool {
+        *self == other.slot
+    }
+}
+
+/// Adaptive KV output token reservation for admission budgeting: bounds initial output token
+/// reservation against the KV budget to `min(max_tokens, max(generated + 128, cap))` instead of
+/// locking down the full client `max_tokens` (e.g. 4096) upfront.
+#[inline]
+pub fn output_token_reservation_with_cap(
+    max_tokens: usize,
+    generated_tokens: usize,
+    cap: usize,
+) -> usize {
+    if cap == 0 {
+        max_tokens.max(generated_tokens).max(1)
+    } else {
+        let dynamic = generated_tokens.saturating_add(cap.min(128)).max(cap);
+        max_tokens.min(dynamic).max(generated_tokens).max(1)
+    }
+}
+
+#[inline]
+pub fn output_token_reservation(max_tokens: usize, generated_tokens: usize) -> usize {
+    output_token_reservation_with_cap(
+        max_tokens,
+        generated_tokens,
+        crate::config::RuntimeConfig::get().kv_reserve_output_tokens(),
+    )
+}
+
+#[inline]
+pub fn reserved_kv_rows_with_cap(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    generated_tokens: usize,
+    cap: usize,
+) -> u64 {
+    prompt_tokens.saturating_add(output_token_reservation_with_cap(
+        max_tokens,
+        generated_tokens,
+        cap,
+    )) as u64
+}
+
+#[inline]
 pub fn reserved_kv_rows(prompt_tokens: usize, max_tokens: usize, generated_tokens: usize) -> u64 {
-    prompt_tokens.saturating_add(max_tokens.max(generated_tokens).max(1)) as u64
+    reserved_kv_rows_with_cap(
+        prompt_tokens,
+        max_tokens,
+        generated_tokens,
+        crate::config::RuntimeConfig::get().kv_reserve_output_tokens(),
+    )
 }
 
 /// THE seat decision, in one place and in this order: liveness, then a slot, then the whole-device
@@ -340,18 +432,20 @@ pub fn seat(
     engine_dead: bool,
     free_slot: Option<usize>,
     want_rows: u64,
+    soft_want_rows: Option<u64>,
     committed_rows: impl IntoIterator<Item = u64>,
     budget: Option<KvBudget>,
     downstream_full: bool,
-) -> Result<usize, Denied> {
+) -> Result<Seated, Denied> {
     if engine_dead {
         return Err(Denied::EngineDead);
     }
     let slot = free_slot.ok_or(Denied::NoFreeSlot)?;
-    if budget.is_some_and(|b| !b.fits_requests([want_rows])) {
+    let effective_min_want = soft_want_rows.map_or(want_rows, |s| s.min(want_rows));
+    if budget.is_some_and(|b| !b.fits_requests([effective_min_want])) {
         let max_rows = budget.map_or(0, |b| b.max_rows());
         return Err(Denied::ExceedsWholeBudget {
-            want: want_rows,
+            want: effective_min_want,
             max_rows,
         });
     }
@@ -359,11 +453,38 @@ pub fn seat(
         return Err(Denied::DownstreamFull);
     }
     if let Some(budget) = budget {
-        if !budget.fits_requests(committed_rows.into_iter().chain(std::iter::once(want_rows))) {
-            return Err(Denied::KvBudgetFull { want: want_rows });
+        let mut committed_bytes = 0u64;
+        let mut fits = true;
+        for rows in committed_rows {
+            if let Some(next) = committed_bytes.checked_add(budget.bytes_for_rows(rows)) {
+                committed_bytes = next;
+            } else {
+                fits = false;
+                break;
+            }
         }
+        if !fits {
+            return Err(Denied::KvBudgetFull {
+                want: soft_want_rows.unwrap_or(want_rows),
+            });
+        }
+        let want_bytes = budget.bytes_for_rows(want_rows);
+        if committed_bytes.saturating_add(want_bytes) <= budget.budget_bytes {
+            return Ok(Seated::new(slot, want_rows, false));
+        }
+        if let Some(soft_rows) = soft_want_rows {
+            if soft_rows < want_rows {
+                let soft_bytes = budget.bytes_for_rows(soft_rows);
+                if committed_bytes.saturating_add(soft_bytes) <= budget.budget_bytes {
+                    return Ok(Seated::new(slot, soft_rows, true));
+                }
+            }
+        }
+        return Err(Denied::KvBudgetFull {
+            want: soft_want_rows.unwrap_or(want_rows),
+        });
     }
-    Ok(slot)
+    Ok(Seated::new(slot, want_rows, false))
 }
 
 pub const MAX_KV_BLOCK_GROUPS: usize = 8;
@@ -509,14 +630,17 @@ mod seat_tests {
     #[test]
     fn liveness_is_decided_before_capacity() {
         assert_eq!(
-            seat(true, None, 1, [], None, false),
+            seat(true, None, 1, None, [], None, false),
             Err(Denied::EngineDead)
         );
         assert_eq!(
-            seat(false, None, 1, [], None, false),
+            seat(false, None, 1, None, [], None, false),
             Err(Denied::NoFreeSlot)
         );
-        assert_eq!(seat(false, Some(3), 1, [], None, false), Ok(3));
+        assert_eq!(
+            seat(false, Some(3), 1, None, [], None, false).map(|s| s.slot),
+            Ok(3)
+        );
     }
 
     /// A request larger than the whole device is terminal, not retryable: deferring it would
@@ -525,7 +649,7 @@ mod seat_tests {
     fn a_request_over_the_whole_budget_is_terminal_not_queued() {
         let b = glm_budget();
         let max = b.max_rows();
-        let err = seat(false, Some(0), max + 1, [], Some(b), false).unwrap_err();
+        let err = seat(false, Some(0), max + 1, None, [], Some(b), false).unwrap_err();
         assert!(matches!(err, Denied::ExceedsWholeBudget { .. }));
         assert!(!err.is_retryable());
     }
@@ -535,26 +659,86 @@ mod seat_tests {
     #[test]
     fn live_sequences_push_a_fitting_request_back_onto_the_queue() {
         let b = glm_budget();
-        assert_eq!(seat(false, Some(0), 70_700, [], Some(b), false), Ok(0));
-        let err = seat(false, Some(0), 70_700, [70_700; 12], Some(b), false).unwrap_err();
+        assert_eq!(
+            seat(false, Some(0), 70_700, None, [], Some(b), false).map(|s| s.slot),
+            Ok(0)
+        );
+        let err = seat(false, Some(0), 70_700, None, [70_700; 12], Some(b), false).unwrap_err();
         assert_eq!(err, Denied::KvBudgetFull { want: 70_700 });
         assert!(err.is_retryable());
         // 11 already seated leaves room for the twelfth.
         assert_eq!(
-            seat(false, Some(0), 70_700, [70_700; 11], Some(b), false),
+            seat(false, Some(0), 70_700, None, [70_700; 11], Some(b), false).map(|s| s.slot),
             Ok(0)
         );
+    }
+
+    /// When normal reservation cannot fit into remaining KV budget, soft admission allows
+    /// seating the request with a smaller initial reservation (e.g. 64 tokens) to start prefill.
+    #[test]
+    fn soft_admission_seats_under_pressure() {
+        let b = glm_budget();
+        // 11 sequences of 70,700 committed.
+        // A 12th sequence wanting 70,700 fits:
+        let res = seat(
+            false,
+            Some(0),
+            70_700,
+            Some(5_000),
+            [70_700; 11],
+            Some(b),
+            false,
+        )
+        .unwrap();
+        assert_eq!(res.slot, 0);
+        assert_eq!(res.admitted_rows, 70_700);
+        assert!(!res.is_soft);
+
+        // 12 sequences committed: 70,700 does NOT fit anymore.
+        // But if soft_want is 5_000 (which fits in the remaining tail), it is admitted softly!
+        let remaining_bytes = b.budget_bytes - 12 * b.bytes_for_rows(70_700);
+        assert!(remaining_bytes > 0);
+        let soft_rows = 100;
+        assert!(b.bytes_for_rows(soft_rows) <= remaining_bytes);
+
+        let res = seat(
+            false,
+            Some(1),
+            70_700,
+            Some(soft_rows),
+            [70_700; 12],
+            Some(b),
+            false,
+        )
+        .unwrap();
+        assert_eq!(res.slot, 1);
+        assert_eq!(res.admitted_rows, soft_rows);
+        assert!(res.is_soft);
+
+        // If even the soft reservation does not fit:
+        let too_big_soft = 70_000;
+        let err = seat(
+            false,
+            Some(1),
+            70_700,
+            Some(too_big_soft),
+            [70_700; 12],
+            Some(b),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, Denied::KvBudgetFull { want: too_big_soft });
     }
 
     /// A behind downstream stage queues the request; a request that can never fit is still
     /// answered first.
     #[test]
     fn a_full_downstream_is_retryable_and_follows_the_whole_budget() {
-        let err = seat(false, Some(0), 1, [], None, true).unwrap_err();
+        let err = seat(false, Some(0), 1, None, [], None, true).unwrap_err();
         assert_eq!(err, Denied::DownstreamFull);
         assert!(err.is_retryable());
         let b = glm_budget();
-        let err = seat(false, Some(0), b.max_rows() + 1, [], Some(b), true).unwrap_err();
+        let err = seat(false, Some(0), b.max_rows() + 1, None, [], Some(b), true).unwrap_err();
         assert!(matches!(err, Denied::ExceedsWholeBudget { .. }));
         let credit = std::sync::Arc::new(DownstreamCredit::default());
         let w = credit.work();
@@ -614,7 +798,7 @@ mod seat_tests {
     #[test]
     fn no_budget_means_slots_alone() {
         assert_eq!(
-            seat(false, Some(0), u64::MAX, [u64::MAX; 4], None, false),
+            seat(false, Some(0), u64::MAX, None, [u64::MAX; 4], None, false).map(|s| s.slot),
             Ok(0)
         );
     }

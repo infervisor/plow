@@ -144,9 +144,10 @@ pub(crate) fn prompt_bytes_overflow(
     })
 }
 
-/// Prompts at least this long encode with [`tokio::task::block_in_place`]: a 64 KiB prompt already
-/// takes tens of ms, and a 64 MiB one stalled every connection on its worker, `/health` included.
-const BLOCKING_ENCODE_BYTES: usize = 64 * 1024;
+/// Prompts at least this long encode with [`tokio::task::block_in_place`]: a 4 KiB prompt (~1k tokens)
+/// already takes a millisecond or more, and stalling the Tokio worker thread starves the async reactor
+/// (TCP accepts, SSE flushes, and `/health` checks).
+const BLOCKING_ENCODE_BYTES: usize = 4 * 1024;
 
 pub(crate) fn encode_prompt(text: &str, encode: impl FnOnce(&str) -> Vec<u32>) -> Vec<u32> {
     let multi_thread = || {
@@ -617,12 +618,16 @@ pub enum Residency {
     /// Explicitly unloaded. `ensure_resident` refuses and the preloader skips
     /// it until an explicit load returns it to `Auto`.
     Unloaded,
+    /// Hibernated in warm dormancy: driver VMM virtual addresses, CUDA graphs,
+    /// cuBLASLt algorithm profiles, and cubin modules stay resident, while weights,
+    /// activations, and KV cache physical memory are unmapped (0 MiB VRAM).
+    Dormant,
 }
 
 impl Residency {
     /// Whether new requests for this slug may be admitted.
     pub fn admits(self) -> bool {
-        matches!(self, Residency::Auto)
+        matches!(self, Residency::Auto | Residency::Dormant)
     }
 
     /// The wire spelling, shared by the admin status and the model card.
@@ -631,6 +636,7 @@ impl Residency {
             Residency::Auto => "auto",
             Residency::Unloading => "unloading",
             Residency::Unloaded => "unloaded",
+            Residency::Dormant => "dormant",
         }
     }
 }
@@ -1978,6 +1984,70 @@ pub fn spawn_bucket_demand_log(state: Arc<AppState>) {
     });
 }
 
+/// Model memory & hibernation metrics for Prometheus (`/metrics`).
+fn model_memory_metrics(out: &mut String, state: &AppState) {
+    use std::fmt::Write;
+
+    crate::obs::serving::family(
+        out,
+        "plowrt_model_is_dormant",
+        "gauge",
+        "Whether the model is hibernating in dormant state (1 = dormant, 0 = otherwise).",
+    );
+    for slug in state.registry.slugs() {
+        let is_dormant = u8::from(state.residency(&slug) == Residency::Dormant);
+        let label = crate::obs::serving::escape_label(&slug);
+        let _ = writeln!(out, "plowrt_model_is_dormant{{model=\"{label}\"}} {is_dormant}");
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hsa", feature = "cpu"))]
+    {
+        crate::obs::serving::family(
+            out,
+            "plowrt_model_physical_weights_bytes",
+            "gauge",
+            "Committed physical VRAM for weights and activations in bytes (0 when dormant or unloaded).",
+        );
+        for slug in state.registry.slugs() {
+            let label = crate::obs::serving::escape_label(&slug);
+            let bytes = if state.residency(&slug) == Residency::Dormant || !state.has_gpu_engine(&slug) {
+                0u64
+            } else {
+                state
+                    .manager_for(&slug)
+                    .and_then(|m| m.plan(&slug))
+                    .map_or(0, |p| p.weights_bytes)
+            };
+            let _ = writeln!(
+                out,
+                "plowrt_model_physical_weights_bytes{{model=\"{label}\"}} {bytes}"
+            );
+        }
+
+        crate::obs::serving::family(
+            out,
+            "plowrt_model_reserved_weights_bytes",
+            "gauge",
+            "Virtual address reservation for weights and activations in bytes (retained across hibernation).",
+        );
+        for slug in state.registry.slugs() {
+            let label = crate::obs::serving::escape_label(&slug);
+            let bytes = if state.has_gpu_engine(&slug) {
+                state
+                    .manager_for(&slug)
+                    .and_then(|m| m.plan(&slug))
+                    .map_or(0, |p| p.weights_bytes)
+            } else {
+                0u64
+            };
+            let _ = writeln!(
+                out,
+                "plowrt_model_reserved_weights_bytes{{model=\"{label}\"}} {bytes}"
+            );
+        }
+    }
+}
+
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::response::Response {
@@ -2016,6 +2086,7 @@ async fn metrics_handler(
         dp_metrics(&mut out, router, &state);
     }
     mm_metrics(&mut out, &state);
+    model_memory_metrics(&mut out, &state);
     // Prefix-cache (VMM) counters, one block per GPU-served model, read
     // through the engine-lock-free stats handles — series stay continuous
     // under sustained inference (only the pool mutex is taken, µs holds).
@@ -2632,6 +2703,8 @@ pub fn admin_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/models/load", post(admin::load))
         .route("/v1/models/unload", post(admin::unload))
+        .route("/v1/models/hibernate", post(admin::hibernate))
+        .route("/v1/models/awaken", post(admin::awaken))
         .route("/v1/models/status", get(admin::status))
         .route("/v1/models/available", get(admin::available))
         .with_state(state)

@@ -1,9 +1,11 @@
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import recipe_common as rc
+from test_packet_sections import write_packet
 
 
 class SpeechPolicyTests(unittest.TestCase):
@@ -56,6 +58,44 @@ class SpeechPolicyTests(unittest.TestCase):
         m["tags"].update(laugh=dict(text="(laugh)", langs={"en": "(laugh)"}),
                          giggle=dict(alias="laugh"), calm=dict(instruction="Speak calmly.", langs=["en"]))
         self.assertEqual(rc.speech_tag_map(m)["tags"]["giggle"]["carry"], False)
+
+    def test_tag_policy_reads_both_pipeline_envelopes(self):
+        recipe = self.policy()
+        pipeline = dict(name="speech", driver="tts.codec_lm.v2",
+                        parameters={"text.tags_version": 1},
+                        strings={"text.tags": json.dumps(recipe["speech_tags"]["map"])})
+        with tempfile.TemporaryDirectory() as tmp:
+            packet = Path(tmp) / "model.pkt"
+            for version in (1, 2):
+                envelope = {"handoff_plans": {"tick": {}}} if version == 2 else {}
+                with self.subTest(version=version):
+                    write_packet(packet, [pipeline], version=version, **envelope)
+                    self.assertEqual(rc.speech_pipelines(packet), [pipeline])
+                    self.assertEqual(rc.check_packet_speech_tags(packet, recipe)[0][0], "ok")
+                    for mutation in ("map", "tag-version"):
+                        changed = copy.deepcopy(pipeline)
+                        if mutation == "map":
+                            changed["strings"]["text.tags"] = json.dumps({
+                                **recipe["speech_tags"]["map"], "unknown": "reject"})
+                        else:
+                            changed["parameters"]["text.tags_version"] = 2
+                        write_packet(packet, [changed], version=version, **envelope)
+                        with self.assertRaises(rc.Fail):
+                            rc.check_packet_speech_tags(packet, recipe)
+
+    def test_tag_reader_refuses_unknown_versions_and_malformed_v2_containers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            packet = Path(tmp) / "model.pkt"
+            for version in (0, 3, "2", True, None):
+                with self.subTest(version=version):
+                    write_packet(packet, [], version=version)
+                    with self.assertRaises(rc.Fail):
+                        rc.speech_pipelines(packet)
+            for plans in (None, [], {}, {"tick": []}):
+                with self.subTest(plans=plans):
+                    write_packet(packet, [], version=2, handoff_plans=plans)
+                    with self.assertRaises(rc.Fail):
+                        rc.speech_pipelines(packet)
 
 
 if __name__ == "__main__":

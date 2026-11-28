@@ -156,11 +156,19 @@ pub enum DevOp {
     /// path byte-identical, so prefill and B=1 decode are unchanged.
     /// `cos = TENSOR_NONE` skips RoPE. `out_row0` lets K/V land directly at a row
     /// offset of the KV cache, so the cache write is not a separate copy.
+    /// CUDA pair mode 4 applies the optional BF16 scale per head and channel, then clips
+    /// the FP32 L2 norm to the FP32 bits in `i4` (+ `f0` epsilon in the divisor). Output is dense.
+    /// In mode 4 slot 3 optionally supplies log-position parameters [floor:u32, alpha:f32].
+    /// CUDA mode 5 instead clips 16 relative channels and multiplies by the BF16
+    /// projection in slot 3, giving i3 output distances per head. Slot 4 optionally
+    /// carries the log-position parameters. Both modes read the position in slot 5.
     HeadNormRope = 3,
     /// `t0=out t1=a t2=b t3=pre?` · `i0=n` · `f0=scale`, computing
     /// `(a + b) * scale`, or `(pre + bf16(a + b)) * scale` when `pre` is present.
     /// `scale` absorbs Gemma's per-layer `layer_scalar` on the SECOND residual
     /// add; pass 1.0 for the first.
+    /// CUDA mode `i7=1` copies `i0` BF16 elements from block `i2` in slot 1
+    /// into block `i1` in slot 0. Block offsets are measured in units of `i0`.
     Residual = 4,
     /// `t0=out t1=gate t2=up` · `i0=n i1=act` · `f0=alpha f1=limit` (act 0 = gelu_tanh,
     /// 1 = silu, 3 = swiglu_oai). Gemma is GeGLU (gelu_tanh), not SwiGLU.
@@ -221,14 +229,18 @@ pub enum DevOp {
     /// whose own spec was updated at the time and already agreed. Caught by
     /// `crate::slots`' drift test; see that module for why the table is checked
     /// against these comments rather than generated from them.
+    /// CUDA HD128 relative attention uses equal nonempty slots 6 and 7 for
+    /// BF16 bias [query, head, 1024] indexed by key distance, with slot 5 absent.
     FlashPrefill = 11,
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32) t6=decode_slot(i32)?` ·
     /// `i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd` ·
     /// `f0=scale`. For ordinary BF16, `decode_slot[b]` selects the physical KV slot for
     /// compact row `b`; when absent, physical slot and compact row are identical. Packed
     /// extension forms retain their extension-specific operands.
+    /// CUDA relative attention uses j1 = all ones and slot 7 for the same
+    /// distance-indexed bias. Slot 6 remains the optional physical KV slot map.
     FlashDecode = 12,
-    /// `t0=O t1=Opart t2=mlpart t3=sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
+    /// `t0=O t1=Opart t2=mlpart t3=sinks? t4=gate? t5=row_sinks?` · `i0=n_batch i1=n_head i2=nsplit i3=hd`.
     ///
     /// `sinks` (optional bf16 `[n_head]`, GPT-OSS `self_attn.sinks`) is one extra UNSCALED logit
     /// per head that joins the softmax denominator with no value row, folded HERE and only here:
@@ -236,6 +248,10 @@ pub enum DevOp {
     /// `O = sum_s O_s e^(m_s - gm') / gl'`. With sinks present the emitter must emit the merge at
     /// every `nsplit` (including 1) and leave [`DevOp::FlashPrefill`]'s `t5` (`O_final`, which
     /// normalises inside the flash) at `TENSOR_NONE`. See `dev_isa.h` op 13.
+    ///
+    /// CUDA HD128 accepts paired BF16 `gate[n_batch,n_head,hd]` and
+    /// `row_sinks[n_batch,n_head]` instead of the static sink vector. The
+    /// sigmoid gate scales the FP32 merge result before BF16 storage.
     FlashMerge = 13,
     /// As [`DevOp::Gemm`], 64x128 tile.
     GemmSmall = 14,
@@ -505,7 +521,7 @@ pub enum DevOp {
     /// routing table `[k]` of `(u32 expert_id, f32 gate)`, padding unused slots with the
     /// `EXPERT_UNUSED` sentinel. Its completion counter is the data-dependent gate the K
     /// expert slots wait on.
-    /// `t0=routing_table(out) t1=x t2=Wr [t3=e_score_correction_bias f32[n_exp]]` ·
+    /// `t0=table t1=x t2=wr t3=bias?` ·
     /// `i0=H i1=n_exp i2=k i3=flags` · `f0=route_scale`.
     /// `flags` bit0 = scoring (1 sigmoid, 0 softmax), bit1 = norm_topk, bit2 = apply t3
     /// `e_score_correction_bias` to the top-k SELECTION only (DeepSeek/GLM noaux_tc — the
@@ -882,8 +898,8 @@ pub enum DevOp {
     // arrays are sized `T*k + n_exp*(MPF_BM-1)`.
     /// T-token router tail — a block-per-token loop of [`DevOp::MoeRouterTopk`], so it is
     /// bit-identical PER TOKEN to the decode router by construction. The `[T,n_exp]` logit matrix is
-    /// an ordinary [`DevOp::Gemm`], already in the prefill bucket; only this tail was missing.
-    /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t2=atom_acc? t3=bias` ·
+    /// an ordinary [`DevOp::Gemm`] or an FP32-output projection. Flag bit 3 selects FP32 logits.
+    /// `t0=table[T*k] t1=logit([T,n_exp]) t2=atom_acc? t3=bias` ·
     /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T i5=shared_tail` · `f0=route_scale
     /// f1=logit_scale?` (as [`DevOp::MoeRouterTopk`]).
     ///
@@ -900,7 +916,8 @@ pub enum DevOp {
     /// `MPF_BM`-padded prefix, scatter each live slot into its expert's contiguous gathered-row
     /// range. `meta` is `[3*n_exp+1]` i32 (rowoff | cnt | m-tile prefix).
     /// `t0=meta(i32) t1=table t2=row_token(u32) t3=row_partidx(u32) t4=row_gate(f32)` ·
-    /// `i0=T i1=n_exp i2=k`.
+    /// `i0=T i1=n_exp i2=k`. Hopper NVFP4 gate/up may set `i3=aligned_rows`
+    /// with `t4=t3`, storing the gate array after the routed-slot array.
     MoeAlignPf = 84,
     /// Grouped gate/up GEMM + GLU: A gathered from `xn2` by `row_token`, B is the tile's expert's
     /// gate|up staged into one BN tile. `i3` selects the block-fp8 or bf16 weight arm.
@@ -1144,7 +1161,7 @@ pub enum DevOp {
     ///
     /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb_cap,H] bf16)
     /// t3=score_w([H] f32) t4=push_src? t5=gamma? t6=res_a? t7=res_b?` ·
-    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre? i6=mwg_scratch` · `f0=eps`.
+    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre? i6=mwg_scratch i7=cuda_mode` · `f0=eps`.
     ///
     /// `gamma` is the FUSED POST-NORM, `[H] bf16`, and it is what makes the slice map above
     /// affordable. Every AttnRes in a K3 program is read by exactly one consumer and that consumer
@@ -1176,6 +1193,18 @@ pub enum DevOp {
     /// `mwg_scratch` (non-zero only on a decode packet emitted with `PLOW_ATTNRES_DECODE_MWG=n`)
     /// is the tagged-word rendezvous scratch of the banded multi-workgroup arm; `blocks = n`
     /// column bands then share one packet. `f1` carries the output-norm epsilon (f32-mix).
+    /// CUDA mode `i7=1` mixes RMS-normalized BF16 sources in FP32, with optional
+    /// BF16 post-normalization. Slot 2 is a block-major stack, slot 1 is the last
+    /// block, slot 7 optionally adds to that last block in FP32, and slot 3
+    /// holds unscaled FP32 queries. Slot 5 optionally holds BF16 gamma by query.
+    /// Here i2 counts stack blocks, i3 counts queries and i4 is the stack stride
+    /// in rows. i5 is the starting row in slot 3. Output is query-major FP32
+    /// without gamma and BF16 with gamma.
+    /// Mode 2 independently RMS-normalizes FP32 destination and message
+    /// (slots 1 and 2), writing their concatenation as BF16 per row.
+    /// Mode 3 mixes them using FP32 gain and forget logits (slots 3 and 4),
+    /// then applies BF16 gamma (slot 5) after RMSNorm. Both use i0 rows,
+    /// i1 hidden width, and f0 epsilon.
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).
@@ -1817,6 +1846,11 @@ pub enum DevOp {
     /// column inside an N-concatenated projection's output (runtime contract 4).
     ///
     /// `t0=out t1=x t2=weight t3=history t4=active?` · `i0=C i1=W i2=B` · `j1=source?`.
+    /// CUDA `i4 != 0` selects the four-tap residual mode: `i4` is channels
+    /// per group, `f0` scales the sum of input and convolution. Optional BF16
+    /// `t6` adds row/group/tap deltas to transposed static weights [W,C].
+    /// Optional BF16 slot 7 adds to the rounded convolution output. With slot
+    /// 7 present, optional BF16 slot 5 adds to it in FP32 before convolution output is added.
     QwenGdnConv = 136,
     /// Recurrent GDN with K=128 and HV divisible by HK. BF16 out[B,HV,V], packed qkv[B,2*HK*K+HV*V], a/b[B,HV], and dt_bias[HV]. A_log[HV] is BF16 unless alog_f32 is nonzero. Mutable FP32 state[B,HV,V,K]; optional I32 active[B] masks writes. Beta rounds to BF16 before recurrence.
     ///
@@ -1855,6 +1889,8 @@ pub enum DevOp {
     /// `source` (j1) as [`DevOp::QwenGdnConv`].
     ///
     /// `t0=out t1=x t2=weight t3=history` · `i0=C i1=W i2=T` · `j1=source?`.
+    /// CUDA residual mode uses the same operands as [`DevOp::QwenGdnConv`]
+    /// and `i3` gives the padded row count. It consumes one request per launch.
     QwenGdnConvPrefill = 143,
     /// Unpack BF16 packed[T,2*HK*K+HV*V]; normalize Q/K[T,HK,K] and round to BF16, copy V[T,HV,V]. No Q scaling.
     ///
@@ -1886,8 +1922,11 @@ pub enum DevOp {
     ///
     /// `t0=fu(bf16[B*k][I]) t1=x(bf16[B][K]) t2=table t3=W_gu(fp4[E][2I][K/2])
     /// t4=S_gu(e8m0[E][2I][K/32]) t5=bias_gu?` ·
-    /// `i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch` · `f0=alpha f1=limit`.
-    /// `bias_gu` is bf16 `[E][2I]`.
+    /// `i0=k i1=I i2=K i3=n_exp i4=layout i5=act i6=n_batch i7=mode` · `f0=alpha f1=limit`.
+    /// `bias_gu` is bf16 `[E][2I]`. CUDA NVFP4 mode (`i7=2`) uses block-16 E4M3 scales
+    /// and accepts paired `t6=amax(f32[E]) t7=denominator(f32)` to scale each expert's
+    /// gate/up projections before the bias and activation. `act=4` takes gate/up caps in `f0/f1`
+    /// and stores BF16 `softcap(gate)*sigmoid(gate)*softcap(up)*router_weight`.
     MoeGluMx = 150,
     /// GPT-OSS MXFP4 MoE, DECODE grouped down + gate scale, flat tensors as [`DevOp::MoeGluMx`]:
     /// `part[s][h] = table[s].gate * (dot(W_e[h], fu[s]) + b_e[h])` in f32 (the bias is inside
@@ -1895,8 +1934,10 @@ pub enum DevOp {
     /// is [`DevOp::MoeCombine`] / [`DevOp::MoeCombinePf`] (`i2 = T = n_batch`) in fixed slot order.
     ///
     /// `t0=part(f32[B*k][H]) t1=fu(bf16[B*k][I]) t2=table t3=W_d(fp4[E][H][I/2])
-    /// t4=S_d(e8m0[E][H][I/32]) t5=bias_d?` · `i0=k i1=H i2=I i3=n_exp i6=n_batch`.
-    /// `bias_d` is bf16 `[E][H]`.
+    /// t4=S_d(e8m0[E][H][I/32]) t5=bias_d?` · `i0=k i1=H i2=I i3=n_exp i6=n_batch i7=mode`.
+    /// `bias_d` is bf16 `[E][H]`. CUDA NVFP4 accepts the same outer-scale operands
+    /// as [`DevOp::MoeGluMx`], applied before bias and router weighting. Set `i5=1` when the
+    /// activation already includes the router weight.
     MoeDownMx = 151,
     /// PREFILL twin of [`DevOp::MoeGluMx`]: token-sorted gathered rows from
     /// [`DevOp::MoeRouterTopkPf`] + [`DevOp::MoeAlignPf`] exactly as [`DevOp::MoeGroupGluPf`]
@@ -1905,7 +1946,12 @@ pub enum DevOp {
     /// segment: `fu_g[r] = swiglu_oai(W_e xn2[row_token[r]] + b_e)`.
     ///
     /// `t0=fu_g(bf16[rows][I]) t1=xn2(bf16[T][K]) t2=W_gu t3=S_gu t4=meta(i32) t5=row_token(u32)
-    /// t6=bias_gu?` · `i0=I i1=K i2=n_exp i3=layout i5=act` · `f0=alpha f1=limit`.
+    /// t6=bias_gu?` · `i0=I i1=K i2=n_exp i3=layout i5=act i7=mode` · `f0=alpha f1=limit`.
+    ///
+    /// Hopper NVFP4 grouped mode (`i7=3`) uses `t5=paired slot/gate arrays
+    /// t6=expert_amax t7=outer_scale_denominator` and writes BF16 by original routed slot.
+    /// `i0=I i1=K i2=n_exp i3=routed_slots i4=aligned_rows i5=topk`;
+    /// `f0=gate_softcap f1=up_softcap`.
     MoeGluMxPf = 152,
     /// PREFILL twin of [`DevOp::MoeDownMx`], slot map after [`DevOp::MoeGroupDownPf`] (the bias
     /// takes the `fu_scale` slot these flat-fp4 ops do not need):
@@ -1913,7 +1959,12 @@ pub enum DevOp {
     /// (`row_partidx == EXPERT_UNUSED`) are dropped.
     ///
     /// `t0=part(f32[T*k][H]) t1=fu_g t2=W_d t3=S_d t4=meta t5=bias_d? t6=row_partidx(u32)
-    /// t7=row_gate(f32)` · `i0=H i1=I i2=n_exp`.
+    /// t7=row_gate(f32)` · `i0=H i1=I i2=n_exp i3=routed_slots i4=aligned_rows i7=mode`.
+    /// Hopper mode `i7=3` uses NVFP4 weights and block-16 E4M3 scales.
+    /// Slot 6 maps expert-grouped rows to original routed slots in both fu
+    /// and part. Slots 5 and 7 hold per-expert FP32 amax and the FP32 outer
+    /// scale denominator. i3 and i4 bound routed slots and grouped rows.
+    /// The activation already includes the router weight.
     MoeDownMxPf = 153,
     /// `t0=out(bf16 [S][H]) t1=x(bf16 [M][H]) t2=rows(u32 [S])` · `i0=S i1=H i2=M`, computing
     /// `out[s][h] = x[rows[s]][h]`.
@@ -2122,7 +2173,7 @@ pub enum DevOp {
     /// t3=overlay(f32[overlay_rows,width]) t4=overlay_index(u32[rows])` ·
     /// `i0=rows i1=width i2=vocab i3=overlay_rows`.
     EmbedOverlayBf16 = 179,
-    /// BF16 projection with an FP32 accumulator/output, used for GLM router logits.
+    /// BF16 projection with an FP32 accumulator/output, used for router logits.
     /// `t0=C(f32[M,N]) t1=A(bf16[M,K]) t2=W(bf16[N,K])` · `i0=M i1=N i2=K`.
     GemmF32 = 180,
     /// Decode context parallelism, pack half: this rank copies the latent KV records its DCP
@@ -2244,6 +2295,11 @@ pub enum DevOp {
     /// `[out_channels,in_channels,kernel]`; other implementations read that prefix.
     /// Optional `row_scale` f32 `[batch][out_rows]` scales each row after the output activation,
     /// before the residual: `out = residual + row_scale[b][t] * post(bias + conv)`.
+    /// Input-only SnakeBeta over a stream input (pre code snake + bits 2, 19 and 22, no post code;
+    /// speech flag layout 6): `t4=[a|r](f32[2*in_channels]) t5=state(f32[slots,L,in_channels])
+    /// t6=slot(u32[batch]) t7=pos(u32[batch])`, `L = (kernel-1)*dilation`; input row `u < L` of
+    /// item `b` is `state[slot[b]]` row `u` (zero while `pos[b] == 0`), row `u >= L` is `x` row
+    /// `b*(in_rows-L) + u - L`.
     /// `t0=out(f32[batch,out_rows,out_channels]) t1=x(f32[batch,in_rows,in_channels])
     /// t2=weight(f32|f16[out_channels,in_channels/groups,kernel]) t3=bias? t4=alpha?
     /// t5=residual? t6=lengths(u32[batch])? t7=row_scale?` ·
@@ -2322,6 +2378,11 @@ pub enum DevOp {
     /// Old keys are at absolute_position modulo history; current QKV supplies new keys.
     /// Zero-length items produce zero without reading their slot or position. Ring stores
     /// must depend on every attention producer, before any current key overwrites history.
+    /// `j1` bit 31 (layout 5, `v_col0` below it): Q / K / V and the output are fp16 rows (stride
+    /// and column offsets in halves), probabilities rounded to fp16 after normalization, V read
+    /// saturated to the finite fp16 range (+-65504; a NaN reads as -65504); only the
+    /// short geometry (head width 64, q_rows and kv_rows <= 32, flags but causal 0, no bias or
+    /// prefix), anything else traps.
     /// `t0=out t1=query t2=key t3=value t4=key_lengths(u32[batch])? t5=bias|prefix_rows? t6=prefix?
     /// t7=prefix_index(u32[batch])?` ·
     /// `i0=batch i1=q_rows i2=kv_rows i3=heads i4=head_width i5=in_stride i6=flags
@@ -2672,6 +2733,9 @@ pub const ACT_LOG: u32 = 20;
 /// GLU-family `act` code for GPT-OSS's `swiglu_oai` (pair form, `f0 = alpha`, `f1 = limit`).
 /// Codes 0/1/2 are gelu_tanh / silu / situ; see [`DevOp::Glu`].
 pub const ACT_SWIGLU_OAI: u32 = 3;
+
+/// CUDA flat MoE: softcap gate and up independently, then apply the router weight before rounding.
+pub const ACT_SWIGLU_SOFTCAP: u32 = 4;
 /// GLU-family `act` code for the clamped SwiGLU `silu(min(g, L)) * clamp(u, ±L)` (pair form,
 /// `f1 = L`): DeepSeek-V4 and GLM-5.3-Flash `swiglu_limit`. Only the pair-form epilogues
 /// (`moe_glu`, `act_glu_pair`) serve it; the gate-only GEMM/GEMV GLU epilogues poison it to NaN.
@@ -2681,6 +2745,11 @@ pub const ROPE_PAIR_HALF: u32 = 2;
 /// [`DevOp::HeadNormRope`] `i5 = pair_mode`: the DSA indexer key prep (PLOW_DSA_PREP) — LayerNorm
 /// with bias (`t2 = gamma`, `t6 = beta`, `f0 = eps`) then HD=128 interleaved rope, skip_norm.
 pub const ROPE_PAIR_DSA_KPREP: u32 = 3;
+/// Dense CUDA scaled L2 clipping without RoPE or KV addressing.
+pub const ROPE_PAIR_L2_CLIP: u32 = 4;
+pub const ROPE_PAIR_RELATIVE_LOGITS: u32 = 5;
+pub const FLASH_RELATIVE_EXTENT: u32 = 1024;
+pub const FLASH_DECODE_RELATIVE: u32 = u32::MAX;
 
 impl DevOp {
     /// Every opcode, in numeric order.

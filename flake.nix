@@ -440,7 +440,8 @@
             # libhsa-runtime64), no HIP runtime involved.
             buildFeatures = lib.optionals isLinux [ "cuda" "hsa" ];
             cargoBuildFlags = [ "--package" "plowrt" ];
-            cargoTestFlags = [ "--package" "plowrt" ];
+            # Every test binary runs: a failure in one does not hide the rest.
+            cargoTestFlags = [ "--package" "plowrt" "--no-fail-fast" ];
 
             meta = {
               description = "plow host runtime — CPU + GPU in one binary on Linux (drivers dlopen'd), CPU-only on darwin";
@@ -598,6 +599,14 @@
               pkgs.git
               pkgs.actionlint
             ];
+          };
+
+          # The lean-correctness lane on a hosted runner: the CI tools plus the
+          # Lean toolchain manager (lean-plow/lean-toolchain pins the version).
+          lean = pkgs.mkShell {
+            name = "plow-lean";
+            inputsFrom = [ self.devShells.${system}.ci ];
+            packages = [ pkgs.elan ];
           };
 
           default = pkgs.mkShell {

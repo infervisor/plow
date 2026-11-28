@@ -56,6 +56,8 @@ int cuMemGetAllocationGranularity(void) { return 0; }
 int cuMemAddressReserve(void) { return 0; }
 int cuMemAddressFree(void) { return 0; }
 int cuMemCreate(void) { return 0; }
+int cuMemExportToShareableHandle(void) { return 0; }
+int cuMemImportFromShareableHandle(void) { return 0; }
 int cuMemRelease(void) { return 0; }
 int cuMemMap(void) { return 0; }
 int cuMemUnmap(void) { return 0; }
@@ -64,6 +66,7 @@ int cuMemcpyDtoD_v2(void) { return 0; }
 int cuStreamCreate(void) { return 0; }
 int cuStreamDestroy_v2(void) { return 0; }
 int cuStreamSynchronize(void) { return 0; }
+int cuStreamWriteValue32(void) { return 0; }
 int cuMemcpyHtoDAsync_v2(void) { return 0; }
 int cuMemcpyDtoHAsync_v2(void) { return 0; }
 int cuMemcpyDtoDAsync_v2(void) { return 0; }

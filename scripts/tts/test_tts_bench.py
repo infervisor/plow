@@ -1,11 +1,12 @@
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
-from tts_bench import main, underruns
+from tts_bench import main, open_loop, open_loop_summary, poisson_plan, underruns
 
 SR = 24000
 B = 2 * SR  # bytes of one second of pcm16
@@ -47,6 +48,22 @@ class UnderrunTests(unittest.TestCase):
         self.assertEqual(underruns([(0.0, B // 10), (0.1005, B // 10)], SR), (0, 0.0, 0))
         self.assertEqual(underruns([], SR), (0, 0.0, 0))
         self.assertEqual(underruns([(3.0, B)], SR), (0, 0.0, 0))
+
+    def test_open_loop_plan_is_seeded_and_starts_do_not_wait_for_completions(self):
+        plan = poisson_plan(200.0, 0.2, 7)
+        self.assertEqual(plan, poisson_plan(200.0, 0.2, 7))
+        self.assertTrue(all(0 < a < b < 0.2 for a, b in zip(plan, plan[1:])))
+        # All three must be in flight at once for the barrier to release.
+        together = threading.Barrier(3)
+        res, late, peak = open_loop([0.0, 0.01, 0.02], lambda k: together.wait(5) * 0 + k)
+        self.assertEqual((res, peak, len(late)), ([0, 1, 2], 3, 3))
+
+    def test_open_loop_goodput_excludes_failed_late_and_stalled_requests(self):
+        row = lambda ttfa, audio=1.0, stalls=0, lat=0.5: dict(ttfa_s=ttfa, latency_s=lat, audio_s=audio, stalls=stalls)
+        rows = [row(0.1), row(0.9), row(0.1, stalls=1), row(None, audio=0.0), row(0.1, lat=9.0)]
+        s = open_loop_summary(rows, [0.0, 1.0, 2.0, 3.0, 4.0], [0.0, 0.0, 0.02, 0.0, 0.0], 5.0, 500.0)
+        self.assertEqual((s["offered_rps"], s["goodput_rps"], s["completed_rps"], s["late_starts"]), (1.0, 0.4, 0.6, 1))
+        self.assertAlmostEqual(s["slo_attainment"], 0.4)
 
 
 if __name__ == "__main__":
